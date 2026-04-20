@@ -19,6 +19,7 @@ pub mod context;
 pub mod guardrails;
 pub mod hooks;
 pub mod mcp;
+pub mod memdir;
 pub mod memory;
 pub mod migrations;
 pub mod modes;
