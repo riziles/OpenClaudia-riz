@@ -211,6 +211,22 @@ fn sessions_dir() -> PathBuf {
         .join("chat_sessions")
 }
 
+/// Format a [`SystemTime`] as an ISO-8601 date string
+/// (`YYYY-MM-DD`). Used only for the log-selector "last activity"
+/// column where the exact minute doesn't matter — the picker shows
+/// entries newest-first so users orient by relative position, not a
+/// wall-clock string. Returns `"?"` on the far-past clock drift case
+/// where the timestamp predates the Unix epoch.
+fn iso_of_systemtime(t: std::time::SystemTime) -> String {
+    match chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%Y-%m-%d")
+        .to_string()
+    {
+        s if s.is_empty() => "?".to_string(),
+        s => s,
+    }
+}
+
 fn save_session(session: &TuiSession) -> Result<(), String> {
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -297,6 +313,19 @@ pub struct App {
     /// Absolute cwd used for the transcript path. Captured once so
     /// later appends survive the user changing dirs within a skill.
     transcript_cwd: PathBuf,
+    /// Active modal overlay (help / log picker / …). At most one at a
+    /// time. `None` when the main chat UI has focus. Closing an
+    /// overlay goes through its `OverlayAction` return value so the
+    /// event loop stays the single owner of App-level state changes.
+    overlay: Option<ActiveOverlay>,
+}
+
+/// Which overlay component is currently open. Each variant owns its
+/// component state directly — the enum is the single-slot union the
+/// event loop matches on to dispatch draw / key events.
+pub enum ActiveOverlay {
+    Help(super::components::HelpOverlay),
+    LogSelector(super::components::LogSelector),
 }
 
 impl App {
@@ -331,7 +360,82 @@ impl App {
             rules_injected: false,
             transcript_watermark: 0,
             transcript_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            overlay: None,
         }
+    }
+
+    /// Open the help-cheatsheet overlay. Subsequent keystrokes go to
+    /// the overlay until it returns `OverlayAction::Close`.
+    pub fn open_help_overlay(&mut self) {
+        self.overlay = Some(ActiveOverlay::Help(
+            super::components::HelpOverlay::new(),
+        ));
+    }
+
+    /// Resume the session whose id equals or prefix-matches `id`.
+    /// Shared between the log-selector overlay (exact id) and the
+    /// `/load` / `/continue` text commands (prefix match). No-op
+    /// with a user-visible system message when no match is found.
+    fn resume_session_by_id(&mut self, id: &str) {
+        let sessions = list_sessions();
+        let Some(loaded) = sessions.iter().find(|s| s.id.starts_with(id)).cloned()
+        else {
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: format!("No session found with id prefix '{id}'."),
+                tool_name: None,
+                is_error: true,
+                is_thinking: false,
+            });
+            return;
+        };
+        self.chat_session = loaded.clone();
+        self.session_messages = loaded.messages.clone();
+        self.model = loaded.model.clone();
+        self.provider = loaded.provider.clone();
+        self.mode = loaded.mode.clone();
+        self.tokens = self.chat_session.estimate_tokens();
+        self.transcript_cwd =
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.transcript_watermark = self.session_messages.len();
+        // Repaint the transcript.
+        self.messages = super::messages::MessageList::new();
+        for msg in &loaded.messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("system");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if role == "system" {
+                continue;
+            }
+            self.messages.add(DisplayMessage {
+                role: role.to_string(),
+                content: content.to_string(),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
+        }
+    }
+
+    /// Open the log-selector (session picker) overlay seeded with
+    /// every transcript for the current project's cwd. No-op when
+    /// there are zero saved sessions — the caller should show a
+    /// different affordance in that case (current behavior: the
+    /// overlay still opens with an empty-state message, matching
+    /// Claude Code's `/resume` UX).
+    pub fn open_log_selector(&mut self) {
+        let transcripts = crate::transcript::list_transcripts(&self.transcript_cwd);
+        let rows = transcripts
+            .into_iter()
+            .map(|info| super::components::log_selector::SessionRow {
+                session_id: info.session_id,
+                first_prompt: info.first_prompt,
+                message_count: info.message_count,
+                modified_iso: iso_of_systemtime(info.modified),
+            })
+            .collect();
+        self.overlay = Some(ActiveOverlay::LogSelector(
+            super::components::LogSelector::new(rows),
+        ));
     }
 
     /// Fire the `Stop` hook. Invoked when a turn reaches a terminal
@@ -598,6 +702,29 @@ impl App {
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Modal overlays consume every keystroke while open. Ordering
+        // matters: overlay handling comes BEFORE the global Ctrl+C
+        // quit so dismissing the overlay with Ctrl+C doesn't tear
+        // down the whole app.
+        if self.overlay.is_some() {
+            use super::components::{Overlay as _, OverlayAction};
+            let action = match self.overlay.as_mut().unwrap() {
+                ActiveOverlay::Help(o) => o.handle_key(key),
+                ActiveOverlay::LogSelector(o) => o.handle_key(key),
+            };
+            match action {
+                OverlayAction::Consumed => {}
+                OverlayAction::Close => {
+                    self.overlay = None;
+                }
+                OverlayAction::ResumeSession(id) => {
+                    self.overlay = None;
+                    self.resume_session_by_id(&id);
+                }
+            }
+            return;
+        }
+
         // Ctrl+C always quits
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             // If permission prompt is active, deny and dismiss
@@ -711,34 +838,19 @@ impl App {
         }
 
         if text == "/help" || text == "?" {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: "Commands:\n\
-                                      /help          Show this help\n\
-                                      /mode          Toggle Build/Plan mode\n\
-                                      /effort [lvl]  Set effort (low/medium/high) or cycle\n\
-                                      /status        Show session info\n\
-                                      /sessions      List saved sessions\n\
-                                      /load <id>     Load a saved session\n\
-                                      /undo          Undo last message pair\n\
-                                      /redo          Redo undone messages\n\
-                                      /rewind [N]    Rewind N turns, or show turn list\n\
-                                      /diff          Show uncommitted git changes\n\
-                                      /review        Show git diff for review\n\
-                                      /context       Show token context usage\n\
-                                      /doctor        Run diagnostics\n\
-                                      /init          Initialize project config\n\
-                                      /clear         Clear conversation\n\
-                                      /skill [name]  List or run skills\n\
-                                      /export        Export conversation to markdown\n\
-                                      !<cmd>         Run shell command\n\
-                                      /quit          Exit\n\n\
-                                      Scroll: Up/Down/PageUp/PageDown · Cancel: Esc · Quit: Ctrl+C"
-                    .to_string(),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            // Rich scrollable overlay — handled by the help component.
+            // Falls back to a plain inline message when the overlay is
+            // unavailable (e.g. during headless tests) — unreachable
+            // in the interactive TUI but kept for defence-in-depth.
+            self.open_help_overlay();
+            return true;
+        }
+
+        if text == "/resume" || text == "/continue" {
+            // No-arg form → open the picker overlay. Args form is
+            // handled by the existing `/load <id>` / `/continue <id>`
+            // branch below.
+            self.open_log_selector();
             return true;
         }
 
@@ -1679,7 +1791,7 @@ impl App {
         });
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1801,6 +1913,19 @@ impl App {
                 )
                 .style(Style::default().bg(Color::Black));
             frame.render_widget(dialog, dialog_area);
+        }
+
+        // ── Modal overlay (rendered last so it floats above everything) ──
+        // Use `Clear` to blank the underlying region; both overlays paint
+        // their own background via the border-block's default bg.
+        if let Some(ref mut overlay) = self.overlay {
+            use super::components::Overlay as _;
+            let area = super::components::centered_rect(60, 60, frame.area());
+            frame.render_widget(ratatui::widgets::Clear, area);
+            match overlay {
+                ActiveOverlay::Help(o) => o.render(frame, area),
+                ActiveOverlay::LogSelector(o) => o.render(frame, area),
+            }
         }
     }
 

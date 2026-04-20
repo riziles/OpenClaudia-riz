@@ -7,6 +7,7 @@
 //! The interactive full-screen TUI is in the `app` submodule, launched via `--tui`.
 
 pub mod app;
+pub mod components;
 pub mod events;
 pub mod input;
 pub mod messages;
