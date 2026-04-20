@@ -288,17 +288,27 @@ pub fn get_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web and return relevant results. Uses DuckDuckGo by default (free, no API key). Falls back to Tavily or Brave API if configured. Returns titles, snippets, and URLs.",
+                "description": "Search the web and return relevant results. Uses DuckDuckGo by default (free, no API key). Falls back to Tavily or Brave API if configured. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The search query"
+                            "description": "The search query (must be at least 2 characters)"
                         },
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of results to return (default: 5)"
+                        },
+                        "allowed_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Only include search results from these domains. Matches the hostname suffix, so 'docs.python.org' would match both 'docs.python.org' and 'foo.docs.python.org'."
+                        },
+                        "blocked_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Never include search results from these domains. Same hostname-suffix matching as `allowed_domains`. Takes precedence when a result matches both lists."
                         }
                     },
                     "required": ["query"]
@@ -374,7 +384,7 @@ pub fn get_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "notebook_edit",
-                "description": "Edit a Jupyter notebook (.ipynb file). Supports replacing cell contents, inserting new cells, and deleting cells. The notebook must be read with read_file before editing.",
+                "description": "Edit a Jupyter notebook (.ipynb file). Supports replacing cell contents, inserting new cells, and deleting cells. The notebook must be read with read_file before editing. Accepts either `cell_id` (Claude Code-compatible stable ID from the notebook's cell metadata) or `cell_number` (0-indexed position). For `insert`, `cell_id` means 'insert after this cell' and omitting it inserts at the beginning.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -382,9 +392,13 @@ pub fn get_tool_definitions() -> Value {
                             "type": "string",
                             "description": "The absolute path to the .ipynb file to edit"
                         },
+                        "cell_id": {
+                            "type": "string",
+                            "description": "Claude Code-compatible stable cell ID (preferred over cell_number). For `insert`, new cell is added after this one; omit to insert at the beginning."
+                        },
                         "cell_number": {
                             "type": "integer",
-                            "description": "The 0-indexed cell number to operate on"
+                            "description": "Legacy 0-indexed cell position. Use `cell_id` when possible — `cell_number` is kept only for back-compat with earlier OpenClaudia sessions."
                         },
                         "new_source": {
                             "type": "string",
@@ -401,7 +415,7 @@ pub fn get_tool_definitions() -> Value {
                             "description": "The edit operation: 'replace' (default) overwrites cell source, 'insert' adds a new cell at the index, 'delete' removes the cell."
                         }
                     },
-                    "required": ["notebook_path", "cell_number", "new_source"]
+                    "required": ["notebook_path", "new_source"]
                 }
             }
         },
@@ -437,7 +451,7 @@ pub fn get_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "ask_user_question",
-                "description": "Ask the user one or more structured questions with predefined options. Use this when you need clarification or want the user to make a choice before proceeding. Each question can have 2-4 options plus an automatic 'Other' option. Supports single or multi-select.",
+                "description": "Ask the user one or more structured questions with predefined options. Use this when you need clarification or want the user to make a choice before proceeding. Each question can have 2-4 options plus an automatic 'Other' option. Supports single- or multi-select (via `multiSelect`). Question texts must be unique across the array, and option labels must be unique within each question.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -473,14 +487,18 @@ pub fn get_tool_definitions() -> Value {
                                                 "description": {
                                                     "type": "string",
                                                     "description": "Brief description of this option"
+                                                },
+                                                "preview": {
+                                                    "type": "string",
+                                                    "description": "Optional preview content (mockup, code snippet, comparison) rendered when this option is focused. Claude Code-compatible."
                                                 }
                                             },
                                             "required": ["label", "description"]
                                         }
                                     },
-                                    "multi_select": {
+                                    "multiSelect": {
                                         "type": "boolean",
-                                        "description": "If true, user can select multiple options (comma-separated)"
+                                        "description": "If true, user can select multiple options (comma-separated). Claude Code-compatible name; `multi_select` is also accepted for back-compat."
                                     }
                                 },
                                 "required": ["question", "header", "options"]
@@ -2085,6 +2103,93 @@ mod tests {
             cell.get("execution_count").is_some(),
             "Code cell should have execution_count"
         );
+    }
+
+    // === cell_id path (Claude Code parity) ===
+
+    #[test]
+    fn test_notebook_edit_resolves_by_cell_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb_path = dir.path().join("by-id.ipynb");
+        let notebook = json!({
+            "cells": [
+                {"id": "cell-a", "cell_type": "code", "metadata": {}, "source": ["a"], "outputs": [], "execution_count": null},
+                {"id": "cell-b", "cell_type": "code", "metadata": {}, "source": ["b"], "outputs": [], "execution_count": null},
+            ],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5
+        });
+        fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
+        READ_TRACKER.mark_read(&nb_path);
+
+        // Replace by cell_id — no cell_number supplied.
+        let mut args = HashMap::new();
+        args.insert("notebook_path".to_string(), json!(nb_path.to_str().unwrap()));
+        args.insert("cell_id".to_string(), json!("cell-b"));
+        args.insert("new_source".to_string(), json!("replaced-b"));
+        let (output, is_error) = file::execute_notebook_edit(&args);
+        assert!(!is_error, "replace by cell_id should succeed: {output}");
+
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
+        assert_eq!(updated["cells"][1]["source"][0], json!("replaced-b"));
+        // cell-a was left alone.
+        assert_eq!(updated["cells"][0]["source"][0], json!("a"));
+    }
+
+    #[test]
+    fn test_notebook_edit_insert_after_cell_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb_path = dir.path().join("insert-after.ipynb");
+        let notebook = json!({
+            "cells": [
+                {"id": "one", "cell_type": "code", "metadata": {}, "source": ["1"], "outputs": [], "execution_count": null},
+                {"id": "two", "cell_type": "code", "metadata": {}, "source": ["2"], "outputs": [], "execution_count": null},
+            ],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5
+        });
+        fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
+        READ_TRACKER.mark_read(&nb_path);
+
+        // Insert AFTER "one" — should land at position 1, pushing "two" to position 2.
+        let mut args = HashMap::new();
+        args.insert("notebook_path".to_string(), json!(nb_path.to_str().unwrap()));
+        args.insert("cell_id".to_string(), json!("one"));
+        args.insert("edit_mode".to_string(), json!("insert"));
+        args.insert("cell_type".to_string(), json!("markdown"));
+        args.insert("new_source".to_string(), json!("inserted"));
+        let (output, is_error) = file::execute_notebook_edit(&args);
+        assert!(!is_error, "insert after cell_id should succeed: {output}");
+
+        let updated: Value =
+            serde_json::from_str(&fs::read_to_string(&nb_path).unwrap()).unwrap();
+        let cells = updated["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0]["source"][0], json!("1"));
+        assert_eq!(cells[1]["source"][0], json!("inserted"));
+        assert_eq!(cells[1]["cell_type"], json!("markdown"));
+        assert_eq!(cells[2]["source"][0], json!("2"));
+    }
+
+    #[test]
+    fn test_notebook_edit_unknown_cell_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb_path = dir.path().join("unknown.ipynb");
+        let notebook = json!({
+            "cells": [
+                {"id": "a", "cell_type": "code", "metadata": {}, "source": ["x"], "outputs": [], "execution_count": null},
+            ],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5
+        });
+        fs::write(&nb_path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
+        READ_TRACKER.mark_read(&nb_path);
+
+        let mut args = HashMap::new();
+        args.insert("notebook_path".to_string(), json!(nb_path.to_str().unwrap()));
+        args.insert("cell_id".to_string(), json!("does-not-exist"));
+        args.insert("new_source".to_string(), json!("x"));
+        let (output, is_error) = file::execute_notebook_edit(&args);
+        assert!(is_error);
+        assert!(output.contains("does-not-exist"));
     }
 
     // ====================================================================

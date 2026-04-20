@@ -26,7 +26,25 @@ pub fn source_to_line_array(source: &str) -> Value {
     result.into()
 }
 
-/// Edit a Jupyter notebook cell
+/// Look up a cell's position in the array by its stable `id` field
+/// (set by modern Jupyter clients in each cell's top-level metadata).
+/// Returns `None` when no cell matches.
+fn find_cell_by_id(cells: &[Value], cell_id: &str) -> Option<usize> {
+    cells.iter().position(|c| {
+        c.get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == cell_id)
+    })
+}
+
+/// Edit a Jupyter notebook cell.
+///
+/// Accepts either `cell_id` (Claude Code-compatible — matches the `id`
+/// field Jupyter clients write into each cell's top-level metadata) or
+/// `cell_number` (legacy 0-indexed position, kept for back-compat). At
+/// least one of the two must be present for `replace` and `delete`.
+/// For `insert`, `cell_id` means "insert AFTER the cell with this id";
+/// omitting both inserts at position 0.
 #[allow(clippy::too_many_lines)]
 pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
     let Some(raw_path) = args.get("notebook_path").and_then(|v| v.as_str()) else {
@@ -38,10 +56,14 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    let Some(cell_number) = args.get("cell_number").and_then(serde_json::Value::as_u64) else {
-        return ("Missing 'cell_number' argument".to_string(), true);
-    };
-    let cell_number = usize::try_from(cell_number).unwrap_or(usize::MAX);
+    let cell_id_arg = args
+        .get("cell_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let cell_number_arg = args
+        .get("cell_number")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
     let Some(new_source) = args.get("new_source").and_then(|v| v.as_str()) else {
         return ("Missing 'new_source' argument".to_string(), true);
@@ -114,26 +136,59 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
         return ("Notebook has no 'cells' array.".to_string(), true);
     };
 
+    // Resolve the target index from whichever of cell_id / cell_number
+    // the caller supplied. `cell_id` wins when both are present — it's
+    // the stable identifier, `cell_number` shifts whenever a cell gets
+    // inserted above it.
+    let resolved_index: Option<usize> = if let Some(id) = cell_id_arg.as_deref() {
+        match find_cell_by_id(cells, id) {
+            Some(idx) => Some(idx),
+            None => {
+                return (
+                    format!("No cell with id '{id}' found in notebook."),
+                    true,
+                );
+            }
+        }
+    } else {
+        cell_number_arg
+    };
+    // Display text for error messages — "id 'abc'" when id was provided,
+    // "number N" otherwise.
+    let target_desc = if let Some(id) = cell_id_arg.as_deref() {
+        format!("id '{id}'")
+    } else if let Some(n) = cell_number_arg {
+        format!("number {n}")
+    } else {
+        "<unspecified>".to_string()
+    };
+
+    // Index used when we print "Replaced cell ..." / "Deleted cell ..."
+    // in the summary. Filled in per-branch; stays None for the "insert
+    // at the beginning" case where no prior cell_id was passed.
+    let mut summary_index: Option<usize> = resolved_index;
+
     match edit_mode {
         "replace" => {
-            if cell_number >= cells.len() {
+            let Some(index) = resolved_index else {
+                return (
+                    "replace requires either 'cell_id' or 'cell_number'.".to_string(),
+                    true,
+                );
+            };
+            if index >= cells.len() {
                 return (
                     format!(
-                        "Cell number {} is out of bounds. Notebook has {} cells (0-indexed, valid range: 0-{}).",
-                        cell_number,
+                        "Cell {target_desc} is out of bounds. Notebook has {} cells (valid range: 0-{}).",
                         cells.len(),
                         cells.len().saturating_sub(1)
                     ),
                     true,
                 );
             }
-
-            // Update the cell's source
-            cells[cell_number]["source"] = source_to_line_array(new_source);
-
-            // Optionally update cell_type if provided
+            cells[index]["source"] = source_to_line_array(new_source);
             if let Some(ct) = cell_type {
-                cells[cell_number]["cell_type"] = json!(ct);
+                cells[index]["cell_type"] = json!(ct);
             }
         }
         "insert" => {
@@ -145,11 +200,20 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
                 );
             };
 
-            if cell_number > cells.len() {
+            // Semantics diverge from replace/delete here: Claude Code's
+            // cell_id means "insert AFTER this cell", so the insertion
+            // position is index+1. Legacy cell_number still means "at
+            // this position". Omitting both inserts at the beginning.
+            let insert_at = match (cell_id_arg.as_deref(), cell_number_arg) {
+                (Some(_), _) => resolved_index.map_or(0, |i| i + 1),
+                (None, Some(n)) => n,
+                (None, None) => 0,
+            };
+
+            if insert_at > cells.len() {
                 return (
                     format!(
-                        "Cell number {} is out of bounds for insertion. Notebook has {} cells (valid range: 0-{}).",
-                        cell_number,
+                        "Cell {target_desc} is out of bounds for insertion. Notebook has {} cells (valid range: 0-{}).",
                         cells.len(),
                         cells.len()
                     ),
@@ -157,35 +221,36 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
                 );
             }
 
-            // Create a new cell
             let mut new_cell = json!({
                 "cell_type": ct,
                 "metadata": {},
                 "source": source_to_line_array(new_source)
             });
-
-            // Code cells have an outputs array and execution_count
             if ct == "code" {
                 new_cell["outputs"] = json!([]);
                 new_cell["execution_count"] = Value::Null;
             }
-
-            cells.insert(cell_number, new_cell);
+            cells.insert(insert_at, new_cell);
+            summary_index = Some(insert_at);
         }
         "delete" => {
-            if cell_number >= cells.len() {
+            let Some(index) = resolved_index else {
+                return (
+                    "delete requires either 'cell_id' or 'cell_number'.".to_string(),
+                    true,
+                );
+            };
+            if index >= cells.len() {
                 return (
                     format!(
-                        "Cell number {} is out of bounds. Notebook has {} cells (0-indexed, valid range: 0-{}).",
-                        cell_number,
+                        "Cell {target_desc} is out of bounds. Notebook has {} cells (valid range: 0-{}).",
                         cells.len(),
                         cells.len().saturating_sub(1)
                     ),
                     true,
                 );
             }
-
-            cells.remove(cell_number);
+            cells.remove(index);
         }
         _ => unreachable!(),
     }
@@ -202,14 +267,16 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
                         new_lines,
                         old_lines,
                     );
+                    let where_str = summary_index
+                        .map_or_else(|| target_desc.clone(), |idx| format!("{idx}"));
                     let action = match edit_mode {
-                        "replace" => format!("Replaced cell {cell_number} contents"),
+                        "replace" => format!("Replaced cell {where_str} contents"),
                         "insert" => format!(
                             "Inserted new {} cell at position {}",
                             cell_type.unwrap_or("unknown"),
-                            cell_number
+                            where_str
                         ),
-                        "delete" => format!("Deleted cell {cell_number}"),
+                        "delete" => format!("Deleted cell {where_str}"),
                         _ => unreachable!(),
                     };
                     let mut result = format!(

@@ -81,15 +81,37 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
         String::new()
     };
 
+    // Claude Code parity: when every item is `completed`, clear the list
+    // instead of keeping a list of done items. Keeps the session cleanup
+    // clean and signals the agent to stop referring back to finished work.
+    // See claude-code/tools/TodoWriteTool/TodoWriteTool.ts (`allDone` branch).
+    let all_done = !new_todos.is_empty()
+        && new_todos.iter().all(|t| t.status == "completed");
+    let stored_todos = if all_done {
+        Vec::new()
+    } else {
+        new_todos.clone()
+    };
+
     // Update the global todo list
     match TODO_LIST.lock() {
         Ok(mut list) => {
-            list.clone_from(&new_todos);
+            list.clone_from(&stored_todos);
         }
         Err(e) => return (format!("Failed to update todo list: {e}"), true),
     }
 
-    // Format output
+    if all_done {
+        return (
+            format!(
+                "Todos have been modified successfully — all {} items completed, list cleared.",
+                new_todos.len()
+            ),
+            false,
+        );
+    }
+
+    // Format output for the non-all-done case.
     let completed = new_todos.iter().filter(|t| t.status == "completed").count();
     let in_progress = new_todos
         .iter()
@@ -158,5 +180,72 @@ pub fn get_todo_list() -> Vec<TodoItem> {
 pub fn clear_todo_list() {
     if let Ok(mut list) = TODO_LIST.lock() {
         list.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The task list is process-global state (matches the original
+    /// design), so these tests serialize on a shared mutex to avoid
+    /// interleaving under `cargo test`'s parallel runner.
+    fn task_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn args_with(v: Value) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("todos".to_string(), v);
+        m
+    }
+
+    #[test]
+    fn all_done_clears_the_list() {
+        let _lock = task_lock();
+        clear_todo_list();
+
+        let args = args_with(json!([
+            {"content": "one", "status": "completed", "activeForm": "Doing one"},
+            {"content": "two", "status": "completed", "activeForm": "Doing two"},
+        ]));
+        let (msg, err) = execute_todo_write(&args);
+        assert!(!err);
+        assert!(msg.contains("all 2 items completed"));
+        assert!(get_todo_list().is_empty());
+    }
+
+    #[test]
+    fn mixed_statuses_are_preserved() {
+        let _lock = task_lock();
+        clear_todo_list();
+
+        let args = args_with(json!([
+            {"content": "one", "status": "completed", "activeForm": "Doing one"},
+            {"content": "two", "status": "in_progress", "activeForm": "Doing two"},
+        ]));
+        let (_, err) = execute_todo_write(&args);
+        assert!(!err);
+        let stored = get_todo_list();
+        assert_eq!(stored.len(), 2, "partial completion must keep the list");
+    }
+
+    #[test]
+    fn empty_input_is_not_treated_as_all_done() {
+        let _lock = task_lock();
+        clear_todo_list();
+
+        let args = args_with(json!([]));
+        let (msg, err) = execute_todo_write(&args);
+        assert!(!err);
+        // Empty input must NOT trigger the "all done" cleared-list
+        // message — that message implies the agent finished actual work.
+        assert!(!msg.contains("all 0 items completed"));
+        assert!(get_todo_list().is_empty());
     }
 }
