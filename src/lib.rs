@@ -31,6 +31,7 @@ pub mod prompt;
 pub mod providers;
 pub mod proxy;
 pub mod rules;
+pub mod services;
 pub mod session;
 pub mod skills;
 pub mod streaming;
