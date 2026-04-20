@@ -887,6 +887,11 @@ pub async fn run_subagent(
                 },
             };
 
+            // Bind the subagent's id as the session key so its task
+            // list lives in its own bucket. Claude Code uses the
+            // `agentId ?? sessionId` fallback; here agent_id is always
+            // present. Closes crosslink #518 for subagents.
+            let _session_guard = crate::tools::SessionIdGuard::set(&agent_id);
             let result = crate::tools::execute_tool_with_memory(
                 &tc,
                 None,

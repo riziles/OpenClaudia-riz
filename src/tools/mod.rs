@@ -31,7 +31,9 @@ pub mod worktree;
 pub use accumulator::{
     AnthropicContentBlock, AnthropicToolAccumulator, PartialToolCall, ToolCallAccumulator,
 };
-pub use todo::{clear_todo_list, get_todo_list, TodoItem};
+pub use todo::{
+    clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem,
+};
 
 use crate::config::AppConfig;
 use crate::memory::MemoryDb;

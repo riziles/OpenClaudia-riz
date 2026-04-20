@@ -2011,6 +2011,10 @@ async fn cmd_chat(
                                                 // tool, and closes the fail-open surface
                                                 // tracked by crosslink #505 (follow-up to
                                                 // #460 mandated point 2).
+                                                // Bind session id so todo_write/read see the
+                                                // right per-session bucket (crosslink #518).
+                                                let _session_guard =
+                                                    tools::SessionIdGuard::set(&chat_session.id);
                                                 let result = if let Some(ref db) = memory_db {
                                                     tools::execute_tool_with_memory(
                                                         tool_call,
@@ -2735,6 +2739,9 @@ async fn cmd_chat(
 
                                                 // Library-layer gate: see note at the first
                                                 // call site above. Closes crosslink #505.
+                                                // Bind session id (crosslink #518).
+                                                let _session_guard =
+                                                    tools::SessionIdGuard::set(&chat_session.id);
                                                 let result = if let Some(ref db) = memory_db {
                                                     tools::execute_tool_with_memory(
                                                         tool_call,
@@ -3465,7 +3472,9 @@ async fn cmd_chat(
 
                                         // Execute tool with library-layer permission gate
                                         // in addition to the interactive UX gate above.
-                                        // Closes crosslink #505.
+                                        // Closes crosslink #505. Bind session id (#518).
+                                        let _session_guard =
+                                            tools::SessionIdGuard::set(&chat_session.id);
                                         let result = if let Some(ref db) = memory_db {
                                             tools::execute_tool_with_memory(
                                                 tool_call,

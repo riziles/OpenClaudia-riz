@@ -947,7 +947,13 @@ async fn execute_tool_calls_for_tui(
         // `PermissionResponse` flow. Closes crosslink #505 — previously
         // threaded `None`, which emitted a one-shot warn and left the
         // config-driven `default_allow` patterns unenforced.
+        // Bind the session id on the blocking worker so todo_write /
+        // todo_read pick the right per-session bucket. Guard drops at
+        // end of closure → next spawn_blocking on this worker thread
+        // sees a clean slate, no leaked session key.
+        let session_for_task = session_id.map(str::to_string);
         let result = tokio::task::spawn_blocking(move || {
+            let _session_guard = session_for_task.map(tools::SessionIdGuard::set);
             let pm = perm_mgr.as_deref();
             if let Some(ref db) = mem_db {
                 tools::execute_tool_with_memory(&tool_call_clone, Some(db), pm)
