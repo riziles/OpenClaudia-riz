@@ -491,6 +491,21 @@ session:
                 }
             }
         }
+        "agents" => {
+            // Port of Claude Code's `/agents` command — list every
+            // subagent type the `task` tool accepts along with a
+            // one-line description so the user can pick one by name.
+            println!("\nAvailable subagent types:\n");
+            for kind in openclaudia::subagent::AgentType::ALL {
+                println!("  \u{2022} {:<20} {}", kind.name(), kind.description());
+            }
+            println!();
+            println!(
+                "Invoke via the `task` tool with `subagent_type: \"<name>\"`."
+            );
+            println!();
+            Some(SlashCommandResult::Handled)
+        }
         "keybindings" | "keys" | "bindings" => Some(SlashCommandResult::Keybindings),
         "rename" | "title" => {
             if args.is_empty() {

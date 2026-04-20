@@ -45,6 +45,41 @@ pub enum AgentType {
 }
 
 impl AgentType {
+    /// Every agent type, in display order. Stable order so `/agents`
+    /// output doesn't shuffle between runs.
+    pub const ALL: &'static [Self] = &[
+        Self::GeneralPurpose,
+        Self::Explore,
+        Self::Plan,
+        Self::Guide,
+        Self::Coordinator,
+    ];
+
+    /// Canonical kebab-case name as accepted by `parse_type` and the
+    /// `task` tool's `subagent_type` field.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::GeneralPurpose => "general-purpose",
+            Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Guide => "claude-code-guide",
+            Self::Coordinator => "coordinator",
+        }
+    }
+
+    /// One-line human-readable description for help output.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::GeneralPurpose => "Complex multi-step tasks with full tool access",
+            Self::Explore => "Fast codebase exploration and searches (read-only)",
+            Self::Plan => "Software architect for implementation plans (read-only)",
+            Self::Guide => "Documentation lookup and usage questions",
+            Self::Coordinator => "Multi-agent orchestrator that delegates work",
+        }
+    }
+
     /// Parse agent type from string
     #[must_use]
     pub fn parse_type(s: &str) -> Option<Self> {
@@ -1435,6 +1470,24 @@ mod tests {
         assert_eq!(AgentType::parse_type("guide"), Some(AgentType::Guide));
         assert_eq!(AgentType::parse_type("test-builder"), None);
         assert_eq!(AgentType::parse_type("unknown"), None);
+    }
+
+    #[test]
+    fn agent_type_all_is_exhaustive() {
+        // ALL must list every variant so /agents output stays
+        // complete when new agents are added. Round-trip each name
+        // through parse_type to catch name/parse drift at compile
+        // time… actually at test time. Compile-time would need a
+        // match — but test-time is close enough and cheaper.
+        for kind in AgentType::ALL {
+            let parsed = AgentType::parse_type(kind.name())
+                .unwrap_or_else(|| panic!("{} not round-trippable", kind.name()));
+            assert_eq!(&parsed, kind);
+            assert!(!kind.description().is_empty());
+        }
+        // Sanity check on the current set — bump this when a variant
+        // is added and list it in ALL.
+        assert_eq!(AgentType::ALL.len(), 5);
     }
 
     #[test]
