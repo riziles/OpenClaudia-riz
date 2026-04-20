@@ -334,6 +334,46 @@ impl App {
         }
     }
 
+    /// Fire the `Stop` hook. Invoked when a turn reaches a terminal
+    /// assistant response (no further tool-call follow-up). Best-effort
+    /// — runtime/engine absence short-circuits silently.
+    fn fire_stop_hook(&self) {
+        if let (Some(engine), Some(handle)) =
+            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
+        {
+            let engine = engine.clone();
+            let session_id = self.chat_session.id.clone();
+            handle.spawn(async move {
+                let input = crate::hooks::HookInput::new(
+                    crate::hooks::HookEvent::Stop,
+                )
+                .with_session_id(session_id);
+                let _ = engine.run(crate::hooks::HookEvent::Stop, &input).await;
+            });
+        }
+    }
+
+    /// Fire the `Notification` hook with a free-form message. Used for
+    /// API errors, rate-limit warnings, etc. Best-effort as above.
+    fn fire_notification_hook(&self, message: &str, level: &str) {
+        if let (Some(engine), Some(handle)) =
+            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
+        {
+            let engine = engine.clone();
+            let session_id = self.chat_session.id.clone();
+            let message = message.to_string();
+            let level = level.to_string();
+            handle.spawn(async move {
+                let payload = serde_json::json!({
+                    "message": message,
+                    "level": level.clone(),
+                    "session_id": session_id,
+                });
+                let _ = engine.fire_notification(&level, payload).await;
+            });
+        }
+    }
+
     /// Append every `session_messages` entry past the watermark to the
     /// Claude Code-layout JSONL transcript at
     /// `$CLAUDE_CONFIG_HOME_DIR/projects/<sanitized-cwd>/<session>.jsonl`.
@@ -480,6 +520,11 @@ impl App {
                     self.persist_transcript_tail();
                     // Update token estimate
                     self.tokens = self.chat_session.estimate_tokens();
+                    // Fire Stop hook — assistant reached a terminal state.
+                    // run_turn already suppresses ResponseDone when the
+                    // agentic loop needs another follow-up, so reaching
+                    // this branch means the turn is genuinely done.
+                    self.fire_stop_hook();
                 }
                 Ok(AppEvent::ApiError(msg)) => {
                     self.messages.finish_streaming();
@@ -491,6 +536,8 @@ impl App {
                         is_thinking: false,
                     });
                     self.is_waiting = false;
+                    // Surface the error to user-configured Notification hooks.
+                    self.fire_notification_hook(&format!("API error: {msg}"), "error");
                 }
                 Ok(AppEvent::Resize(_, _)) => {} // terminal.draw handles it
                 // Pipeline follow-up: tool results need another API call
@@ -528,6 +575,24 @@ impl App {
         self.chat_session.messages = self.session_messages.clone();
         self.chat_session.touch();
         let _ = save_session(&self.chat_session);
+
+        // Fire SessionEnd hooks. Best-effort: the app is already exiting
+        // so we can't recover from a failure, and we must not spam the
+        // terminal (already restored from alt-screen). The hook engine
+        // owns its own error logging via tracing.
+        if let (Some(engine), Some(handle)) =
+            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
+        {
+            let session_id = self.chat_session.id.clone();
+            let engine = engine.clone();
+            handle.block_on(async move {
+                let input = crate::hooks::HookInput::new(
+                    crate::hooks::HookEvent::SessionEnd,
+                )
+                .with_session_id(session_id);
+                let _ = engine.run(crate::hooks::HookEvent::SessionEnd, &input).await;
+            });
+        }
 
         Ok(())
     }
@@ -1424,6 +1489,7 @@ impl App {
         let claude_code_token = self.claude_code_token.clone();
         let prompt_blocks = self.prompt_blocks.clone();
         let hook_engine = self.hook_engine.clone();
+        let session_id_for_task = self.chat_session.id.clone();
         let memory_db = self.memory_db.clone();
         let permission_mgr = self.permission_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
@@ -1487,6 +1553,8 @@ impl App {
                 &provider,
                 memory_db.clone(),
                 permission_mgr.clone(),
+                hook_engine.clone(),
+                Some(session_id_for_task.clone()),
                 tx.clone(),
             )
             .await
@@ -1547,6 +1615,8 @@ impl App {
                                 &provider,
                                 memory_db.clone(),
                                 permission_mgr.clone(),
+                                hook_engine.clone(),
+                                Some(session_id_for_task.clone()),
                                 tx.clone(),
                             )
                             .await

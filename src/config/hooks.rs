@@ -11,10 +11,30 @@ pub struct HooksConfig {
     pub pre_tool_use: Vec<HookEntry>,
     #[serde(default)]
     pub post_tool_use: Vec<HookEntry>,
+    /// Tool completed with `is_error = true`. Claude Code-compatible.
+    /// When absent, `post_tool_use` handlers still run on failures too.
+    #[serde(default)]
+    pub post_tool_use_failure: Vec<HookEntry>,
     #[serde(default)]
     pub user_prompt_submit: Vec<HookEntry>,
     #[serde(default)]
     pub stop: Vec<HookEntry>,
+    /// A subagent was spawned. Claude Code-compatible.
+    #[serde(default)]
+    pub subagent_start: Vec<HookEntry>,
+    /// A subagent finished. Claude Code-compatible.
+    #[serde(default)]
+    pub subagent_stop: Vec<HookEntry>,
+    /// About to run compaction. Claude Code-compatible.
+    #[serde(default)]
+    pub pre_compact: Vec<HookEntry>,
+    /// Permission prompt is about to be shown. Claude Code-compatible.
+    #[serde(default)]
+    pub permission_request: Vec<HookEntry>,
+    /// Generic notification surface (API errors, token limits, etc.).
+    /// Claude Code-compatible.
+    #[serde(default)]
+    pub notification: Vec<HookEntry>,
     #[serde(default)]
     pub pre_adversary_review: Vec<HookEntry>,
     #[serde(default)]

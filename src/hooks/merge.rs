@@ -119,17 +119,33 @@ pub(crate) fn merge_claude_hooks(config: &mut HooksConfig, settings: &ClaudeCode
             })
             .collect();
 
-        // Append to the appropriate event list
+        // Append to the appropriate event list. Full Claude Code
+        // hook-event coverage — anything Claude Code can configure in
+        // settings.json reaches our HookEngine.
         match event {
             HookEvent::SessionStart => config.session_start.extend(converted_entries),
             HookEvent::SessionEnd => config.session_end.extend(converted_entries),
             HookEvent::PreToolUse => config.pre_tool_use.extend(converted_entries),
             HookEvent::PostToolUse => config.post_tool_use.extend(converted_entries),
+            HookEvent::PostToolUseFailure => {
+                config.post_tool_use_failure.extend(converted_entries);
+            }
             HookEvent::UserPromptSubmit => config.user_prompt_submit.extend(converted_entries),
             HookEvent::Stop => config.stop.extend(converted_entries),
-            // Other events not yet supported in HooksConfig
-            _ => {
-                debug!(event = ?event, "Event not yet supported in config, skipping");
+            HookEvent::SubagentStart => config.subagent_start.extend(converted_entries),
+            HookEvent::SubagentStop => config.subagent_stop.extend(converted_entries),
+            HookEvent::PreCompact => config.pre_compact.extend(converted_entries),
+            HookEvent::PermissionRequest => {
+                config.permission_request.extend(converted_entries);
+            }
+            HookEvent::Notification => config.notification.extend(converted_entries),
+            // VDD events aren't in Claude Code's schema — merge path
+            // never sees them (from_claude_code_name filters them out).
+            HookEvent::PreAdversaryReview
+            | HookEvent::PostAdversaryReview
+            | HookEvent::VddConflict
+            | HookEvent::VddConverged => {
+                debug!(event = ?event, "VDD-specific event not expected in Claude Code settings");
             }
         }
     }

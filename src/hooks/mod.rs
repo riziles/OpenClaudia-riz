@@ -131,8 +131,14 @@ impl HooksConfig {
             && self.session_end.is_empty()
             && self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
+            && self.post_tool_use_failure.is_empty()
             && self.user_prompt_submit.is_empty()
             && self.stop.is_empty()
+            && self.subagent_start.is_empty()
+            && self.subagent_stop.is_empty()
+            && self.pre_compact.is_empty()
+            && self.permission_request.is_empty()
+            && self.notification.is_empty()
             && self.pre_adversary_review.is_empty()
             && self.post_adversary_review.is_empty()
             && self.vdd_conflict.is_empty()
@@ -333,6 +339,35 @@ impl HookEngine {
         self
     }
 
+    /// Fire a `PostToolUse` hook (success) or `PostToolUseFailure`
+    /// (error), depending on `success`. Convenience wrapper around
+    /// [`HookEngine::run`] so every tool-execution call site can emit
+    /// the post-tool lifecycle events in one line. Silently ignores
+    /// missing session IDs (tests / one-shot invocations).
+    pub async fn fire_post_tool(
+        &self,
+        success: bool,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        tool_output: &str,
+        session_id: Option<&str>,
+    ) {
+        let event = if success {
+            HookEvent::PostToolUse
+        } else {
+            HookEvent::PostToolUseFailure
+        };
+        let mut input = HookInput::new(event).with_tool(tool_name, tool_input);
+        if let Some(sid) = session_id {
+            input = input.with_session_id(sid);
+        }
+        input = input.with_extra(
+            "tool_output",
+            serde_json::Value::String(tool_output.to_string()),
+        );
+        let _ = self.run(event, &input).await;
+    }
+
     /// Run all matching hooks for an event
     pub async fn run(&self, event: HookEvent, input: &HookInput) -> HookResult {
         let entries = self.get_entries_for_event(event);
@@ -413,22 +448,31 @@ impl HookEngine {
         hook_result
     }
 
-    /// Get hook entries for a specific event
+    /// Get hook entries for a specific event. PostToolUseFailure falls
+    /// back to PostToolUse when no failure-specific handlers are defined
+    /// — matches Claude Code's behavior where a single PostToolUse hook
+    /// sees both success and failure paths unless a dedicated handler
+    /// exists.
     fn get_entries_for_event(&self, event: HookEvent) -> &[HookEntry] {
         match event {
             HookEvent::SessionStart => &self.config.session_start,
             HookEvent::SessionEnd => &self.config.session_end,
             HookEvent::PreToolUse => &self.config.pre_tool_use,
             HookEvent::PostToolUse => &self.config.post_tool_use,
+            HookEvent::PostToolUseFailure => {
+                if self.config.post_tool_use_failure.is_empty() {
+                    &self.config.post_tool_use
+                } else {
+                    &self.config.post_tool_use_failure
+                }
+            }
             HookEvent::UserPromptSubmit => &self.config.user_prompt_submit,
             HookEvent::Stop => &self.config.stop,
-            // Events not yet in config (return empty)
-            HookEvent::PostToolUseFailure
-            | HookEvent::SubagentStart
-            | HookEvent::SubagentStop
-            | HookEvent::PreCompact
-            | HookEvent::PermissionRequest
-            | HookEvent::Notification => &[],
+            HookEvent::SubagentStart => &self.config.subagent_start,
+            HookEvent::SubagentStop => &self.config.subagent_stop,
+            HookEvent::PreCompact => &self.config.pre_compact,
+            HookEvent::PermissionRequest => &self.config.permission_request,
+            HookEvent::Notification => &self.config.notification,
             // VDD events
             HookEvent::PreAdversaryReview => &self.config.pre_adversary_review,
             HookEvent::PostAdversaryReview => &self.config.post_adversary_review,
@@ -1385,5 +1429,94 @@ mod tests {
 
         assert!(result.allowed);
         assert_eq!(result.outputs.len(), 2);
+    }
+
+    /// PostToolUseFailure with no dedicated handlers falls back to the
+    /// PostToolUse entries. Matches Claude Code's single-handler-sees-both
+    /// behavior (see claude_compat.rs PostToolUse mapping).
+    #[tokio::test]
+    async fn post_tool_use_failure_falls_back_to_post_tool_use() {
+        let config = HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        };
+        let engine = HookEngine::new(config);
+        let input = HookInput::new(HookEvent::PostToolUseFailure)
+            .with_tool("bash", serde_json::json!({}))
+            .with_extra("tool_output", serde_json::json!("boom"));
+
+        let result = engine.run(HookEvent::PostToolUseFailure, &input).await;
+        assert!(result.allowed);
+        assert_eq!(
+            result.outputs.len(),
+            1,
+            "PostToolUseFailure must dispatch to post_tool_use when no dedicated config"
+        );
+    }
+
+    /// When a `post_tool_use_failure` entry exists, it takes precedence
+    /// over `post_tool_use` — no double-fire.
+    #[tokio::test]
+    async fn post_tool_use_failure_prefers_dedicated_entries() {
+        let config = HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "false".to_string(), // would fail
+                    timeout: 5,
+                }],
+            }],
+            post_tool_use_failure: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        };
+        let engine = HookEngine::new(config);
+        let input = HookInput::new(HookEvent::PostToolUseFailure)
+            .with_tool("bash", serde_json::json!({}));
+
+        let result = engine.run(HookEvent::PostToolUseFailure, &input).await;
+        assert_eq!(result.outputs.len(), 1, "dedicated handlers run exactly once");
+        // Dedicated handler ran `true` — the failing `post_tool_use` entry
+        // must not have fired.
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fire_post_tool_dispatches_on_success_and_failure() {
+        // A single post_tool_use entry sees both paths when no
+        // failure-specific handler exists.
+        let config = HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        };
+        let engine = HookEngine::new(config);
+
+        engine
+            .fire_post_tool(true, "bash", serde_json::json!({}), "ok", Some("s1"))
+            .await;
+        engine
+            .fire_post_tool(false, "bash", serde_json::json!({}), "fail", Some("s1"))
+            .await;
+        // Success assertion: neither call panicked or returned an error
+        // that bubbled up — the fire_post_tool helper swallows hook
+        // failures by design (tool execution must never fail because of
+        // a misbehaving hook).
     }
 }

@@ -298,6 +298,8 @@ pub async fn run_turn(
     provider: &str,
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    session_id: Option<String>,
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
     tracing::info!(
@@ -366,11 +368,28 @@ pub async fn run_turn(
 
     // For Google, handle non-streaming JSON response
     if provider == "google" {
-        return handle_google_response(response, memory_db, permission_mgr, &tx).await;
+        return handle_google_response(
+            response,
+            memory_db,
+            permission_mgr,
+            hook_engine.clone(),
+            session_id.clone(),
+            &tx,
+        )
+        .await;
     }
 
     // Stream SSE response (Anthropic / OpenAI format)
-    stream_sse_response(response, provider, memory_db, permission_mgr, &tx).await
+    stream_sse_response(
+        response,
+        provider,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        session_id,
+        &tx,
+    )
+    .await
 }
 
 /// Handle a non-streaming Google Gemini response.
@@ -378,6 +397,8 @@ async fn handle_google_response(
     response: reqwest::Response,
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    session_id: Option<String>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
     let body = response.text().await.unwrap_or_default();
@@ -456,8 +477,15 @@ async fn handle_google_response(
         .unwrap_or(0);
 
     // Execute tool calls if any
-    let (tool_results, needs_followup) =
-        execute_tool_calls_for_tui(&tool_calls, memory_db, permission_mgr, tx).await;
+    let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        &tool_calls,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        session_id.as_deref(),
+        tx,
+    )
+    .await;
 
     if !needs_followup {
         send_event!(tx, AppEvent::ResponseDone);
@@ -483,6 +511,8 @@ async fn stream_sse_response(
     provider: &str,
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    session_id: Option<String>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
     let mut stream = response.bytes_stream();
@@ -574,8 +604,15 @@ async fn stream_sse_response(
     };
 
     // Execute tool calls if any
-    let (tool_results, has_tools) =
-        execute_tool_calls_for_tui(&tool_calls, memory_db, permission_mgr, tx).await;
+    let (tool_results, has_tools) = execute_tool_calls_for_tui(
+        &tool_calls,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        session_id.as_deref(),
+        tx,
+    )
+    .await;
 
     // Only send ResponseDone if there are NO tool calls needing followup.
     // When there are tool calls, the caller (app.rs agentic loop) handles
@@ -716,6 +753,8 @@ async fn execute_tool_calls_for_tui(
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    session_id: Option<&str>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> (Vec<Value>, bool) {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
@@ -931,6 +970,23 @@ async fn execute_tool_calls_for_tui(
                 content: result.content.clone(),
             }
         );
+
+        // Fire PostToolUse / PostToolUseFailure for user-configured hook
+        // scripts. Best-effort: hook errors are logged inside the engine
+        // and don't affect the tool result the caller sees.
+        if let Some(engine) = hook_engine.as_ref() {
+            let tool_input: Value = serde_json::from_str(&tool_call.function.arguments)
+                .unwrap_or(Value::Null);
+            engine
+                .fire_post_tool(
+                    !result.is_error,
+                    tool_name,
+                    tool_input,
+                    &result.content,
+                    session_id,
+                )
+                .await;
+        }
 
         let result_content = if result.is_error {
             format!("[ERROR] {}", result.content)
