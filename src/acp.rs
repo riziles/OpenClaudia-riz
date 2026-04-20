@@ -26,7 +26,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
@@ -147,6 +147,169 @@ pub struct AcpServer {
     /// Terminal ID counter for ACP terminal lifecycle
     #[allow(dead_code)]
     next_terminal_id: AtomicU64,
+    /// Latest IDE-state snapshot received over ACP notifications.
+    /// Updated by `ide/*` handlers; exposed via [`Self::ide_state`]
+    /// so the prompt builder can inject it as context on the next turn.
+    ide_state: IdeState,
+}
+
+/// Snapshot of everything the editor has told us about the user's
+/// current workspace. All fields are optional and independently
+/// updated — a single notification only touches the fields it names.
+///
+/// Port of the `ide/*` MCP notifications Claude Code consumes in
+/// `hooks/useIdeSelection.ts`, `hooks/useIdeLogging.ts`, and the
+/// broader bridge layer. Matches the field names used in Claude
+/// Code's SelectionChangedSchema / file-opened notifications so
+/// editor plugins can target both harnesses with one implementation.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct IdeState {
+    /// Currently focused file in the editor. Updated on
+    /// `ide/file_opened` and cleared (to `None`) when the editor
+    /// closes the last tab. Absolute path.
+    pub active_file: Option<String>,
+    /// Recently opened files (most-recent-first, capped to
+    /// [`IDE_FILE_RING_CAP`]). Lets the agent see what the user was
+    /// looking at across the last few minutes without flooding the
+    /// system prompt.
+    pub recent_files: Vec<String>,
+    /// Current text selection, if any. Matches Claude Code's
+    /// SelectionData shape: file path + start line + line count + text.
+    pub selection: Option<IdeSelection>,
+    /// Diagnostics pushed by LSP over `ide/diagnostics`. Keyed by
+    /// file path for fast replacement when a file's diagnostics
+    /// change.
+    pub diagnostics: HashMap<String, Vec<IdeDiagnostic>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeSelection {
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_count: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdeDiagnostic {
+    /// 0-indexed line. Matches LSP convention.
+    pub line: u32,
+    /// `error` / `warning` / `info` / `hint`.
+    pub severity: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Cap on [`IdeState::recent_files`] — older entries are pushed out.
+/// Twelve covers a typical "active tabs" row without letting a
+/// pathological editor spam fill the system prompt.
+const IDE_FILE_RING_CAP: usize = 12;
+
+/// Pure state-mutation helpers for IDE notifications. Extracted so
+/// tests can exercise the notification logic against a bare
+/// [`IdeState`] without constructing a full [`AcpServer`] (config,
+/// permission manager, stdout channels, etc. aren't needed to
+/// validate parse/update behavior).
+pub(crate) fn apply_ide_file_opened(state: &mut IdeState, params: &Value) {
+    let Some(path) = params.get("filePath").and_then(|v| v.as_str()) else {
+        warn!("ide/file_opened notification missing `filePath`");
+        return;
+    };
+    let path = path.to_string();
+    state.active_file = Some(path.clone());
+    // Move-to-front in the recents ring.
+    state.recent_files.retain(|p| p != &path);
+    state.recent_files.insert(0, path);
+    if state.recent_files.len() > IDE_FILE_RING_CAP {
+        state.recent_files.truncate(IDE_FILE_RING_CAP);
+    }
+}
+
+pub(crate) fn apply_ide_file_closed(state: &mut IdeState, params: &Value) {
+    let Some(path) = params.get("filePath").and_then(|v| v.as_str()) else {
+        warn!("ide/file_closed notification missing `filePath`");
+        return;
+    };
+    if state.active_file.as_deref() == Some(path) {
+        state.active_file = None;
+    }
+    state.diagnostics.remove(path);
+}
+
+pub(crate) fn apply_ide_selection_changed(state: &mut IdeState, params: &Value) {
+    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = params
+        .get("filePath")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let range = params.get("selection");
+
+    match (file_path, range) {
+        (Some(fp), Some(sel)) => {
+            let Some(start) = sel.get("start") else {
+                warn!("ide/selection_changed: missing selection.start");
+                return;
+            };
+            let Some(end) = sel.get("end") else {
+                warn!("ide/selection_changed: missing selection.end");
+                return;
+            };
+            let line_start = start
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            let line_end = end
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::from(line_start))
+                as u32;
+            let line_count = line_end.saturating_sub(line_start).saturating_add(1);
+            state.selection = Some(IdeSelection {
+                file_path: fp,
+                line_start,
+                line_count,
+                text: text.to_string(),
+            });
+        }
+        _ => {
+            state.selection = None;
+        }
+    }
+}
+
+pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
+    let Some(file_path) = params.get("filePath").and_then(|v| v.as_str()) else {
+        warn!("ide/diagnostics notification missing `filePath`");
+        return;
+    };
+    let Some(items) = params.get("diagnostics").and_then(|v| v.as_array()) else {
+        state.diagnostics.remove(file_path);
+        return;
+    };
+    let parsed: Vec<IdeDiagnostic> = items
+        .iter()
+        .filter_map(|item| {
+            let line = item.get("line")?.as_u64()? as u32;
+            let severity = item.get("severity")?.as_str()?.to_string();
+            let message = item.get("message")?.as_str()?.to_string();
+            let source = item
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(IdeDiagnostic {
+                line,
+                severity,
+                message,
+                source,
+            })
+        })
+        .collect();
+    if parsed.is_empty() {
+        state.diagnostics.remove(file_path);
+    } else {
+        state.diagnostics.insert(file_path.to_string(), parsed);
+    }
 }
 
 impl AcpServer {
@@ -189,7 +352,17 @@ impl AcpServer {
             stdout_tx,
             config_options: HashMap::new(),
             next_terminal_id: AtomicU64::new(1),
+            ide_state: IdeState::default(),
         }
+    }
+
+    /// Read-only snapshot of the current IDE state (active file,
+    /// selection, recent files, diagnostics). Used by the prompt
+    /// builder to inject editor context into the system prompt on
+    /// the next turn.
+    #[must_use]
+    pub fn ide_state(&self) -> &IdeState {
+        &self.ide_state
     }
 
     // ========================================================================
@@ -324,6 +497,14 @@ impl AcpServer {
             "session/cancel" => self.handle_session_cancel(msg.id, params),
             "session/set_mode" => self.handle_session_set_mode(msg.id, &params),
             "session/set_config_option" => self.handle_session_set_config_option(msg.id, &params),
+            // ─── IDE bridge notifications (crosslink #517) ───
+            // Editor plugins push file-open / selection / diagnostic
+            // events here. They're fire-and-forget (no response) —
+            // the next prompt turn reads ide_state() for context.
+            "ide/file_opened" => self.handle_ide_file_opened(&params),
+            "ide/file_closed" => self.handle_ide_file_closed(&params),
+            "ide/selection_changed" => self.handle_ide_selection_changed(&params),
+            "ide/diagnostics" => self.handle_ide_diagnostics(&params),
             _ => {
                 if let Some(id) = msg.id {
                     self.send_error(id, METHOD_NOT_FOUND, &format!("Unknown method: {method}"));
@@ -509,6 +690,33 @@ impl AcpServer {
         self.send_response(id, Some(json!({"key": key, "value": value})), None);
 
         info!(key = %key, "Config option set");
+    }
+
+    // ========================================================================
+    // IDE bridge notifications (crosslink #517)
+    //
+    // These are fire-and-forget JSON-RPC notifications — the editor
+    // plugin pushes events as they happen, and the agent reads them
+    // from `ide_state()` when building the next prompt. Invalid
+    // payloads are logged at `warn` and dropped rather than surfaced
+    // as errors: we'd rather lose one notification than crash the
+    // bridge loop over a schema drift in a 3rd-party plugin.
+    // ========================================================================
+
+    fn handle_ide_file_opened(&mut self, params: &Value) {
+        apply_ide_file_opened(&mut self.ide_state, params);
+    }
+
+    fn handle_ide_file_closed(&mut self, params: &Value) {
+        apply_ide_file_closed(&mut self.ide_state, params);
+    }
+
+    fn handle_ide_selection_changed(&mut self, params: &Value) {
+        apply_ide_selection_changed(&mut self.ide_state, params);
+    }
+
+    fn handle_ide_diagnostics(&mut self, params: &Value) {
+        apply_ide_diagnostics(&mut self.ide_state, params);
     }
 
     // ========================================================================
@@ -1618,4 +1826,133 @@ pub async fn run_acp_server(
     let _ = writer_handle.join();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ide_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn file_opened_updates_active_and_recents_most_recent_first() {
+        let mut state = IdeState::default();
+        apply_ide_file_opened(&mut state, &json!({"filePath": "/a.rs"}));
+        apply_ide_file_opened(&mut state, &json!({"filePath": "/b.rs"}));
+        apply_ide_file_opened(&mut state, &json!({"filePath": "/c.rs"}));
+
+        assert_eq!(state.active_file.as_deref(), Some("/c.rs"));
+        assert_eq!(state.recent_files, vec!["/c.rs", "/b.rs", "/a.rs"]);
+
+        // Re-opening an existing file promotes it without duplicating.
+        apply_ide_file_opened(&mut state, &json!({"filePath": "/a.rs"}));
+        assert_eq!(state.active_file.as_deref(), Some("/a.rs"));
+        assert_eq!(state.recent_files, vec!["/a.rs", "/c.rs", "/b.rs"]);
+    }
+
+    #[test]
+    fn recent_files_ring_is_capped() {
+        let mut state = IdeState::default();
+        for i in 0..20 {
+            apply_ide_file_opened(
+                &mut state,
+                &json!({"filePath": format!("/f-{i}.rs")}),
+            );
+        }
+        assert_eq!(state.recent_files.len(), IDE_FILE_RING_CAP);
+        // Most recent first.
+        assert_eq!(state.recent_files[0], "/f-19.rs");
+    }
+
+    #[test]
+    fn file_closed_clears_active_only_when_matching() {
+        let mut state = IdeState::default();
+        apply_ide_file_opened(&mut state, &json!({"filePath": "/foreground.rs"}));
+        // Closing a background file doesn't touch foreground.
+        apply_ide_file_closed(&mut state, &json!({"filePath": "/background.rs"}));
+        assert_eq!(state.active_file.as_deref(), Some("/foreground.rs"));
+
+        apply_ide_file_closed(&mut state, &json!({"filePath": "/foreground.rs"}));
+        assert!(state.active_file.is_none());
+    }
+
+    #[test]
+    fn selection_changed_computes_line_count() {
+        let mut state = IdeState::default();
+        apply_ide_selection_changed(
+            &mut state,
+            &json!({
+                "filePath": "/x.rs",
+                "text": "selected lines",
+                "selection": {
+                    "start": {"line": 10, "character": 0},
+                    "end":   {"line": 12, "character": 0},
+                }
+            }),
+        );
+        let sel = state.selection.as_ref().unwrap();
+        assert_eq!(sel.file_path, "/x.rs");
+        assert_eq!(sel.line_start, 10);
+        // 10..=12 = 3 lines
+        assert_eq!(sel.line_count, 3);
+
+        // Empty-text notification drops the selection.
+        apply_ide_selection_changed(
+            &mut state,
+            &json!({"filePath": "/x.rs", "text": ""}),
+        );
+        assert!(state.selection.is_none());
+    }
+
+    #[test]
+    fn diagnostics_replace_per_file() {
+        let mut state = IdeState::default();
+        apply_ide_diagnostics(
+            &mut state,
+            &json!({
+                "filePath": "/x.rs",
+                "diagnostics": [
+                    {"line": 3, "severity": "error", "message": "E0308",
+                     "source": "rustc"}
+                ]
+            }),
+        );
+        assert_eq!(state.diagnostics.get("/x.rs").unwrap().len(), 1);
+        assert_eq!(state.diagnostics["/x.rs"][0].severity, "error");
+
+        // New set replaces rather than appends.
+        apply_ide_diagnostics(
+            &mut state,
+            &json!({
+                "filePath": "/x.rs",
+                "diagnostics": [
+                    {"line": 5, "severity": "warning", "message": "unused_var"},
+                    {"line": 8, "severity": "warning", "message": "dead_code"},
+                ]
+            }),
+        );
+        let diags = state.diagnostics.get("/x.rs").unwrap();
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[1].line, 8);
+
+        // Empty-diagnostics notification clears the file's entries.
+        apply_ide_diagnostics(
+            &mut state,
+            &json!({"filePath": "/x.rs", "diagnostics": []}),
+        );
+        assert!(state.diagnostics.get("/x.rs").is_none());
+    }
+
+    #[test]
+    fn malformed_payloads_are_dropped_not_panicked() {
+        let mut state = IdeState::default();
+        // Missing filePath.
+        apply_ide_file_opened(&mut state, &json!({}));
+        apply_ide_file_closed(&mut state, &json!({}));
+        apply_ide_selection_changed(&mut state, &json!({"text": ""}));
+        apply_ide_diagnostics(&mut state, &json!({}));
+        assert!(state.active_file.is_none());
+        assert!(state.selection.is_none());
+        assert!(state.diagnostics.is_empty());
+    }
 }
