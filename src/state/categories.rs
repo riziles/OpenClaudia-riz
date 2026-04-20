@@ -1,0 +1,387 @@
+//! Per-category sub-structs that compose [`super::SessionState`].
+//!
+//! Each category is plain data (no `Arc`s) so [`super::SessionState`]
+//! stays `Clone + Serialize + Deserialize` without reaching through
+//! shared handles. The process-scoped handles
+//! (`memory_db`, `permission_mgr`, …) live on a separate
+//! `AppHandles` struct that callers pass alongside a
+//! [`super::StateStore`] when both are needed.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+// ─── Identity ───────────────────────────────────────────────────────
+
+/// Session identifier — UUID-shaped string. Newtype so session ids
+/// don't get confused with teammate / agent / transcript ids at call
+/// sites (the subagent module already uses raw `String`s for
+/// `agent_id`; this one is deliberately typed).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Generate a fresh v4 UUID as a session id.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Borrow the inner string — useful for log fields and for
+    /// bridging into modules that still take `&str` (chat session,
+    /// transcript writer) until they migrate.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Wrap a caller-supplied string without re-validating. Used by
+    /// persist.rs when deserializing v1 files written before this
+    /// newtype existed.
+    #[must_use]
+    pub fn from_raw(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Who / where / which. Seven fields matching the Identity group in
+/// Claude Code's state-management REQ-1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Identity {
+    pub session_id: SessionId,
+    /// Parent session id when this session was forked from another
+    /// (e.g. the coordinator spawning a teammate). `None` for the
+    /// primary user-started session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
+    /// The cwd the user launched the harness in — never mutates
+    /// during the session. Used for transcript-path stability when
+    /// the user changes dir inside a tool call.
+    pub original_cwd: PathBuf,
+    /// Current working directory. May drift from `original_cwd`
+    /// during a session (a `bash cd` tool call updates this).
+    pub cwd: PathBuf,
+    /// Project root (git toplevel or `original_cwd` when not in a
+    /// repo). Used by MEMORY.md discovery and rules/plugins scope.
+    pub project_root: PathBuf,
+    /// Where transcripts / session-memory / subagent metadata all
+    /// anchor. Today derives from `cwd`; kept separate so a future
+    /// `/teleport` command can rebase it without touching the live
+    /// cwd.
+    pub session_project_dir: PathBuf,
+    /// Additional directories whose CLAUDE.md files should be
+    /// included in the system prompt. Matches CC's `--add-dir`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories_for_claude_md: Vec<PathBuf>,
+}
+
+impl Identity {
+    /// Build an Identity rooted at `cwd` — every directory field
+    /// starts equal to `cwd`, no parent session, no extra dirs.
+    #[must_use]
+    pub fn rooted_at(cwd: PathBuf) -> Self {
+        Self {
+            session_id: SessionId::new(),
+            parent_session_id: None,
+            original_cwd: cwd.clone(),
+            cwd: cwd.clone(),
+            project_root: cwd.clone(),
+            session_project_dir: cwd,
+            additional_directories_for_claude_md: Vec::new(),
+        }
+    }
+}
+
+// ─── Conversation ───────────────────────────────────────────────────
+
+/// Messages + undo stack + behavioral mode — everything the agentic
+/// loop reads per turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Conversation {
+    /// Wire-format messages. `serde_json::Value` because the provider
+    /// adapters (Anthropic / OpenAI / Google) each want slightly
+    /// different on-wire shapes; we keep the Value and let the
+    /// adapter pick what it needs.
+    #[serde(default)]
+    pub messages: Vec<serde_json::Value>,
+    /// Stack of `(user, assistant)` pairs popped by `/undo`. Popping
+    /// again via `/redo` pushes them back onto `messages`.
+    #[serde(default)]
+    pub undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
+    /// Plan-mode-approved text injected as system context on the
+    /// next turn. `None` when plan mode hasn't been used or the user
+    /// has already acted on the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_plan: Option<String>,
+    /// Plan-mode state machine — re-exported from the existing
+    /// session module so we don't invalidate on-disk formats that
+    /// reference it. Phase 1 moves all reads to this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode: Option<crate::session::PlanModeState>,
+    /// Active behavioral mode (agency/quality/scope axes + modifiers).
+    #[serde(default)]
+    pub behavior_mode: crate::modes::BehaviorMode,
+}
+
+// ─── UI state ───────────────────────────────────────────────────────
+
+/// Ephemeral UI flags that don't survive a clean quit. Currently
+/// all four are booleans tracking one-shot notification / exit
+/// conditions. Matches CC's REQ-1 "UI State" group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiState {
+    /// True after the user has exited plan mode at least once this
+    /// session. Controls whether `/plan` shows the "you were in plan
+    /// mode" resumption hint.
+    #[serde(default)]
+    pub has_exited_plan_mode: bool,
+    /// Set to true when plan-mode exit left an un-applied plan that
+    /// should be attached to the next user message as context.
+    #[serde(default)]
+    pub needs_plan_mode_exit_attachment: bool,
+    /// Same as `needs_plan_mode_exit_attachment` but for auto mode
+    /// exit. Fires once and clears after attachment.
+    #[serde(default)]
+    pub needs_auto_mode_exit_attachment: bool,
+    /// True after the LSP recommendation card has been shown this
+    /// session. Prevents repeated suggestions on every tool call.
+    #[serde(default)]
+    pub lsp_recommendation_shown_this_session: bool,
+}
+
+// ─── Modes ──────────────────────────────────────────────────────────
+
+/// Build / Plan — legacy two-state agent mode. Duplicates the
+/// enum that today lives at `bin::cli::repl::AgentMode`; kept
+/// here because `src/state/` is library-visible and `cli` is not.
+/// Phase 5 of the migration retires the binary-side copy and this
+/// becomes canonical. Values must match the existing on-disk
+/// serde so resumed sessions don't silently shift mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    /// Full access — write/edit/bash permitted.
+    #[default]
+    Build,
+    /// Read-only — tools that mutate are blocked.
+    Plan,
+}
+
+/// Agent / behavior mode toggles that aren't already in
+/// [`Conversation::behavior_mode`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModesState {
+    /// Build / Plan — legacy two-state mode. Kept for back-compat
+    /// with existing TuiSession field; new code should use
+    /// `Conversation::behavior_mode` for fine-grained control.
+    #[serde(default)]
+    pub agent_mode: AgentMode,
+    /// Coordinator mode active — leader orchestrating teammates.
+    #[serde(default)]
+    pub coordinator: bool,
+}
+
+// ─── Permissions ────────────────────────────────────────────────────
+
+/// Permission state for this session. The `permission_mgr` itself
+/// lives on `AppHandles`; these flags describe the per-session
+/// decisions layered on top of it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionsState {
+    /// `--dangerously-skip-permissions` was set for this session.
+    /// Does NOT persist across sessions.
+    #[serde(default)]
+    pub bypass_mode: bool,
+    /// The user has accepted the per-project trust prompt. Persists
+    /// across sessions via the existing `permission_mgr` storage;
+    /// mirrored here so callers can read a coherent snapshot.
+    #[serde(default)]
+    pub trust_accepted: bool,
+    /// When true, no permission decisions made this session get
+    /// persisted to the on-disk permissions store. Used by tests
+    /// and ephemeral sandboxed sessions.
+    #[serde(default)]
+    pub persistence_disabled: bool,
+}
+
+// ─── Budgets ────────────────────────────────────────────────────────
+
+/// Effort levels for thinking / reasoning budget. Matches the
+/// string form accepted by `pipeline::build_request`; a dedicated
+/// enum here catches typos at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Max,
+}
+
+impl EffortLevel {
+    /// Stringify for the on-wire request format.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse from the string form sent over the wire / accepted at
+    /// the slash-command layer. Unrecognized inputs return `None`
+    /// so the caller can decide whether to error or fall back.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "low" | "l" => Some(Self::Low),
+            "medium" | "med" | "m" => Some(Self::Medium),
+            "high" | "h" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+/// Budgets — tokens, cost, rate limits. All numeric — no `Arc`s.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetsState {
+    #[serde(default)]
+    pub effort_level: EffortLevel,
+    /// When `Some`, overrides the default thinking budget derived
+    /// from `effort_level`. Set by `MAX_THINKING_TOKENS` env var at
+    /// startup (matches `crate::thinking::anthropic_thinking_budget`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_override: Option<u32>,
+    /// Rough running token estimate for the status bar. Not
+    /// authoritative — the provider response carries the real count.
+    #[serde(default)]
+    pub estimated_tokens: usize,
+}
+
+// ─── Transcript ─────────────────────────────────────────────────────
+
+/// Per-session transcript bookkeeping. The transcript itself lives
+/// on disk (via `crate::transcript`); this is just the watermark
+/// + cached cwd needed to append new lines without re-enumerating
+/// the file on every turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscriptState {
+    /// Count of `conversation.messages` already appended to the
+    /// JSONL transcript. Everything past this index gets appended
+    /// on the next `persist_transcript_tail` call.
+    #[serde(default)]
+    pub watermark: usize,
+    /// The cwd captured when the transcript first opened. Stays
+    /// stable even if the user cd's inside a tool call, so later
+    /// appends hit the same project dir.
+    #[serde(default)]
+    pub transcript_cwd: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_is_uuid_shaped() {
+        let id = SessionId::new();
+        // UUID v4 as a hyphenated string is 36 characters.
+        assert_eq!(id.as_str().len(), 36);
+        // Survives Display.
+        let s = format!("{id}");
+        assert_eq!(s, id.as_str());
+    }
+
+    #[test]
+    fn session_id_round_trips_from_raw() {
+        let raw = "abcd-1234";
+        let id = SessionId::from_raw(raw);
+        assert_eq!(id.as_str(), raw);
+    }
+
+    #[test]
+    fn identity_rooted_sets_every_directory_field() {
+        let cwd = PathBuf::from("/home/user/project");
+        let id = Identity::rooted_at(cwd.clone());
+        assert_eq!(id.original_cwd, cwd);
+        assert_eq!(id.cwd, cwd);
+        assert_eq!(id.project_root, cwd);
+        assert_eq!(id.session_project_dir, cwd);
+        assert!(id.additional_directories_for_claude_md.is_empty());
+        assert!(id.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn effort_level_parses_common_aliases() {
+        assert_eq!(EffortLevel::parse("low"), Some(EffortLevel::Low));
+        assert_eq!(EffortLevel::parse("l"), Some(EffortLevel::Low));
+        assert_eq!(EffortLevel::parse("MEDIUM"), Some(EffortLevel::Medium));
+        assert_eq!(EffortLevel::parse("med"), Some(EffortLevel::Medium));
+        assert_eq!(EffortLevel::parse("High"), Some(EffortLevel::High));
+        assert_eq!(EffortLevel::parse("max"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::parse("xxl"), None);
+    }
+
+    #[test]
+    fn effort_level_as_str_matches_wire_format() {
+        // Matches what pipeline::build_request expects.
+        assert_eq!(EffortLevel::Low.as_str(), "low");
+        assert_eq!(EffortLevel::Medium.as_str(), "medium");
+        assert_eq!(EffortLevel::High.as_str(), "high");
+        assert_eq!(EffortLevel::Max.as_str(), "max");
+    }
+
+    #[test]
+    fn defaults_match_existing_tui_session_defaults() {
+        // When Phase 1 drops this in place of TuiSession, these
+        // defaults must match what TuiSession produced so resumed
+        // sessions look the same to the user.
+        let conv = Conversation::default();
+        assert!(conv.messages.is_empty());
+        assert!(conv.undo_stack.is_empty());
+        assert!(conv.approved_plan.is_none());
+
+        let budgets = BudgetsState::default();
+        assert_eq!(budgets.effort_level, EffortLevel::Medium);
+        assert!(budgets.thinking_budget_override.is_none());
+
+        let perms = PermissionsState::default();
+        assert!(!perms.bypass_mode);
+        assert!(!perms.trust_accepted);
+    }
+
+    #[test]
+    fn json_omits_empty_optional_fields() {
+        // skip_serializing_if attributes keep the on-disk shape
+        // tight. Default state → minimal JSON.
+        let id = Identity::rooted_at(PathBuf::from("/x"));
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("parent_session_id"));
+        assert!(!json.contains("additional_directories_for_claude_md"));
+    }
+}

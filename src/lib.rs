@@ -34,6 +34,7 @@ pub mod rules;
 pub mod services;
 pub mod session;
 pub mod skills;
+pub mod state;
 pub mod streaming;
 pub mod subagent;
 pub mod thinking;
