@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 
 // ─── Identity ───────────────────────────────────────────────────────
 
-/// Session identifier — UUID-shaped string. Newtype so session ids
-/// don't get confused with teammate / agent / transcript ids at call
-/// sites (the subagent module already uses raw `String`s for
+/// Session identifier — UUID-shaped string.
+///
+/// Newtype so session ids don't get confused with teammate / agent / transcript
+/// ids at call sites (the subagent module already uses raw `String`s for
 /// `agent_id`; this one is deliberately typed).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -138,38 +139,54 @@ pub struct Conversation {
 
 // ─── UI state ───────────────────────────────────────────────────────
 
-/// Ephemeral UI flags that don't survive a clean quit. Currently
-/// all four are booleans tracking one-shot notification / exit
-/// conditions. Matches CC's REQ-1 "UI State" group.
+/// Plan-mode one-shot notification flags, nested inside [`UiState`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UiState {
+pub struct PlanModeFlags {
     /// True after the user has exited plan mode at least once this
     /// session. Controls whether `/plan` shows the "you were in plan
     /// mode" resumption hint.
     #[serde(default)]
-    pub has_exited_plan_mode: bool,
+    pub has_exited: bool,
     /// Set to true when plan-mode exit left an un-applied plan that
     /// should be attached to the next user message as context.
     #[serde(default)]
-    pub needs_plan_mode_exit_attachment: bool,
-    /// Same as `needs_plan_mode_exit_attachment` but for auto mode
-    /// exit. Fires once and clears after attachment.
+    pub needs_exit_attachment: bool,
+    /// Same as `needs_exit_attachment` but for auto mode exit.
+    /// Fires once and clears after attachment.
     #[serde(default)]
-    pub needs_auto_mode_exit_attachment: bool,
+    pub needs_auto_exit_attachment: bool,
+}
+
+/// Ephemeral UI flags that don't survive a clean quit.
+///
+/// Matches CC's REQ-1 "UI State" group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiState {
+    /// Plan-mode one-shot notification flags.
+    #[serde(default)]
+    pub plan_mode: PlanModeFlags,
     /// True after the LSP recommendation card has been shown this
     /// session. Prevents repeated suggestions on every tool call.
     #[serde(default)]
     pub lsp_recommendation_shown_this_session: bool,
 }
 
+impl UiState {
+    /// Convenience accessor — `true` after the user has exited plan mode once.
+    #[must_use]
+    pub const fn has_exited_plan_mode(&self) -> bool {
+        self.plan_mode.has_exited
+    }
+}
+
 // ─── Modes ──────────────────────────────────────────────────────────
 
-/// Build / Plan — legacy two-state agent mode. Duplicates the
-/// enum that today lives at `bin::cli::repl::AgentMode`; kept
-/// here because `src/state/` is library-visible and `cli` is not.
-/// Phase 5 of the migration retires the binary-side copy and this
-/// becomes canonical. Values must match the existing on-disk
-/// serde so resumed sessions don't silently shift mode.
+/// Build / Plan — legacy two-state agent mode.
+///
+/// Duplicates the enum at `bin::cli::repl::AgentMode`; kept here because
+/// `src/state/` is library-visible and `cli` is not. Phase 5 of the migration
+/// retires the binary-side copy and this becomes canonical. Values must match
+/// the existing on-disk serde so resumed sessions don't silently shift mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMode {
@@ -277,10 +294,11 @@ pub struct BudgetsState {
 
 // ─── Transcript ─────────────────────────────────────────────────────
 
-/// Per-session transcript bookkeeping. The transcript itself lives
-/// on disk (via `crate::transcript`); this is just the watermark
-/// + cached cwd needed to append new lines without re-enumerating
-/// the file on every turn.
+/// Per-session transcript bookkeeping.
+///
+/// The transcript itself lives on disk (via `crate::transcript`); this is
+/// just the watermark + cached cwd needed to append new lines without
+/// re-enumerating the file on every turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranscriptState {
     /// Count of `conversation.messages` already appended to the

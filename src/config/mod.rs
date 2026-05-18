@@ -100,6 +100,21 @@ pub fn config_file_exists() -> bool {
     false
 }
 
+/// Set a config override only when `value` is non-empty.
+///
+/// An empty value is treated as "unset" to avoid surfacing `ApiKeyError::Empty`
+/// when users export `FOO_API_KEY=""`.
+fn maybe_set_api_key(
+    builder: config::ConfigBuilder<config::builder::DefaultState>,
+    path: &str,
+    value: String,
+) -> Result<config::ConfigBuilder<config::builder::DefaultState>, ConfigError> {
+    if value.trim().is_empty() {
+        return Ok(builder);
+    }
+    builder.set_override(path, value)
+}
+
 /// Load configuration from all sources.
 ///
 /// # Errors
@@ -160,26 +175,7 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     );
 
     // Also check for provider API keys from standard env vars.
-    //
-    // An empty env var is treated as "unset" (historical behavior): we skip
-    // `set_override` rather than feed `""` into `ApiKey::deserialize`,
-    // which would otherwise raise `ApiKeyError::Empty` and fail config load
-    // on a cosmetic `export FOO_API_KEY=""`. Non-empty env vars go through
-    // verbatim — `ApiKey::deserialize` runs full validation and surfaces a
-    // clear error for CRLF / control-char / non-ASCII values at
-    // config-load time rather than five layers deep in an HTTP call.
     // Closes crosslink #256 mandated refactor point 2.
-    fn maybe_set_api_key(
-        builder: config::ConfigBuilder<config::builder::DefaultState>,
-        path: &str,
-        value: String,
-    ) -> Result<config::ConfigBuilder<config::builder::DefaultState>, ConfigError> {
-        if value.trim().is_empty() {
-            return Ok(builder);
-        }
-        builder.set_override(path, value)
-    }
-
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         builder = maybe_set_api_key(builder, "providers.anthropic.api_key", key)?;
     }

@@ -198,17 +198,11 @@ pub async fn load_credentials() -> Result<LoadedCredentials, String> {
 /// Caller must hold `CredentialLock` — this function reads, refreshes via API,
 /// and writes the credentials file. The lock prevents concurrent processes from
 /// racing on the same file.
-async fn refresh_and_load(
-    path: &PathBuf,
-    oauth: &ClaudeAiOauth,
-) -> Result<LoadedCredentials, String> {
-    let refresh_token = oauth
-        .refresh_token
-        .as_deref()
-        .ok_or("No refresh token available — re-login with Claude Code")?;
-
-    let scopes = oauth.scopes.join(" ");
-
+/// Call the OAuth token-refresh endpoint and return the raw JSON response body.
+async fn call_token_refresh_api(
+    refresh_token: &str,
+    scopes: &str,
+) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::new();
     let response = client
         .post(TOKEN_URL)
@@ -235,10 +229,26 @@ async fn refresh_and_load(
         ));
     }
 
-    let refresh_response: serde_json::Value = response
+    response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse refresh response: {e}"))?;
+        .map_err(|e| format!("Failed to parse refresh response: {e}"))
+}
+
+async fn refresh_and_load(
+    path: &PathBuf,
+    oauth: &ClaudeAiOauth,
+) -> Result<LoadedCredentials, String> {
+    const MIN_EXPIRES_IN_SECS: i64 = 60;
+    const MAX_EXPIRES_IN_SECS: i64 = 30 * 24 * 3600;
+
+    let refresh_token = oauth
+        .refresh_token
+        .as_deref()
+        .ok_or("No refresh token available — re-login with Claude Code")?;
+
+    let scopes = oauth.scopes.join(" ");
+    let refresh_response = call_token_refresh_api(refresh_token, &scopes).await?;
 
     let new_access_token = refresh_response["access_token"]
         .as_str()
@@ -264,8 +274,6 @@ async fn refresh_and_load(
             "Refresh response returned non-positive 'expires_in' ({expires_in_raw})"
         ));
     }
-    const MIN_EXPIRES_IN_SECS: i64 = 60;
-    const MAX_EXPIRES_IN_SECS: i64 = 30 * 24 * 3600;
     let expires_in = if expires_in_raw < MIN_EXPIRES_IN_SECS {
         tracing::warn!(
             received = expires_in_raw,
@@ -363,10 +371,10 @@ pub fn get_oauth_endpoint(_model: &str) -> String {
     "https://api.anthropic.com/v1/messages".to_string()
 }
 
-/// The system prompt prefix that must be present for OAuth tokens to access
-/// premium models (Sonnet, Opus). The Anthropic API validates this string.
-/// The exact prefix string the API validates for OAuth access.
-/// Must be in its own system block — do NOT append to this.
+/// The system prompt prefix that must be present for OAuth tokens to access premium models.
+///
+/// The Anthropic API validates this exact string. Must be in its own system
+/// block — do NOT append to this.
 pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 

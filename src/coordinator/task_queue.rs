@@ -15,10 +15,11 @@ use crate::subagent::AgentType;
 
 use super::TeammateId;
 
-/// Task identifier — opaque. Assigned by [`TaskQueue::submit`],
-/// used by dependency edges and for re-attaching results after
-/// teammate completion. Wrapping a `u64` keeps it `Copy` so the
-/// usual `Vec<TaskId>` manipulation doesn't force clones.
+/// Task identifier — opaque. Assigned by [`TaskQueue::submit`].
+///
+/// Used by dependency edges and for re-attaching results after teammate
+/// completion. Wrapping a `u64` keeps it `Copy` so the usual `Vec<TaskId>`
+/// manipulation doesn't force clones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(u64);
 
@@ -49,10 +50,10 @@ pub enum TaskState {
     Failed(String),
 }
 
-/// One unit of work. Constructed by the coordinator caller, passed
-/// to [`TaskQueue::submit`]. The queue assigns an id on submit and
-/// returns it so the caller can reference the task in `depends_on`
-/// vectors of subsequent submissions.
+/// One unit of work. Constructed by the coordinator caller, passed to [`TaskQueue::submit`].
+///
+/// The queue assigns an id on submit and returns it so the caller can reference
+/// the task in `depends_on` vectors of subsequent submissions.
 #[derive(Debug, Clone)]
 pub struct Task {
     /// Assigned by submit — callers leave this at the default
@@ -457,15 +458,15 @@ mod phase2_spec_pins {
     #[test]
     fn b1_len_counts_all_states_exhaustive() {
         let mut q = TaskQueue::new();
-        let a = q.submit(t("a")).unwrap();
-        let b = q.submit(t("b")).unwrap();
-        let c = q.submit(t("c")).unwrap();
-        let d = q.submit(t("d")).unwrap();
+        let task_pending = q.submit(t("a")).unwrap();
+        let task_running = q.submit(t("b")).unwrap();
+        let task_done = q.submit(t("c")).unwrap();
+        let task_failed = q.submit(t("d")).unwrap();
 
-        q.get_mut(a).unwrap().state = TaskState::Pending;
-        q.get_mut(b).unwrap().state = TaskState::Running;
-        q.get_mut(c).unwrap().state = TaskState::Done("ok".into());
-        q.get_mut(d).unwrap().state = TaskState::Failed("err".into());
+        q.get_mut(task_pending).unwrap().state = TaskState::Pending;
+        q.get_mut(task_running).unwrap().state = TaskState::Running;
+        q.get_mut(task_done).unwrap().state = TaskState::Done("ok".into());
+        q.get_mut(task_failed).unwrap().state = TaskState::Failed("err".into());
 
         assert_eq!(q.len(), 4, "len must count Pending+Running+Done+Failed");
     }

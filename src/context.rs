@@ -35,7 +35,6 @@ fn wrap_system_reminder(content: &str) -> String {
 /// output is prevented from closing the envelope; other `<` / `>`
 /// uses are unaffected.
 fn neutralize_reminder_delimiters(content: &str) -> String {
-    let mut out = content.to_string();
     // Order matters — replace longer forms first so we don't produce
     // double-escapes when a prefix appears inside a longer match.
     const DELIMITERS: &[&str] = &[
@@ -44,6 +43,7 @@ fn neutralize_reminder_delimiters(content: &str) -> String {
         "</system>",
         "<system>",
     ];
+    let mut out = content.to_string();
     for delim in DELIMITERS {
         // Case-insensitive replacement: find every occurrence (lowercased
         // comparison) and replace with an HTML-escaped form preserving

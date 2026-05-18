@@ -92,16 +92,13 @@ pub fn load_entrypoint(cwd: &Path) -> Option<EntrypointFile> {
                     truncation,
                 });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %err,
                     "could not read MEMORY.md candidate — trying next"
                 );
-                continue;
             }
         }
     }
@@ -137,13 +134,13 @@ pub(crate) fn truncate_content(raw: &str) -> (String, EntrypointTruncation) {
 
     let mut lines_triggered = false;
     let mut bytes_triggered = false;
-    let mut truncated = raw.to_string();
-
-    if line_count > MAX_ENTRYPOINT_LINES {
+    let mut truncated = if line_count > MAX_ENTRYPOINT_LINES {
         lines_triggered = true;
         let kept: Vec<&str> = raw.lines().take(MAX_ENTRYPOINT_LINES).collect();
-        truncated = kept.join("\n");
-    }
+        kept.join("\n")
+    } else {
+        raw.to_string()
+    };
 
     if truncated.len() > MAX_ENTRYPOINT_BYTES {
         bytes_triggered = true;

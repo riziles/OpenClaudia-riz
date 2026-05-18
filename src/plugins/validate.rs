@@ -18,9 +18,10 @@ use url::Url;
 ///  * Everything else (ftp, ldap, gopher, …) is rejected outright.
 pub const ALLOWED_URL_SCHEMES: &[&str] = &["https", "ssh"];
 
-/// Validate a source URL against the scheme allowlist, host presence, and
-/// the no-userinfo rule (reject `user:pass@host` embedded credentials —
-/// those belong in git's credential helper, not in a marketplace manifest).
+/// Validate a source URL against the scheme allowlist, host presence, and the no-userinfo rule.
+///
+/// Rejects `user:pass@host` embedded credentials — those belong in git's
+/// credential helper, not in a marketplace manifest.
 ///
 /// # Errors
 ///

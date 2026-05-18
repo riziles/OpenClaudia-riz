@@ -135,18 +135,18 @@ async fn b1_retry_max_is_3_pin_gap_592() {
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    let result = openclaudia::pipeline::run_turn(
-        &client,
-        &endpoint,
-        &[],
-        &request_body,
-        "anthropic",
-        None,
-        None,
-        None,
-        None,
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        client: &client,
+        endpoint: &endpoint,
+        headers: &[],
+        request_body: &request_body,
+        provider: "anthropic",
+        memory_db: None,
+        permission_mgr: None,
+        hook_engine: None,
+        session_id: None,
         tx,
-    )
+    })
     .await;
 
     // After exhausting 3 retries, the final 429 falls through to the
@@ -196,18 +196,18 @@ async fn b1_503_is_retried() {
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    let result = openclaudia::pipeline::run_turn(
-        &client,
-        &endpoint,
-        &[],
-        &request_body,
-        "anthropic",
-        None,
-        None,
-        None,
-        None,
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        client: &client,
+        endpoint: &endpoint,
+        headers: &[],
+        request_body: &request_body,
+        provider: "anthropic",
+        memory_db: None,
+        permission_mgr: None,
+        hook_engine: None,
+        session_id: None,
         tx,
-    )
+    })
     .await;
 
     assert!(result.is_ok(), "503 must be retried and succeed on 2nd try");
@@ -256,18 +256,18 @@ async fn b1_retry_after_header_used_verbatim_no_jitter_gap_596() {
     // OC emits plain AppEvent::StreamText (current broken contract)
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let result = openclaudia::pipeline::run_turn(
-        &client,
-        &endpoint,
-        &[],
-        &request_body,
-        "anthropic",
-        None,
-        None,
-        None,
-        None,
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        client: &client,
+        endpoint: &endpoint,
+        headers: &[],
+        request_body: &request_body,
+        provider: "anthropic",
+        memory_db: None,
+        permission_mgr: None,
+        hook_engine: None,
+        session_id: None,
         tx,
-    )
+    })
     .await;
 
     assert!(result.is_ok(), "must succeed after one 429 retry");
@@ -275,17 +275,14 @@ async fn b1_retry_after_header_used_verbatim_no_jitter_gap_596() {
     // Drain events and check that a retry message was sent as StreamText
     // (NOT as a structured event type — gap #595)
     let events: Vec<_> = rx.try_iter().collect();
-    let retry_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                openclaudia::tui::events::AppEvent::StreamText(s) if s.contains("Retrying")
-            )
-        })
-        .collect();
+    let has_retry_event = events.iter().any(|e| {
+        matches!(
+            e,
+            openclaudia::tui::events::AppEvent::StreamText(s) if s.contains("Retrying")
+        )
+    });
     assert!(
-        !retry_events.is_empty(),
+        has_retry_event,
         "OC emits plain-text retry notice (gap #595: should be typed api_retry event)"
     );
 }
@@ -308,18 +305,18 @@ async fn b1_408_not_retried_pin_gap_597() {
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    let result = openclaudia::pipeline::run_turn(
-        &client,
-        &endpoint,
-        &[],
-        &request_body,
-        "anthropic",
-        None,
-        None,
-        None,
-        None,
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        client: &client,
+        endpoint: &endpoint,
+        headers: &[],
+        request_body: &request_body,
+        provider: "anthropic",
+        memory_db: None,
+        permission_mgr: None,
+        hook_engine: None,
+        session_id: None,
         tx,
-    )
+    })
     .await;
 
     // OC returns API error immediately for 408 — no retry

@@ -152,13 +152,10 @@ pub fn execute_notebook_edit(args: &HashMap<String, Value>) -> (String, bool) {
     };
     // Display text for error messages — "id 'abc'" when id was provided,
     // "number N" otherwise.
-    let target_desc = if let Some(id) = cell_id_arg.as_deref() {
-        format!("id '{id}'")
-    } else if let Some(n) = cell_number_arg {
-        format!("number {n}")
-    } else {
-        "<unspecified>".to_string()
-    };
+    let target_desc = cell_id_arg.as_deref().map_or_else(
+        || cell_number_arg.map_or_else(|| "<unspecified>".to_string(), |n| format!("number {n}")),
+        |id| format!("id '{id}'"),
+    );
 
     // Index used when we print "Replaced cell ..." / "Deleted cell ..."
     // in the summary. Filled in per-branch; stays None for the "insert
@@ -337,7 +334,7 @@ mod tests {
     // =========================================================================
 
     /// Build a minimal valid .ipynb JSON with the given cells.
-    fn make_notebook(cells: Value) -> Value {
+    fn make_notebook(cells: &Value) -> Value {
         json!({
             "nbformat": 4,
             "nbformat_minor": 5,
@@ -423,7 +420,7 @@ mod tests {
     #[test]
     fn notebook_replace_by_cell_id_succeeds() {
         // Behavior 7: cell found by id field → source updated
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"id": "cell-a", "cell_type": "code", "source": "old source", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
@@ -442,7 +439,7 @@ mod tests {
     #[test]
     fn notebook_replace_by_cell_id_not_found_returns_error() {
         // Behavior 7 edge: cell_id not found and no cell_number fallback → error
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"id": "cell-a", "cell_type": "code", "source": "x", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
@@ -461,7 +458,7 @@ mod tests {
         // Behavior 7: OC exposes cell_number as a distinct parameter (not a
         // fallback parse of cell_id as CC does). When cell_id is absent,
         // cell_number is used directly as the 0-indexed position.
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"cell_type": "code", "source": "first", "metadata": {}, "outputs": [], "execution_count": null},
             {"cell_type": "code", "source": "second", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
@@ -481,7 +478,7 @@ mod tests {
     #[test]
     fn notebook_replace_without_cell_id_or_number_errors() {
         // Behavior 7 edge: replace requires cell_id or cell_number
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"cell_type": "code", "source": "x", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
@@ -503,7 +500,7 @@ mod tests {
         // Behavior 7 edge: index == cells.len() in OC returns out-of-bounds error.
         // CC silently promotes to insert (line 372-376 of CC source).
         // Pinned as current OC behavior.
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"cell_type": "code", "source": "only", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
@@ -529,7 +526,7 @@ mod tests {
         // Behavior 7 edge (GAP): CC resets execution_count=null and outputs=[]
         // on code-cell replace (CC source line 420-423). OC does NOT reset them.
         // Pinned as current OC behavior; gap noted in #525 spec.
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {
                 "id": "cell-x",
                 "cell_type": "code",
@@ -563,7 +560,7 @@ mod tests {
     #[test]
     fn notebook_insert_without_cell_id_inserts_at_position_zero() {
         // Behavior 7 edge: omitting both cell_id and cell_number on insert → position 0
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"cell_type": "code", "source": "existing", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
         let (_f, path) = tmp_notebook(&nb);
@@ -583,7 +580,7 @@ mod tests {
     #[test]
     fn notebook_insert_after_cell_id_inserts_at_next_position() {
         // Behavior 7: insert with cell_id means "insert AFTER" that cell
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"id": "first", "cell_type": "code", "source": "a", "metadata": {}, "outputs": [], "execution_count": null},
             {"id": "second", "cell_type": "code", "source": "b", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
@@ -607,7 +604,7 @@ mod tests {
 
     #[test]
     fn notebook_delete_by_cell_id_removes_correct_cell() {
-        let nb = make_notebook(json!([
+        let nb = make_notebook(&json!([
             {"id": "keep", "cell_type": "code", "source": "keep me", "metadata": {}, "outputs": [], "execution_count": null},
             {"id": "remove", "cell_type": "code", "source": "remove me", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
@@ -649,7 +646,7 @@ mod tests {
 
     #[test]
     fn notebook_invalid_edit_mode_returns_error() {
-        let nb = make_notebook(json!([]));
+        let nb = make_notebook(&json!([]));
         let (_f, path) = tmp_notebook(&nb);
         let mut args = HashMap::new();
         args.insert("notebook_path".to_string(), json!(&path));

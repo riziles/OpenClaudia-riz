@@ -72,10 +72,11 @@ impl CompactionConfig {
     }
 }
 
-/// Sentinel prefix that marks a system message as a compact-boundary
-/// divider. Callers detect one via [`is_compact_boundary_message`]
-/// rather than matching the raw string. Kept stable across releases
-/// because it lives in on-disk JSONL transcripts.
+/// Sentinel prefix that marks a system message as a compact-boundary divider.
+///
+/// Callers detect one via [`is_compact_boundary_message`] rather than matching
+/// the raw string. Kept stable across releases because it lives in on-disk
+/// JSONL transcripts.
 pub const COMPACT_BOUNDARY_MARKER: &str = "[openclaudia:compact_boundary]";
 
 /// Metadata carried inside a compact-boundary message, immediately
@@ -92,11 +93,12 @@ pub struct CompactBoundaryMetadata {
     pub messages_summarized: usize,
 }
 
-/// Build a compact-boundary system message. Format:
-/// `<marker> <json>\n<human-readable content>`. The JSON line allows
-/// transcript readers to recover the metadata without parsing the
-/// whole summary; the human-readable suffix keeps inline rendering
-/// legible when no reader is present.
+/// Build a compact-boundary system message.
+///
+/// Format: `<marker> <json>\n<human-readable content>`. The JSON line allows
+/// transcript readers to recover the metadata without parsing the whole
+/// summary; the human-readable suffix keeps inline rendering legible when no
+/// reader is present.
 #[must_use]
 pub fn build_compact_boundary_message(
     pre_tokens: usize,
@@ -120,11 +122,11 @@ pub fn build_compact_boundary_message(
     }
 }
 
-/// True when `msg` is a compact-boundary marker emitted by
-/// [`build_compact_boundary_message`]. Checks the raw text prefix so
-/// the predicate works against both in-memory [`ChatMessage`]s and
-/// [`crate::transcript::SerializedMessage`] envelopes round-tripped
-/// through JSONL.
+/// True when `msg` is a compact-boundary marker emitted by [`build_compact_boundary_message`].
+///
+/// Checks the raw text prefix so the predicate works against both in-memory
+/// [`ChatMessage`]s and [`crate::transcript::SerializedMessage`] envelopes
+/// round-tripped through JSONL.
 #[must_use]
 pub fn is_compact_boundary_message(msg: &ChatMessage) -> bool {
     if msg.role != "system" {
@@ -139,10 +141,11 @@ pub fn is_compact_boundary_message(msg: &ChatMessage) -> bool {
     }
 }
 
-/// Parse the JSON metadata out of a compact-boundary message. Returns
-/// `None` for non-boundary messages or when the metadata line is
-/// malformed (reader should treat this as "we know compaction
-/// happened but not the details" rather than an error).
+/// Parse the JSON metadata out of a compact-boundary message.
+///
+/// Returns `None` for non-boundary messages or when the metadata line is
+/// malformed (reader should treat this as "we know compaction happened but not
+/// the details" rather than an error).
 #[must_use]
 pub fn extract_compact_boundary_metadata(msg: &ChatMessage) -> Option<CompactBoundaryMetadata> {
     if !is_compact_boundary_message(msg) {
@@ -1207,7 +1210,7 @@ mod tests {
     fn test_compaction_config_default() {
         let config = CompactionConfig::default();
         assert_eq!(config.max_context_tokens, DEFAULT_CONTEXT);
-        assert_eq!(config.threshold, COMPACTION_THRESHOLD);
+        assert!((config.threshold - COMPACTION_THRESHOLD).abs() < f32::EPSILON);
         assert_eq!(config.preserve_recent, 4);
         assert!(config.preserve_system);
         assert!(config.preserve_tool_calls);
@@ -1217,20 +1220,20 @@ mod tests {
     #[test]
     fn test_context_compactor_config_access() {
         let config = CompactionConfig {
-            max_context_tokens: 50000,
+            max_context_tokens: 50_000,
             ..Default::default()
         };
 
         let mut compactor = ContextCompactor::new(config);
-        assert_eq!(compactor.config().max_context_tokens, 50000);
+        assert_eq!(compactor.config().max_context_tokens, 50_000);
 
         // Update config
         let new_config = CompactionConfig {
-            max_context_tokens: 100000,
+            max_context_tokens: 100_000,
             ..Default::default()
         };
         compactor.set_config(new_config);
-        assert_eq!(compactor.config().max_context_tokens, 100000);
+        assert_eq!(compactor.config().max_context_tokens, 100_000);
     }
 
     #[test]
@@ -1270,15 +1273,15 @@ mod tests {
     fn test_compaction_result_fields() {
         let result = CompactionResult {
             compacted: true,
-            original_tokens: 50000,
-            new_tokens: 20000,
+            original_tokens: 50_000,
+            new_tokens: 20_000,
             messages_summarized: 10,
             summary: Some("Summary content".to_string()),
         };
 
         assert!(result.compacted);
-        assert_eq!(result.original_tokens, 50000);
-        assert_eq!(result.new_tokens, 20000);
+        assert_eq!(result.original_tokens, 50_000);
+        assert_eq!(result.new_tokens, 20_000);
         assert_eq!(result.messages_summarized, 10);
         assert!(result.summary.is_some());
     }
@@ -1294,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_check_context_budget_normal() {
-        let (warn, compact, _) = check_context_budget(50000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(50_000, "claude-sonnet-4-6");
         assert!(!warn);
         assert!(!compact);
     }
@@ -1302,21 +1305,21 @@ mod tests {
     #[test]
     fn test_check_context_budget_warn() {
         // Claude sonnet context is 200k, 85% = 170k
-        let (warn, compact, _) = check_context_budget(175000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(175_000, "claude-sonnet-4-6");
         assert!(warn);
         assert!(!compact);
     }
 
     #[test]
     fn test_check_context_budget_compact() {
-        let (warn, compact, _) = check_context_budget(185000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(185_000, "claude-sonnet-4-6");
         assert!(warn);
         assert!(compact);
     }
 
     #[test]
     fn test_check_context_budget_percentage() {
-        let (_, _, pct) = check_context_budget(100000, "claude-sonnet-4-6");
+        let (_, _, pct) = check_context_budget(100_000, "claude-sonnet-4-6");
         // 100k / 200k = 50%
         assert!((pct - 50.0).abs() < 0.1);
     }
@@ -1580,7 +1583,7 @@ mod tests {
     fn b3_for_model_uses_default_fields_except_context_window() {
         let config = CompactionConfig::for_model("gpt-4");
         assert_eq!(config.max_context_tokens, GPT4_CONTEXT);
-        assert_eq!(config.threshold, COMPACTION_THRESHOLD);
+        assert!((config.threshold - COMPACTION_THRESHOLD).abs() < f32::EPSILON);
         assert_eq!(config.preserve_recent, 4);
         assert!(config.preserve_system);
         assert!(config.preserve_tool_calls);

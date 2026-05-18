@@ -152,19 +152,19 @@ pub fn open_external_editor() -> Option<String> {
 
     match status {
         Ok(s) if s.success() => {
-            if let Ok(content) = fs::read_to_string(&temp_file) {
-                let _ = fs::remove_file(&temp_file);
-                let trimmed = content.trim().to_string();
-                if trimmed.is_empty() {
-                    println!("Editor closed with empty content.\n");
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            } else {
-                println!("No content entered.\n");
-                None
-            }
+            fs::read_to_string(&temp_file).map_or_else(
+                |_| { println!("No content entered.\n"); None },
+                |content| {
+                    let _ = fs::remove_file(&temp_file);
+                    let trimmed = content.trim().to_string();
+                    if trimmed.is_empty() {
+                        println!("Editor closed with empty content.\n");
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                },
+            )
         }
         Ok(_) => {
             eprintln!("Editor exited with error.\n");
@@ -196,7 +196,7 @@ pub fn expand_file_references(input: &str) -> String {
             continue;
         };
         let full_match = full_match.as_str();
-        let Some(raw_path) = cap.get(1).or(cap.get(2)) else {
+        let Some(raw_path) = cap.get(1).or_else(|| cap.get(2)) else {
             continue;
         };
         let raw_path = raw_path.as_str();

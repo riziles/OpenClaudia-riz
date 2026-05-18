@@ -611,8 +611,8 @@ fn b4_full_valid_skill_file() {
 //     nextest or similar.
 // ---------------------------------------------------------------------------
 
-/// Pin the scan-both-dirs + missing-dir + dropped-bad-file + dir-format
-/// + name-fallback + dedup (B5 + B6) contracts in a single serialised
+/// Pin the scan-both-dirs, missing-dir, dropped-bad-file, dir-format,
+/// name-fallback, and dedup (B5 + B6) contracts in a single serialised
 /// test that controls HOME and cwd.
 ///
 /// All five B5 behaviours and all three B6 behaviours are pinned here to
@@ -627,84 +627,7 @@ fn b5_b6_load_skills_serial() {
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // ---- fixture roots ----
-    let user_home = TempDir::new().unwrap();
-    let project_root = TempDir::new().unwrap();
-
-    let user_skills = user_home.path().join(".openclaudia").join("skills");
-    let proj_skills = project_root.path().join(".openclaudia").join("skills");
-    fs::create_dir_all(&user_skills).unwrap();
-    fs::create_dir_all(&proj_skills).unwrap();
-
-    // ---- B5-a: both dirs scanned ----
-    write_skill(
-        &user_skills.join("user-skill.md"),
-        "user-skill",
-        "From user dir",
-        "User body.",
-    );
-    write_skill(
-        &proj_skills.join("project-skill.md"),
-        "project-skill",
-        "From project dir",
-        "Project body.",
-    );
-
-    // ---- B5-b: unparseable file is silently dropped ----
-    fs::write(proj_skills.join("bad.md"), "no frontmatter here at all").unwrap();
-
-    // ---- B5-c: directory format (`<name>/SKILL.md`) ----
-    let dir_skill_dir = proj_skills.join("dir-format");
-    fs::create_dir_all(&dir_skill_dir).unwrap();
-    write_skill(
-        &dir_skill_dir.join("SKILL.md"),
-        "dir-format",
-        "Dir format skill",
-        "Dir body.",
-    );
-
-    // ---- B5-d: name fallback when YAML name is empty ----
-    write_skill_raw(
-        &proj_skills.join("fallback-name.md"),
-        "name: \"\"\ndescription: fallback test",
-        "Body.",
-    );
-
-    // ---- B6-a: project shadows user on same name ----
-    write_skill(
-        &proj_skills.join("shared.md"),
-        "shared",
-        "Project version",
-        "PROJECT body",
-    );
-    write_skill(
-        &user_skills.join("shared.md"),
-        "shared",
-        "User version",
-        "USER body",
-    );
-
-    // ---- B6-b: user-only skill is not suppressed ----
-    write_skill(
-        &user_skills.join("user-only.md"),
-        "user-only",
-        "Only user",
-        "User only body.",
-    );
-
-    // ---- B6-c: distinct skills from both dirs all survive ----
-    write_skill(
-        &proj_skills.join("alpha.md"),
-        "alpha",
-        "Alpha",
-        "Alpha body.",
-    );
-    write_skill(
-        &user_skills.join("gamma.md"),
-        "gamma",
-        "Gamma",
-        "Gamma body.",
-    );
+    let (user_home, project_root) = b5_b6_write_fixtures();
 
     // ---- swap global state ----
     let original_home = std::env::var("HOME").ok();
@@ -722,65 +645,78 @@ fn b5_b6_load_skills_serial() {
         let _ = std::env::set_current_dir(cwd);
     }
 
+    b5_b6_assert_contracts(&skills);
+}
+
+/// Write all B5+B6 fixture files into fresh temp dirs.
+/// Returns `(user_home, project_root)` — must be kept alive until after
+/// `load_skills()` returns.
+fn b5_b6_write_fixtures() -> (TempDir, TempDir) {
+    let user_home = TempDir::new().unwrap();
+    let project_root = TempDir::new().unwrap();
+
+    let user_skills = user_home.path().join(".openclaudia").join("skills");
+    let proj_skills = project_root.path().join(".openclaudia").join("skills");
+    fs::create_dir_all(&user_skills).unwrap();
+    fs::create_dir_all(&proj_skills).unwrap();
+
+    // B5-a: both dirs scanned
+    write_skill(&user_skills.join("user-skill.md"), "user-skill", "From user dir", "User body.");
+    write_skill(&proj_skills.join("project-skill.md"), "project-skill", "From project dir", "Project body.");
+
+    // B5-b: unparseable file is silently dropped
+    fs::write(proj_skills.join("bad.md"), "no frontmatter here at all").unwrap();
+
+    // B5-c: directory format (`<name>/SKILL.md`)
+    let dir_skill_dir = proj_skills.join("dir-format");
+    fs::create_dir_all(&dir_skill_dir).unwrap();
+    write_skill(&dir_skill_dir.join("SKILL.md"), "dir-format", "Dir format skill", "Dir body.");
+
+    // B5-d: name fallback when YAML name is empty
+    write_skill_raw(&proj_skills.join("fallback-name.md"), "name: \"\"\ndescription: fallback test", "Body.");
+
+    // B6-a: project shadows user on same name
+    write_skill(&proj_skills.join("shared.md"), "shared", "Project version", "PROJECT body");
+    write_skill(&user_skills.join("shared.md"), "shared", "User version", "USER body");
+
+    // B6-b: user-only skill is not suppressed
+    write_skill(&user_skills.join("user-only.md"), "user-only", "Only user", "User only body.");
+
+    // B6-c: distinct skills from both dirs all survive
+    write_skill(&proj_skills.join("alpha.md"), "alpha", "Alpha", "Alpha body.");
+    write_skill(&user_skills.join("gamma.md"), "gamma", "Gamma", "Gamma body.");
+
+    (user_home, project_root)
+}
+
+/// Assert all B5+B6 behavioural contracts against the loaded skills list.
+fn b5_b6_assert_contracts(skills: &[SkillDefinition]) {
     let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
 
     // B5-a: both dirs scanned
-    assert!(
-        names.contains(&"project-skill"),
-        "B5-a: project skill must appear; got: {names:?}"
-    );
-    assert!(
-        names.contains(&"user-skill"),
-        "B5-a: user skill must appear; got: {names:?}"
-    );
+    assert!(names.contains(&"project-skill"), "B5-a: project skill must appear; got: {names:?}");
+    assert!(names.contains(&"user-skill"), "B5-a: user skill must appear; got: {names:?}");
 
     // B5-b: unparseable file is dropped
-    assert!(
-        !names.contains(&"bad"),
-        "B5-b: unparseable file must be silently dropped; got: {names:?}"
-    );
+    assert!(!names.contains(&"bad"), "B5-b: unparseable file must be silently dropped; got: {names:?}");
 
     // B5-c: directory-format skill discovered
-    assert!(
-        names.contains(&"dir-format"),
-        "B5-c: dir-format skill must be discovered; got: {names:?}"
-    );
+    assert!(names.contains(&"dir-format"), "B5-c: dir-format skill must be discovered; got: {names:?}");
 
     // B5-d: name fallback to file stem
-    assert!(
-        names.contains(&"fallback-name"),
-        "B5-d: empty YAML name must fall back to 'fallback-name'; got: {names:?}"
-    );
+    assert!(names.contains(&"fallback-name"), "B5-d: empty YAML name must fall back to 'fallback-name'; got: {names:?}");
 
     // B6-a: project skill shadows user skill with same name
-    let shared_entries: Vec<&SkillDefinition> =
-        skills.iter().filter(|s| s.name == "shared").collect();
-    assert_eq!(
-        shared_entries.len(),
-        1,
-        "B6-a: exactly one 'shared' entry must survive; got: {shared_entries:?}"
-    );
-    assert!(
-        shared_entries[0].prompt.contains("PROJECT body"),
-        "B6-a: project version must win; prompt was {:?}",
-        shared_entries[0].prompt
-    );
+    let shared_entries: Vec<&SkillDefinition> = skills.iter().filter(|s| s.name == "shared").collect();
+    assert_eq!(shared_entries.len(), 1, "B6-a: exactly one 'shared' entry must survive; got: {shared_entries:?}");
+    assert!(shared_entries[0].prompt.contains("PROJECT body"), "B6-a: project version must win; prompt was {:?}", shared_entries[0].prompt);
 
     // B6-b: user-only skill survives
-    assert!(
-        names.contains(&"user-only"),
-        "B6-b: user-only skill must not be suppressed; got: {names:?}"
-    );
+    assert!(names.contains(&"user-only"), "B6-b: user-only skill must not be suppressed; got: {names:?}");
 
     // B6-c: distinct skills from both dirs all survive
-    assert!(
-        names.contains(&"alpha"),
-        "B6-c: 'alpha' (project) must survive; got: {names:?}"
-    );
-    assert!(
-        names.contains(&"gamma"),
-        "B6-c: 'gamma' (user) must survive; got: {names:?}"
-    );
+    assert!(names.contains(&"alpha"), "B6-c: 'alpha' (project) must survive; got: {names:?}");
+    assert!(names.contains(&"gamma"), "B6-c: 'gamma' (user) must survive; got: {names:?}");
 }
 
 /// B5 component test: `parse_skill_file` on a valid `.md` file at an

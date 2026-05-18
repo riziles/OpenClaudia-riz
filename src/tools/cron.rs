@@ -57,14 +57,6 @@ impl ScheduleStore {
 
 /// Validate a cron expression (basic check for 5-field format)
 fn validate_cron(expr: &str) -> Result<(), String> {
-    let fields: Vec<&str> = expr.split_whitespace().collect();
-    if fields.len() != 5 {
-        return Err(format!(
-            "Cron expression must have 5 fields (minute hour day month weekday), got {}",
-            fields.len()
-        ));
-    }
-
     const FIELD_NAMES: [&str; 5] = [
         "minute (0-59)",
         "hour (0-23)",
@@ -75,6 +67,13 @@ fn validate_cron(expr: &str) -> Result<(), String> {
     const FIELD_RANGES: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
     // Compile-time assertion that both arrays have matching lengths
     const _: () = assert!(FIELD_NAMES.len() == FIELD_RANGES.len());
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "Cron expression must have 5 fields (minute hour day month weekday), got {}",
+            fields.len()
+        ));
+    }
 
     let field_names = FIELD_NAMES;
     let field_ranges = FIELD_RANGES;

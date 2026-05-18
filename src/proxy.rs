@@ -626,11 +626,7 @@ async fn record_turn_estimate(state: &ProxyState, request: &ChatCompletionReques
     );
     let context_window = crate::compaction::get_context_window(&request.model);
     // Integer-safe utilization computation.
-    let utilization_pct_x10 = if context_window > 0 {
-        estimated_input.saturating_mul(1000) / context_window
-    } else {
-        0
-    };
+    let utilization_pct_x10 = estimated_input.saturating_mul(1000).checked_div(context_window).unwrap_or(0);
     #[allow(clippy::cast_possible_truncation)]
     let usage_pct_f64 = f64::from(utilization_pct_x10 as u32) / 10.0;
 
@@ -712,10 +708,12 @@ async fn apply_vdd_review(
         return Ok(Response::from_parts(parts, Body::from(response_bytes)));
     };
 
-    let engine = vdd_engine.lock().await;
-    let vdd_result = engine
-        .process_response(&response_json, request, provider_name, Some(api_key))
-        .await;
+    let vdd_result = {
+        let engine = vdd_engine.lock().await;
+        engine
+            .process_response(&response_json, request, provider_name, Some(api_key))
+            .await
+    };
 
     // Decide which bytes to ship back. Only `Blocking` produces new bytes;
     // every other path reuses the original response body.
@@ -760,6 +758,60 @@ async fn apply_vdd_review(
     Ok(Response::from_parts(parts, Body::from(body_bytes)))
 }
 
+/// Build a model-specific compactor, apply session hints, and compact the
+/// request context if needed. Logs results and fires hooks. Non-fatal: errors
+/// are logged at warn and do not abort the request.
+async fn compact_request_context(request: &mut ChatCompletionRequest, state: &ProxyState) {
+    let mut compactor = crate::compaction::ContextCompactor::for_model(&request.model);
+    let base_config = state.compactor.config().clone();
+    let mut model_config = compactor.config().clone();
+    model_config.preserve_recent = base_config.preserve_recent;
+    model_config.preserve_system = base_config.preserve_system;
+    model_config.preserve_tool_calls = base_config.preserve_tool_calls;
+    compactor.set_config(model_config);
+
+    let actual_token_hint: Option<usize> = {
+        let sm = state.session_manager.read().await;
+        sm.get_session().and_then(|session| {
+            session
+                .turn_metrics
+                .last()
+                .and_then(|tm| tm.actual_usage.as_ref())
+                .map(|u| usize::try_from(u.input_tokens).unwrap_or(usize::MAX))
+        })
+    };
+
+    match compactor
+        .compact_with_hint(request, Some(&state.hook_engine), None, actual_token_hint)
+        .await
+    {
+        Ok(result) if result.compacted => {
+            let summary_len = result.summary.as_ref().map_or(0, std::string::String::len);
+            info!(
+                original = result.original_tokens,
+                new = result.new_tokens,
+                summarized = result.messages_summarized,
+                summary_len = summary_len,
+                "Context compacted"
+            );
+            if let Some(summary) = &result.summary {
+                debug!(summary = %summary, "Compaction summary generated");
+            }
+            state
+                .hook_engine
+                .fire_notification("compaction", serde_json::json!({ "summary_length": summary_len }))
+                .await;
+        }
+        Ok(_) => {}
+        Err(crate::compaction::CompactionError::HookBlocked(reason)) => {
+            warn!(reason = %reason, "Compaction blocked by hook");
+        }
+        Err(crate::compaction::CompactionError::Failed(reason)) => {
+            warn!(reason = %reason, "Compaction failed");
+        }
+    }
+}
+
 async fn proxy_chat_completions(
     State(state): State<ProxyState>,
     headers: HeaderMap,
@@ -798,71 +850,7 @@ async fn proxy_chat_completions(
     let mut request = request;
     prepare_request_context(&mut request, &state).await?;
 
-    // Create model-specific compactor for accurate context limits
-    let mut compactor = crate::compaction::ContextCompactor::for_model(&request.model);
-
-    // Optionally update config from state compactor settings
-    let base_config = state.compactor.config().clone();
-    let mut model_config = compactor.config().clone();
-    model_config.preserve_recent = base_config.preserve_recent;
-    model_config.preserve_system = base_config.preserve_system;
-    model_config.preserve_tool_calls = base_config.preserve_tool_calls;
-    compactor.set_config(model_config);
-
-    // Get last actual input token count from session for more accurate compaction
-    let actual_token_hint: Option<usize> = {
-        let sm = state.session_manager.read().await;
-        sm.get_session().and_then(|session| {
-            session
-                .turn_metrics
-                .last()
-                .and_then(|tm| tm.actual_usage.as_ref())
-                .map(|u| usize::try_from(u.input_tokens).unwrap_or(usize::MAX))
-        })
-    };
-
-    // Compact context if needed (for long conversations)
-    let compaction_result = compactor
-        .compact_with_hint(
-            &mut request,
-            Some(&state.hook_engine),
-            None,
-            actual_token_hint,
-        )
-        .await;
-
-    match compaction_result {
-        Ok(result) => {
-            if result.compacted {
-                let summary_len = result.summary.as_ref().map_or(0, std::string::String::len);
-                info!(
-                    original = result.original_tokens,
-                    new = result.new_tokens,
-                    summarized = result.messages_summarized,
-                    summary_len = summary_len,
-                    "Context compacted"
-                );
-                // Log the summary if available (for debugging)
-                if let Some(summary) = &result.summary {
-                    debug!(summary = %summary, "Compaction summary generated");
-                }
-                // Fire compaction notification
-                state
-                    .hook_engine
-                    .fire_notification(
-                        "compaction",
-                        serde_json::json!({ "summary_length": summary_len }),
-                    )
-                    .await;
-            }
-        }
-        Err(crate::compaction::CompactionError::HookBlocked(reason)) => {
-            warn!(reason = %reason, "Compaction blocked by hook");
-        }
-        Err(crate::compaction::CompactionError::Failed(reason)) => {
-            warn!(reason = %reason, "Compaction failed");
-        }
-    }
+    compact_request_context(&mut request, &state).await;
 
     // Get the provider adapter for request transformation
     let adapter = get_adapter(&provider_name);
@@ -1145,6 +1133,15 @@ async fn proxy_passthrough(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, ProxyError> {
+    // Whitelist safe headers to forward — prevents credential leaks from
+    // custom X-* headers or Authorization headers meant for other services.
+    const SAFE_PASSTHROUGH_HEADERS: &[&str] = &[
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "user-agent",
+        "content-type",
+    ];
     let path = request.uri().path();
     let provider = state
         .config
@@ -1160,15 +1157,6 @@ async fn proxy_passthrough(
 
     let mut req_builder = state.client.request(request.method().clone(), &url);
 
-    // Whitelist safe headers to forward — prevents credential leaks from
-    // custom X-* headers or Authorization headers meant for other services.
-    const SAFE_PASSTHROUGH_HEADERS: &[&str] = &[
-        "accept",
-        "accept-encoding",
-        "accept-language",
-        "user-agent",
-        "content-type",
-    ];
     for (key, value) in &headers {
         let key_lower = key.as_str().to_lowercase();
         if SAFE_PASSTHROUGH_HEADERS.contains(&key_lower.as_str()) {

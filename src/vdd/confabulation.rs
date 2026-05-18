@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn test_confabulation_tracker_empty() {
         let tracker = ConfabulationTracker::new(0.75, 2);
-        assert_eq!(tracker.current_rate(), 0.0);
-        assert_eq!(tracker.latest_rate(), 0.0);
+        assert!(tracker.current_rate().abs() < f32::EPSILON);
+        assert!(tracker.latest_rate().abs() < f32::EPSILON);
         assert!(!tracker.should_terminate());
     }
 

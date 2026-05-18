@@ -5,6 +5,8 @@ edition = "2021"
 description = "Open-source universal agent harness - Claude Code capabilities for any AI"
 license = "MIT"
 repository = "https://github.com/dollspace-gay/openclaudia"
+categories = ["development-tools", "command-line-utilities"]
+keywords = ["claude", "agent", "anthropic", "ai", "llm"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -96,6 +98,18 @@ tempfile = "3"
 tokio-test = "0.4"
 wiremock = "0.6"
 predicates = "3"
+
+[lints.clippy]
+# Group denies at priority -1 so specific overrides (priority 0) can selectively allow.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Targeted exception (architectural review): 32 transitive duplicates from
+# ratatui-termwiz optional chain, headless_chrome optional dep, the ring/rustls
+# TLS chain, and ecosystem-wide windows-sys major-version drift. Fix requires
+# upstream coordination, not source changes.
+multiple_crate_versions = "allow"
 
 [lib]
 name = "openclaudia"

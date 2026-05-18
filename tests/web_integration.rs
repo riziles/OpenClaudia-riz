@@ -244,6 +244,7 @@ fn fetch_output_format_contains_url_header() {
 
 #[test]
 fn fetch_output_format_url_line_in_success_path() {
+    use std::fmt::Write as _;
     // The success formatter in execute_web_fetch writes "URL: {url}\n\n"
     // (src/tools/web.rs:43). Verify the literal appears in formatted output.
     // This is a white-box unit test of the formatting code — it does not make
@@ -256,9 +257,9 @@ fn fetch_output_format_url_line_in_success_path() {
 
     let mut output = String::new();
     if let Some(t) = &title {
-        output.push_str(&format!("# {t}\n\n"));
+        let _ = write!(output, "# {t}\n\n");
     }
-    output.push_str(&format!("URL: {url}\n\n"));
+    let _ = write!(output, "URL: {url}\n\n");
     output.push_str(content);
 
     assert!(
@@ -731,11 +732,11 @@ async fn browser_fetch_blocks_ssrf_before_launch() {
 #[tokio::test]
 #[ignore = "requires headless Chrome — set OPENCLAUDIA_TEST_BROWSER=1 and run with --ignored"]
 async fn browser_fetch_success_contains_url_line() {
+    use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
     if std::env::var("OPENCLAUDIA_TEST_BROWSER").is_err() {
         eprintln!("OPENCLAUDIA_TEST_BROWSER not set — skipping browser fetch test");
         return;
     }
-    use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
     let call = ToolCall {
         id: "bfetch".to_string(),

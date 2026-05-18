@@ -552,10 +552,11 @@ pub fn draw_status_bar(model: &str, tokens: usize, cost: Option<f64>, mode: &str
 
 // ─── Streaming markdown renderer ────────────────────────────────────────────
 
-/// A streaming markdown renderer that buffers incoming text tokens and renders
-/// completed lines with markdown formatting (headings, bold, italic, code blocks,
-/// lists, links, inline code). Incomplete trailing lines are held in a buffer
-/// until a newline arrives or `flush()` is called at stream end.
+/// A streaming markdown renderer that buffers incoming text tokens.
+///
+/// Renders completed lines with markdown formatting (headings, bold, italic,
+/// code blocks, lists, links, inline code). Incomplete trailing lines are held
+/// in a buffer until a newline arrives or `flush()` is called at stream end.
 pub struct StreamingMarkdownRenderer {
     /// Buffered text that hasn't been rendered yet (no trailing newline)
     line_buffer: String,
@@ -569,6 +570,20 @@ pub struct StreamingMarkdownRenderer {
     theme: Theme,
 }
 
+/// The `Send`-able subset of [`StreamingMarkdownRenderer`] state that can be
+/// carried across `.await` boundaries.
+///
+/// `StreamingMarkdownRenderer` holds a `HighlightLines` (from syntect/onig) that
+/// contains raw pointers and is therefore `!Send`. When the streaming loop needs
+/// to yield at `stream.next().await`, it first extracts this state, drops the
+/// renderer, awaits, then reconstructs the renderer from the state.
+pub struct MarkdownRenderState {
+    line_buffer: String,
+    in_code_block: bool,
+    code_lang: String,
+    theme: Theme,
+}
+
 impl StreamingMarkdownRenderer {
     /// Create a new streaming renderer with the loaded theme
     #[must_use]
@@ -579,6 +594,47 @@ impl StreamingMarkdownRenderer {
             code_lang: String::new(),
             highlighter: None,
             theme: Theme::load(),
+        }
+    }
+
+    /// Extract the `Send`-able render state, consuming `self`.
+    ///
+    /// The `HighlightLines` (which is `!Send`) is discarded; it will be
+    /// reconstructed from `code_lang` when the renderer is restored via
+    /// [`StreamingMarkdownRenderer::from_state`].
+    #[must_use]
+    pub fn into_state(self) -> MarkdownRenderState {
+        MarkdownRenderState {
+            line_buffer: self.line_buffer,
+            in_code_block: self.in_code_block,
+            code_lang: self.code_lang,
+            theme: self.theme,
+        }
+    }
+
+    /// Reconstruct a renderer from previously saved state.
+    ///
+    /// If the state records an active code block, the `HighlightLines` is
+    /// rebuilt from the language token so highlighting resumes correctly.
+    #[must_use]
+    pub fn from_state(state: MarkdownRenderState) -> Self {
+        let highlighter = if state.in_code_block && !state.code_lang.is_empty() {
+            let syntax = SYNTAX_SET
+                .find_syntax_by_token(&state.code_lang)
+                .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+            THEME_SET
+                .themes
+                .get("base16-ocean.dark")
+                .map(|t| HighlightLines::new(syntax, t))
+        } else {
+            None
+        };
+        Self {
+            line_buffer: state.line_buffer,
+            in_code_block: state.in_code_block,
+            code_lang: state.code_lang,
+            highlighter,
+            theme: state.theme,
         }
     }
 
@@ -609,6 +665,32 @@ impl StreamingMarkdownRenderer {
     }
 
     /// Render a single complete line with markdown formatting
+    /// Render one line of code-block content, applying syntax highlighting when available.
+    fn render_code_block_line(&mut self, line: &str) {
+        let mut stdout = io::stdout();
+        if let Some(ref mut hl) = self.highlighter {
+            if let Ok(ranges) = hl.highlight_line(line, &SYNTAX_SET) {
+                let _ = stdout.execute(Print("    "));
+                for (style, text) in ranges {
+                    let color = CtColor::Rgb {
+                        r: style.foreground.r,
+                        g: style.foreground.g,
+                        b: style.foreground.b,
+                    };
+                    let _ = stdout.execute(SetForegroundColor(color));
+                    let _ = stdout.execute(Print(text));
+                }
+            } else {
+                let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
+                print!("    {line}");
+            }
+        } else {
+            let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
+            print!("    {line}");
+        }
+        let _ = stdout.execute(ResetColor);
+    }
+
     fn render_line(&mut self, line: &str) {
         let mut stdout = io::stdout();
 
@@ -648,30 +730,7 @@ impl StreamingMarkdownRenderer {
 
         // Inside code block: syntax highlight
         if self.in_code_block {
-            if let Some(ref mut hl) = self.highlighter {
-                // Render with syntax highlighting (inline, no trailing newline)
-                if let Ok(ranges) = hl.highlight_line(line, &SYNTAX_SET) {
-                    let _ = stdout.execute(Print("    "));
-                    for (style, text) in ranges {
-                        let color = CtColor::Rgb {
-                            r: style.foreground.r,
-                            g: style.foreground.g,
-                            b: style.foreground.b,
-                        };
-                        let _ = stdout.execute(SetForegroundColor(color));
-                        let _ = stdout.execute(Print(text));
-                    }
-                    let _ = stdout.execute(ResetColor);
-                } else {
-                    let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-                    print!("    {line}");
-                    let _ = stdout.execute(ResetColor);
-                }
-                return;
-            }
-            let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-            print!("    {line}");
-            let _ = stdout.execute(ResetColor);
+            self.render_code_block_line(line);
             return;
         }
 

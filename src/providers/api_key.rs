@@ -60,9 +60,10 @@ pub enum ApiKeyError {
     },
 }
 
-/// Upper bound on the byte length of an accepted API key. Anthropic,
-/// `OpenAI`, Google, and Z.AI keys are all well under 200 bytes; 512 gives
-/// the occasional long session/project-scoped key enough room while
+/// Upper bound on the byte length of an accepted API key.
+///
+/// Anthropic, `OpenAI`, Google, and Z.AI keys are all well under 200 bytes;
+/// 512 gives the occasional long session/project-scoped key enough room while
 /// refusing 8 KiB attack payloads. See crosslink #452.
 pub const MAX_API_KEY_LEN: usize = 512;
 

@@ -172,6 +172,10 @@ impl MemoryDb {
     /// # Errors
     ///
     /// Returns an error if the SQL execution fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal connection mutex is poisoned.
     pub fn execute_raw(&self, sql: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(sql).with_context(|| {

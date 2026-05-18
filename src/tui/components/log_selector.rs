@@ -70,10 +70,11 @@ impl LogSelector {
         if self.rows.is_empty() {
             return;
         }
-        let len = self.rows.len() as i32;
-        let current = self.state.selected().unwrap_or(0) as i32;
-        let next = (current + delta).rem_euclid(len);
-        self.state.select(Some(next as usize));
+        let len = i32::try_from(self.rows.len()).unwrap_or(i32::MAX);
+        let current = i32::try_from(self.state.selected().unwrap_or(0)).unwrap_or(0);
+        // rem_euclid guarantees next ∈ [0, len), so the cast to usize is safe.
+        let next = usize::try_from((current + delta).rem_euclid(len)).unwrap_or(0);
+        self.state.select(Some(next));
     }
 
     fn selected_id(&self) -> Option<String> {
@@ -178,10 +179,7 @@ impl Overlay for LogSelector {
                 }
                 OverlayAction::Consumed
             }
-            KeyCode::Enter => match self.selected_id() {
-                Some(id) => OverlayAction::ResumeSession(id),
-                None => OverlayAction::Close,
-            },
+            KeyCode::Enter => self.selected_id().map_or(OverlayAction::Close, OverlayAction::ResumeSession),
             _ => OverlayAction::Consumed,
         }
     }

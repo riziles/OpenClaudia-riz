@@ -1005,16 +1005,16 @@ mod tests {
     #[test]
     fn test_hook_input_with_extra() {
         let input = HookInput::new(HookEvent::PreCompact)
-            .with_extra("current_tokens", serde_json::json!(50000))
-            .with_extra("max_tokens", serde_json::json!(100000));
+            .with_extra("current_tokens", serde_json::json!(50_000))
+            .with_extra("max_tokens", serde_json::json!(100_000));
 
         assert_eq!(
             input.extra.get("current_tokens"),
-            Some(&serde_json::json!(50000))
+            Some(&serde_json::json!(50_000))
         );
         assert_eq!(
             input.extra.get("max_tokens"),
-            Some(&serde_json::json!(100000))
+            Some(&serde_json::json!(100_000))
         );
     }
 

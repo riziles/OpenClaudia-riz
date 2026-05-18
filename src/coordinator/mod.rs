@@ -2,24 +2,19 @@
 //!
 //! Phased rollout (see `docs/designs/507-coordinator.md`):
 //!
-//! - **Phase 1 (this commit)**: infrastructure only. Types + queue
-//!   + teammate registry + tests. `Coordinator::dispatch` returns
-//!   an error because no teammate-spawn path is wired yet — nothing
-//!   in the harness calls it.
-//! - **Phase 2**: spawn one teammate per task sequentially via the
-//!   existing `subagent::run_subagent`, fire `SubagentStart` /
-//!   `SubagentStop` hooks (already defined in #513).
-//! - **Phase 3**: parallel teammates + leader permission bridge +
-//!   agent color assignment.
+//! - **Phase 1 (this commit)**: infrastructure only — types, queue, teammate
+//!   registry, and tests. `Coordinator::dispatch` returns an error because no
+//!   teammate-spawn path is wired yet; nothing in the harness calls it.
+//! - **Phase 2**: spawn one teammate per task sequentially via the existing
+//!   `subagent::run_subagent`, fire `SubagentStart` / `SubagentStop` hooks
+//!   (already defined in #513).
+//! - **Phase 3**: parallel teammates, leader permission bridge, agent color
+//!   assignment.
 //!
 //! Process-scoped handles (`hook_engine`, `permission_mgr`, service
 //! registry) arrive via the `Coordinator::new` constructor rather
 //! than living on the coordinator struct long-term — Phase 2 will
 //! convert them to an `AppHandles` param passed per dispatch.
-// Pre-existing doc continuation lines trigger clippy::doc_lazy_continuation;
-// suppressed here because reflowing the inherited doc is out of scope for #547.
-#![allow(clippy::doc_lazy_continuation)]
-
 pub mod permission;
 pub mod task_queue;
 pub mod teammate;
@@ -41,10 +36,10 @@ pub enum CoordinatorError {
     Queue(#[from] TaskQueueError),
 }
 
-/// What the coordinator owns: a task graph + live teammates +
-/// permission bridge. Phase 1 lands the shape only; Phase 2 adds
-/// the async `dispatch` loop that pulls from `queue.next_ready()`
-/// and spawns teammates.
+/// What the coordinator owns: a task graph + live teammates + permission bridge.
+///
+/// Phase 1 lands the shape only; Phase 2 adds the async `dispatch` loop that
+/// pulls from `queue.next_ready()` and spawns teammates.
 pub struct Coordinator {
     queue: TaskQueue,
     teammates: HashMap<TeammateId, Teammate>,
@@ -97,7 +92,7 @@ impl Coordinator {
     /// # Errors
     ///
     /// Returns `CoordinatorError::NotImplemented` until Phase 2.
-    pub async fn dispatch(&mut self) -> Result<(), CoordinatorError> {
+    pub const fn dispatch(&mut self) -> Result<(), CoordinatorError> {
         Err(CoordinatorError::NotImplemented)
     }
 }
@@ -121,10 +116,10 @@ mod tests {
         assert!(co.permission_bridge().is_idle());
     }
 
-    #[tokio::test]
-    async fn phase_one_dispatch_errors_not_implemented() {
+    #[test]
+    fn phase_one_dispatch_errors_not_implemented() {
         let mut co = Coordinator::new();
-        let err = co.dispatch().await.unwrap_err();
+        let err = co.dispatch().unwrap_err();
         assert!(matches!(err, CoordinatorError::NotImplemented));
     }
 
@@ -180,10 +175,10 @@ mod phase2_spec_pins {
     // ── B2: dispatch always returns NotImplemented ───────────────────
 
     /// B2a: empty coordinator returns `NotImplemented` immediately.
-    #[tokio::test]
-    async fn b2_empty_coordinator_dispatch_not_implemented() {
+    #[test]
+    fn b2_empty_coordinator_dispatch_not_implemented() {
         let mut co = Coordinator::new();
-        let result = co.dispatch().await;
+        let result = co.dispatch();
         assert!(
             matches!(result, Err(CoordinatorError::NotImplemented)),
             "dispatch must return NotImplemented in Phase 1 — got {result:?}",
@@ -192,15 +187,15 @@ mod phase2_spec_pins {
 
     /// B2b: coordinator with pending tasks still returns `NotImplemented`
     /// without touching the queue (#532 B2 side-effect: none).
-    #[tokio::test]
-    async fn b2_pending_tasks_not_executed_by_dispatch() {
+    #[test]
+    fn b2_pending_tasks_not_executed_by_dispatch() {
         let mut co = Coordinator::new();
         co.queue_mut()
             .submit(Task::new(AgentType::Explore, "task-a"))
             .unwrap();
         let len_before = co.queue().len();
 
-        let result = co.dispatch().await;
+        let result = co.dispatch();
 
         assert!(matches!(result, Err(CoordinatorError::NotImplemented)));
         // Queue must be untouched — dispatch must not pop or mutate.

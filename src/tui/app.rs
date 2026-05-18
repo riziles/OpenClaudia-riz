@@ -140,7 +140,7 @@ fn expand_file_refs(input: &str) -> String {
 
     for cap in re.captures_iter(input) {
         let full_match = cap.get(0).unwrap().as_str();
-        let raw_path = cap.get(1).or(cap.get(2)).unwrap().as_str();
+        let raw_path = cap.get(1).or_else(|| cap.get(2)).unwrap().as_str();
 
         // Resolve and validate path — reject traversal attempts
         let resolved = if std::path::Path::new(raw_path).is_absolute() {
@@ -250,7 +250,7 @@ fn list_sessions() -> Vec<TuiSession> {
             }
         }
     }
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     sessions
 }
 
@@ -386,11 +386,11 @@ impl App {
             });
             return;
         };
-        self.chat_session = loaded.clone();
-        self.session_messages = loaded.messages.clone();
-        self.model = loaded.model.clone();
-        self.provider = loaded.provider.clone();
-        self.mode = loaded.mode.clone();
+        self.chat_session.clone_from(&loaded);
+        self.session_messages.clone_from(&loaded.messages);
+        self.model.clone_from(&loaded.model);
+        self.provider.clone_from(&loaded.provider);
+        self.mode.clone_from(&loaded.mode);
         self.tokens = self.chat_session.estimate_tokens();
         self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         self.transcript_watermark = self.session_messages.len();
@@ -551,112 +551,9 @@ impl App {
 
         loop {
             terminal.draw(|frame| self.draw(frame))?;
-
-            match events.next() {
-                Ok(AppEvent::Key(key)) => self.handle_key(key),
-                Ok(AppEvent::Tick) => {
-                    self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
-                }
-                Ok(AppEvent::StreamText(text)) => {
-                    // First regular-text delta ends any active thinking
-                    // block, replacing the live `∴ Thinking…` indicator
-                    // with a collapsed `∴ Thought for Xs` summary.
-                    self.messages.finish_thinking();
-                    self.messages.append_streaming(&text);
-                    self.messages.scroll_to_bottom();
-                }
-                Ok(AppEvent::StreamThinking(text)) => {
-                    // Hide the raw reasoning tokens behind a collapsed
-                    // indicator — the text is kept in `thinking_buffer`
-                    // for session persistence but not rendered inline.
-                    self.messages.push_thinking(&text);
-                    self.messages.scroll_to_bottom();
-                }
-                Ok(AppEvent::ToolStart { name, description }) => {
-                    self.messages.add(DisplayMessage {
-                        role: "tool".to_string(),
-                        content: description,
-                        tool_name: Some(name),
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                }
-                Ok(AppEvent::ToolDone {
-                    name,
-                    success,
-                    content,
-                }) => {
-                    let preview = if content.len() > 300 {
-                        format!("{}...", crate::tools::safe_truncate(&content, 297))
-                    } else {
-                        content
-                    };
-                    self.messages.add(DisplayMessage {
-                        role: "tool".to_string(),
-                        content: preview,
-                        tool_name: Some(name),
-                        is_error: !success,
-                        is_thinking: false,
-                    });
-                }
-                Ok(AppEvent::ResponseDone) => {
-                    // Close any open thinking block first so the summary
-                    // lands above the final answer even if no regular
-                    // text was streamed (e.g. thinking-only response).
-                    self.messages.finish_thinking();
-                    self.messages.finish_streaming();
-                    self.is_waiting = false;
-                    // Sync session messages and auto-save
-                    self.chat_session.messages = self.session_messages.clone();
-                    self.chat_session.update_title();
-                    self.chat_session.touch();
-                    let _ = save_session(&self.chat_session);
-                    self.persist_transcript_tail();
-                    // Update token estimate
-                    self.tokens = self.chat_session.estimate_tokens();
-                    // Fire Stop hook — assistant reached a terminal state.
-                    // run_turn already suppresses ResponseDone when the
-                    // agentic loop needs another follow-up, so reaching
-                    // this branch means the turn is genuinely done.
-                    self.fire_stop_hook();
-                }
-                Ok(AppEvent::ApiError(msg)) => {
-                    self.messages.finish_streaming();
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("Error: {msg}"),
-                        tool_name: None,
-                        is_error: true,
-                        is_thinking: false,
-                    });
-                    self.is_waiting = false;
-                    // Surface the error to user-configured Notification hooks.
-                    self.fire_notification_hook(&format!("API error: {msg}"), "error");
-                }
-                Ok(AppEvent::Resize(_, _)) => {} // terminal.draw handles it
-                // Pipeline follow-up: tool results need another API call
-                Ok(AppEvent::FollowUp) => {
-                    self.spawn_api_turn();
-                }
-                // Sync updated session messages after agentic loop
-                Ok(AppEvent::SyncMessages(messages)) => {
-                    self.session_messages = messages;
-                }
-                // Pipeline asking permission for a write/destructive tool
-                Ok(AppEvent::PermissionRequest {
-                    tool_name,
-                    tool_args,
-                    reply,
-                }) => {
-                    self.pending_permission = Some(PendingPermission {
-                        tool_name,
-                        tool_args,
-                        reply,
-                    });
-                }
-                Err(_) => break,
+            if !self.handle_app_event(events.next()) {
+                break;
             }
-
             if self.should_quit {
                 break;
             }
@@ -689,6 +586,69 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Process one async event from the event loop. Returns `false` when the loop should stop.
+    fn handle_app_event(&mut self, event: Result<AppEvent, std::sync::mpsc::RecvError>) -> bool {
+        match event {
+            Ok(AppEvent::Key(key)) => self.handle_key(key),
+            Ok(AppEvent::Tick) => {
+                self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            }
+            Ok(AppEvent::StreamText(text)) => {
+                self.messages.finish_thinking();
+                self.messages.append_streaming(&text);
+                self.messages.scroll_to_bottom();
+            }
+            Ok(AppEvent::StreamThinking(text)) => {
+                self.messages.push_thinking(&text);
+                self.messages.scroll_to_bottom();
+            }
+            Ok(AppEvent::ToolStart { name, description }) => {
+                self.messages.add(DisplayMessage {
+                    role: "tool".to_string(), content: description,
+                    tool_name: Some(name), is_error: false, is_thinking: false,
+                });
+            }
+            Ok(AppEvent::ToolDone { name, success, content }) => {
+                let preview = if content.len() > 300 {
+                    format!("{}...", crate::tools::safe_truncate(&content, 297))
+                } else { content };
+                self.messages.add(DisplayMessage {
+                    role: "tool".to_string(), content: preview,
+                    tool_name: Some(name), is_error: !success, is_thinking: false,
+                });
+            }
+            Ok(AppEvent::ResponseDone) => {
+                self.messages.finish_thinking();
+                self.messages.finish_streaming();
+                self.is_waiting = false;
+                self.chat_session.messages = self.session_messages.clone();
+                self.chat_session.update_title();
+                self.chat_session.touch();
+                let _ = save_session(&self.chat_session);
+                self.persist_transcript_tail();
+                self.tokens = self.chat_session.estimate_tokens();
+                self.fire_stop_hook();
+            }
+            Ok(AppEvent::ApiError(msg)) => {
+                self.messages.finish_streaming();
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(), content: format!("Error: {msg}"),
+                    tool_name: None, is_error: true, is_thinking: false,
+                });
+                self.is_waiting = false;
+                self.fire_notification_hook(&format!("API error: {msg}"), "error");
+            }
+            Ok(AppEvent::Resize(_, _)) => {}
+            Ok(AppEvent::FollowUp) => { self.spawn_api_turn(); }
+            Ok(AppEvent::SyncMessages(messages)) => { self.session_messages = messages; }
+            Ok(AppEvent::PermissionRequest { tool_name, tool_args, reply }) => {
+                self.pending_permission = Some(PendingPermission { tool_name, tool_args, reply });
+            }
+            Err(_) => return false,
+        }
+        true
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -728,39 +688,45 @@ impl App {
 
         // Handle permission prompt keystrokes
         if self.pending_permission.is_some() {
-            use super::events::PermissionResponse;
-            let response = match key.code {
-                KeyCode::Char('y' | 'Y') => Some(PermissionResponse::Allow),
-                KeyCode::Char('n' | 'N') => Some(PermissionResponse::Deny),
-                KeyCode::Char('a' | 'A') => Some(PermissionResponse::AlwaysAllow),
-                KeyCode::Char('d' | 'D') => Some(PermissionResponse::AlwaysDeny),
-                KeyCode::Esc => Some(PermissionResponse::Deny),
-                _ => None,
-            };
-            if let Some(resp) = response {
-                if let Some(perm) = self.pending_permission.take() {
-                    let label = match resp {
-                        PermissionResponse::Allow => "Allowed",
-                        PermissionResponse::AlwaysAllow => "Always allowed",
-                        PermissionResponse::Deny => "Denied",
-                        PermissionResponse::AlwaysDeny => "Always denied",
-                    };
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("{label}: {}", perm.tool_name),
-                        tool_name: None,
-                        is_error: matches!(
-                            resp,
-                            PermissionResponse::Deny | PermissionResponse::AlwaysDeny
-                        ),
-                        is_thinking: false,
-                    });
-                    let _ = perm.reply.send(resp);
-                }
-            }
+            self.handle_permission_key(key);
             return;
         }
 
+        self.handle_editing_key(key);
+    }
+
+    /// Dispatch keystrokes when a permission prompt is active.
+    fn handle_permission_key(&mut self, key: crossterm::event::KeyEvent) {
+        use super::events::PermissionResponse;
+        let response = match key.code {
+            KeyCode::Char('y' | 'Y') => Some(PermissionResponse::Allow),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(PermissionResponse::Deny),
+            KeyCode::Char('a' | 'A') => Some(PermissionResponse::AlwaysAllow),
+            KeyCode::Char('d' | 'D') => Some(PermissionResponse::AlwaysDeny),
+            _ => None,
+        };
+        if let Some(resp) = response {
+            if let Some(perm) = self.pending_permission.take() {
+                let label = match resp {
+                    PermissionResponse::Allow => "Allowed",
+                    PermissionResponse::AlwaysAllow => "Always allowed",
+                    PermissionResponse::Deny => "Denied",
+                    PermissionResponse::AlwaysDeny => "Always denied",
+                };
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("{label}: {}", perm.tool_name),
+                    tool_name: None,
+                    is_error: matches!(resp, PermissionResponse::Deny | PermissionResponse::AlwaysDeny),
+                    is_thinking: false,
+                });
+                let _ = perm.reply.send(resp);
+            }
+        }
+    }
+
+    /// Dispatch keystrokes for normal editing / streaming-cancel.
+    fn handle_editing_key(&mut self, key: crossterm::event::KeyEvent) {
         // During streaming, Escape cancels
         if self.is_waiting {
             if key.code == KeyCode::Esc {
@@ -778,11 +744,10 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Enter
-                if !self.input.is_empty() => {
-                    let text = self.input.take();
-                    self.handle_input(text);
-                }
+            KeyCode::Enter if !self.input.is_empty() => {
+                let text = self.input.take();
+                self.handle_input(text);
+            }
             KeyCode::Char(c) => self.input.insert(c),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -817,6 +782,123 @@ impl App {
 
         // Normal message → send to API
         self.send_user_message(text);
+    }
+
+    /// Handle session-management slash commands. Returns true if handled.
+    fn handle_session_slash(&mut self, text: &str) -> bool {
+        if text == "/sessions" || text == "/list" {
+            let sessions = list_sessions();
+            if sessions.is_empty() {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "No saved sessions.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            } else {
+                let list = sessions.iter().take(10).map(|s| format!("  {} — {} ({})", &s.id[..8], s.title, s.updated_at.format("%Y-%m-%d %H:%M"))).collect::<Vec<_>>().join("\n");
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Saved sessions:\n{list}\n\nUse /load <id> to resume."), tool_name: None, is_error: false, is_thinking: false });
+            }
+            return true;
+        }
+        if text.starts_with("/load ") || text.starts_with("/continue ") {
+            let id = text.split_whitespace().nth(1).unwrap_or("");
+            self.resume_session_by_id(id);
+            return true;
+        }
+        if text == "/rewind" || text.starts_with("/rewind ") {
+            self.handle_rewind(text);
+            return true;
+        }
+        if text == "/undo" {
+            if self.chat_session.undo() {
+                self.session_messages = self.chat_session.messages.clone();
+                if self.messages.len() >= 2 { self.messages.pop_last(2); }
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Undone last message pair.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                let _ = save_session(&self.chat_session);
+            } else {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to undo.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            }
+            return true;
+        }
+        if text == "/redo" {
+            if self.chat_session.redo() {
+                self.session_messages = self.chat_session.messages.clone();
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Redone last undone messages.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                let _ = save_session(&self.chat_session);
+            } else {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to redo.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Handle /rewind subcommand.
+    fn handle_rewind(&mut self, text: &str) {
+        use std::fmt::Write as _;
+        let arg = text.strip_prefix("/rewind").unwrap_or("").trim();
+        if arg.is_empty() {
+            let mut turn_list = String::new();
+            let mut turn_num = 0;
+            for msg in &self.chat_session.messages {
+                if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    turn_num += 1;
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let preview = if content.len() > 60 { format!("{}...", crate::tools::safe_truncate(content, 57)) } else { content.to_string() };
+                    let _ = writeln!(turn_list, "  {turn_num}. {preview}");
+                }
+            }
+            if turn_list.is_empty() { turn_list = "  (no conversation turns yet)\n".to_string(); }
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Conversation has {turn_num} turn(s):\n{turn_list}\nUse /rewind N to undo the last N turns."), tool_name: None, is_error: false, is_thinking: false });
+        } else if let Ok(n) = arg.parse::<usize>() {
+            if n == 0 {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to rewind (0 turns).".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            } else {
+                let mut rewound = 0;
+                for _ in 0..n { if self.chat_session.undo() { rewound += 1; } else { break; } }
+                if rewound > 0 {
+                    self.session_messages = self.chat_session.messages.clone();
+                    let to_remove = rewound * 2;
+                    if self.messages.len() >= to_remove { self.messages.pop_last(to_remove); }
+                    self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Rewound {rewound} turn(s)."), tool_name: None, is_error: false, is_thinking: false });
+                    let _ = save_session(&self.chat_session);
+                    self.persist_transcript_tail();
+                } else {
+                    self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to rewind.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                }
+            }
+        } else {
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: "Usage: /rewind [N] — rewind N turns, or show turn list".to_string(), tool_name: None, is_error: false, is_thinking: false });
+        }
+    }
+
+    /// Handle /export and /effort slash commands. Returns true if handled.
+    fn handle_export_effort_slash(&mut self, text: &str) -> bool {
+        if text == "/export" {
+            use std::fmt::Write as _;
+            let mut md = format!("# {}\n\n", self.chat_session.title);
+            let _ = write!(md, "Model: {} · Provider: {} · {}\n\n---\n\n", self.model, self.provider, self.chat_session.created_at.format("%Y-%m-%d %H:%M"));
+            for msg in &self.session_messages {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if role == "system" { continue; }
+                let _ = write!(md, "**{role}:**\n{content}\n\n");
+            }
+            let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
+            match std::fs::write(&export_path, &md) {
+                Ok(()) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Exported to {export_path}"), tool_name: None, is_error: false, is_thinking: false }),
+                Err(e) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Export failed: {e}"), tool_name: None, is_error: true, is_thinking: false }),
+            }
+            return true;
+        }
+        if text.starts_with("/effort") {
+            let parts: Vec<&str> = text.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let level = parts[1].trim();
+                if matches!(level, "low" | "medium" | "high") { self.effort_level = level.to_string(); }
+            } else {
+                self.effort_level = match self.effort_level.as_str() { "low" => "medium".to_string(), "medium" => "high".to_string(), _ => "low".to_string() };
+            }
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Effort level: {}", self.effort_level), tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        false
     }
 
     /// Handle slash commands. Returns true if the command was recognized.
@@ -886,291 +968,11 @@ impl App {
             return true;
         }
 
-        if text == "/sessions" || text == "/list" {
-            let sessions = list_sessions();
-            if sessions.is_empty() {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "No saved sessions.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            } else {
-                let list = sessions
-                    .iter()
-                    .take(10)
-                    .map(|s| {
-                        format!(
-                            "  {} — {} ({})",
-                            &s.id[..8],
-                            s.title,
-                            s.updated_at.format("%Y-%m-%d %H:%M")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Saved sessions:\n{list}\n\nUse /load <id> to resume."),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            }
+        if self.handle_session_slash(text) {
             return true;
         }
 
-        if text.starts_with("/load ") || text.starts_with("/continue ") {
-            let id = text.split_whitespace().nth(1).unwrap_or("");
-            let sessions = list_sessions();
-            if let Some(loaded) = sessions.iter().find(|s| s.id.starts_with(id)) {
-                self.chat_session = loaded.clone();
-                self.session_messages = loaded.messages.clone();
-                self.model = loaded.model.clone();
-                self.provider = loaded.provider.clone();
-                self.mode = loaded.mode.clone();
-                self.tokens = self.chat_session.estimate_tokens();
-                // Sync transcript cwd/watermark to the loaded session so
-                // future appends target the correct JSONL and skip the
-                // history that's already on disk.
-                self.transcript_cwd =
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.transcript_watermark = self.session_messages.len();
-                // Show loaded messages in the display
-                self.messages = super::messages::MessageList::new();
-                for msg in &loaded.messages {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("system");
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    if role == "system" {
-                        continue;
-                    }
-                    self.messages.add(DisplayMessage {
-                        role: role.to_string(),
-                        content: content.to_string(),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                }
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Resumed session: {} ({})", loaded.title, &loaded.id[..8]),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Session not found: {id}"),
-                    tool_name: None,
-                    is_error: true,
-                    is_thinking: false,
-                });
-            }
-            return true;
-        }
-
-        if text == "/rewind" || text.starts_with("/rewind ") {
-            let arg = text.strip_prefix("/rewind").unwrap_or("").trim();
-            if arg.is_empty() {
-                // Show conversation turns for the user to see what they can rewind to
-                let mut turn_list = String::new();
-                let mut turn_num = 0;
-                for msg in &self.chat_session.messages {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                    if role == "user" {
-                        turn_num += 1;
-                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let preview = if content.len() > 60 {
-                            format!("{}...", crate::tools::safe_truncate(content, 57))
-                        } else {
-                            content.to_string()
-                        };
-                        turn_list.push_str(&format!("  {turn_num}. {preview}\n"));
-                    }
-                }
-                if turn_list.is_empty() {
-                    turn_list = "  (no conversation turns yet)\n".to_string();
-                }
-                self.messages.add(DisplayMessage {
-                                role: "system".to_string(),
-                                content: format!(
-                                    "Conversation has {turn_num} turn(s):\n{turn_list}\nUse /rewind N to undo the last N turns."
-                                ),
-                                tool_name: None,
-                                is_error: false,
-                                is_thinking: false,
-                            });
-            } else if let Ok(n) = arg.parse::<usize>() {
-                if n == 0 {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: "Nothing to rewind (0 turns).".to_string(),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                } else {
-                    let mut rewound = 0;
-                    for _ in 0..n {
-                        if self.chat_session.undo() {
-                            rewound += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    if rewound > 0 {
-                        self.session_messages = self.chat_session.messages.clone();
-                        // Remove display messages for rewound turns
-                        let to_remove = rewound * 2; // user + assistant per turn
-                        if self.messages.len() >= to_remove {
-                            self.messages.pop_last(to_remove);
-                        }
-                        self.messages.add(DisplayMessage {
-                            role: "system".to_string(),
-                            content: format!("Rewound {rewound} turn(s)."),
-                            tool_name: None,
-                            is_error: false,
-                            is_thinking: false,
-                        });
-                        let _ = save_session(&self.chat_session);
-                        self.persist_transcript_tail();
-                    } else {
-                        self.messages.add(DisplayMessage {
-                            role: "system".to_string(),
-                            content: "Nothing to rewind.".to_string(),
-                            tool_name: None,
-                            is_error: false,
-                            is_thinking: false,
-                        });
-                    }
-                }
-            } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Usage: /rewind [N] — rewind N turns, or show turn list".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            }
-            return true;
-        }
-
-        if text == "/undo" {
-            if self.chat_session.undo() {
-                self.session_messages = self.chat_session.messages.clone();
-                // Remove last two display messages (user + assistant)
-                if self.messages.len() >= 2 {
-                    self.messages.pop_last(2);
-                }
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Undone last message pair.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                let _ = save_session(&self.chat_session);
-            } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Nothing to undo.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            }
-            return true;
-        }
-
-        if text == "/redo" {
-            if self.chat_session.redo() {
-                self.session_messages = self.chat_session.messages.clone();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Redone last undone messages.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                let _ = save_session(&self.chat_session);
-            } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Nothing to redo.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-            }
-            return true;
-        }
-
-        if text == "/export" {
-            let mut md = format!("# {}\n\n", self.chat_session.title);
-            md.push_str(&format!(
-                "Model: {} · Provider: {} · {}\n\n---\n\n",
-                self.model,
-                self.provider,
-                self.chat_session.created_at.format("%Y-%m-%d %H:%M")
-            ));
-            for msg in &self.session_messages {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if role == "system" {
-                    continue;
-                }
-                md.push_str(&format!("**{role}:**\n{content}\n\n"));
-            }
-            let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
-            match std::fs::write(&export_path, &md) {
-                Ok(()) => {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("Exported to {export_path}"),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                }
-                Err(e) => {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("Export failed: {e}"),
-                        tool_name: None,
-                        is_error: true,
-                        is_thinking: false,
-                    });
-                }
-            }
-            return true;
-        }
-
-        if text.starts_with("/effort") {
-            let parts: Vec<&str> = text.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let level = parts[1].trim();
-                if matches!(level, "low" | "medium" | "high") {
-                    self.effort_level = level.to_string();
-                }
-            } else {
-                // Cycle: low -> medium -> high -> low
-                self.effort_level = match self.effort_level.as_str() {
-                    "low" => "medium".to_string(),
-                    "medium" => "high".to_string(),
-                    _ => "low".to_string(),
-                };
-            }
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("Effort level: {}", self.effort_level),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+        if self.handle_export_effort_slash(text) {
             return true;
         }
 
@@ -1201,275 +1003,129 @@ impl App {
             return true;
         }
 
-        // Check if it's a skill invocation: /skillname or /skill skillname
+        // Skill invocations and info/diagnostic commands starting with /
         if text.starts_with('/') {
-            let skill_name = if text.starts_with("/skill ") {
-                text.strip_prefix("/skill ").unwrap_or("").trim()
-            } else {
-                text.strip_prefix('/').unwrap_or("")
-            };
-
-            if let Some(skill) = crate::skills::get_skill(skill_name) {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Running skill: /{}", skill.name),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-
-                // Inject skill prompt as user message and send to API
-                self.session_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": skill.prompt
-                }));
-                self.is_waiting = true;
-                self.spawn_api_turn();
-                return true;
-            }
-
-            // /rename — rename the current session
-            if text.starts_with("/rename ") {
-                let new_title = text.strip_prefix("/rename ").unwrap_or("").trim();
-                if new_title.is_empty() {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: "Usage: /rename <new title>".to_string(),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                } else {
-                    self.chat_session.title = new_title.to_string();
-                    self.chat_session.touch();
-                    let _ = save_session(&self.chat_session);
-                    self.persist_transcript_tail();
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("Session renamed to: {new_title}"),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                }
-                return true;
-            }
-
-            // /cost — show estimated session cost
-            if text == "/cost" {
-                let tokens = self.chat_session.estimate_tokens();
-                // Rough cost estimate based on model
-                #[allow(clippy::cast_precision_loss)]
-                let cost = match self.model.as_str() {
-                    m if m.contains("opus") => (tokens as f64).mul_add(0.000015, tokens as f64 * 0.000075),
-                    m if m.contains("sonnet") => {
-                        (tokens as f64).mul_add(0.000003, tokens as f64 * 0.000015)
-                    }
-                    m if m.contains("haiku") => {
-                        (tokens as f64).mul_add(0.00000025, tokens as f64 * 0.00000125)
-                    }
-                    _ => 0.0,
-                };
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                return true;
-            }
-
-            // /files — list files in current directory
-            if text == "/files" || text.starts_with("/files ") {
-                let dir = text.strip_prefix("/files").unwrap_or("").trim();
-                let dir = if dir.is_empty() { "." } else { dir };
-                match std::fs::read_dir(dir) {
-                    Ok(entries) => {
-                        let mut items: Vec<String> = entries
-                            .flatten()
-                            .map(|e| {
-                                let name = e.file_name().to_string_lossy().to_string();
-                                let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) {
-                                    "/"
-                                } else {
-                                    ""
-                                };
-                                format!("  {name}{suffix}")
-                            })
-                            .collect();
-                        items.sort();
-                        self.messages.add(DisplayMessage {
-                            role: "system".to_string(),
-                            content: format!("Files in {dir}:\n{}", items.join("\n")),
-                            tool_name: None,
-                            is_error: false,
-                            is_thinking: false,
-                        });
-                    }
-                    Err(e) => {
-                        self.messages.add(DisplayMessage {
-                            role: "system".to_string(),
-                            content: format!("Failed to list {dir}: {e}"),
-                            tool_name: None,
-                            is_error: true,
-                            is_thinking: false,
-                        });
-                    }
-                }
-                return true;
-            }
-
-            // /diff — show uncommitted git changes
-            if text == "/diff" {
-                let output = std::process::Command::new("git")
-                    .args(["diff", "--stat"])
-                    .output();
-                let content = match output {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        if stdout.is_empty() {
-                            "No uncommitted changes.".to_string()
-                        } else {
-                            format!("Uncommitted changes:\n{stdout}")
-                        }
-                    }
-                    Err(e) => format!("Failed to run git diff: {e}"),
-                };
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content,
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                return true;
-            }
-
-            // /context — show token context usage
-            if text == "/context" {
-                let msg_count = self.session_messages.len();
-                let tokens = self.chat_session.estimate_tokens();
-                let content = format!(
-                            "Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}",
-                            self.model, self.provider
-                        );
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content,
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                return true;
-            }
-
-            // /doctor — diagnostics
-            if text == "/doctor" {
-                let mut checks = Vec::new();
-                // Check config
-                checks.push(match crate::config::load_config() {
-                    Ok(_) => "✓ Config: loaded".to_string(),
-                    Err(e) => format!("✗ Config: {e}"),
-                });
-                // Check API connectivity
-                checks.push(format!("✓ Provider: {}", self.provider));
-                checks.push(format!("✓ Model: {}", self.model));
-                checks.push(format!("✓ Endpoint: {}", self.endpoint));
-                // Check skills
-                let skills = crate::skills::load_skills();
-                checks.push(format!("✓ Skills: {} loaded", skills.len()));
-                // Check memory
-                if self.memory_db.is_some() {
-                    checks.push("✓ Memory DB: connected".to_string());
-                } else {
-                    checks.push("✗ Memory DB: not available".to_string());
-                }
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Diagnostics:\n{}", checks.join("\n")),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                return true;
-            }
-
-            // /review — show git changes for review
-            if text == "/review" || text.starts_with("/review ") {
-                let output = std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .output();
-                let content = match output {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        if stdout.is_empty() {
-                            "No changes to review.".to_string()
-                        } else {
-                            let lines: Vec<&str> = stdout.lines().take(100).collect();
-                            if stdout.lines().count() > 100 {
-                                format!(
-                                    "{}\n... (truncated, {} total lines)",
-                                    lines.join("\n"),
-                                    stdout.lines().count()
-                                )
-                            } else {
-                                lines.join("\n")
-                            }
-                        }
-                    }
-                    Err(e) => format!("Failed to run git diff: {e}"),
-                };
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content,
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
-                return true;
-            }
-
-            // /init — initialize project config
-            if text == "/init" {
-                if crate::config::config_file_exists() {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: "Config already exists. Use /doctor to check it.".to_string(),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                } else {
-                    // Run init in the background
-                    let output = std::process::Command::new("openclaudia")
-                        .arg("init")
-                        .output();
-                    let content = match output {
-                        Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-                        Err(e) => format!("Init failed: {e}"),
-                    };
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content,
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
-                }
-                return true;
-            }
-
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("Unknown command: {text}. Type /help for commands."),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.handle_info_slash(text);
             return true;
         }
 
+        false
+    }
+
+    /// Handle skill invocations and info/diagnostic commands.
+    fn handle_info_slash(&mut self, text: &str) {
+        let skill_name = if text.starts_with("/skill ") {
+            text.strip_prefix("/skill ").unwrap_or("").trim()
+        } else {
+            text.strip_prefix('/').unwrap_or("")
+        };
+        if let Some(skill) = crate::skills::get_skill(skill_name) {
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Running skill: /{}", skill.name), tool_name: None, is_error: false, is_thinking: false });
+            self.session_messages.push(serde_json::json!({ "role": "user", "content": skill.prompt }));
+            self.is_waiting = true;
+            self.spawn_api_turn();
+            return;
+        }
+        if text.starts_with("/rename ") {
+            let new_title = text.strip_prefix("/rename ").unwrap_or("").trim();
+            if new_title.is_empty() {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Usage: /rename <new title>".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            } else {
+                self.chat_session.title = new_title.to_string();
+                self.chat_session.touch();
+                let _ = save_session(&self.chat_session);
+                self.persist_transcript_tail();
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Session renamed to: {new_title}"), tool_name: None, is_error: false, is_thinking: false });
+            }
+            return;
+        }
+        if self.handle_diagnostic_slash(text) { return; }
+        self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Unknown command: {text}. Type /help for commands."), tool_name: None, is_error: false, is_thinking: false });
+    }
+
+    /// Handle diagnostic/info slash commands. Returns true if handled.
+    fn handle_diagnostic_slash(&mut self, text: &str) -> bool {
+        if text == "/cost" {
+            let tokens = self.chat_session.estimate_tokens();
+            let tokens_f64 = f64::from(u32::try_from(tokens).unwrap_or(u32::MAX));
+            let cost = match self.model.as_str() {
+                m if m.contains("opus") => tokens_f64.mul_add(0.000_015, tokens_f64 * 0.000_075),
+                m if m.contains("sonnet") => tokens_f64.mul_add(0.000_003, tokens_f64 * 0.000_015),
+                m if m.contains("haiku") => tokens_f64.mul_add(0.000_000_25, tokens_f64 * 0.000_001_25),
+                _ => 0.0,
+            };
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"), tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        if text == "/files" || text.starts_with("/files ") {
+            let dir = text.strip_prefix("/files").unwrap_or("").trim();
+            let dir = if dir.is_empty() { "." } else { dir };
+            match std::fs::read_dir(dir) {
+                Ok(entries) => {
+                    let mut items: Vec<String> = entries.flatten().map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) { "/" } else { "" };
+                        format!("  {name}{suffix}")
+                    }).collect();
+                    items.sort();
+                    self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Files in {dir}:\n{}", items.join("\n")), tool_name: None, is_error: false, is_thinking: false });
+                }
+                Err(e) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Failed to list {dir}: {e}"), tool_name: None, is_error: true, is_thinking: false }),
+            }
+            return true;
+        }
+        if text == "/diff" {
+            let content = match std::process::Command::new("git").args(["diff", "--stat"]).output() {
+                Ok(out) => { let s = String::from_utf8_lossy(&out.stdout); if s.is_empty() { "No uncommitted changes.".to_string() } else { format!("Uncommitted changes:\n{s}") } }
+                Err(e) => format!("Failed to run git diff: {e}"),
+            };
+            self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        if text == "/context" {
+            let msg_count = self.session_messages.len();
+            let tokens = self.chat_session.estimate_tokens();
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}", self.model, self.provider), tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        if text == "/doctor" {
+            let checks = [
+                match crate::config::load_config() { Ok(_) => "✓ Config: loaded".to_string(), Err(e) => format!("✗ Config: {e}") },
+                format!("✓ Provider: {}", self.provider),
+                format!("✓ Model: {}", self.model),
+                format!("✓ Endpoint: {}", self.endpoint),
+                format!("✓ Skills: {} loaded", crate::skills::load_skills().len()),
+                if self.memory_db.is_some() { "✓ Memory DB: connected".to_string() } else { "✗ Memory DB: not available".to_string() },
+            ];
+            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Diagnostics:\n{}", checks.join("\n")), tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        if text == "/review" || text.starts_with("/review ") {
+            let content = match std::process::Command::new("git").args(["diff", "HEAD"]).output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if stdout.is_empty() { "No changes to review.".to_string() } else {
+                        let lines: Vec<&str> = stdout.lines().take(100).collect();
+                        if stdout.lines().count() > 100 { format!("{}\n... (truncated, {} total lines)", lines.join("\n"), stdout.lines().count()) } else { lines.join("\n") }
+                    }
+                }
+                Err(e) => format!("Failed to run git diff: {e}"),
+            };
+            self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+            return true;
+        }
+        if text == "/init" {
+            if crate::config::config_file_exists() {
+                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Config already exists. Use /doctor to check it.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            } else {
+                let content = match std::process::Command::new("openclaudia").arg("init").output() {
+                    Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+                    Err(e) => format!("Init failed: {e}"),
+                };
+                self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+            }
+            return true;
+        }
         false
     }
 
@@ -1591,188 +1247,13 @@ impl App {
         let memory_db = self.memory_db.clone();
         let permission_mgr = self.permission_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
-        let mut session_messages = self.session_messages.clone();
+        let session_messages = self.session_messages.clone();
 
-        handle.spawn(async move {
-            // Run UserPromptSubmit hooks before the API call
-            if let Some(ref engine) = hook_engine {
-                // Get the last user message as the prompt
-                let user_prompt = session_messages
-                    .last()
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let hook_input =
-                    crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit)
-                        .with_prompt(&user_prompt);
-                let hook_result = engine
-                    .run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
-                    .await;
-
-                if !hook_result.allowed {
-                    let reason = hook_result
-                        .errors
-                        .first().map_or_else(|| "Hook blocked the request".to_string(), std::string::ToString::to_string);
-                    let _ = tx.send(AppEvent::ApiError(format!("Blocked by hook: {reason}")));
-                    return;
-                }
-
-                // Inject any system messages from hooks
-                for output in &hook_result.outputs {
-                    if let Some(ref sys_msg) = output.system_message {
-                        session_messages.push(serde_json::json!({
-                            "role": "system",
-                            "content": sys_msg
-                        }));
-                    }
-                }
-            }
-
-            // Build request body AFTER hooks (hooks may inject system messages)
-            let request_body = crate::pipeline::build_request(
-                &provider,
-                &model,
-                &session_messages,
-                &effort_level,
-                claude_code_token.as_deref(),
-                prompt_blocks.as_ref(),
-            );
-
-            // Run the turn (may include tool execution)
-            match crate::pipeline::run_turn(
-                &client,
-                &endpoint,
-                &headers,
-                &request_body,
-                &provider,
-                memory_db.clone(),
-                permission_mgr.clone(),
-                hook_engine.clone(),
-                Some(session_id_for_task.clone()),
-                tx.clone(),
-            )
-            .await
-            {
-                Ok(turn_result) => {
-                    tracing::debug!(
-                        content_len = turn_result.content.len(),
-                        tool_calls = turn_result.tool_calls.len(),
-                        needs_followup = turn_result.needs_followup,
-                        "Turn result"
-                    );
-                    // If the model returned tool calls, we need to append the
-                    // assistant message + tool results and send a follow-up.
-                    if turn_result.needs_followup {
-                        // Build assistant message with tool calls
-                        let assistant_msg = crate::pipeline::build_assistant_message_with_tools(
-                            &turn_result.content,
-                            &turn_result.tool_calls,
-                            &provider,
-                        );
-                        session_messages.push(assistant_msg);
-                        // Append tool results
-                        session_messages.extend(turn_result.tool_results.iter().cloned());
-
-                        // Agentic loop: keep calling until no more tool calls
-                        tracing::info!(
-                            tool_count = turn_result.tool_calls.len(),
-                            result_count = turn_result.tool_results.len(),
-                            "Starting agentic follow-up loop"
-                        );
-                        let max_iterations = 25u32;
-                        let mut iteration = 0u32;
-                        let mut current_messages = session_messages;
-                        loop {
-                            iteration += 1;
-                            tracing::debug!(iteration, "Agentic loop iteration");
-                            if iteration > max_iterations {
-                                let _ = tx.send(AppEvent::ApiError(
-                                    "Reached maximum tool iterations (25)".to_string(),
-                                ));
-                                break;
-                            }
-
-                            let followup_body = crate::pipeline::build_request(
-                                &provider,
-                                &model,
-                                &current_messages,
-                                &effort_level,
-                                claude_code_token.as_deref(),
-                                prompt_blocks.as_ref(),
-                            );
-
-                            match crate::pipeline::run_turn(
-                                &client,
-                                &endpoint,
-                                &headers,
-                                &followup_body,
-                                &provider,
-                                memory_db.clone(),
-                                permission_mgr.clone(),
-                                hook_engine.clone(),
-                                Some(session_id_for_task.clone()),
-                                tx.clone(),
-                            )
-                            .await
-                            {
-                                Ok(followup) => {
-                                    tracing::debug!(
-                                        content_len = followup.content.len(),
-                                        tool_calls = followup.tool_calls.len(),
-                                        needs_followup = followup.needs_followup,
-                                        "Follow-up result"
-                                    );
-                                    if followup.needs_followup {
-                                        let asst_msg =
-                                            crate::pipeline::build_assistant_message_with_tools(
-                                                &followup.content,
-                                                &followup.tool_calls,
-                                                &provider,
-                                            );
-                                        current_messages.push(asst_msg);
-                                        current_messages
-                                            .extend(followup.tool_results.iter().cloned());
-                                        // continue loop
-                                    } else {
-                                        // Done — add final assistant message
-                                        if !followup.content.is_empty() {
-                                            current_messages.push(serde_json::json!({
-                                                "role": "assistant",
-                                                "content": followup.content
-                                            }));
-                                        }
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Agentic follow-up failed");
-                                    let _ = tx.send(AppEvent::ApiError(e));
-                                    break;
-                                }
-                            }
-                        }
-                        // Sync updated messages back to the App
-                        let _ = tx.send(AppEvent::SyncMessages(current_messages));
-                        let _ = tx.send(AppEvent::ResponseDone);
-                    } else {
-                        // No tool calls — add assistant text to session
-                        if !turn_result.content.is_empty() {
-                            session_messages.push(serde_json::json!({
-                                "role": "assistant",
-                                "content": turn_result.content
-                            }));
-                            let _ = tx.send(AppEvent::SyncMessages(session_messages));
-                        }
-                        // ResponseDone already sent by run_turn
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::ApiError(e));
-                }
-            }
-        });
+        handle.spawn(run_api_turn_async(ApiTurnParams {
+            session_messages, client, endpoint, headers, provider, model,
+            effort_level, claude_code_token, prompt_blocks, memory_db,
+            permission_mgr, hook_engine, session_id: session_id_for_task, tx,
+        }));
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -1811,9 +1292,9 @@ impl App {
 
         // Cursor
         if !self.is_waiting {
-            #[allow(clippy::cast_possible_truncation)]
             let prompt_width = 2u16;
-            let cx = chunks[2].x + prompt_width + self.input.cursor_position() as u16;
+            let cursor_pos = u16::try_from(self.input.cursor_position()).unwrap_or(u16::MAX);
+            let cx = chunks[2].x + prompt_width + cursor_pos;
             let cy = chunks[2].y + 1;
             frame.set_cursor_position(Position::new(
                 cx.min(chunks[2].right().saturating_sub(1)),
@@ -1840,64 +1321,7 @@ impl App {
         frame.render_widget(status, chunks[3]);
 
         // ── Permission prompt overlay ──
-        if let Some(ref perm) = self.pending_permission {
-            let area = frame.area();
-            // Center a dialog box
-            let dialog_width = area.width.min(70);
-            let dialog_height = 7u16;
-            let x = (area.width.saturating_sub(dialog_width)) / 2;
-            let y = area.height.saturating_sub(dialog_height + 4);
-            let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
-
-            // Clear the area behind the dialog
-            let clear = Paragraph::new("").style(Style::default().bg(Color::Black));
-            frame.render_widget(clear, dialog_area);
-
-            let args_preview = if perm.tool_args.len() > 50 {
-                format!("{}...", crate::tools::safe_truncate(&perm.tool_args, 47))
-            } else {
-                perm.tool_args.clone()
-            };
-
-            let prompt_text = vec![
-                Line::from(Span::styled(
-                    format!("  Tool: {}", perm.tool_name),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!("  Args: {args_preview}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  [y] ", Style::default().fg(Color::Green)),
-                    Span::raw("Allow  "),
-                    Span::styled("[n] ", Style::default().fg(Color::Red)),
-                    Span::raw("Deny  "),
-                    Span::styled("[a] ", Style::default().fg(Color::Cyan)),
-                    Span::raw("Always  "),
-                    Span::styled("[d] ", Style::default().fg(Color::Yellow)),
-                    Span::raw("Never"),
-                ]),
-            ];
-
-            let dialog = Paragraph::new(prompt_text)
-                .block(
-                    Block::default()
-                        .title(" Permission Required ")
-                        .title_style(
-                            Style::default()
-                                .fg(Color::Rgb(218, 165, 32))
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Rgb(218, 165, 32))),
-                )
-                .style(Style::default().bg(Color::Black));
-            frame.render_widget(dialog, dialog_area);
-        }
+        self.draw_permission_overlay(frame);
 
         // ── Modal overlay (rendered last so it floats above everything) ──
         // Use `Clear` to blank the underlying region; both overlays paint
@@ -1911,6 +1335,39 @@ impl App {
                 ActiveOverlay::LogSelector(o) => o.render(frame, area),
             }
         }
+    }
+
+    /// Render the permission-prompt dialog when one is pending.
+    fn draw_permission_overlay(&self, frame: &mut Frame) {
+        let Some(ref perm) = self.pending_permission else { return; };
+        let area = frame.area();
+        let dialog_width = area.width.min(70);
+        let dialog_height = 7u16;
+        let x = (area.width.saturating_sub(dialog_width)) / 2;
+        let y = area.height.saturating_sub(dialog_height + 4);
+        let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+        let clear = Paragraph::new("").style(Style::default().bg(Color::Black));
+        frame.render_widget(clear, dialog_area);
+        let args_preview = if perm.tool_args.len() > 50 {
+            format!("{}...", crate::tools::safe_truncate(&perm.tool_args, 47))
+        } else {
+            perm.tool_args.clone()
+        };
+        let prompt_text = vec![
+            Line::from(Span::styled(format!("  Tool: {}", perm.tool_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(format!("  Args: {args_preview}"), Style::default().fg(Color::DarkGray))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  [y] ", Style::default().fg(Color::Green)), Span::raw("Allow  "),
+                Span::styled("[n] ", Style::default().fg(Color::Red)), Span::raw("Deny  "),
+                Span::styled("[a] ", Style::default().fg(Color::Cyan)), Span::raw("Always  "),
+                Span::styled("[d] ", Style::default().fg(Color::Yellow)), Span::raw("Never"),
+            ]),
+        ];
+        let dialog = Paragraph::new(prompt_text)
+            .block(Block::default().title(" Permission Required ").title_style(Style::default().fg(Color::Rgb(218, 165, 32)).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(218, 165, 32))))
+            .style(Style::default().bg(Color::Black));
+        frame.render_widget(dialog, dialog_area);
     }
 
     /// Render the welcome box — two-column bordered widget matching the old inline UI.
@@ -2009,3 +1466,93 @@ impl App {
         frame.render_widget(right, cols[1]);
     }
 }
+
+/// Owned call parameters for one spawned API turn.
+struct ApiTurnParams {
+    session_messages: Vec<serde_json::Value>,
+    client: reqwest::Client,
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    provider: String,
+    model: String,
+    effort_level: String,
+    claude_code_token: Option<String>,
+    prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+    memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
+    permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
+    hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    session_id: String,
+    tx: std::sync::mpsc::Sender<super::events::AppEvent>,
+}
+
+/// Run a complete API turn: pre-turn hooks, first `run_turn`, and an agentic
+/// follow-up loop when tool calls are present.
+async fn run_api_turn_async(p: ApiTurnParams) {
+    const MAX_ITER: u32 = 25;
+    let ApiTurnParams { mut session_messages, client, endpoint, headers, provider, model, effort_level, claude_code_token, prompt_blocks, memory_db, permission_mgr, hook_engine, session_id, tx } = p;
+    if let Some(ref engine) = hook_engine {
+        let user_prompt = session_messages.last()
+            .and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let hook_input = crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit).with_prompt(&user_prompt);
+        let hook_result = engine.run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input).await;
+        if !hook_result.allowed {
+            let reason = hook_result.errors.first().map_or_else(|| "Hook blocked the request".to_string(), std::string::ToString::to_string);
+            let _ = tx.send(super::events::AppEvent::ApiError(format!("Blocked by hook: {reason}")));
+            return;
+        }
+        for output in &hook_result.outputs {
+            if let Some(ref sys_msg) = output.system_message {
+                session_messages.push(serde_json::json!({ "role": "system", "content": sys_msg }));
+            }
+        }
+    }
+    let request_body = crate::pipeline::build_request(&provider, &model, &session_messages, &effort_level, claude_code_token.as_deref(), prompt_blocks.as_ref());
+    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams { client: &client, endpoint: &endpoint, headers: &headers, request_body: &request_body, provider: &provider, memory_db: memory_db.clone(), permission_mgr: permission_mgr.clone(), hook_engine: hook_engine.clone(), session_id: Some(session_id.clone()), tx: tx.clone() }).await {
+        Ok(turn_result) => {
+            tracing::debug!(content_len = turn_result.content.len(), tool_calls = turn_result.tool_calls.len(), needs_followup = turn_result.needs_followup, "Turn result");
+            if turn_result.needs_followup {
+                let asst = crate::pipeline::build_assistant_message_with_tools(&turn_result.content, &turn_result.tool_calls, &provider);
+                session_messages.push(asst);
+                session_messages.extend(turn_result.tool_results.iter().cloned());
+                tracing::info!(tool_count = turn_result.tool_calls.len(), result_count = turn_result.tool_results.len(), "Starting agentic follow-up loop");
+                let mut iteration = 0u32;
+                loop {
+                    iteration += 1;
+                    tracing::debug!(iteration, "Agentic loop iteration");
+                    if iteration > MAX_ITER {
+                        let _ = tx.send(super::events::AppEvent::ApiError("Reached maximum tool iterations (25)".to_string()));
+                        break;
+                    }
+                    let body = crate::pipeline::build_request(&provider, &model, &session_messages, &effort_level, claude_code_token.as_deref(), prompt_blocks.as_ref());
+                    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams { client: &client, endpoint: &endpoint, headers: &headers, request_body: &body, provider: &provider, memory_db: memory_db.clone(), permission_mgr: permission_mgr.clone(), hook_engine: hook_engine.clone(), session_id: Some(session_id.clone()), tx: tx.clone() }).await {
+                        Ok(followup) => {
+                            tracing::debug!(content_len = followup.content.len(), tool_calls = followup.tool_calls.len(), needs_followup = followup.needs_followup, "Follow-up result");
+                            if followup.needs_followup {
+                                let asst = crate::pipeline::build_assistant_message_with_tools(&followup.content, &followup.tool_calls, &provider);
+                                session_messages.push(asst);
+                                session_messages.extend(followup.tool_results.iter().cloned());
+                            } else {
+                                if !followup.content.is_empty() {
+                                    session_messages.push(serde_json::json!({ "role": "assistant", "content": followup.content }));
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Agentic follow-up failed");
+                            let _ = tx.send(super::events::AppEvent::ApiError(e));
+                            break;
+                        }
+                    }
+                }
+                let _ = tx.send(super::events::AppEvent::SyncMessages(session_messages));
+                let _ = tx.send(super::events::AppEvent::ResponseDone);
+            } else if !turn_result.content.is_empty() {
+                session_messages.push(serde_json::json!({ "role": "assistant", "content": turn_result.content }));
+                let _ = tx.send(super::events::AppEvent::SyncMessages(session_messages));
+            }
+        }
+        Err(e) => { let _ = tx.send(super::events::AppEvent::ApiError(e)); }
+    }
+}
+

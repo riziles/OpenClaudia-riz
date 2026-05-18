@@ -209,10 +209,7 @@ impl ToolInterceptor {
     pub fn strip_hallucinated_blocks(&mut self) {
         // Remove <function_results>...</function_results> or <function_results>...</function_calls>
         // (models sometimes hallucinate the wrong closing tag)
-        loop {
-            let Some(start) = self.buffer.find("<function_results>") else {
-                break;
-            };
+        while let Some(start) = self.buffer.find("<function_results>") {
 
             // Prefer proper closing tag; fall back to </function_calls> (common hallucination)
             let end = if let Some(rel) = self.buffer[start..].find("</function_results>") {

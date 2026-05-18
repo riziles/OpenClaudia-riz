@@ -66,6 +66,57 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     )
 }
 
+fn handle_plan_edit(
+    chat_session: &mut ChatSession,
+    plan_state: &openclaudia::session::PlanModeState,
+    allowed_prompts_json: &str,
+) -> (String, bool) {
+    use std::io::{self, Write};
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
+    let edit_result = std::process::Command::new(&editor).arg(&plan_state.plan_file).status();
+    match edit_result {
+        Ok(status) if status.success() => {
+            let edited_content = fs::read_to_string(&plan_state.plan_file).unwrap_or_default();
+            println!("\n\x1b[1;36m## Edited Plan\x1b[0m\n");
+            println!("{edited_content}");
+            println!();
+            print!("\x1b[1;33mApprove edited plan? [y/n]: \x1b[0m");
+            io::stdout().flush().ok();
+            let mut input2 = String::new();
+            if io::stdin().read_line(&mut input2).is_err() {
+                return ("Failed to read user input.".to_string(), false);
+            }
+            if input2.trim().to_lowercase().starts_with('y') {
+                let allowed_prompts = tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
+                chat_session.plan_mode = None;
+                chat_session.mode = AgentMode::Build;
+                chat_session.approved_plan = Some(edited_content.clone());
+                println!("\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n");
+                chat_session.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Approved Implementation Plan (edited by user)]\n\
+                         The user has edited and approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+                        edited_content,
+                        if allowed_prompts.is_empty() { String::new() }
+                        else { format!("Allowed operations:\n{}", allowed_prompts.iter().map(|p| format!("- {}: {}", p.tool, p.prompt)).collect::<Vec<_>>().join("\n")) }
+                    )
+                }));
+                ("Plan edited and approved by user. Full tool access restored. Proceed with implementation according to the edited plan.".to_string(), true)
+            } else {
+                println!("\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n");
+                ("Edited plan rejected by user. Still in plan mode. Revise and try again.".to_string(), false)
+            }
+        }
+        Ok(_) => ("Editor exited with error. Plan unchanged. Still in plan mode.".to_string(), false),
+        Err(e) => {
+            println!("\x1b[31mFailed to open editor '{editor}': {e}\x1b[0m");
+            ("Failed to open editor. Still in plan mode.".to_string(), false)
+        }
+    }
+}
+
 /// Handle exiting plan mode. Reads plan file, shows to user for approval.
 /// Returns (`result_text`, `should_exit_plan_mode`).
 pub fn handle_exit_plan_mode(
@@ -158,86 +209,7 @@ pub fn handle_exit_plan_mode(
                 false,
             )
         }
-        "edit" | "e" => {
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-            println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
-
-            let edit_result = std::process::Command::new(&editor)
-                .arg(&plan_state.plan_file)
-                .status();
-
-            match edit_result {
-                Ok(status) if status.success() => {
-                    let edited_content =
-                        fs::read_to_string(&plan_state.plan_file).unwrap_or_default();
-
-                    println!("\n\x1b[1;36m## Edited Plan\x1b[0m\n");
-                    println!("{edited_content}");
-                    println!();
-                    print!("\x1b[1;33mApprove edited plan? [y/n]: \x1b[0m");
-                    io::stdout().flush().ok();
-
-                    let mut input2 = String::new();
-                    if io::stdin().read_line(&mut input2).is_err() {
-                        return ("Failed to read user input.".to_string(), false);
-                    }
-
-                    if input2.trim().to_lowercase().starts_with('y') {
-                        let allowed_prompts =
-                            tools::parse_exit_plan_mode_prompts(allowed_prompts_json);
-
-                        chat_session.plan_mode = None;
-                        chat_session.mode = AgentMode::Build;
-                        chat_session.approved_plan = Some(edited_content.clone());
-
-                        println!("\n\x1b[1;32m>> Plan Approved - Returning to Build Mode\x1b[0m\n");
-
-                        chat_session.messages.push(serde_json::json!({
-                            "role": "system",
-                            "content": format!(
-                                "[Approved Implementation Plan (edited by user)]\n\
-                                 The user has edited and approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-                                edited_content,
-                                if allowed_prompts.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        "Allowed operations:\n{}",
-                                        allowed_prompts
-                                            .iter()
-                                            .map(|p| format!("- {}: {}", p.tool, p.prompt))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    )
-                                }
-                            )
-                        }));
-
-                        (
-                            "Plan edited and approved by user. Full tool access restored. Proceed with implementation according to the edited plan.".to_string(),
-                            true,
-                        )
-                    } else {
-                        println!("\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n");
-                        (
-                            "Edited plan rejected by user. Still in plan mode. Revise and try again.".to_string(),
-                            false,
-                        )
-                    }
-                }
-                Ok(_) => (
-                    "Editor exited with error. Plan unchanged. Still in plan mode.".to_string(),
-                    false,
-                ),
-                Err(e) => {
-                    println!("\x1b[31mFailed to open editor '{editor}': {e}\x1b[0m");
-                    (
-                        "Failed to open editor. Still in plan mode.".to_string(),
-                        false,
-                    )
-                }
-            }
-        }
+        "edit" | "e" => handle_plan_edit(chat_session, &plan_state, allowed_prompts_json),
         _ => {
             println!("\x1b[90mUnrecognized input. Staying in plan mode.\x1b[0m");
             (

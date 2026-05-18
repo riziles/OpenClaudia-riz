@@ -169,7 +169,7 @@ impl HelpOverlay {
     /// Flatten the section tree into one `Vec<Line>` for the paragraph
     /// widget. Allocation-per-render is fine — the cheatsheet is <50
     /// lines and this runs once per frame, at human-input cadence.
-    fn build_lines(&self) -> Vec<Line<'static>> {
+    fn build_lines() -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
             "Keyboard shortcuts",
@@ -210,7 +210,7 @@ impl HelpOverlay {
     }
 
     /// Max scroll offset given the current lines and viewport.
-    const fn max_scroll(&self, lines: u16, viewport: u16) -> u16 {
+    const fn max_scroll(lines: u16, viewport: u16) -> u16 {
         lines.saturating_sub(viewport)
     }
 }
@@ -218,12 +218,12 @@ impl HelpOverlay {
 impl Overlay for HelpOverlay {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height.saturating_sub(2); // borders
-        let lines = self.build_lines();
+        let lines = Self::build_lines();
         #[allow(clippy::cast_possible_truncation)] // list is tiny
         let total_lines = lines.len() as u16;
         // Clamp scroll to the current viewport so resize doesn't leave
         // us scrolled past the bottom.
-        let max = self.max_scroll(total_lines, self.last_height);
+        let max = Self::max_scroll(total_lines, self.last_height);
         if self.scroll > max {
             self.scroll = max;
         }

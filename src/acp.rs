@@ -255,14 +255,19 @@ pub(crate) fn apply_ide_selection_changed(state: &mut IdeState, params: &Value) 
                 warn!("ide/selection_changed: missing selection.end");
                 return;
             };
-            let line_start = start
-                .get("line")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            let line_end = end
-                .get("line")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::from(line_start)) as u32;
+            let line_start = u32::try_from(
+                start
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u32::MAX);
+            let line_end = u32::try_from(
+                end.get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| u64::from(line_start)),
+            )
+            .unwrap_or(u32::MAX);
             let line_count = line_end.saturating_sub(line_start).saturating_add(1);
             state.selection = Some(IdeSelection {
                 file_path: fp,
@@ -289,7 +294,7 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
     let parsed: Vec<IdeDiagnostic> = items
         .iter()
         .filter_map(|item| {
-            let line = item.get("line")?.as_u64()? as u32;
+            let line = u32::try_from(item.get("line")?.as_u64()?).ok()?;
             let severity = item.get("severity")?.as_str()?.to_string();
             let message = item.get("message")?.as_str()?.to_string();
             let source = item
@@ -1930,7 +1935,7 @@ mod ide_tests {
 
         // Empty-diagnostics notification clears the file's entries.
         apply_ide_diagnostics(&mut state, &json!({"filePath": "/x.rs", "diagnostics": []}));
-        assert!(state.diagnostics.get("/x.rs").is_none());
+        assert!(!state.diagnostics.contains_key("/x.rs"));
     }
 
     #[test]

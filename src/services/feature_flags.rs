@@ -22,11 +22,11 @@ pub trait FeatureFlagSource: Send + Sync {
     fn is_enabled(&self, name: &str) -> bool;
 }
 
-/// Default implementation backed by a `HashMap<String, bool>` +
-/// environment-variable fallback. `set` writes are intentionally
-/// build-time / startup-time — no lock overhead on the `is_enabled`
-/// hot path at the cost of needing `&mut self` for mutation. Wrap in
-/// `Arc<RwLock<>>` if you need concurrent updates.
+/// Default implementation backed by a `HashMap<String, bool>` plus an environment-variable fallback.
+///
+/// `set` writes are intentionally build-time / startup-time — no lock overhead
+/// on the `is_enabled` hot path at the cost of needing `&mut self` for
+/// mutation. Wrap in `Arc<RwLock<>>` if you need concurrent updates.
 #[derive(Debug, Default, Clone)]
 pub struct StaticFlags {
     entries: HashMap<String, bool>,

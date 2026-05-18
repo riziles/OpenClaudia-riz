@@ -100,18 +100,26 @@ impl StateStore {
         self.inner.read().ok().map(|g| g.clone())
     }
 
-    /// Read accessor. Panics if the lock is poisoned — see
-    /// `snapshot` for a non-panicking alternative. Use for short
-    /// field reads; drop before any `.await`.
+    /// Read accessor. Use for short field reads; drop before any `.await`.
+    ///
+    /// See `snapshot` for a non-panicking alternative.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
     pub fn read(&self) -> RwLockReadGuard<'_, SessionState> {
         self.inner.read().expect("state store lock poisoned")
     }
 
-    /// Mutation guard. The returned guard dereferences to
-    /// `&mut SessionState`; on drop it emits the accumulated events
-    /// via the broadcast channel. Call [`StateWriteGuard::note`]
-    /// from inside the scope to record what changed.
-    #[must_use] 
+    /// Mutation guard. The returned guard dereferences to `&mut SessionState`.
+    ///
+    /// On drop it emits the accumulated events via the broadcast channel. Call
+    /// [`StateWriteGuard::note`] from inside the scope to record what changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    #[must_use]
     pub fn write(&self) -> StateWriteGuard<'_> {
         let inner = self.inner.write().expect("state store lock poisoned");
         StateWriteGuard {
@@ -128,11 +136,11 @@ impl Default for StateStore {
     }
 }
 
-/// Mutation guard returned from [`StateStore::write`]. Record
-/// changes via [`Self::note`] — the guard flushes every noted event
-/// to subscribers when it drops. Drop runs on panic too, so the
-/// event stream stays coherent even if a mutation handler aborts
-/// mid-way.
+/// Mutation guard returned from [`StateStore::write`].
+///
+/// Record changes via [`Self::note`] — the guard flushes every noted event to
+/// subscribers when it drops. Drop runs on panic too, so the event stream stays
+/// coherent even if a mutation handler aborts mid-way.
 pub struct StateWriteGuard<'a> {
     inner: RwLockWriteGuard<'a, SessionState>,
     events: &'a broadcast::Sender<StateEvent>,

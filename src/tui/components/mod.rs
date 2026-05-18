@@ -24,10 +24,11 @@ pub use log_selector::{LogSelector, SelectedSession};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-/// What the event loop should do after handing a key event to an
-/// overlay. Returned by `handle_key` so the loop can close the overlay
-/// (no change / selection made / canceled) without the component
-/// reaching into app state itself.
+/// What the event loop should do after handing a key event to an overlay.
+///
+/// Returned by `handle_key` so the loop can close the overlay (no change /
+/// selection made / canceled) without the component reaching into app state
+/// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayAction {
     /// Overlay consumed the key and stays open.
@@ -38,10 +39,10 @@ pub enum OverlayAction {
     ResumeSession(String),
 }
 
-/// Every overlay component implements this so the event loop can
-/// render + drive it uniformly regardless of type. Kept minimal on
-/// purpose — components that need config (e.g. a list of models to
-/// pick from) accept it at construction.
+/// Every overlay component implements this so the event loop can render and drive it uniformly.
+///
+/// Kept minimal on purpose — components that need config (e.g. a list of
+/// models to pick from) accept it at construction.
 pub trait Overlay {
     /// Render the overlay into `area` on top of the main UI. Callers
     /// typically center the area with `centered_rect`.

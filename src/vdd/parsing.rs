@@ -243,7 +243,6 @@ pub(crate) fn extract_token_usage(response: &Value) -> TokenUsage {
 mod tests {
     use super::*;
 
-    #[test]
     // --- Regression tests for crosslink #337 (UTF-8 safety) ---
     #[test]
     fn extract_json_survives_leading_emoji() {

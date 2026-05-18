@@ -224,16 +224,16 @@ fn is_compact_boundary(entry: &SerializedMessage) -> bool {
     false
 }
 
-/// Return the subset of `entries` starting from the last
-/// compact-boundary marker onward (inclusive). When no boundary
-/// exists, returns `entries` unchanged. Used by `--resume` to avoid
-/// re-feeding the model content that was already summarized away.
+/// Return the subset of `entries` starting from the last compact-boundary marker onward.
+///
+/// When no boundary exists, returns `entries` unchanged. Used by `--resume` to
+/// avoid re-feeding the model content that was already summarized away.
 #[must_use]
 pub fn entries_after_last_boundary(entries: &[SerializedMessage]) -> &[SerializedMessage] {
-    match entries.iter().rposition(is_compact_boundary) {
-        Some(idx) => &entries[idx..],
-        None => entries,
-    }
+    entries
+        .iter()
+        .rposition(is_compact_boundary)
+        .map_or(entries, |idx| &entries[idx..])
 }
 
 /// Read every JSONL line in `path` as a [`SerializedMessage`]. Lines
@@ -305,7 +305,7 @@ pub fn list_transcripts(cwd: &Path) -> Vec<TranscriptInfo> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|t| std::cmp::Reverse(t.modified));
     out
 }
 

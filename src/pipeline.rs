@@ -148,6 +148,8 @@ pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str)
 /// Build a Google Gemini-format request body.
 #[must_use]
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Value {
+    static EMPTY_STR: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| serde_json::json!(""));
+    static EMPTY_OBJ: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| serde_json::json!({}));
     let openai_tools = tools::get_all_tool_definitions(true);
     let tools_vec = openai_tools.as_array().cloned().unwrap_or_default();
     let functions: Vec<Value> = tools_vec
@@ -156,8 +158,8 @@ pub fn build_google_request(messages: &[Value], effort_level: &str) -> Value {
             let func = tool.get("function")?;
             Some(serde_json::json!({
                 "name": func.get("name")?,
-                "description": func.get("description").unwrap_or(&serde_json::json!("")),
-                "parameters": func.get("parameters").unwrap_or(&serde_json::json!({}))
+                "description": func.get("description").unwrap_or_else(|| &*EMPTY_STR),
+                "parameters": func.get("parameters").unwrap_or_else(|| &*EMPTY_OBJ)
             }))
         })
         .collect();
@@ -263,19 +265,35 @@ pub fn resolve_headers(
     claude_code_token: Option<&str>,
     extra_headers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut headers = if let Some(token) = claude_code_token {
-        crate::claude_credentials::get_oauth_headers(token)
-    } else if let Some(key) = api_key {
-        let adapter = get_adapter(provider);
-        adapter.get_headers(key)
-    } else {
-        Vec::new()
-    };
+    let mut headers = claude_code_token.map_or_else(
+        || {
+            api_key.map_or_else(Vec::new, |key| {
+                let adapter = get_adapter(provider);
+                adapter.get_headers(key)
+            })
+        },
+        crate::claude_credentials::get_oauth_headers,
+    );
     headers.extend(extra_headers.iter().cloned());
     headers
 }
 
 // ─── Streaming + tool execution ─────────────────────────────────────────────
+
+/// Parameters for [`run_turn`]. Bundled to keep the call-site argument count
+/// within clippy's `too_many_arguments` limit.
+pub struct RunTurnParams<'a> {
+    pub client: &'a reqwest::Client,
+    pub endpoint: &'a str,
+    pub headers: &'a [(String, String)],
+    pub request_body: &'a Value,
+    pub provider: &'a str,
+    pub memory_db: Option<Arc<MemoryDb>>,
+    pub permission_mgr: Option<Arc<PermissionManager>>,
+    pub hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    pub session_id: Option<String>,
+    pub tx: mpsc::Sender<AppEvent>,
+}
 
 /// Run one turn of the conversation: send request, stream response, execute tools.
 ///
@@ -285,18 +303,8 @@ pub fn resolve_headers(
 /// # Errors
 ///
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
-pub async fn run_turn(
-    client: &reqwest::Client,
-    endpoint: &str,
-    headers: &[(String, String)],
-    request_body: &Value,
-    provider: &str,
-    memory_db: Option<Arc<MemoryDb>>,
-    permission_mgr: Option<Arc<PermissionManager>>,
-    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
-    session_id: Option<String>,
-    tx: mpsc::Sender<AppEvent>,
-) -> Result<TurnResult, String> {
+pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
+    let RunTurnParams { client, endpoint, headers, request_body, provider, memory_db, permission_mgr, hook_engine, session_id, tx } = p;
     tracing::info!(
         endpoint,
         model = request_body
@@ -339,7 +347,7 @@ pub async fn run_turn(
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(2u64.pow(attempt + 1));
+                .unwrap_or_else(|| 2u64.pow(attempt + 1));
             tracing::warn!(status, attempt, wait_secs, "Transient API error, retrying");
             let _ = tx.send(AppEvent::StreamText(format!(
                 "\n(Retrying in {wait_secs}s — {status}...)\n"
@@ -732,6 +740,115 @@ pub fn tool_needs_permission(tool_name: &str) -> bool {
 /// event channel stays responsive — the TUI can redraw and show progress
 /// while tools execute.
 ///
+/// Outcome of a TUI permission check for a single tool call.
+enum PermissionOutcome {
+    /// The tool is allowed to proceed.
+    Allowed,
+    /// The tool was denied; the caller should push `result_json` and `continue`.
+    DeniedWithResult(serde_json::Value),
+    /// The permission channel is broken; the caller should `break`.
+    ChannelBroken,
+}
+
+/// Check whether a tool call is permitted in the current session.
+///
+/// Consults `always_allowed`/`always_denied` session caches, then sends a
+/// `PermissionRequest` event and blocks for the user's decision if needed.
+fn check_tool_permission(
+    tool_name: &str,
+    tool_call_id: &str,
+    arguments: &str,
+    always_allowed: &mut std::collections::HashSet<String>,
+    always_denied: &mut std::collections::HashSet<String>,
+    tx: &mpsc::Sender<AppEvent>,
+) -> PermissionOutcome {
+    if always_denied.contains(tool_name) {
+        let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied (always deny for this session)".to_string() });
+        return PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission for this tool.", "is_error": true }));
+    }
+    if always_allowed.contains(tool_name) {
+        return PermissionOutcome::Allowed;
+    }
+    let args_preview = if arguments.len() > 200 {
+        format!("{}...", crate::tools::safe_truncate(arguments, 197))
+    } else {
+        arguments.to_string()
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if tx.send(AppEvent::PermissionRequest { tool_name: tool_name.to_string(), tool_args: args_preview, reply: reply_tx }).is_err() {
+        return PermissionOutcome::ChannelBroken;
+    }
+    match reply_rx.recv() {
+        Ok(PermissionResponse::Allow) => PermissionOutcome::Allowed,
+        Ok(PermissionResponse::AlwaysAllow) => {
+            always_allowed.insert(tool_name.to_string());
+            PermissionOutcome::Allowed
+        }
+        Ok(PermissionResponse::AlwaysDeny) => {
+            always_denied.insert(tool_name.to_string());
+            let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied (always deny)".to_string() });
+            PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }))
+        }
+        Ok(PermissionResponse::Deny) | Err(_) => {
+            let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied by user".to_string() });
+            PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }))
+        }
+    }
+}
+
+/// Execute one tool call on a blocking thread, fire `PostToolUse` hooks, and
+/// return the JSON result to append to conversation history.
+/// Returns `None` when the event channel is broken (caller should `break`).
+async fn execute_single_tool(
+    tool_call: &ToolCall,
+    memory_db: Option<Arc<MemoryDb>>,
+    permission_mgr: Option<Arc<PermissionManager>>,
+    session_id: Option<&str>,
+    hook_engine: Option<&crate::hooks::HookEngine>,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Option<Value> {
+    let tool_name = &tool_call.function.name;
+    let tool_call_clone = tool_call.clone();
+    let mem_db = memory_db;
+    let perm_mgr = permission_mgr;
+    let session_for_task = session_id.map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || {
+        let _session_guard = session_for_task.map(tools::SessionIdGuard::set);
+        tools::execute_tool_with_memory(&tool_call_clone, mem_db.as_deref(), perm_mgr.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| tools::ToolResult { tool_call_id: tool_call.id.clone(), content: format!("Tool execution panicked: {e}"), is_error: true });
+
+    if tx.send(AppEvent::ToolDone { name: tool_name.clone(), success: !result.is_error, content: result.content.clone() }).is_err() {
+        return None;
+    }
+    if let Some(engine) = hook_engine {
+        let tool_input: Value = serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
+        engine.fire_post_tool(!result.is_error, tool_name, tool_input, &result.content, session_id).await;
+    }
+    let result_content = if result.is_error { format!("[ERROR] {}", result.content) } else { result.content };
+    Some(serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }))
+}
+
+/// Build a human-readable one-line description of what a tool call will do.
+fn describe_tool_call(tool_name: &str, arguments: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    match tool_name {
+        "read_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Reading file".to_string(), |p| format!("Reading {p}")),
+        "write_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Writing file".to_string(), |p| format!("Writing {p}")),
+        "edit_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Editing file".to_string(), |p| format!("Editing {p}")),
+        "bash" => args.get("command").and_then(|v| v.as_str()).map_or_else(|| "Running command".to_string(), |c| {
+            let truncated = if c.len() > 80 { crate::tools::safe_truncate(c, 77) } else { c };
+            format!("$ {truncated}")
+        }),
+        "list_files" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Listing files".to_string(), |p| format!("Listing {p}")),
+        "web_search" => args.get("query").and_then(|v| v.as_str()).map_or_else(|| "Searching web".to_string(), |q| format!("Searching: {q}")),
+        "web_fetch" => args.get("url").and_then(|v| v.as_str()).map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
+        "chainlink" => args.get("args").and_then(|v| v.as_str()).map_or_else(|| "Running crosslink".to_string(), |a| format!("crosslink {a}")),
+        _ => format!("Running {tool_name}"),
+    }
+}
+
 /// Checks permissions for write/destructive tools via a channel-based
 /// handshake: sends `PermissionRequest` to the TUI and blocks until
 /// the user responds with y/n/a/d.
@@ -779,205 +896,24 @@ async fn execute_tool_calls_for_tui(
 
         // Permission check for write/destructive tools
         if tool_needs_permission(tool_name) {
-            if always_denied.contains(tool_name) {
-                send_event_or_break!(
-                    tx,
-                    AppEvent::ToolDone {
-                        name: tool_name.clone(),
-                        success: false,
-                        content: "Denied (always deny for this session)".to_string(),
-                    }
-                );
-                results.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": "[DENIED] User denied permission for this tool.",
-                    "is_error": true
-                }));
-                continue;
-            }
-
-            if !always_allowed.contains(tool_name) {
-                // Send permission request and wait for response
-                let (reply_tx, reply_rx) = mpsc::channel();
-                let args_preview = if tool_call.function.arguments.len() > 200 {
-                    format!(
-                        "{}...",
-                        crate::tools::safe_truncate(&tool_call.function.arguments, 197)
-                    )
-                } else {
-                    tool_call.function.arguments.clone()
-                };
-                send_event_or_break!(
-                    tx,
-                    AppEvent::PermissionRequest {
-                        tool_name: tool_name.clone(),
-                        tool_args: args_preview,
-                        reply: reply_tx,
-                    }
-                );
-
-                // Block until user responds (TUI sends back the decision)
-                match reply_rx.recv() {
-                    Ok(PermissionResponse::Allow) => {}
-                    Ok(PermissionResponse::AlwaysAllow) => {
-                        always_allowed.insert(tool_name.clone());
-                    }
-                    Ok(PermissionResponse::AlwaysDeny) => {
-                        always_denied.insert(tool_name.clone());
-                        send_event_or_break!(
-                            tx,
-                            AppEvent::ToolDone {
-                                name: tool_name.clone(),
-                                success: false,
-                                content: "Denied (always deny)".to_string(),
-                            }
-                        );
-                        results.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": "[DENIED] User denied permission.",
-                            "is_error": true
-                        }));
-                        continue;
-                    }
-                    Ok(PermissionResponse::Deny) | Err(_) => {
-                        send_event_or_break!(
-                            tx,
-                            AppEvent::ToolDone {
-                                name: tool_name.clone(),
-                                success: false,
-                                content: "Denied by user".to_string(),
-                            }
-                        );
-                        results.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": "[DENIED] User denied permission.",
-                            "is_error": true
-                        }));
-                        continue;
-                    }
+            match check_tool_permission(tool_name, &tool_call.id, &tool_call.function.arguments, &mut always_allowed, &mut always_denied, tx) {
+                PermissionOutcome::Allowed => {}
+                PermissionOutcome::DeniedWithResult(result_json) => {
+                    results.push(result_json);
+                    continue;
                 }
+                PermissionOutcome::ChannelBroken => break,
             }
         }
 
-        // Build a descriptive preview of what the tool is doing
-        let args_desc = {
-            let args: serde_json::Value =
-                serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
-            match tool_name.as_str() {
-                "read_file" => args
-                    .get("path")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Reading file".to_string(), |p| format!("Reading {p}")),
-                "write_file" => args
-                    .get("path")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Writing file".to_string(), |p| format!("Writing {p}")),
-                "edit_file" => args
-                    .get("path")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Editing file".to_string(), |p| format!("Editing {p}")),
-                "bash" => args
-                    .get("command")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Running command".to_string(), |c| {
-                        let truncated = if c.len() > 80 {
-                            crate::tools::safe_truncate(c, 77)
-                        } else {
-                            c
-                        };
-                        format!("$ {truncated}")
-                    }),
-                "list_files" => args
-                    .get("path")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Listing files".to_string(), |p| format!("Listing {p}")),
-                "web_search" => args
-                    .get("query")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Searching web".to_string(), |q| format!("Searching: {q}")),
-                "web_fetch" => args
-                    .get("url")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
-                "chainlink" => args
-                    .get("args")
-                    .and_then(|v| v.as_str()).map_or_else(|| "Running crosslink".to_string(), |a| format!("crosslink {a}")),
-                _ => format!("Running {tool_name}"),
-            }
-        };
+        let args_desc = describe_tool_call(tool_name, &tool_call.function.arguments);
+        send_event_or_break!(tx, AppEvent::ToolStart { name: tool_name.clone(), description: args_desc });
 
-        send_event_or_break!(
-            tx,
-            AppEvent::ToolStart {
-                name: tool_name.clone(),
-                description: args_desc,
-            }
-        );
-
-        // Run tool on a blocking thread so the async event channel stays
-        // responsive — TUI can redraw and show the spinner/progress while
-        // the tool executes.
-        let tool_call_clone = tool_call.clone();
-        let mem_db = memory_db.clone();
-        let perm_mgr = permission_mgr.clone();
-        // Library-layer gate runs in addition to the TUI's UX-layer
-        // `PermissionResponse` flow. Closes crosslink #505 — previously
-        // threaded `None`, which emitted a one-shot warn and left the
-        // config-driven `default_allow` patterns unenforced.
-        // Bind the session id on the blocking worker so todo_write /
-        // todo_read pick the right per-session bucket. Guard drops at
-        // end of closure → next spawn_blocking on this worker thread
-        // sees a clean slate, no leaked session key.
-        let session_for_task = session_id.map(str::to_string);
-        let result = tokio::task::spawn_blocking(move || {
-            let _session_guard = session_for_task.map(tools::SessionIdGuard::set);
-            let pm = perm_mgr.as_deref();
-            if let Some(ref db) = mem_db {
-                tools::execute_tool_with_memory(&tool_call_clone, Some(db), pm)
-            } else {
-                tools::execute_tool_with_memory(&tool_call_clone, None, pm)
-            }
-        })
-        .await
-        .unwrap_or_else(|e| tools::ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content: format!("Tool execution panicked: {e}"),
-            is_error: true,
-        });
-
-        send_event_or_break!(
-            tx,
-            AppEvent::ToolDone {
-                name: tool_name.clone(),
-                success: !result.is_error,
-                content: result.content.clone(),
-            }
-        );
-
-        // Fire PostToolUse / PostToolUseFailure for user-configured hook
-        // scripts. Best-effort: hook errors are logged inside the engine
-        // and don't affect the tool result the caller sees.
-        if let Some(engine) = hook_engine.as_ref() {
-            let tool_input: Value =
-                serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
-            engine
-                .fire_post_tool(
-                    !result.is_error,
-                    tool_name,
-                    tool_input,
-                    &result.content,
-                    session_id,
-                )
-                .await;
+        let tool_result = execute_single_tool(tool_call, memory_db.clone(), permission_mgr.clone(), session_id, hook_engine.as_ref().map(Arc::as_ref), tx).await;
+        match tool_result {
+            None => break, // channel broken
+            Some(result_json) => results.push(result_json),
         }
-
-        let result_content = if result.is_error {
-            format!("[ERROR] {}", result.content)
-        } else {
-            result.content
-        };
-        results.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": result.tool_call_id,
-            "content": result_content,
-            "is_error": result.is_error
-        }));
     }
 
     // Run quality gates after tool execution
@@ -1248,6 +1184,7 @@ mod tests {
     /// Gemini 2.5 thinking is capped at 24576.
     #[test]
     fn b2_google_request_thinking_budget_capped() {
+        const GEMINI_CAP: u64 = 24_576;
         let prev = std::env::var("MAX_THINKING_TOKENS").ok();
         // SAFETY: single-threaded test, no concurrent writers.
         unsafe {
@@ -1258,7 +1195,6 @@ mod tests {
         let budget = req["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_u64()
             .unwrap_or(0);
-        const GEMINI_CAP: u64 = 24_576;
         assert!(budget > 0, "high effort must set thinkingBudget > 0");
         assert!(
             budget <= GEMINI_CAP,

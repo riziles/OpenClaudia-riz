@@ -87,10 +87,11 @@ pub fn encode(state: &SessionState) -> Result<String, PersistError> {
     Ok(serde_json::to_string_pretty(&wrapped)?)
 }
 
-/// Decode a JSON string written by [`encode`]. Checks the version
-/// tag first; future schemas that outrank `CURRENT_VERSION` return
-/// `FutureSchema` so a newer harness doesn't clobber a downgrade
-/// user's file on save.
+/// Decode a JSON string written by [`encode`].
+///
+/// Checks the version tag first; future schemas that outrank `CURRENT_VERSION`
+/// return `FutureSchema` so a newer harness doesn't clobber a downgrade user's
+/// file on save.
 ///
 /// # Errors
 ///

@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// isolation even when `cargo test` uses multiple threads.
 static READ_TRACKER_LOCK: Mutex<()> = Mutex::new(());
 
-fn make_call(name: &str, args: serde_json::Value) -> ToolCall {
+fn make_call(name: &str, args: &serde_json::Value) -> ToolCall {
     ToolCall {
         id: format!("inttest_{name}"),
         call_type: "function".to_string(),
@@ -45,7 +45,7 @@ fn write_read_edit_read_cross_tool_flow() {
     // ---- Step 1: write creates missing parent directory (Behavior 6) --------
     let write_call = make_call(
         "write_file",
-        json!({
+        &json!({
             "path": sub.to_string_lossy(),
             "content": "line one\nline two\nline three\n"
         }),
@@ -56,7 +56,7 @@ fn write_read_edit_read_cross_tool_flow() {
     assert!(sub.parent().expect("parent").is_dir(), "parent dir created");
 
     // ---- Step 2: read without offset returns all lines (Behavior 1) ----------
-    let read_all_call = make_call("read_file", json!({ "path": sub.to_string_lossy() }));
+    let read_all_call = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
     let ra = execute_tool(&read_all_call);
     assert!(!ra.is_error, "read_file must succeed: {}", ra.content);
     assert!(ra.content.contains("line one"), "all lines present");
@@ -65,7 +65,7 @@ fn write_read_edit_read_cross_tool_flow() {
     // ---- Step 3: read with offset + limit (Behavior 1) ----------------------
     let read_slice_call = make_call(
         "read_file",
-        json!({
+        &json!({
             "path": sub.to_string_lossy(),
             "offset": 2,
             "limit": 1
@@ -89,7 +89,7 @@ fn write_read_edit_read_cross_tool_flow() {
     // ---- Step 4: edit with matching old_string (Behavior 4 happy path) ------
     let edit_ok_call = make_call(
         "edit_file",
-        json!({
+        &json!({
             "path": sub.to_string_lossy(),
             "old_string": "line two",
             "new_string": "LINE TWO (edited)"
@@ -104,7 +104,7 @@ fn write_read_edit_read_cross_tool_flow() {
     assert!(!disk.contains("line two\n"), "old string gone");
 
     // ---- Step 6: re-read and confirm the new content (Behavior 1 round-trip)
-    let read_final = make_call("read_file", json!({ "path": sub.to_string_lossy() }));
+    let read_final = make_call("read_file", &json!({ "path": sub.to_string_lossy() }));
     let rf = execute_tool(&read_final);
     assert!(!rf.is_error, "re-read must succeed: {}", rf.content);
     assert!(
@@ -115,7 +115,7 @@ fn write_read_edit_read_cross_tool_flow() {
     // ---- Step 7: edit with absent old_string returns error (Behavior 4) -----
     let edit_bad_call = make_call(
         "edit_file",
-        json!({
+        &json!({
             "path": sub.to_string_lossy(),
             "old_string": "ABSENT TEXT",
             "new_string": "whatever"
@@ -158,7 +158,7 @@ fn write_creates_deeply_nested_parent_directories() {
         .join("file.txt");
     let call = make_call(
         "write_file",
-        json!({
+        &json!({
             "path": deep.to_string_lossy(),
             "content": "deep"
         }),
@@ -182,7 +182,7 @@ fn read_offset_beyond_eof_is_non_error() {
 
     let call = make_call(
         "read_file",
-        json!({
+        &json!({
             "path": path.to_string_lossy(),
             "offset": 999
         }),
@@ -215,7 +215,7 @@ fn read_large_file_truncated_as_non_error() {
     let content = line.repeat(600);
     fs::write(&path, &content).expect("write");
 
-    let call = make_call("read_file", json!({ "path": path.to_string_lossy() }));
+    let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
     let r = execute_tool(&call);
     assert!(
         !r.is_error,
@@ -241,7 +241,7 @@ fn read_image_extensions_dispatched_as_image() {
     for ext in &["png", "jpg", "jpeg", "gif", "webp"] {
         let path = dir.path().join(format!("img.{ext}"));
         fs::write(&path, b"\x00").expect("write");
-        let call = make_call("read_file", json!({ "path": path.to_string_lossy() }));
+        let call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
         let r = execute_tool(&call);
         // OC returns a plain-text block with base64 (Behavior 2 OC path)
         assert!(
@@ -270,7 +270,7 @@ fn glob_tool_not_exported_from_file_module() {
     // We can't directly assert the absence of a symbol at runtime in Rust, so
     // we verify via the execute_tool dispatch: calling a "glob_tool" name must
     // return an error (unknown tool), not succeed.
-    let call = make_call("glob_tool", json!({ "pattern": "**/*.rs" }));
+    let call = make_call("glob_tool", &json!({ "pattern": "**/*.rs" }));
     let r = execute_tool(&call);
     assert!(
         r.is_error,
@@ -287,7 +287,7 @@ fn glob_tool_not_exported_from_file_module() {
 fn grep_tool_not_exported_from_file_module() {
     // Gap #568: OC has no native GrepTool. Regex search uses bash.
     // Pinned as current (missing) state; update when #568 is resolved.
-    let call = make_call("grep_tool", json!({ "pattern": "fn main" }));
+    let call = make_call("grep_tool", &json!({ "pattern": "fn main" }));
     let r = execute_tool(&call);
     assert!(
         r.is_error,
@@ -313,12 +313,12 @@ fn edit_replace_all_multi_occurrence_currently_errors() {
     fs::write(&path, "foo bar foo baz foo\n").expect("write");
 
     // Read first (enforced by OC)
-    let read_call = make_call("read_file", json!({ "path": path.to_string_lossy() }));
+    let read_call = make_call("read_file", &json!({ "path": path.to_string_lossy() }));
     let _ = execute_tool(&read_call);
 
     let edit_call = make_call(
         "edit_file",
-        json!({
+        &json!({
             "path": path.to_string_lossy(),
             "old_string": "foo",
             "new_string": "qux",

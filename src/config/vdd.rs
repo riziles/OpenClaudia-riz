@@ -281,10 +281,10 @@ mod tests {
         assert_eq!(config.mode, VddMode::Advisory);
         assert_eq!(config.adversary.provider, "google");
         assert!(config.adversary.model.is_none());
-        assert_eq!(config.adversary.temperature, 0.3);
+        assert!((config.adversary.temperature - 0.3_f32).abs() < f32::EPSILON);
         assert_eq!(config.adversary.max_tokens, 4096);
         assert_eq!(config.thresholds.max_iterations, 5);
-        assert_eq!(config.thresholds.false_positive_rate, 0.75);
+        assert!((config.thresholds.false_positive_rate - 0.75_f32).abs() < f32::EPSILON);
         assert_eq!(config.thresholds.min_iterations, 2);
         assert!(config.static_analysis.enabled);
         assert!(config.static_analysis.commands.is_empty());
@@ -326,10 +326,10 @@ mod tests {
         assert_eq!(config.mode, VddMode::Blocking);
         assert_eq!(config.adversary.provider, "google");
         assert_eq!(config.adversary.model, Some("gemini-2.5-pro".to_string()));
-        assert_eq!(config.adversary.temperature, 0.2);
+        assert!((config.adversary.temperature - 0.2_f32).abs() < f32::EPSILON);
         assert_eq!(config.adversary.max_tokens, 8192);
         assert_eq!(config.thresholds.max_iterations, 8);
-        assert_eq!(config.thresholds.false_positive_rate, 0.80);
+        assert!((config.thresholds.false_positive_rate - 0.80_f32).abs() < f32::EPSILON);
         assert_eq!(config.thresholds.min_iterations, 3);
         assert_eq!(config.static_analysis.commands.len(), 2);
         assert_eq!(config.static_analysis.timeout_seconds, 180);

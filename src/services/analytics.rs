@@ -62,10 +62,11 @@ impl AnalyticsSink for NoopAnalytics {
     }
 }
 
-/// Forwards events to the `tracing` subscriber as structured fields
-/// under a stable target (`openclaudia::analytics`) so operators can
-/// filter them via `RUST_LOG=openclaudia::analytics=info` without
-/// flipping every tracing span on.
+/// Forwards events to the `tracing` subscriber as structured fields.
+///
+/// Uses a stable target (`openclaudia::analytics`) so operators can filter
+/// via `RUST_LOG=openclaudia::analytics=info` without flipping every tracing
+/// span on.
 pub struct TracingAnalytics;
 
 impl AnalyticsSink for TracingAnalytics {

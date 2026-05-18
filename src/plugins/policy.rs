@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use super::marketplace::MarketplaceSource;
 
-/// Enterprise policy snapshot pulled from the settings.json layering
-/// chain. The `managed` flag notes whether the policy is load-bearing
-/// for compliance (so violations log at `warn`) or a user-level
-/// preference (log at `debug`).
+/// Enterprise policy snapshot pulled from the settings.json layering chain.
+///
+/// The `managed` flag notes whether the policy is load-bearing for compliance
+/// (so violations log at `warn`) or a user-level preference (log at `debug`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginPolicy {
     /// Exclusive allowlist. `None` → no allowlist enforcement.
@@ -55,7 +55,7 @@ pub struct PluginPolicy {
 /// Why a marketplace was rejected. Kept as an enum rather than a
 /// string so callers (CLI, TUI error messages, audit logs) can
 /// format their own human-readable text without string-matching.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyRejection {
     /// A `blocked_marketplaces` entry matched — rejection is final
     /// even if the source would also appear in the allowlist.
@@ -131,7 +131,7 @@ fn sources_match(candidate: &MarketplaceSource, rule: &MarketplaceSource) -> boo
                 git_ref: ref2,
                 path: p2,
             },
-        ) => r1.eq_ignore_ascii_case(r2) && wild_match_opt(ref1, ref2) && wild_match_opt(p1, p2),
+        ) => r1.eq_ignore_ascii_case(r2) && wild_match_opt(ref1.as_ref(), ref2.as_ref()) && wild_match_opt(p1.as_ref(), p2.as_ref()),
         (
             MarketplaceSource::Git {
                 url: u1,
@@ -145,8 +145,8 @@ fn sources_match(candidate: &MarketplaceSource, rule: &MarketplaceSource) -> boo
             },
         ) => {
             canonical_git(u1) == canonical_git(u2)
-                && wild_match_opt(ref1, ref2)
-                && wild_match_opt(p1, p2)
+                && wild_match_opt(ref1.as_ref(), ref2.as_ref())
+                && wild_match_opt(p1.as_ref(), p2.as_ref())
         }
         (MarketplaceSource::Url { url: u1, .. }, MarketplaceSource::Url { url: u2, .. }) => {
             u1 == u2
@@ -161,7 +161,7 @@ fn sources_match(candidate: &MarketplaceSource, rule: &MarketplaceSource) -> boo
 
 /// Matches two optional fields: `None` on the rule side wildcards
 /// (any candidate matches); otherwise both must be `Some` and equal.
-fn wild_match_opt(candidate: &Option<String>, rule: &Option<String>) -> bool {
+fn wild_match_opt(candidate: Option<&String>, rule: Option<&String>) -> bool {
     match (candidate, rule) {
         (_, None) => true,
         (Some(c), Some(r)) => c == r,

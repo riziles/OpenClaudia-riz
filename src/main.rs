@@ -154,7 +154,10 @@ enum Commands {
     },
 }
 
-#[tokio::main]
+// OpenClaudia is a single-user CLI; a current-thread runtime is sufficient
+// and keeps all futures on one thread, which is required by the `onig`-backed
+// StreamingMarkdownRenderer (holds `*mut` raw pointers that are not Send).
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -179,14 +182,10 @@ async fn main() -> anyhow::Result<()> {
                 .open(path)
                 .ok()
         });
-        match file {
-            Some(f) => {
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f))
-            }
-            // If we can't open a log file, fall back to sink so we never spray
-            // stderr onto the TUI.
-            None => tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink),
-        }
+        file.map_or_else(
+            || tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink),
+            |f| tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)),
+        )
     } else {
         tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
     };
@@ -254,9 +253,7 @@ async fn main() -> anyhow::Result<()> {
 /// Loads config, resolves the provider/model/API key, builds the system prompt,
 /// then launches the ratatui interactive TUI with the API pipeline wired up.
 async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
-    use openclaudia::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
-    use openclaudia::rules::RulesEngine;
-    let config = match config::load_config() {
+    let mut config = match config::load_config() {
         Ok(c) => c,
         Err(e) => {
             if config::config_file_exists() {
@@ -269,7 +266,6 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
     };
 
     // Auto-detect provider from model name
-    let mut config = config;
     if let Some(ref model) = model_override {
         let detected = openclaudia::proxy::determine_provider(model, &config);
         if detected != config.proxy.target {
@@ -277,139 +273,74 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    let provider = if let Some(p) = config.active_provider() {
-        p
-    } else {
-        eprintln!(
-            "No provider configured for target '{}'",
-            config.proxy.target
-        );
+    let Some(provider) = config.active_provider() else {
+        eprintln!("No provider configured for target '{}'", config.proxy.target);
         return Ok(());
     };
 
-    // Resolve API key (same logic as cmd_chat)
-    let mut claude_code_token: Option<String> = None;
-
-    // `api_key` is `Option<ApiKey>` rather than a raw String to keep the
-    // log-safe newtype semantics (crosslink #256). In the OAuth/Claude-Code
-    // path it's `None` — `resolve_headers` ignores it when `claude_code_token`
-    // is provided. Otherwise we require a real key from provider config.
-    let api_key: Option<openclaudia::providers::ApiKey> = if config.proxy.target == "anthropic"
-        && provider.api_key.is_none()
-    {
-        if openclaudia::claude_credentials::has_claude_code_credentials() {
-            match openclaudia::claude_credentials::load_credentials().await {
-                Ok(creds) => {
-                    claude_code_token = Some(creds.access_token);
-                    None
-                }
-                Err(e) => {
-                    eprintln!("Error: Claude Code credentials unusable: {e}");
-                    eprintln!(
-                        "Install Claude Code and run `claude` to log in, or set ANTHROPIC_API_KEY."
-                    );
-                    return Ok(());
-                }
-            }
-        } else {
-            eprintln!("No API key configured for Anthropic.");
-            eprintln!("Install Claude Code and run `claude` to log in, or set ANTHROPIC_API_KEY.");
-            return Ok(());
-        }
-    } else if let Some(k) = &provider.api_key {
-        Some(k.clone())
-    } else {
-        let env_var = match config.proxy.target.as_str() {
-            "openai" => "OPENAI_API_KEY",
-            "google" => "GOOGLE_API_KEY",
-            "zai" => "ZAI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "qwen" => "QWEN_API_KEY",
-            _ => "API_KEY",
-        };
-        eprintln!(
-            "No API key configured for '{}'. Set {} or add to config.",
-            config.proxy.target, env_var
-        );
+    let Some(ChatAuth { api_key, claude_code_token }) =
+        resolve_chat_auth(&config.proxy.target, provider).await?
+    else {
         return Ok(());
     };
 
-    let model = model_override
-        .or_else(|| provider.model.clone())
-        .unwrap_or_else(|| match config.proxy.target.as_str() {
-            "anthropic" => "claude-opus-4-6".to_string(),
-            "openai" => "gpt-5.2".to_string(),
-            "google" => "gemini-2.5-flash".to_string(),
-            "zai" => "glm-5".to_string(),
-            "deepseek" => "deepseek-chat".to_string(),
-            "qwen" => "qwen3.5-plus".to_string(),
-            _ => "gpt-5.2".to_string(),
-        });
-
-    // Resolve endpoint
+    let model = resolve_model_name(model_override, provider.model.clone(), &config.proxy.target);
     let endpoint = openclaudia::pipeline::resolve_endpoint(
         &config.proxy.target,
         &model,
         &provider.base_url,
         claude_code_token.as_deref(),
     );
-
-    // Resolve headers
     let headers = openclaudia::pipeline::resolve_headers(
         &config.proxy.target,
         api_key.as_ref(),
         claude_code_token.as_deref(),
-        &provider
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>(),
+        &provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
     );
 
-    // Initialize guardrails
     guardrails::configure(&config.guardrails);
+    tui_launch(&config, &model, endpoint, headers, claude_code_token)
+}
 
-    // Initialize memory database
+/// Build TUI system resources (memory, prompt, hooks, rules) and launch the app.
+///
+/// Extracted from `cmd_tui` to keep that function under the line limit.
+fn tui_launch(
+    config: &config::AppConfig,
+    model: &str,
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    claude_code_token: Option<String>,
+) -> anyhow::Result<()> {
+    use openclaudia::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
+    use openclaudia::rules::RulesEngine;
+
     let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let memory_db: Option<memory::MemoryDb> = memory::MemoryDb::open_for_project(&cwd_path).ok();
 
-    // Build system prompt blocks (stable prefix + dynamic suffix for cache efficiency)
     let cwd = cwd_path.to_string_lossy().to_string();
     let tui_prompt_blocks = prompt::build_system_prompt_blocks(
         &openclaudia::modes::BehaviorMode::default(),
-        None, // Hook instructions injected per-turn, not at init
+        None,
         None,
         memory_db.as_ref(),
         Some(&cwd),
     );
     let system_prompt = tui_prompt_blocks.to_combined();
 
-    // Initialize hook engine
     let claude_hooks = load_claude_code_hooks();
     let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
 
-    // Initialize rules engine and load rules
     let rules_engine = RulesEngine::new(".openclaudia/rules");
     let rules_content = {
         let extensions: Vec<&str> = vec!["rs", "py", "ts", "js", "go", "java", "rb", "md"];
         let content = rules_engine.get_combined_rules(&extensions);
-        if content.is_empty() {
-            None
-        } else {
-            Some(content)
-        }
+        if content.is_empty() { None } else { Some(content) }
     };
 
-    // Build and launch the TUI
-    let mut app = tui::app::App::new(&model, &config.proxy.target);
-    app.set_api_config(
-        endpoint,
-        headers,
-        system_prompt,
-        Some(tui_prompt_blocks),
-        claude_code_token,
-    );
+    let mut app = tui::app::App::new(model, &config.proxy.target);
+    app.set_api_config(endpoint, headers, system_prompt, Some(tui_prompt_blocks), claude_code_token);
     app.hook_engine = Some(hook_engine);
     app.memory_db = memory_db.map(std::sync::Arc::new);
     app.rules_content = rules_content;
@@ -438,6 +369,7 @@ fn check_tool_permission_interactive(
     skip_permissions: bool,
     always_allowed: &mut std::collections::HashSet<String>,
 ) -> ToolPermissionResult {
+    use std::io::Write as _;
     // Tools that never need permission (read-only / informational)
     let needs_permission = !matches!(
         tool_name,
@@ -497,7 +429,6 @@ fn check_tool_permission_interactive(
     };
 
     eprint!("\x1b[33m⚠ {description}\x1b[0m [y/n/a(lways)] ");
-    use std::io::Write as _;
     std::io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -804,7 +735,6 @@ fn resolve_model_name(
         .or(provider_model)
         .unwrap_or_else(|| match target {
             "anthropic" => "claude-opus-4-6".to_string(),
-            "openai" => "gpt-5.2".to_string(),
             "google" => "gemini-2.5-flash".to_string(),
             "zai" => "glm-5".to_string(),
             "deepseek" => "deepseek-chat".to_string(),
@@ -910,13 +840,226 @@ async fn resolve_chat_auth(
     Ok(None)
 }
 
+/// Build the provider-specific JSON request body for one chat turn.
+///
+/// Handles Anthropic multi-block system prompts, Google Gemini content
+/// format, and the OpenAI-compatible format used by every other provider.
+/// Also applies effort-level thinking parameters and injects the Claude
+/// Code OAuth system prompt when `claude_code_token` is present.
+///
+/// Extracted from `cmd_chat` (crosslink #262) to reduce function length
+/// and enable independent unit tests.
+/// Run VDD adversarial review and print findings.
+///
+/// Extracted from `cmd_chat` (crosslink #262) — this block appears at three
+/// call sites in the function.  The caller is responsible for the `!cancelled`
+/// guard and the `vdd_engine.is_some()` check before calling.
+async fn run_vdd_review(
+    engine: &vdd::VddEngine,
+    content: &str,
+    messages: &mut Vec<serde_json::Value>,
+    target: &str,
+    api_key: Option<&openclaudia::providers::ApiKey>,
+) {
+    let user_task = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("");
+
+    match engine.review_text(content, user_task, target, api_key).await {
+        Ok(result) => {
+            if result.findings.is_empty() {
+                println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
+            } else {
+                let genuine_count = result
+                    .findings
+                    .iter()
+                    .filter(|f| f.status == vdd::FindingStatus::Genuine)
+                    .count();
+                println!(
+                    "\n\x1b[33m🔍 VDD Review: {} finding(s) ({} genuine)\x1b[0m",
+                    result.findings.len(),
+                    genuine_count
+                );
+                for finding in &result.findings {
+                    let status_icon = match finding.status {
+                        vdd::FindingStatus::Genuine => "⚠",
+                        vdd::FindingStatus::FalsePositive => "✗",
+                        vdd::FindingStatus::Disputed => "?",
+                    };
+                    println!("  {} [{}] {}", status_icon, finding.severity, finding.description);
+                }
+                if !result.context_injection.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!(
+                            "<vdd-review>\n{}\n</vdd-review>",
+                            result.context_injection
+                        )
+                    }));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("VDD review failed: {}", e);
+            println!("\n\x1b[31m⚠ VDD review failed: {e}\x1b[0m");
+        }
+    }
+}
+
+fn build_chat_request_body(
+    target: &str,
+    messages: &[serde_json::Value],
+    model: &str,
+    prompt_blocks: &openclaudia::prompt::SystemPromptBlocks,
+    effort_level: &str,
+    claude_code_token: Option<&str>,
+) -> serde_json::Value {
+    use openclaudia::providers::{convert_messages_to_anthropic, convert_tools_to_anthropic};
+
+    let mut request_body = if target == "anthropic" {
+        // Anthropic direct API mode — convert to Anthropic message/tool format
+        let anthropic_messages = convert_messages_to_anthropic(messages);
+        let openai_tools = tools::get_all_tool_definitions(true);
+        let anthropic_tools =
+            convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
+
+        let mut req = serde_json::json!({
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
+            "stream": true,
+            "tools": anthropic_tools
+        });
+        // Multi-block system prompt: stable prefix cached, dynamic suffix reprocessed.
+        req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
+        req
+    } else if target == "google" {
+        // Google Gemini — native contents/generationConfig format
+        let openai_tools = tools::get_all_tool_definitions(true);
+        let tools_vec = openai_tools.as_array().cloned().unwrap_or_default();
+        let functions: Vec<serde_json::Value> = tools_vec
+            .iter()
+            .filter_map(|tool| {
+                let func = tool.get("function")?;
+                let description = func
+                    .get("description")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(""));
+                let parameters = func
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                Some(serde_json::json!({
+                    "name": func.get("name")?,
+                    "description": description,
+                    "parameters": parameters
+                }))
+            })
+            .collect();
+
+        let mut contents = Vec::new();
+        let mut system_text: Option<String> = None;
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if role == "system" {
+                system_text = Some(text.to_string());
+                continue;
+            }
+            let gemini_role = if role == "assistant" { "model" } else { "user" };
+            contents.push(serde_json::json!({
+                "role": gemini_role,
+                "parts": [{"text": text}]
+            }));
+        }
+
+        let mut req = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 4096},
+            "tools": [{"functionDeclarations": functions}]
+        });
+        if let Some(sys) = system_text {
+            req["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
+        }
+        req
+    } else {
+        // OpenAI-compatible format for all other providers
+        serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
+            "stream": true,
+            "tools": tools::get_all_tool_definitions(true)
+        })
+    };
+
+    // Inject Claude Code OAuth system prompt when using OAuth auth
+    if claude_code_token.is_some() {
+        openclaudia::claude_credentials::inject_system_prompt(&mut request_body);
+    }
+
+    // Apply effort-level thinking parameters (Anthropic only)
+    if target == "anthropic" {
+        match effort_level {
+            "high" => {
+                request_body["thinking"] =
+                    serde_json::json!({"type": "enabled", "budget_tokens": 10000});
+                request_body["max_tokens"] = serde_json::json!(16000);
+            }
+            "low" => {
+                request_body["max_tokens"] = serde_json::json!(2048);
+            }
+            _ => {} // medium = default
+        }
+    }
+
+    request_body
+}
+
+/// Build the per-turn API endpoint URL and auth headers.
+///
+/// Handles Claude Code OAuth (direct Anthropic) vs key-based auth
+/// and merges any custom headers from the provider configuration.
+///
+/// Extracted from `cmd_chat` (crosslink #262).
+fn build_chat_endpoint_and_headers(
+    target: &str,
+    model: &str,
+    provider: &config::ProviderConfig,
+    adapter: &dyn openclaudia::providers::ProviderAdapter,
+    api_key: Option<&openclaudia::providers::ApiKey>,
+    claude_code_token: Option<&str>,
+) -> (String, Vec<(String, String)>) {
+    let _ = target; // used only for documentation clarity; routing is on claude_code_token
+    let endpoint = if claude_code_token.is_some() {
+        openclaudia::claude_credentials::get_oauth_endpoint(model)
+    } else {
+        format!(
+            "{}{}",
+            normalize_base_url(&provider.base_url),
+            adapter.chat_endpoint(model)
+        )
+    };
+
+    let mut headers: Vec<(String, String)> = claude_code_token.map_or_else(
+        || api_key.map_or_else(Vec::new, |key| adapter.get_headers(key)),
+        openclaudia::claude_credentials::get_oauth_headers,
+    );
+    // Merge in any custom headers from provider config
+    headers.extend(provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+    (endpoint, headers)
+}
+
 async fn cmd_chat(
     model_override: Option<String>,
     resume: bool,
     session_id: Option<String>,
     coordinator: bool,
     dangerously_skip_permissions: bool,
-    mode_override: Option<String>,
+    mode_arg: Option<String>,
 ) -> anyhow::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use openclaudia::hooks::{HookEvent, HookInput};
@@ -926,6 +1069,9 @@ async fn cmd_chat(
     use openclaudia::rules::RulesEngine;
     use rustyline::error::ReadlineError;
     use rustyline::{Config, DefaultEditor, EditMode, Editor};
+
+    // indicatif spinner template — uses indicatif placeholder syntax, not format! syntax.
+    const SPINNER_TMPL: &str = "{spinner:.cyan} {msg}";
 
     chdir_to_git_root();
 
@@ -958,7 +1104,7 @@ async fn cmd_chat(
         }
     }
 
-    let initial_behavior_mode = match parse_initial_behavior_mode(mode_override.as_deref()) {
+    let initial_behavior_mode = match parse_initial_behavior_mode(mode_arg.as_deref()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("{e}");
@@ -969,9 +1115,7 @@ async fn cmd_chat(
     // Initialize guardrails engine from config
     guardrails::configure(&config.guardrails);
 
-    let provider = if let Some(p) = config.active_provider() {
-        p
-    } else {
+    let Some(provider) = config.active_provider() else {
         eprintln!(
             "No provider configured for target '{}'",
             config.proxy.target
@@ -1618,139 +1762,31 @@ async fn cmd_chat(
                     );
                 }
 
-                // Build request body based on provider target.
-                let mut request_body = if config.proxy.target == "anthropic" {
-                    // Anthropic direct API mode - need proper Anthropic format
-                    // Convert messages to Anthropic format (handles tool_calls and tool results)
-                    let anthropic_messages = convert_messages_to_anthropic(&chat_session.messages);
+                // Build provider-specific request body (extracted helper, crosslink #262).
+                let request_body = build_chat_request_body(
+                    &config.proxy.target,
+                    &chat_session.messages,
+                    &model,
+                    &prompt_blocks,
+                    &effort_level,
+                    claude_code_token.as_deref(),
+                );
 
-                    // Get tools in OpenAI format and convert to Anthropic format
-                    let openai_tools = tools::get_all_tool_definitions(true);
-                    let anthropic_tools =
-                        convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
-
-                    let mut req = serde_json::json!({
-                        "model": model,
-                        "messages": anthropic_messages,
-                        "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
-                        "stream": true,
-                        "tools": anthropic_tools
-                    });
-
-                    // Multi-block system prompt for cache efficiency:
-                    // Block 0 (stable prefix): identity + axes + tools + principles + comms
-                    //   → cache_control: { type: "ephemeral" } — cached across turns
-                    // Block 1 (dynamic suffix): env + memory + hooks + file knowledge
-                    //   → no cache_control — reprocessed each turn
-                    req["system"] = openclaudia::providers::build_system_blocks(&prompt_blocks);
-
-                    req
-                } else if config.proxy.target == "google" {
-                    // Google Gemini - build native Gemini format
-                    // Convert OpenAI-style messages to Gemini contents
-                    let openai_tools = tools::get_all_tool_definitions(true);
-                    let tools_vec = openai_tools.as_array().cloned().unwrap_or_default();
-                    let functions: Vec<serde_json::Value> = tools_vec.iter().filter_map(|tool| {
-                        let func = tool.get("function")?;
-                        Some(serde_json::json!({
-                            "name": func.get("name")?,
-                            "description": func.get("description").unwrap_or(&serde_json::json!("")),
-                            "parameters": func.get("parameters").unwrap_or(&serde_json::json!({}))
-                        }))
-                    }).collect();
-
-                    // Convert messages to Gemini contents format
-                    let mut contents = Vec::new();
-                    let mut system_text: Option<String> = None;
-                    for msg in &chat_session.messages {
-                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                        let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if role == "system" {
-                            system_text = Some(text.to_string());
-                            continue;
-                        }
-                        let gemini_role = if role == "assistant" { "model" } else { "user" };
-                        contents.push(serde_json::json!({
-                            "role": gemini_role,
-                            "parts": [{"text": text}]
-                        }));
-                    }
-
-                    let mut req = serde_json::json!({
-                        "contents": contents,
-                        "generationConfig": {"maxOutputTokens": 4096},
-                        "tools": [{"functionDeclarations": functions}]
-                    });
-                    if let Some(sys) = system_text {
-                        req["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
-                    }
-                    req
-                } else {
-                    // OpenAI-compatible format for other providers
-                    serde_json::json!({
-                        "model": model,
-                        "messages": chat_session.messages,
-                        "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
-                        "stream": true,
-                        "tools": tools::get_all_tool_definitions(true)
-                    })
-                };
-
-                // Inject Claude Code system prompt for OAuth model access
-                if claude_code_token.is_some() {
-                    openclaudia::claude_credentials::inject_system_prompt(&mut request_body);
-                }
-
-                // Apply effort level to thinking params (Anthropic only)
-                if config.proxy.target == "anthropic" {
-                    match effort_level.as_str() {
-                        "high" => {
-                            request_body["thinking"] =
-                                serde_json::json!({"type": "enabled", "budget_tokens": 10000});
-                            request_body["max_tokens"] = serde_json::json!(16000);
-                        }
-                        "low" => {
-                            request_body["max_tokens"] = serde_json::json!(2048);
-                        }
-                        _ => {} // medium = default behavior
-                    }
-                }
-
-                // Build headers based on auth mode
-                // Get endpoint - Claude Code OAuth goes direct to Anthropic API
-                let endpoint = if claude_code_token.is_some() {
-                    openclaudia::claude_credentials::get_oauth_endpoint(&model)
-                } else {
-                    format!(
-                        "{}{}",
-                        normalize_base_url(&provider.base_url),
-                        adapter.chat_endpoint(&model)
-                    )
-                };
-                let headers: Vec<(String, String)> = if let Some(ref token) = claude_code_token {
-                    // Claude Code OAuth: Bearer token directly to Anthropic API
-                    openclaudia::claude_credentials::get_oauth_headers(token)
-                } else if let Some(ref key) = api_key {
-                    adapter.get_headers(key)
-                } else {
-                    // Neither OAuth token nor api_key — earlier validation
-                    // guarantees this is unreachable, but we handle it
-                    // defensively rather than panicking.
-                    Vec::new()
-                };
-
-                // Merge in any custom headers from provider config
-                let headers: Vec<(String, String)> = {
-                    let mut h = headers;
-                    h.extend(provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    h
-                };
+                // Build per-turn endpoint URL and auth headers (extracted helper, crosslink #262).
+                let (endpoint, headers) = build_chat_endpoint_and_headers(
+                    &config.proxy.target,
+                    &model,
+                    provider,
+                    adapter.as_ref(),
+                    api_key.as_ref(),
+                    claude_code_token.as_deref(),
+                );
 
                 // Show spinner while connecting
                 let spinner = ProgressBar::new_spinner();
                 spinner.set_style(
                     ProgressStyle::default_spinner()
-                        .template("{spinner:.cyan} {msg}") // ProgressStyle template, not format!
+                        .template(SPINNER_TMPL)
                         .unwrap_or_else(|_| ProgressStyle::default_spinner()),
                 );
                 spinner.set_message("Connecting...");
@@ -1896,7 +1932,7 @@ async fn cmd_chat(
                                                         serde_json::from_str(
                                                             &tc.function.arguments,
                                                         )
-                                                        .unwrap_or(serde_json::json!({}));
+                                                        .unwrap_or_else(|_| serde_json::json!({}));
                                                     parts.push(serde_json::json!({
                                                         "functionCall": {
                                                             "name": tc.function.name,
@@ -1960,7 +1996,7 @@ async fn cmd_chat(
 
                                                 // Permission check before execution
                                                 let tool_args_val: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(Default::default()) });
+                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(serde_json::Map::default()) });
                                                 match check_tool_permission_interactive(
                                                     &tool_call.function.name,
                                                     &tool_args_val,
@@ -2008,19 +2044,18 @@ async fn cmd_chat(
                                                 // right per-session bucket (crosslink #518).
                                                 let _session_guard =
                                                     tools::SessionIdGuard::set(&chat_session.id);
-                                                let result = if let Some(ref db) = memory_db {
-                                                    tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        Some(db),
-                                                        Some(&permission_mgr),
-                                                    )
-                                                } else {
-                                                    tools::execute_tool_with_memory(
+                                                let result = memory_db.as_ref().map_or_else(
+                                                    || tools::execute_tool_with_memory(
                                                         tool_call,
                                                         None,
                                                         Some(&permission_mgr),
-                                                    )
-                                                };
+                                                    ),
+                                                    |db| tools::execute_tool_with_memory(
+                                                        tool_call,
+                                                        Some(db),
+                                                        Some(&permission_mgr),
+                                                    ),
+                                                );
 
                                                 // Auto-learn from tool result
                                                 if let Some(ref mut learner) = auto_learner {
@@ -2044,13 +2079,13 @@ async fn cmd_chat(
                                                     }
                                                 }
 
-                                                let (final_content, _was_marker) =
+                                                let (final_content, was_marker) =
                                                     process_tool_result_marker(
                                                         &mut chat_session,
                                                         &tool_call.function.name,
                                                         &result.content,
                                                     );
-                                                let final_is_error = if _was_marker {
+                                                let final_is_error = if was_marker {
                                                     false
                                                 } else {
                                                     result.is_error
@@ -2110,10 +2145,12 @@ async fn cmd_chat(
                                                 .unwrap_or_default();
                                             let functions: Vec<serde_json::Value> = tools_vec.iter().filter_map(|tool| {
                                             let func = tool.get("function")?;
+                                            let description = func.get("description").cloned().unwrap_or_else(|| serde_json::json!(""));
+                                            let parameters = func.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({}));
                                             Some(serde_json::json!({
                                                 "name": func.get("name")?,
-                                                "description": func.get("description").unwrap_or(&serde_json::json!("")),
-                                                "parameters": func.get("parameters").unwrap_or(&serde_json::json!({}))
+                                                "description": description,
+                                                "parameters": parameters
                                             }))
                                         }).collect();
 
@@ -2226,70 +2263,14 @@ async fn cmd_chat(
 
                                         // VDD: Run adversarial review if enabled
                                         if let Some(ref engine) = vdd_engine {
-                                            let user_task = chat_session
-                                                .messages
-                                                .iter()
-                                                .rev()
-                                                .find(|m| {
-                                                    m.get("role").and_then(|r| r.as_str())
-                                                        == Some("user")
-                                                })
-                                                .and_then(|m| {
-                                                    m.get("content").and_then(|c| c.as_str())
-                                                })
-                                                .unwrap_or("");
-
-                                            match engine
-                                                .review_text(
-                                                    &full_content,
-                                                    user_task,
-                                                    &config.proxy.target,
-                                                    api_key.as_ref(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(result) => {
-                                                    if result.findings.is_empty() {
-                                                        println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
-                                                    } else {
-                                                        let genuine_count = result
-                                                            .findings
-                                                            .iter()
-                                                            .filter(|f| {
-                                                                f.status
-                                                                    == vdd::FindingStatus::Genuine
-                                                            })
-                                                            .count();
-                                                        println!("\n\x1b[33m🔍 VDD Review: {} finding(s) ({} genuine)\x1b[0m",
-                                                        result.findings.len(), genuine_count);
-                                                        for finding in &result.findings {
-                                                            let status_icon = match finding.status {
-                                                            vdd::FindingStatus::Genuine => "⚠",
-                                                            vdd::FindingStatus::FalsePositive => "✗",
-                                                            vdd::FindingStatus::Disputed => "?",
-                                                        };
-                                                            println!(
-                                                                "  {} [{}] {}",
-                                                                status_icon,
-                                                                finding.severity,
-                                                                finding.description
-                                                            );
-                                                        }
-                                                        if !result.context_injection.is_empty() {
-                                                            chat_session.messages.push(serde_json::json!({
-                                                            "role": "system",
-                                                            "content": format!("<vdd-review>\n{}\n</vdd-review>", result.context_injection)
-                                                        }));
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("VDD review failed: {}", e);
-                                                    println!(
-                                                        "\n\x1b[31m⚠ VDD review failed: {e}\x1b[0m"
-                                                    );
-                                                }
-                                            }
+                                            run_vdd_review(
+                                                engine,
+                                                &full_content,
+                                                &mut chat_session.messages,
+                                                &config.proxy.target,
+                                                api_key.as_ref(),
+                                            )
+                                            .await;
                                         }
 
                                         // Update status bar
@@ -2345,8 +2326,13 @@ async fn cmd_chat(
                                 let mut in_thinking_block = false;
                                 let mut thinking_start_time: Option<std::time::Instant> = None;
 
-                                // Streaming markdown renderer
-                                let mut md_renderer = tui::StreamingMarkdownRenderer::new();
+                                // Streaming markdown renderer.
+                                // Held as `MarkdownRenderState` (Send) between loop iterations;
+                                // reconstructed into `StreamingMarkdownRenderer` (!Send) only for
+                                // the synchronous body of each iteration, dropped before the next
+                                // `stream.next().await`.  This keeps the future Send-compatible.
+                                let mut md_state =
+                                    tui::StreamingMarkdownRenderer::new().into_state();
 
                                 // SSE usage accumulator
                                 let mut stream_usage = openclaudia::session::TokenUsage::default();
@@ -2366,6 +2352,12 @@ async fn cmd_chat(
                                 );
 
                                 while let Some(chunk_result) = stream.next().await {
+                                    // Reconstruct the !Send renderer from its Send state.
+                                    // It is consumed back into state at the end of this block,
+                                    // so it never lives across an await point.
+                                    let mut md_renderer =
+                                        tui::StreamingMarkdownRenderer::from_state(md_state);
+
                                     // Check stream timeout
                                     if last_data_time.elapsed() > stream_timeout {
                                         eprintln!(
@@ -2383,6 +2375,7 @@ async fn cmd_chat(
                                                 "\n\n[Response truncated: stream timeout]",
                                             );
                                         }
+                                        md_state = md_renderer.into_state();
                                         break;
                                     }
 
@@ -2405,6 +2398,7 @@ async fn cmd_chat(
                                                             cancelled = true;
                                                             print!(" (cancelled)");
                                                             std::io::stdout().flush().ok();
+                                                            md_state = md_renderer.into_state();
                                                             break;
                                                         }
                                                         // Other actions queued for after streaming completes
@@ -2543,13 +2537,22 @@ async fn cmd_chat(
                                         }
                                         Err(e) => {
                                             eprintln!("\nStream error: {e}");
+                                            md_state = md_renderer.into_state();
                                             break;
                                         }
                                     }
+                                    // Convert renderer back to Send state before the next await.
+                                    md_state = md_renderer.into_state();
                                 }
 
-                                // Flush any remaining buffered markdown
-                                md_renderer.flush();
+                                // Flush any remaining buffered markdown, then drop the
+                                // renderer immediately so the non-Send onig handles do
+                                // not span the next `.await` point below.
+                                {
+                                    let mut md_renderer =
+                                        tui::StreamingMarkdownRenderer::from_state(md_state);
+                                    md_renderer.flush();
+                                }
                                 println!();
 
                                 // Audit: log model response
@@ -2696,7 +2699,7 @@ async fn cmd_chat(
 
                                                 // Permission check
                                                 let tool_args_val2: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(Default::default()) });
+                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(serde_json::Map::default()) });
                                                 match check_tool_permission_interactive(
                                                     &tool_call.function.name,
                                                     &tool_args_val2,
@@ -2735,19 +2738,18 @@ async fn cmd_chat(
                                                 // Bind session id (crosslink #518).
                                                 let _session_guard =
                                                     tools::SessionIdGuard::set(&chat_session.id);
-                                                let result = if let Some(ref db) = memory_db {
-                                                    tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        Some(db),
-                                                        Some(&permission_mgr),
-                                                    )
-                                                } else {
-                                                    tools::execute_tool_with_memory(
+                                                let result = memory_db.as_ref().map_or_else(
+                                                    || tools::execute_tool_with_memory(
                                                         tool_call,
                                                         None,
                                                         Some(&permission_mgr),
-                                                    )
-                                                };
+                                                    ),
+                                                    |db| tools::execute_tool_with_memory(
+                                                        tool_call,
+                                                        Some(db),
+                                                        Some(&permission_mgr),
+                                                    ),
+                                                );
 
                                                 // Auto-learn from tool result
                                                 if let Some(ref mut learner) = auto_learner {
@@ -2772,13 +2774,13 @@ async fn cmd_chat(
                                                 }
 
                                                 // Check for special markers (user_question, plan mode)
-                                                let (final_content, _was_marker) =
+                                                let (final_content, was_marker) =
                                                     process_tool_result_marker(
                                                         &mut chat_session,
                                                         &tool_call.function.name,
                                                         &result.content,
                                                     );
-                                                let final_is_error = if _was_marker {
+                                                let final_is_error = if was_marker {
                                                     false
                                                 } else {
                                                     result.is_error
@@ -3264,78 +3266,14 @@ async fn cmd_chat(
 
                                     // VDD: Run adversarial review if enabled
                                     if let Some(ref engine) = vdd_engine {
-                                        // Extract the user's original task from the last user message
-                                        let user_task = chat_session
-                                            .messages
-                                            .iter()
-                                            .rev()
-                                            .find(|m| {
-                                                m.get("role").and_then(|r| r.as_str())
-                                                    == Some("user")
-                                            })
-                                            .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                                            .unwrap_or("");
-
-                                        match engine
-                                            .review_text(
-                                                &full_content,
-                                                user_task,
-                                                &config.proxy.target,
-                                                api_key.as_ref(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(result) => {
-                                                if result.findings.is_empty() {
-                                                    println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
-                                                } else {
-                                                    let genuine_count = result
-                                                        .findings
-                                                        .iter()
-                                                        .filter(|f| {
-                                                            f.status == vdd::FindingStatus::Genuine
-                                                        })
-                                                        .count();
-                                                    println!(
-                                                    "\n\x1b[33m🔍 VDD Review: {} finding(s) ({} genuine)\x1b[0m",
-                                                    result.findings.len(),
-                                                    genuine_count
-                                                );
-                                                    // Display findings
-                                                    for finding in &result.findings {
-                                                        let status_icon = match finding.status {
-                                                            vdd::FindingStatus::Genuine => "⚠",
-                                                            vdd::FindingStatus::FalsePositive => {
-                                                                "✗"
-                                                            }
-                                                            vdd::FindingStatus::Disputed => "?",
-                                                        };
-                                                        println!(
-                                                            "  {} [{}] {}",
-                                                            status_icon,
-                                                            finding.severity,
-                                                            finding.description
-                                                        );
-                                                    }
-                                                    // Inject findings as context for next turn (advisory mode)
-                                                    if !result.context_injection.is_empty() {
-                                                        chat_session.messages.push(serde_json::json!({
-                                                        "role": "system",
-                                                        "content": format!(
-                                                            "<vdd-review>\n{}\n</vdd-review>",
-                                                            result.context_injection
-                                                        )
-                                                    }));
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("VDD review failed: {}", e);
-                                                println!(
-                                                    "\n\x1b[31m⚠ VDD review failed: {e}\x1b[0m"
-                                                );
-                                            }
-                                        }
+                                        run_vdd_review(
+                                            engine,
+                                            &full_content,
+                                            &mut chat_session.messages,
+                                            &config.proxy.target,
+                                            api_key.as_ref(),
+                                        )
+                                        .await;
                                     }
 
                                     println!();
@@ -3438,7 +3376,7 @@ async fn cmd_chat(
                                                         tool_call.function.name,
                                                         e
                                                     );
-                                                    serde_json::Value::Object(Default::default())
+                                                    serde_json::Value::Object(serde_json::Map::default())
                                                 });
                                         match check_tool_permission_interactive(
                                             &tool_call.function.name,
@@ -3468,19 +3406,18 @@ async fn cmd_chat(
                                         // Closes crosslink #505. Bind session id (#518).
                                         let _session_guard =
                                             tools::SessionIdGuard::set(&chat_session.id);
-                                        let result = if let Some(ref db) = memory_db {
-                                            tools::execute_tool_with_memory(
-                                                tool_call,
-                                                Some(db),
-                                                Some(&permission_mgr),
-                                            )
-                                        } else {
-                                            tools::execute_tool_with_memory(
+                                        let result = memory_db.as_ref().map_or_else(
+                                            || tools::execute_tool_with_memory(
                                                 tool_call,
                                                 None,
                                                 Some(&permission_mgr),
-                                            )
-                                        };
+                                            ),
+                                            |db| tools::execute_tool_with_memory(
+                                                tool_call,
+                                                Some(db),
+                                                Some(&permission_mgr),
+                                            ),
+                                        );
 
                                         // Auto-learn from tool result
                                         if let Some(ref mut learner) = auto_learner {
@@ -3503,14 +3440,14 @@ async fn cmd_chat(
                                         }
 
                                         // Check for special markers (user_question, plan mode)
-                                        let (final_content, _was_marker) =
+                                        let (final_content, was_marker) =
                                             process_tool_result_marker(
                                                 &mut chat_session,
                                                 &tool_call.function.name,
                                                 &result.content,
                                             );
                                         let final_is_error =
-                                            if _was_marker { false } else { result.is_error };
+                                            if was_marker { false } else { result.is_error };
 
                                         // Log activity for short-term memory
                                         if let Some(ref db) = memory_db {
@@ -3522,49 +3459,39 @@ async fn cmd_chat(
                                                     "bash" => "bash_command",
                                                     "chainlink" => {
                                                         // Parse chainlink subcommand
-                                                        if let Ok(args) = serde_json::from_str::<
-                                                            serde_json::Value,
-                                                        >(
+                                                        serde_json::from_str::<serde_json::Value>(
                                                             &tool_call.function.arguments,
-                                                        ) {
-                                                            if let Some(cmd) = args
-                                                                .get("command")
+                                                        ).map_or("chainlink", |args| {
+                                                            args.get("command")
                                                                 .and_then(|v| v.as_str())
-                                                            {
-                                                                if cmd.starts_with("create") {
-                                                                    "issue_created"
-                                                                } else if cmd.starts_with("close") {
-                                                                    "issue_closed"
-                                                                } else if cmd.starts_with("comment")
-                                                                {
-                                                                    "issue_comment"
-                                                                } else {
-                                                                    "chainlink"
-                                                                }
-                                                            } else {
-                                                                "chainlink"
-                                                            }
-                                                        } else {
-                                                            "chainlink"
-                                                        }
+                                                                .map_or("chainlink", |cmd| {
+                                                                    if cmd.starts_with("create") {
+                                                                        "issue_created"
+                                                                    } else if cmd.starts_with("close") {
+                                                                        "issue_closed"
+                                                                    } else if cmd.starts_with("comment") {
+                                                                        "issue_comment"
+                                                                    } else {
+                                                                        "chainlink"
+                                                                    }
+                                                                })
+                                                        })
                                                     }
                                                     other => other,
                                                 };
 
                                             // Extract target from args
-                                            let target = if let Ok(args) =
-                                                serde_json::from_str::<serde_json::Value>(
-                                                    &tool_call.function.arguments,
-                                                ) {
-                                                args.get("path")
+                                            let target = serde_json::from_str::<serde_json::Value>(
+                                                &tool_call.function.arguments,
+                                            ).map_or_else(
+                                                |_| tool_call.function.name.clone(),
+                                                |args| args.get("path")
                                                     .or_else(|| args.get("file_path"))
                                                     .or_else(|| args.get("command"))
                                                     .and_then(|v| v.as_str())
                                                     .unwrap_or(&tool_call.function.name)
-                                                    .to_string()
-                                            } else {
-                                                tool_call.function.name.clone()
-                                            };
+                                                    .to_string(),
+                                            );
 
                                             let _ = db.log_activity(
                                                 &chat_session.id,
@@ -3817,72 +3744,15 @@ async fn cmd_chat(
                                 // VDD: Run adversarial review if enabled
                                 if !cancelled {
                                     if let Some(ref engine) = vdd_engine {
-                                        let vdd_content = &current_content;
-                                        if !vdd_content.trim().is_empty() {
-                                            let user_task = chat_session
-                                                .messages
-                                                .iter()
-                                                .rev()
-                                                .find(|m| {
-                                                    m.get("role").and_then(|r| r.as_str())
-                                                        == Some("user")
-                                                })
-                                                .and_then(|m| {
-                                                    m.get("content").and_then(|c| c.as_str())
-                                                })
-                                                .unwrap_or("");
-
-                                            match engine
-                                                .review_text(
-                                                    vdd_content,
-                                                    user_task,
-                                                    &config.proxy.target,
-                                                    api_key.as_ref(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(result) => {
-                                                    if result.findings.is_empty() {
-                                                        println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
-                                                    } else {
-                                                        let genuine_count = result
-                                                            .findings
-                                                            .iter()
-                                                            .filter(|f| {
-                                                                f.status
-                                                                    == vdd::FindingStatus::Genuine
-                                                            })
-                                                            .count();
-                                                        println!("\n\x1b[33m🔍 VDD Review: {} finding(s) ({} genuine)\x1b[0m",
-                                                        result.findings.len(), genuine_count);
-                                                        for finding in &result.findings {
-                                                            let status_icon = match finding.status {
-                                                            vdd::FindingStatus::Genuine => "⚠",
-                                                            vdd::FindingStatus::FalsePositive => "✗",
-                                                            vdd::FindingStatus::Disputed => "?",
-                                                        };
-                                                            println!(
-                                                                "  {} [{}] {}",
-                                                                status_icon,
-                                                                finding.severity,
-                                                                finding.description
-                                                            );
-                                                        }
-                                                        if !result.context_injection.is_empty() {
-                                                            chat_session.messages.push(serde_json::json!({
-                                                            "role": "system",
-                                                            "content": format!("<vdd-review>\n{}\n</vdd-review>", result.context_injection)
-                                                        }));
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("VDD review failed: {}", e);
-                                                    println!(
-                                                        "\n\x1b[31m⚠ VDD review failed: {e}\x1b[0m"
-                                                    );
-                                                }
-                                            }
+                                        if !current_content.trim().is_empty() {
+                                            run_vdd_review(
+                                                engine,
+                                                &current_content,
+                                                &mut chat_session.messages,
+                                                &config.proxy.target,
+                                                api_key.as_ref(),
+                                            )
+                                            .await;
                                         }
                                     }
                                 }

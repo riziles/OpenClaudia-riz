@@ -535,10 +535,9 @@ mod tests {
                 .shells
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(
-                shells.contains_key(&id),
-                "b2_kill_running: must be in map before kill"
-            );
+            let contains = shells.contains_key(&id);
+            drop(shells);
+            assert!(contains, "b2_kill_running: must be in map before kill");
         }
 
         let result = BACKGROUND_SHELLS.kill(&id);
@@ -554,10 +553,9 @@ mod tests {
                 .shells
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(
-                !shells.contains_key(&id),
-                "b2_kill_running: entry must be removed after kill"
-            );
+            let contains = shells.contains_key(&id);
+            drop(shells);
+            assert!(!contains, "b2_kill_running: entry must be removed after kill");
         }
     }
 

@@ -113,10 +113,6 @@ pub(crate) fn redact_oauth_error_body(body: &str) -> String {
 /// True when an `error_description` is safe to surface (does not look like
 /// it carries a token, code, or long base64/hex run).
 fn description_looks_safe(desc: &str) -> bool {
-    if desc.is_empty() {
-        return false;
-    }
-    let lower = desc.to_ascii_lowercase();
     const FORBIDDEN_NEEDLES: &[&str] = &[
         "refresh_token",
         "access_token",
@@ -126,6 +122,10 @@ fn description_looks_safe(desc: &str) -> bool {
         "code=",
         "state=",
     ];
+    if desc.is_empty() {
+        return false;
+    }
+    let lower = desc.to_ascii_lowercase();
     if FORBIDDEN_NEEDLES.iter().any(|n| lower.contains(n)) {
         return false;
     }

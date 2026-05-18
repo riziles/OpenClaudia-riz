@@ -137,144 +137,79 @@ impl MessageList {
         self.scroll_offset = 0;
     }
 
+    /// Append rendered lines for a single message to `out`.
+    fn append_message_lines<'a>(out: &mut Vec<Line<'a>>, msg: &'a DisplayMessage) {
+        match msg.role.as_str() {
+            "system" => {
+                let is_welcome = msg.content.contains("OpenClaudia v");
+                if is_welcome {
+                    for line in msg.content.lines() {
+                        let styled = if line.starts_with("OpenClaudia v") {
+                            Line::from(vec![
+                                Span::styled("OpenClaudia", Style::default().fg(Color::Rgb(147, 112, 219)).add_modifier(Modifier::BOLD)),
+                                Span::styled(&line["OpenClaudia".len()..], Style::default().fg(Color::Rgb(218, 165, 32))),
+                            ])
+                        } else if line.starts_with("Provider:") {
+                            Line::from(Span::styled(line, Style::default().fg(Color::Rgb(147, 112, 219))))
+                        } else if line.starts_with("Model:") {
+                            Line::from(Span::styled(line, Style::default().fg(Color::Rgb(218, 165, 32))))
+                        } else if line.starts_with("Welcome") {
+                            Line::from(Span::styled(line, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))
+                        } else {
+                            Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)))
+                        };
+                        out.push(styled);
+                    }
+                } else {
+                    for line in msg.content.lines() {
+                        out.push(Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))));
+                    }
+                }
+                out.push(Line::from(""));
+            }
+            "user" => {
+                out.push(Line::from(Span::styled("\u{203A} user", Style::default().fg(Color::Rgb(100, 180, 255)).add_modifier(Modifier::BOLD))));
+                for line in msg.content.lines() { out.push(Line::from(format!("  {line}"))); }
+                out.push(Line::from(""));
+            }
+            "assistant" => {
+                out.push(Line::from(Span::styled("\u{23BF} Claudia", Style::default().fg(Color::Rgb(147, 112, 219)).add_modifier(Modifier::BOLD))));
+                let content_style = if msg.is_thinking { Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC) } else { Style::default() };
+                for line in msg.content.lines() { out.push(Line::from(Span::styled(format!("  {line}"), content_style))); }
+                out.push(Line::from(""));
+            }
+            "thinking" => {
+                out.push(Line::from(Span::styled(format!("  \u{2234} {}", msg.content), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))));
+                out.push(Line::from(""));
+            }
+            "tool" => {
+                let tool_name = msg.tool_name.as_deref().unwrap_or("tool");
+                if msg.is_error {
+                    out.push(Line::from(Span::styled(format!("  \u{2717} {tool_name}"), Style::default().fg(Color::Red))));
+                } else {
+                    out.push(Line::from(Span::styled(format!("  \u{2713} {tool_name}"), Style::default().fg(Color::Green))));
+                }
+                let preview = if msg.content.len() > 200 { format!("{}...", crate::tools::safe_truncate(&msg.content, 197)) } else { msg.content.clone() };
+                for line in preview.lines().take(5) {
+                    out.push(Line::from(Span::styled(format!("    {line}"), Style::default().fg(Color::DarkGray))));
+                }
+                out.push(Line::from(""));
+            }
+            _ => {
+                for line in msg.content.lines() {
+                    out.push(Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::DarkGray))));
+                }
+                out.push(Line::from(""));
+            }
+        }
+    }
+
     /// Build ratatui Lines for rendering.
     fn build_lines(&self) -> Vec<Line<'_>> {
         let mut lines: Vec<Line> = Vec::new();
 
         for msg in &self.messages {
-            match msg.role.as_str() {
-                "system" => {
-                    // System messages: render with purple branding for welcome,
-                    // dim for other system messages
-                    let is_welcome = msg.content.contains("OpenClaudia v");
-                    if is_welcome {
-                        // Render welcome block with colored labels
-                        for line in msg.content.lines() {
-                            let styled = if line.starts_with("OpenClaudia v") {
-                                Line::from(vec![
-                                    Span::styled(
-                                        "OpenClaudia",
-                                        Style::default()
-                                            .fg(Color::Rgb(147, 112, 219))
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
-                                    Span::styled(
-                                        &line["OpenClaudia".len()..],
-                                        Style::default().fg(Color::Rgb(218, 165, 32)),
-                                    ),
-                                ])
-                            } else if line.starts_with("Provider:") {
-                                Line::from(Span::styled(
-                                    line,
-                                    Style::default().fg(Color::Rgb(147, 112, 219)),
-                                ))
-                            } else if line.starts_with("Model:") {
-                                Line::from(Span::styled(
-                                    line,
-                                    Style::default().fg(Color::Rgb(218, 165, 32)),
-                                ))
-                            } else if line.starts_with("Welcome") {
-                                Line::from(Span::styled(
-                                    line,
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
-                                ))
-                            } else {
-                                Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)))
-                            };
-                            lines.push(styled);
-                        }
-                    } else {
-                        // Regular system message
-                        for line in msg.content.lines() {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {line}"),
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            )));
-                        }
-                    }
-                    lines.push(Line::from(""));
-                }
-                "user" => {
-                    lines.push(Line::from(Span::styled(
-                        "\u{203A} user",
-                        Style::default()
-                            .fg(Color::Rgb(100, 180, 255))
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(format!("  {line}")));
-                    }
-                    lines.push(Line::from(""));
-                }
-                "assistant" => {
-                    lines.push(Line::from(Span::styled(
-                        "\u{23BF} Claudia",
-                        Style::default()
-                            .fg(Color::Rgb(147, 112, 219))
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    let content_style = if msg.is_thinking {
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC)
-                    } else {
-                        Style::default()
-                    };
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(Span::styled(format!("  {line}"), content_style)));
-                    }
-                    lines.push(Line::from(""));
-                }
-                "thinking" => {
-                    lines.push(Line::from(Span::styled(
-                        format!("  \u{2234} {}", msg.content),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                    lines.push(Line::from(""));
-                }
-                "tool" => {
-                    let tool_name = msg.tool_name.as_deref().unwrap_or("tool");
-                    if msg.is_error {
-                        lines.push(Line::from(Span::styled(
-                            format!("  \u{2717} {tool_name}"),
-                            Style::default().fg(Color::Red),
-                        )));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("  \u{2713} {tool_name}"),
-                            Style::default().fg(Color::Green),
-                        )));
-                    }
-                    // Show truncated content
-                    let preview = if msg.content.len() > 200 {
-                        format!("{}...", crate::tools::safe_truncate(&msg.content, 197))
-                    } else {
-                        msg.content.clone()
-                    };
-                    for line in preview.lines().take(5) {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    lines.push(Line::from(""));
-                }
-                _ => {
-                    for line in msg.content.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    lines.push(Line::from(""));
-                }
-            }
+            Self::append_message_lines(&mut lines, msg);
         }
 
         // Live thinking indicator (while thinking deltas are arriving)

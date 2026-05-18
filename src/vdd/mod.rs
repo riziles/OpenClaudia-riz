@@ -986,7 +986,7 @@ impl VddEngine {
         );
 
         // Parse verdicts from the response
-        self.parse_verification_verdicts(&response_text)
+        Ok(Self::parse_verification_verdicts(&response_text))
     }
 
     /// Send a verification request through the builder's provider.
@@ -1042,13 +1042,12 @@ impl VddEngine {
 
     /// Parse the verification agent's response into a `finding_id` → verdict map.
     fn parse_verification_verdicts(
-        &self,
         response: &str,
-    ) -> Result<std::collections::HashMap<String, String>, VddError> {
+    ) -> std::collections::HashMap<String, String> {
         let mut verdicts = std::collections::HashMap::new();
 
         // Try to extract JSON from the response
-        let json_str = extract_json_from_response(response).unwrap_or(response.to_string());
+        let json_str = extract_json_from_response(response).unwrap_or_else(|| response.to_string());
 
         if let Ok(value) = serde_json::from_str::<Value>(&json_str) {
             if let Some(arr) = value.get("verdicts").and_then(|v| v.as_array()) {
@@ -1081,7 +1080,7 @@ impl VddEngine {
             );
         }
 
-        Ok(verdicts)
+        verdicts
     }
 
     /// Create Chainlink issues for genuine findings.
@@ -1499,13 +1498,14 @@ fn build_verification_code_view(
             out.push_str("\n...\n");
         }
         let end = (*end).min(lines.len());
-        for line_idx in *start..end {
-            if out.len() + lines[line_idx].len() + 16 > max_chars {
+        for (rel, line) in lines[*start..end].iter().enumerate() {
+            let line_num = *start + rel + 1;
+            if out.len() + line.len() + 16 > max_chars {
                 out.push_str("\n... [window truncated]");
                 any_truncated = true;
                 break;
             }
-            let _ = writeln!(out, "{}: {}", line_idx + 1, lines[line_idx]);
+            let _ = writeln!(out, "{line_num}: {line}");
         }
         if out.len() >= max_chars {
             any_truncated = true;
@@ -1634,7 +1634,7 @@ mod tests {
     fn code_view_extracts_window_around_cited_lines() {
         // 200 lines, finding cites lines 150-152. Max bytes forces a
         // window view rather than the whole body.
-        let code: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        let code: String = (1..=200).fold(String::new(), |mut s, n| { let _ = writeln!(s, "line {n}"); s });
         let f = finding_with_lines("f1", 150, 152);
         let findings: Vec<&Finding> = vec![&f];
         let (view, _) = build_verification_code_view(&code, &findings, 500);
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[test]
     fn code_view_merges_overlapping_windows() {
-        let code: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        let code: String = (1..=200).fold(String::new(), |mut s, n| { let _ = writeln!(s, "line {n}"); s });
         let f1 = finding_with_lines("f1", 50, 52);
         let f2 = finding_with_lines("f2", 55, 57); // overlaps f1's ±20 window
         let findings: Vec<&Finding> = vec![&f1, &f2];

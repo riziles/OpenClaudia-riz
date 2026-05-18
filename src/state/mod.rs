@@ -27,11 +27,11 @@ pub use store::{StateEvent, StateStore, StateWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
-/// The single source of truth for one session. Grouped by concern
-/// so adding a new field lands inside the right sub-struct rather
-/// than in a flat list of 98 fields. Each sub-struct is plain data
-/// (no `Arc`s), so the whole thing is cheap to clone for snapshots
-/// and `/rewind` backups.
+/// The single source of truth for one session, grouped by concern.
+///
+/// Adding a new field lands inside the right sub-struct rather than a flat
+/// list of 98 fields. Each sub-struct is plain data (no `Arc`s), so the whole
+/// thing is cheap to clone for snapshots and `/rewind` backups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub identity: Identity,
@@ -107,13 +107,13 @@ mod tests {
             "content": "hello"
         }));
         state.budgets.effort_level = categories::EffortLevel::High;
-        state.ui.has_exited_plan_mode = true;
+        state.ui.plan_mode.has_exited = true;
 
         let json = serde_json::to_string(&state).unwrap();
         let round: SessionState = serde_json::from_str(&json).unwrap();
         assert_eq!(round.identity.session_id, state.identity.session_id);
         assert_eq!(round.conversation.messages, state.conversation.messages);
         assert_eq!(round.budgets.effort_level, state.budgets.effort_level);
-        assert!(round.ui.has_exited_plan_mode);
+        assert!(round.ui.plan_mode.has_exited);
     }
 }

@@ -87,8 +87,6 @@ pub fn is_sensitive_env(key: &str) -> bool {
 /// `curl ... | bash` which can't be matched as fixed substrings).
 #[must_use]
 pub fn denied_reason(command: &str) -> Option<&'static str> {
-    let lower = command.to_ascii_lowercase();
-
     // Fixed substrings — verbatim catastrophic commands.
     const SUBSTRINGS: &[(&str, &str)] = &[
         ("rm -rf /", "rm -rf of root filesystem"),
@@ -117,6 +115,12 @@ pub fn denied_reason(command: &str) -> Option<&'static str> {
         ("nc -e /bin/", "netcat reverse shell (-e exec)"),
         ("ncat -e /bin/", "ncat reverse shell (-e exec)"),
     ];
+    // Structural patterns — `curl <url> | bash`, `wget <url> | sh`, etc.
+    static PIPE_TO_SHELL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(curl|wget|fetch)\b[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b")
+            .expect("PIPE_TO_SHELL regex is a compile-time constant")
+    });
+    let lower = command.to_ascii_lowercase();
 
     for (pat, reason) in SUBSTRINGS {
         if lower.contains(pat) {
@@ -124,11 +128,6 @@ pub fn denied_reason(command: &str) -> Option<&'static str> {
         }
     }
 
-    // Structural patterns — `curl <url> | bash`, `wget <url> | sh`, etc.
-    static PIPE_TO_SHELL: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b(curl|wget|fetch)\b[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b")
-            .expect("PIPE_TO_SHELL regex is a compile-time constant")
-    });
     if PIPE_TO_SHELL.is_match(&lower) {
         return Some("pipe download-to-shell (curl/wget | sh)");
     }

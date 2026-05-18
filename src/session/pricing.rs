@@ -279,6 +279,6 @@ mod tests {
             cache_write_tokens: 0,
         };
         let cost = calculate_cost("claude-3-haiku-20240307", &usage).unwrap();
-        assert_eq!(cost, 0.0);
+        assert!(cost.abs() < f64::EPSILON);
     }
 }

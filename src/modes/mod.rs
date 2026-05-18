@@ -379,31 +379,28 @@ impl BehaviorMode {
     /// Human-readable description of the mode for status displays.
     #[must_use] 
     pub fn description(&self) -> String {
-        if let Some(preset) = self.matching_preset() {
-            let desc = match preset {
-                Preset::Create => "Build from scratch with proper architecture",
-                Preset::Extend => "Extend and improve incrementally",
-                Preset::Safe => "Surgical precision, minimal risk",
-                Preset::Refactor => "Restructure freely across the codebase",
-                Preset::Explore => "Read-only — understand code without changing it",
-                Preset::Debug => "Investigation-first debugging",
-                Preset::Methodical => "Step-by-step precision",
-                Preset::Director => "Orchestrate subagents, delegate and verify",
-            };
-            format!("{preset}: {desc}")
-        } else {
-            format!("custom: {self}")
-        }
+        self.matching_preset().map_or_else(
+            || format!("custom: {self}"),
+            |preset| {
+                let desc = match preset {
+                    Preset::Create => "Build from scratch with proper architecture",
+                    Preset::Extend => "Extend and improve incrementally",
+                    Preset::Safe => "Surgical precision, minimal risk",
+                    Preset::Refactor => "Restructure freely across the codebase",
+                    Preset::Explore => "Read-only — understand code without changing it",
+                    Preset::Debug => "Investigation-first debugging",
+                    Preset::Methodical => "Step-by-step precision",
+                    Preset::Director => "Orchestrate subagents, delegate and verify",
+                };
+                format!("{preset}: {desc}")
+            },
+        )
     }
 
     /// Short display name — preset name if matching, otherwise axis summary.
     #[must_use] 
     pub fn display_name(&self) -> String {
-        if let Some(preset) = self.matching_preset() {
-            preset.to_string()
-        } else {
-            self.to_string()
-        }
+        self.matching_preset().map_or_else(|| self.to_string(), |p| p.to_string())
     }
 
     /// Assemble the complete behavioral prompt fragment for this mode.

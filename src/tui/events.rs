@@ -69,7 +69,7 @@ impl EventHandler {
         std::thread::spawn(move || loop {
             if event::poll(tick_rate).unwrap_or(false) {
                 if let Ok(evt) = event::read() {
-                    if let Some(app_evt) = translate_terminal_event(evt) {
+                    if let Some(app_evt) = translate_terminal_event(&evt) {
                         if event_tx.send(app_evt).is_err() {
                             break;
                         }
@@ -111,12 +111,11 @@ impl EventHandler {
 /// terminals that support the kitty keyboard protocol.
 ///
 /// See: <https://github.com/ratatui/ratatui/issues/347>
-fn translate_terminal_event(evt: CEvent) -> Option<AppEvent> {
-    match evt {
+const fn translate_terminal_event(evt: &CEvent) -> Option<AppEvent> {
+    match *evt {
         CEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             Some(AppEvent::Key(key))
         }
-        CEvent::Key(_) => None,
         CEvent::Resize(w, h) => Some(AppEvent::Resize(w, h)),
         _ => None,
     }
@@ -139,7 +138,7 @@ mod tests {
     #[test]
     fn press_events_are_forwarded() {
         let evt = key(KeyCode::Char('a'), KeyEventKind::Press);
-        match translate_terminal_event(evt) {
+        match translate_terminal_event(&evt) {
             Some(AppEvent::Key(k)) => assert_eq!(k.code, KeyCode::Char('a')),
             _ => panic!("expected AppEvent::Key for Press"),
         }
@@ -150,7 +149,7 @@ mod tests {
         // Repeat should be honored so holding a key still works under the
         // kitty keyboard protocol.
         let evt = key(KeyCode::Char('x'), KeyEventKind::Repeat);
-        match translate_terminal_event(evt) {
+        match translate_terminal_event(&evt) {
             Some(AppEvent::Key(k)) => assert_eq!(k.code, KeyCode::Char('x')),
             _ => panic!("expected AppEvent::Key for Repeat"),
         }
@@ -162,7 +161,7 @@ mod tests {
         // On Windows, crossterm fires a Release alongside every Press. If we
         // forwarded these, every key would be entered twice.
         let evt = key(KeyCode::Char('a'), KeyEventKind::Release);
-        assert!(translate_terminal_event(evt).is_none());
+        assert!(translate_terminal_event(&evt).is_none());
     }
 
     #[test]
@@ -173,12 +172,12 @@ mod tests {
         // same physical key. Verify that the Release is discarded regardless
         // of which glyph it carries.
         let evt = key(KeyCode::Char('/'), KeyEventKind::Release);
-        assert!(translate_terminal_event(evt).is_none());
+        assert!(translate_terminal_event(&evt).is_none());
     }
 
     #[test]
     fn resize_events_are_forwarded() {
-        match translate_terminal_event(CEvent::Resize(120, 40)) {
+        match translate_terminal_event(&CEvent::Resize(120, 40)) {
             Some(AppEvent::Resize(w, h)) => {
                 assert_eq!(w, 120);
                 assert_eq!(h, 40);

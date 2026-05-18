@@ -1063,12 +1063,11 @@ pub fn parse_exit_plan_mode_prompts(content: &str) -> Vec<crate::session::Allowe
 // Permission-Checked Tool Execution
 // =========================================================================
 
-/// Structured outcome of a permission check, suitable for typed dispatch
-/// at the caller. Replaces the previous stringly-typed
-/// `PERMISSION_PROMPT: ...` signal that required callers to regex-parse
-/// a tool result's content string to know a user prompt was required.
+/// Structured outcome of a permission check, suitable for typed dispatch at the caller.
 ///
-/// See crosslink #460.
+/// Replaces the previous stringly-typed `PERMISSION_PROMPT: ...` signal that required
+/// callers to regex-parse a tool result's content string to know a user prompt was
+/// required. See crosslink #460.
 #[derive(Debug, Clone)]
 pub enum PermissionOutcome {
     /// Tool may proceed.
@@ -1150,12 +1149,13 @@ pub fn check_tool_permission_outcome(
     }
 }
 
-/// Strict variant that fails closed when no permission manager is
-/// provided. A disabled manager is treated as an **explicit** allow-all
-/// override (that's the semantic meaning of
-/// [`PermissionManager::unrestricted`]): the caller constructed a concrete
-/// manager and chose disabled-posture deliberately, so the strict check
-/// defers to the normal outcome path which returns `Allowed` on disabled.
+/// Strict variant that fails closed when no permission manager is provided.
+///
+/// A disabled manager is treated as an **explicit** allow-all override (that's
+/// the semantic meaning of [`PermissionManager::unrestricted`]): the caller
+/// constructed a concrete manager and chose disabled-posture deliberately, so
+/// the strict check defers to the normal outcome path which returns `Allowed`
+/// on disabled.
 ///
 /// Use this from new dispatch paths that want certainty that no tool call
 /// can bypass the gate due to a forgotten argument. See crosslink #460
@@ -1166,26 +1166,30 @@ pub fn check_tool_permission_strict(
     permission_mgr: Option<&PermissionManager>,
 ) -> PermissionOutcome {
     let tool_name = tool_call.function.name.as_str();
-    if let Some(m) = permission_mgr { check_tool_permission_outcome(tool_call, Some(m)) } else {
-        tracing::warn!(
-            tool = %tool_name,
-            "strict permission check DENIED: no PermissionManager supplied"
-        );
-        PermissionOutcome::Denied(ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content: format!(
-                "Permission denied: no permission manager is configured for tool '{tool_name}'. \
-                 Construct PermissionManager::unrestricted() if you explicitly want allow-all."
-            ),
-            is_error: true,
-        })
-    }
+    permission_mgr.map_or_else(
+        || {
+            tracing::warn!(
+                tool = %tool_name,
+                "strict permission check DENIED: no PermissionManager supplied"
+            );
+            PermissionOutcome::Denied(ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: format!(
+                    "Permission denied: no permission manager is configured for tool '{tool_name}'. \
+                     Construct PermissionManager::unrestricted() if you explicitly want allow-all."
+                ),
+                is_error: true,
+            })
+        },
+        |m| check_tool_permission_outcome(tool_call, Some(m)),
+    )
 }
 
-/// Back-compat wrapper. Returns `None` on Allowed, `Some(ToolResult)` on
-/// Denied, and a `PERMISSION_PROMPT:` stringly-typed result on `NeedsPrompt`.
-/// New code should call [`check_tool_permission_outcome`] and switch on the
-/// enum instead.
+/// Back-compat wrapper: returns `None` on Allowed, `Some(ToolResult)` on Denied.
+///
+/// Returns a `PERMISSION_PROMPT:` stringly-typed result on `NeedsPrompt`. New
+/// code should call [`check_tool_permission_outcome`] and switch on the enum
+/// instead.
 #[must_use]
 pub fn check_tool_permission(
     tool_call: &ToolCall,
@@ -1306,11 +1310,11 @@ pub fn execute_tool_with_tasks(
     execute_tool_full(tool_call, memory_db, app_config, permission_mgr)
 }
 
-/// New canonical dispatch: takes a required [`PermissionManager`] by
-/// reference and uses the strict fail-closed check. Prefer this in all new
-/// code. If you explicitly want "allow every tool call", construct
-/// [`PermissionManager::unrestricted`] at the call site — the intent is
-/// then documented in source, not smuggled via a missing argument. See
+/// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.
+///
+/// Prefer this in all new code. If you explicitly want "allow every tool call",
+/// construct [`PermissionManager::unrestricted`] at the call site — the intent
+/// is then documented in source, not smuggled via a missing argument. See
 /// crosslink #460 mandated point 1.
 #[must_use]
 pub fn execute_tool_with_permission_required(
@@ -1348,11 +1352,12 @@ pub fn execute_tool_with_permission_required(
     )
 }
 
-/// Typed-outcome dispatch: runs the permission gate, executes the tool
-/// body on Allowed, and returns a structured [`ExecutionOutcome`] instead
-/// of a stringly-typed `PERMISSION_PROMPT:` message on `NeedsPrompt`. New
-/// call sites that want to interactively handle the prompt path should
-/// use this. See crosslink #460 mandated point 3.
+/// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
+///
+/// Executes the tool body on `Allowed` and returns `ExecutionOutcome::NeedsPrompt`
+/// instead of a stringly-typed `PERMISSION_PROMPT:` message. New call sites that
+/// want to interactively handle the prompt path should use this. See crosslink
+/// #460 mandated point 3.
 #[must_use]
 pub fn execute_tool_gated(
     tool_call: &ToolCall,
@@ -2455,7 +2460,7 @@ mod tests {
                     r.content
                 );
             }
-            other => panic!("expected Result(Denied), got {other:?}"),
+            other @ ExecutionOutcome::NeedsPrompt { .. } => panic!("expected Result(Denied), got {other:?}"),
         }
     }
 
@@ -2485,7 +2490,7 @@ mod tests {
                     r.content
                 );
             }
-            other => panic!("expected Result(Allowed-executed), got {other:?}"),
+            other @ ExecutionOutcome::NeedsPrompt { .. } => panic!("expected Result(Allowed-executed), got {other:?}"),
         }
     }
 

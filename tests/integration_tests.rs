@@ -21,7 +21,7 @@ static READ_TRACKER_LOCK: Mutex<()> = Mutex::new(());
 static TODO_LIST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper to create a `ToolCall` from name and arguments
-fn make_tool_call(name: &str, args: Value) -> ToolCall {
+fn make_tool_call(name: &str, args: &Value) -> ToolCall {
     ToolCall {
         id: format!("test_{name}"),
         call_type: "function".to_string(),
@@ -77,7 +77,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy()
             }),
         );
@@ -99,7 +99,7 @@ mod file_tools {
     fn test_read_file_not_found() {
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": "/nonexistent/path/file.txt"
             }),
         );
@@ -130,7 +130,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "offset": 2,
                 "limit": 1
@@ -158,7 +158,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": "New file content\nWith multiple lines"
             }),
@@ -180,7 +180,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": "Overwritten content"
             }),
@@ -206,12 +206,12 @@ mod file_tools {
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", json!({ "path": file_path.to_string_lossy() }));
-        execute_tool(&read_call);
+        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "Hello, World!",
                 "new_string": "Goodbye, World!"
@@ -241,12 +241,12 @@ mod file_tools {
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", json!({ "path": file_path.to_string_lossy() }));
-        execute_tool(&read_call);
+        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "This string does not exist",
                 "new_string": "Replacement"
@@ -271,7 +271,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "list_files",
-            json!({
+            &json!({
                 "path": dir.path().to_string_lossy(),
                 "pattern": "*.txt"
             }),
@@ -293,7 +293,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "list_files",
-            json!({
+            &json!({
                 "path": dir.path().to_string_lossy(),
                 "pattern": "*.xyz"
             }),
@@ -321,7 +321,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy()
             }),
         );
@@ -345,7 +345,7 @@ mod file_tools {
         let unicode_content = "Writing Unicode: 你好 🌍 مرحبا";
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": unicode_content
             }),
@@ -371,7 +371,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy()
             }),
         );
@@ -391,12 +391,12 @@ mod file_tools {
         let file_path = dir.path().join("large.txt");
 
         // Create a large file (10000 lines)
-        let content: String = (0..10000).map(|i| format!("Line {i}\n")).collect();
+        let content: String = (0..10000).fold(String::new(), |mut s, i| { use std::fmt::Write as _; let _ = writeln!(s, "Line {i}"); s });
         fs::write(&file_path, &content).expect("Failed to write large file");
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy()
             }),
         );
@@ -419,12 +419,12 @@ mod file_tools {
         let dir = TempDir::new().expect("Failed to create temp dir");
         let file_path = dir.path().join("large_limit.txt");
 
-        let content: String = (0..1000).map(|i| format!("Line {i}\n")).collect();
+        let content: String = (0..1000).fold(String::new(), |mut s, i| { use std::fmt::Write as _; let _ = writeln!(s, "Line {i}"); s });
         fs::write(&file_path, &content).expect("Failed to write");
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "offset": 500,
                 "limit": 10
@@ -451,12 +451,12 @@ mod file_tools {
         fs::write(&file_path, original).expect("Failed to write");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", json!({ "path": file_path.to_string_lossy() }));
-        execute_tool(&read_call);
+        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "function foo() {\n    console.log('old');\n}",
                 "new_string": "function foo() {\n    console.log('new');\n    return true;\n}"
@@ -489,12 +489,12 @@ mod file_tools {
         fs::write(&file_path, original).expect("Failed to write");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", json!({ "path": file_path.to_string_lossy() }));
-        execute_tool(&read_call);
+        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "$100",
                 "new_string": "$200"
@@ -519,7 +519,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "list_files",
-            json!({
+            &json!({
                 "path": dir.path().to_string_lossy(),
                 "pattern": "**/*.txt"
             }),
@@ -543,7 +543,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": "Content in nested dir"
             }),
@@ -572,7 +572,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy()
             }),
         );
@@ -610,7 +610,7 @@ mod file_tools {
         // Attempt to edit WITHOUT reading first — should be rejected by read tracker
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "original",
                 "new_string": "modified"
@@ -645,7 +645,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": ""
             }),
@@ -673,13 +673,13 @@ mod file_tools {
         fs::write(&file_path, "some content here").expect("Failed to write");
 
         // Read first
-        let read_call = make_tool_call("read_file", json!({ "path": file_path.to_string_lossy() }));
-        execute_tool(&read_call);
+        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let _ = execute_tool(&read_call);
 
         // Edit with same old and new string
         let tool_call = make_tool_call(
             "edit_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "old_string": "some content",
                 "new_string": "some content"
@@ -702,7 +702,7 @@ mod file_tools {
     fn test_read_file_path_traversal() {
         let tool_call = make_tool_call(
             "read_file",
-            json!({
+            &json!({
                 "path": "../../../etc/passwd"
             }),
         );
@@ -726,7 +726,7 @@ mod file_tools {
 
         let tool_call = make_tool_call(
             "write_file",
-            json!({
+            &json!({
                 "path": file_path.to_string_lossy(),
                 "content": "test"
             }),
@@ -756,7 +756,7 @@ mod bash_tools {
     fn test_bash_simple_command() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'Hello from bash'"
             }),
         );
@@ -774,7 +774,7 @@ mod bash_tools {
     fn test_bash_with_exit_code() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "exit 1"
             }),
         );
@@ -793,7 +793,7 @@ mod bash_tools {
     fn test_bash_command_not_found() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "nonexistent_command_12345"
             }),
         );
@@ -822,7 +822,7 @@ mod bash_tools {
 
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": format!("cd '{}' && ls", path_str)
             }),
         );
@@ -844,7 +844,7 @@ mod bash_tools {
     fn test_bash_timeout() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "sleep 60",
                 "timeout": 1000  // 1 second timeout
             }),
@@ -866,7 +866,7 @@ mod bash_tools {
     fn test_bash_background_execution() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "sleep 2",
                 "run_in_background": true
             }),
@@ -890,7 +890,7 @@ mod bash_tools {
         // First start a background shell
         let bg_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "ping -n 10 127.0.0.1",
                 "run_in_background": true
             }),
@@ -902,7 +902,7 @@ mod bash_tools {
         thread::sleep(Duration::from_millis(100));
 
         // Now list shells (no shell_id = list all)
-        let list_call = make_tool_call("bash_output", json!({}));
+        let list_call = make_tool_call("bash_output", &json!({}));
         let list_result = execute_tool(&list_call);
 
         assert!(
@@ -925,7 +925,7 @@ mod bash_tools {
         // Start a background shell that produces output
         let bg_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'test output' && ping -n 2 127.0.0.1",
                 "run_in_background": true
             }),
@@ -941,7 +941,7 @@ mod bash_tools {
         // Get output from specific shell
         let output_call = make_tool_call(
             "bash_output",
-            json!({
+            &json!({
                 "shell_id": shell_id
             }),
         );
@@ -960,7 +960,7 @@ mod bash_tools {
         // Start a long-running background shell
         let bg_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "ping -n 1000 127.0.0.1",
                 "run_in_background": true
             }),
@@ -975,7 +975,7 @@ mod bash_tools {
         // Kill the shell
         let kill_call = make_tool_call(
             "kill_shell",
-            json!({
+            &json!({
                 "shell_id": shell_id
             }),
         );
@@ -1001,7 +1001,7 @@ mod bash_tools {
     fn test_bash_multiline_command() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'line1' && echo 'line2' && echo 'line3'"
             }),
         );
@@ -1022,7 +1022,7 @@ mod bash_tools {
     fn test_bash_pipe_command() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'hello world' | tr 'a-z' 'A-Z'"
             }),
         );
@@ -1044,7 +1044,7 @@ mod bash_tools {
     fn test_bash_variable_expansion() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "VAR='test123' && echo $VAR"
             }),
         );
@@ -1066,7 +1066,7 @@ mod bash_tools {
     fn test_bash_stderr_capture() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'stderr test' >&2"
             }),
         );
@@ -1085,7 +1085,7 @@ mod bash_tools {
     fn test_bash_with_quotes() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo \"double quotes\" && echo 'single quotes'"
             }),
         );
@@ -1111,7 +1111,7 @@ mod bash_tools {
     fn test_kill_shell_nonexistent() {
         let kill_call = make_tool_call(
             "kill_shell",
-            json!({
+            &json!({
                 "shell_id": "nonexistent_shell_12345"
             }),
         );
@@ -1130,7 +1130,7 @@ mod bash_tools {
     fn test_bash_output_nonexistent_shell() {
         let output_call = make_tool_call(
             "bash_output",
-            json!({
+            &json!({
                 "shell_id": "nonexistent_shell_99999"
             }),
         );
@@ -1151,7 +1151,7 @@ mod bash_tools {
     fn test_bash_empty_command() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": ""
             }),
         );
@@ -1175,7 +1175,7 @@ mod bash_tools {
     fn test_bash_special_shell_characters() {
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "echo 'hello; world & test | more'"
             }),
         );
@@ -1201,7 +1201,7 @@ mod bash_tools {
         // Generate a large output to test truncation behavior
         let tool_call = make_tool_call(
             "bash",
-            json!({
+            &json!({
                 "command": "seq 1 5000"
             }),
         );
@@ -1258,7 +1258,7 @@ mod web_tools {
         // Test with a reliable public URL
         let tool_call = make_tool_call(
             "web_fetch",
-            json!({
+            &json!({
                 "url": "https://httpbin.org/html",
                 "prompt": "Extract the main heading"
             }),
@@ -1277,7 +1277,7 @@ mod web_tools {
     fn test_web_fetch_invalid_url() {
         let tool_call = make_tool_call(
             "web_fetch",
-            json!({
+            &json!({
                 "url": "not-a-valid-url",
                 "prompt": "test"
             }),
@@ -1291,11 +1291,11 @@ mod web_tools {
     // DuckDuckGo search uses the browser feature (enabled by default)
     // Falls back to Tavily/Brave APIs if configured
     #[test]
-    #[ignore] // Requires network access; run with `cargo test -- --ignored`
+    #[ignore = "requires network access; run with `cargo test -- --ignored`"]
     fn test_web_search_duckduckgo() {
         let tool_call = make_tool_call(
             "web_search",
-            json!({
+            &json!({
                 "query": "rust programming language"
             }),
         );
@@ -1625,7 +1625,7 @@ mod todo_tools {
 
         let tool_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Fix the bug",
@@ -1672,7 +1672,7 @@ mod todo_tools {
 
         let tool_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Setup project",
@@ -1715,7 +1715,7 @@ mod todo_tools {
 
         let tool_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Task 1",
@@ -1750,7 +1750,7 @@ mod todo_tools {
         // Missing activeForm
         let tool_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Task",
@@ -1781,7 +1781,7 @@ mod todo_tools {
 
         let tool_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Task",
@@ -1814,7 +1814,7 @@ mod todo_tools {
         let _lock = TODO_LIST_LOCK.lock().unwrap();
         clear_todo_list();
 
-        let tool_call = make_tool_call("todo_read", json!({}));
+        let tool_call = make_tool_call("todo_read", &json!({}));
         let result = execute_tool(&tool_call);
 
         assert!(!result.is_error, "Should succeed: {}", result.content);
@@ -1835,7 +1835,7 @@ mod todo_tools {
         // Write some todos
         let write_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Research API",
@@ -1855,10 +1855,10 @@ mod todo_tools {
                 ]
             }),
         );
-        execute_tool(&write_call);
+        let _ = execute_tool(&write_call);
 
         // Read them back
-        let read_call = make_tool_call("todo_read", json!({}));
+        let read_call = make_tool_call("todo_read", &json!({}));
         let result = execute_tool(&read_call);
 
         assert!(!result.is_error, "Should succeed: {}", result.content);
@@ -1897,7 +1897,7 @@ mod todo_tools {
         // Write todos
         let write_call = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Persistent task",
@@ -1907,7 +1907,7 @@ mod todo_tools {
                 ]
             }),
         );
-        execute_tool(&write_call);
+        let _ = execute_tool(&write_call);
 
         // Get the list directly using helper function
         let todos = get_todo_list();
@@ -1926,7 +1926,7 @@ mod todo_tools {
         // First write
         let write1 = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Old task 1",
@@ -1941,12 +1941,12 @@ mod todo_tools {
                 ]
             }),
         );
-        execute_tool(&write1);
+        let _ = execute_tool(&write1);
 
         // Second write (should replace, not append)
         let write2 = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "New task",
@@ -1956,7 +1956,7 @@ mod todo_tools {
                 ]
             }),
         );
-        execute_tool(&write2);
+        let _ = execute_tool(&write2);
 
         let todos = get_todo_list();
         assert_eq!(todos.len(), 1, "Should have replaced list with 1 todo");
@@ -1971,7 +1971,7 @@ mod todo_tools {
         // First add some todos
         let write1 = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": [
                     {
                         "content": "Task",
@@ -1981,12 +1981,12 @@ mod todo_tools {
                 ]
             }),
         );
-        execute_tool(&write1);
+        let _ = execute_tool(&write1);
 
         // Then clear by writing empty list
         let write_empty = make_tool_call(
             "todo_write",
-            json!({
+            &json!({
                 "todos": []
             }),
         );
@@ -2014,7 +2014,7 @@ mod subagent_tools {
     #[test]
     fn test_task_tool_missing_args() {
         // Missing all required arguments
-        let tool_call = make_tool_call("task", json!({}));
+        let tool_call = make_tool_call("task", &json!({}));
         let result = execute_tool(&tool_call);
 
         // Should fail because subagent tools require config context
@@ -2035,7 +2035,7 @@ mod subagent_tools {
     #[test]
     fn test_agent_output_no_agents() {
         // When no agent_id is provided, should list agents (empty list)
-        let tool_call = make_tool_call("agent_output", json!({}));
+        let tool_call = make_tool_call("agent_output", &json!({}));
         let result = execute_tool(&tool_call);
 
         // Must produce a meaningful response — either error about config or empty list message
@@ -2065,7 +2065,7 @@ mod subagent_tools {
     fn test_agent_output_nonexistent_id() {
         let tool_call = make_tool_call(
             "agent_output",
-            json!({
+            &json!({
                 "agent_id": "nonexistent_agent_12345"
             }),
         );
@@ -3051,8 +3051,7 @@ mod vdd_tests {
         let client = reqwest::Client::new();
         let engine = VddEngine::new(&config.vdd, &config, client);
         // Engine should be constructible without panic
-        assert!(true, "VDD engine constructed successfully");
-        let _ = engine; // use it to avoid warning
+        drop(engine); // engine constructed successfully — just verify no panic
     }
 
     #[test]
@@ -3078,7 +3077,7 @@ mod vdd_tests {
         // Iteration 1: adversary finds real issues (0% FP rate)
         tracker.record_iteration(3, 0);
         assert!(!tracker.should_terminate()); // below min_iterations
-        assert_eq!(tracker.current_rate(), 0.0);
+        assert!(tracker.current_rate().abs() < f32::EPSILON);
 
         // Iteration 2: mixed results (50% FP)
         tracker.record_iteration(2, 2);
@@ -3112,7 +3111,7 @@ mod vdd_tests {
             assert!(!tracker.should_terminate());
         }
         // Never terminates because genuine findings keep appearing
-        assert_eq!(tracker.current_rate(), 0.0);
+        assert!(tracker.current_rate().abs() < f32::EPSILON);
     }
 
     // ========================================================================
@@ -3341,10 +3340,10 @@ tracking:
         assert_eq!(config.mode, VddMode::Blocking);
         assert_eq!(config.adversary.provider, "google");
         assert_eq!(config.adversary.model, Some("gemini-2.5-pro".to_string()));
-        assert_eq!(config.adversary.temperature, 0.2);
+        assert!((config.adversary.temperature - 0.2_f32).abs() < f32::EPSILON);
         assert_eq!(config.adversary.max_tokens, 8192);
         assert_eq!(config.thresholds.max_iterations, 8);
-        assert_eq!(config.thresholds.false_positive_rate, 0.80);
+        assert!((config.thresholds.false_positive_rate - 0.80_f32).abs() < f32::EPSILON);
         assert_eq!(config.thresholds.min_iterations, 3);
         assert_eq!(config.static_analysis.commands.len(), 2);
         assert_eq!(config.static_analysis.timeout_seconds, 180);
@@ -3364,7 +3363,7 @@ tracking:
         assert_eq!(config.mode, VddMode::Advisory); // default
         assert_eq!(config.adversary.provider, "google"); // default
         assert_eq!(config.thresholds.max_iterations, 5); // default
-        assert_eq!(config.thresholds.false_positive_rate, 0.75); // default
+        assert!((config.thresholds.false_positive_rate - 0.75_f32).abs() < f32::EPSILON); // default
         assert_eq!(config.thresholds.min_iterations, 2); // default
         assert!(config.static_analysis.enabled); // default true
         assert!(config.static_analysis.commands.is_empty()); // default empty

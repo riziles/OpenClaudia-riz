@@ -178,6 +178,9 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
+        // Max bytes we'll read from a single MCP response — prevents OOM from
+        // malicious servers.
+        const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let request = JsonRpcRequest {
@@ -216,8 +219,6 @@ impl McpTransport for StdioTransport {
         drop(child);
 
         // Read response from the persistent BufReader with size limit.
-        // Prevents memory exhaustion from malicious MCP servers.
-        const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
         let line = {
             let mut reader = self.reader.lock().await;
             let mut buf = String::new();
