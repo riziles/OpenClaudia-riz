@@ -261,6 +261,17 @@ pub fn execute_cron_list(_args: &HashMap<String, Value>) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `set_current_dir` is process-global. Tests that change cwd to a temp
+    /// dir (to control the schedules.json path) must hold this lock so they
+    /// don't race with each other or with worktree tests.
+    fn cwd_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_validate_cron_valid() {
@@ -327,5 +338,284 @@ mod tests {
         let (msg, is_err) = execute_cron_delete(&args);
         assert!(is_err);
         assert!(msg.contains("No schedule found"));
+    }
+
+    // ─── Spec §3: cron_create stores schedule; cron_list reads it back ─────────
+
+    /// Contract: `cron_create` requires a `name` field; absent → is_error=true.
+    #[test]
+    fn cron_create_requires_name_field() {
+        let mut args = HashMap::new();
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 * * * *".to_string()),
+        );
+        args.insert("prompt".to_string(), Value::String("ping".to_string()));
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("name is required"),
+            "error must mention 'name'; got: {msg}"
+        );
+    }
+
+    /// Contract: `cron_create` requires a `schedule` field; absent → is_error=true.
+    #[test]
+    fn cron_create_requires_schedule_field() {
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("myjob".to_string()));
+        args.insert("prompt".to_string(), Value::String("ping".to_string()));
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("schedule") && msg.contains("required"),
+            "error must mention 'schedule'; got: {msg}"
+        );
+    }
+
+    /// Contract: `cron_create` requires a `prompt` field; absent → is_error=true.
+    #[test]
+    fn cron_create_requires_prompt_field() {
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("myjob".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 * * * *".to_string()),
+        );
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("prompt is required"),
+            "error must mention 'prompt'; got: {msg}"
+        );
+    }
+
+    /// Contract: duplicate `name` is rejected with is_error=true.
+    /// OC deduplicates by name (CC does not deduplicate at all — pin this
+    /// OC-specific behaviour).
+    #[test]
+    fn cron_create_rejects_duplicate_name() {
+        use tempfile::TempDir;
+        let _lock = cwd_lock();
+        // Run in a temp dir so we control the schedules.json path.
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("dupjob".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 * * * *".to_string()),
+        );
+        args.insert("prompt".to_string(), Value::String("hello".to_string()));
+
+        let (_, first_err) = execute_cron_create(&args);
+        assert!(!first_err, "first create must succeed");
+
+        let (msg, second_err) = execute_cron_create(&args);
+        assert!(second_err, "duplicate name must fail");
+        assert!(
+            msg.contains("already exists"),
+            "error must say 'already exists'; got: {msg}"
+        );
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Contract: valid `cron_create` stores the schedule so `cron_list` returns it.
+    #[test]
+    fn cron_create_then_list_round_trip() {
+        use tempfile::TempDir;
+        let _lock = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("roundtrip".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("*/5 * * * *".to_string()),
+        );
+        args.insert(
+            "prompt".to_string(),
+            Value::String("check status".to_string()),
+        );
+
+        let (create_msg, create_err) = execute_cron_create(&args);
+        assert!(!create_err, "create must succeed; got: {create_msg}");
+        assert!(
+            create_msg.contains("roundtrip"),
+            "create message must echo the name"
+        );
+
+        let (list_msg, list_err) = execute_cron_list(&HashMap::new());
+        assert!(!list_err);
+        assert!(
+            list_msg.contains("roundtrip"),
+            "list must show the newly created schedule; got: {list_msg}"
+        );
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Contract: `cron_delete` by name removes the schedule.
+    #[test]
+    fn cron_delete_by_name_removes_schedule() {
+        use tempfile::TempDir;
+        let _lock = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        // Create
+        let mut create_args = HashMap::new();
+        create_args.insert("name".to_string(), Value::String("todelete".to_string()));
+        create_args.insert(
+            "schedule".to_string(),
+            Value::String("0 0 * * *".to_string()),
+        );
+        create_args.insert("prompt".to_string(), Value::String("noop".to_string()));
+        let (_, err) = execute_cron_create(&create_args);
+        assert!(!err);
+
+        // Delete by name
+        let mut del_args = HashMap::new();
+        del_args.insert("name".to_string(), Value::String("todelete".to_string()));
+        let (del_msg, del_err) = execute_cron_delete(&del_args);
+        assert!(!del_err, "delete must succeed; got: {del_msg}");
+        assert!(del_msg.contains("todelete"));
+
+        // List must now be empty
+        let (list_msg, _) = execute_cron_list(&HashMap::new());
+        assert!(
+            !list_msg.contains("todelete"),
+            "deleted schedule must not appear in list"
+        );
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Pin gap #621: OC has no `recurring` or `durable` fields in the input
+    /// schema.  This test documents that passing these CC-side fields is silently
+    /// ignored (not an error).
+    #[test]
+    fn cron_create_ignores_recurring_and_durable_fields_gap621() {
+        use tempfile::TempDir;
+        let _lock = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("gap621job".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 12 * * *".to_string()),
+        );
+        args.insert(
+            "prompt".to_string(),
+            Value::String("noon check".to_string()),
+        );
+        // CC fields that OC does not recognise
+        args.insert("recurring".to_string(), Value::Bool(false));
+        args.insert("durable".to_string(), Value::Bool(false));
+
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(
+            !is_err,
+            "gap #621: unknown CC fields must not cause an error; got: {msg}"
+        );
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Pin gap #621: OC has no max-jobs cap (CC enforces ≤50).
+    /// Documented via the absence of a max-jobs check in the source — we pin
+    /// that creating a schedule when <50 jobs exist never fails with a
+    /// max-jobs message.
+    #[test]
+    fn cron_create_has_no_max_jobs_cap_gap621() {
+        use tempfile::TempDir;
+        let _lock = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("captest".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("* * * * *".to_string()),
+        );
+        args.insert("prompt".to_string(), Value::String("ping".to_string()));
+
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(
+            !is_err,
+            "gap #621: must not reject with a max-jobs message; got: {msg}"
+        );
+        assert!(
+            !msg.contains("too many") && !msg.contains("max"),
+            "gap #621: no max-jobs guard present; got: {msg}"
+        );
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Contract: invalid cron expression (wrong field count) is rejected.
+    #[test]
+    fn cron_create_rejects_wrong_field_count() {
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("badjob".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 0 * *".to_string()), // only 4 fields
+        );
+        args.insert("prompt".to_string(), Value::String("test".to_string()));
+        let (msg, is_err) = execute_cron_create(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("Invalid cron"),
+            "error must mention 'Invalid cron'; got: {msg}"
+        );
+    }
+
+    /// Contract: step value of 0 (`*/0`) is rejected.
+    #[test]
+    fn validate_cron_rejects_step_zero() {
+        assert!(
+            validate_cron("*/0 * * * *").is_err(),
+            "step=0 must be invalid"
+        );
+    }
+
+    /// Contract: out-of-range minute (60) is rejected.
+    #[test]
+    fn validate_cron_rejects_minute_60() {
+        assert!(validate_cron("60 * * * *").is_err());
+    }
+
+    /// Contract: out-of-range weekday (7) is rejected.
+    #[test]
+    fn validate_cron_rejects_weekday_7() {
+        assert!(validate_cron("* * * * 7").is_err());
+    }
+
+    /// Contract: comma-separated list within valid range is accepted.
+    #[test]
+    fn validate_cron_accepts_comma_list() {
+        assert!(validate_cron("0,30 9 * * 1,5").is_ok());
     }
 }

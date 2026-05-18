@@ -378,4 +378,271 @@ mod tests {
         assert!(!msg.contains("all 0 items completed"));
         assert!(get_todo_list().is_empty());
     }
+
+    // ─── Spec §4: todo_write — full-replacement, atomic, per-session ───────────
+
+    /// Contract: `todos` argument is required; absent → is_error=true.
+    #[test]
+    fn todo_write_requires_todos_argument() {
+        let _lock = task_lock();
+        let args = HashMap::new(); // no "todos" key
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err, "missing 'todos' must be an error");
+        assert!(
+            msg.contains("Missing 'todos'"),
+            "error must mention 'todos'; got: {msg}"
+        );
+    }
+
+    /// Contract: `todos` must be an array; a scalar → is_error=true.
+    #[test]
+    fn todo_write_requires_todos_to_be_array() {
+        let _lock = task_lock();
+        let mut args = HashMap::new();
+        args.insert("todos".to_string(), json!("not-an-array"));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("must be an array"),
+            "error must say 'must be an array'; got: {msg}"
+        );
+    }
+
+    /// Contract: each item must have a `content` field; absent → is_error=true.
+    #[test]
+    fn todo_write_rejects_item_missing_content() {
+        let _lock = task_lock();
+        let args = args_with(json!([{"status": "pending", "activeForm": "doing"}]));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("missing 'content'"),
+            "error must name missing field; got: {msg}"
+        );
+    }
+
+    /// Contract: each item must have a `status` field; absent → is_error=true.
+    #[test]
+    fn todo_write_rejects_item_missing_status() {
+        let _lock = task_lock();
+        let args = args_with(json!([{"content": "task", "activeForm": "doing"}]));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("missing 'status'"),
+            "error must name missing field; got: {msg}"
+        );
+    }
+
+    /// Contract: each item must have an `activeForm` field; absent → is_error=true.
+    #[test]
+    fn todo_write_rejects_item_missing_active_form() {
+        let _lock = task_lock();
+        let args = args_with(json!([{"content": "task", "status": "pending"}]));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("missing 'activeForm'"),
+            "error must name missing field; got: {msg}"
+        );
+    }
+
+    /// Contract: invalid `status` value → is_error=true naming the bad value.
+    #[test]
+    fn todo_write_rejects_invalid_status_value() {
+        let _lock = task_lock();
+        let args = args_with(json!([{
+            "content": "task",
+            "status": "doing",   // not pending/in_progress/completed
+            "activeForm": "doing"
+        }]));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("invalid status"),
+            "error must say 'invalid status'; got: {msg}"
+        );
+    }
+
+    /// Contract: content > 2000 chars → is_error=true.
+    #[test]
+    fn todo_write_rejects_content_exceeding_2000_chars() {
+        let _lock = task_lock();
+        let long_content = "x".repeat(2001);
+        let args = args_with(json!([{
+            "content": long_content,
+            "status": "pending",
+            "activeForm": "working"
+        }]));
+        let (msg, is_err) = execute_todo_write(&args);
+        assert!(is_err);
+        assert!(
+            msg.contains("maximum length"),
+            "error must mention 'maximum length'; got: {msg}"
+        );
+    }
+
+    /// Contract: content exactly 2000 chars is accepted.
+    #[test]
+    fn todo_write_accepts_content_exactly_2000_chars() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+        let exact_content = "y".repeat(2000);
+        let args = args_with(json!([{
+            "content": exact_content,
+            "status": "pending",
+            "activeForm": "working"
+        }]));
+        let (_, is_err) = execute_todo_write(&args);
+        assert!(!is_err, "exactly 2000 chars must be accepted");
+    }
+
+    /// Contract: write is a full replacement — a second call with a single item
+    /// replaces the entire previous list (no merge/append).
+    #[test]
+    fn todo_write_is_full_replacement_not_merge() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        // First write: two items
+        let (_, e1) = execute_todo_write(&args_with(json!([
+            {"content": "first",  "status": "pending",     "activeForm": "A"},
+            {"content": "second", "status": "in_progress", "activeForm": "B"},
+        ])));
+        assert!(!e1);
+        assert_eq!(get_todo_list().len(), 2);
+
+        // Second write: one item — must replace, not append
+        let (_, e2) = execute_todo_write(&args_with(json!([
+            {"content": "replacement", "status": "pending", "activeForm": "C"},
+        ])));
+        assert!(!e2);
+        let stored = get_todo_list();
+        assert_eq!(
+            stored.len(),
+            1,
+            "full replacement: only the new item must remain"
+        );
+        assert_eq!(stored[0].content, "replacement");
+    }
+
+    /// Contract: all-done semantics — when every item is `completed` the stored
+    /// list is cleared (not kept as a list of done items).
+    #[test]
+    fn todo_write_all_done_clears_list_and_confirms_count() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        let (msg, is_err) = execute_todo_write(&args_with(json!([
+            {"content": "alpha", "status": "completed", "activeForm": "A"},
+            {"content": "beta",  "status": "completed", "activeForm": "B"},
+            {"content": "gamma", "status": "completed", "activeForm": "C"},
+        ])));
+        assert!(!is_err);
+        assert!(
+            msg.contains("all 3 items completed"),
+            "success message must state count; got: {msg}"
+        );
+        assert!(
+            get_todo_list().is_empty(),
+            "list must be empty after all-done"
+        );
+    }
+
+    /// Contract: multiple `in_progress` items trigger a warning (OC-specific
+    /// behaviour absent from CC).
+    #[test]
+    fn todo_write_warns_on_multiple_in_progress() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        let (msg, is_err) = execute_todo_write(&args_with(json!([
+            {"content": "a", "status": "in_progress", "activeForm": "A"},
+            {"content": "b", "status": "in_progress", "activeForm": "B"},
+        ])));
+        assert!(!is_err, "multiple in_progress is not an error");
+        assert!(
+            msg.contains("Warning"),
+            "must warn about multiple in_progress; got: {msg}"
+        );
+    }
+
+    /// Contract: a single `in_progress` item produces no warning.
+    #[test]
+    fn todo_write_no_warning_for_single_in_progress() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        let (msg, is_err) = execute_todo_write(&args_with(json!([
+            {"content": "only", "status": "in_progress", "activeForm": "Only"},
+        ])));
+        assert!(!is_err);
+        assert!(
+            !msg.contains("Warning"),
+            "single in_progress must not warn; got: {msg}"
+        );
+    }
+
+    /// Contract: `execute_todo_read` on an empty (or cleared) list returns a
+    /// non-error "No todos" message.
+    #[test]
+    fn todo_read_on_empty_list_returns_no_todos() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        let (msg, is_err) = execute_todo_read();
+        assert!(!is_err);
+        assert!(
+            msg.contains("No todos"),
+            "empty list read must say 'No todos'; got: {msg}"
+        );
+    }
+
+    /// Contract: `execute_todo_read` after a write returns the stored items.
+    #[test]
+    fn todo_read_returns_written_items() {
+        let _lock = task_lock();
+        clear_all_todo_lists();
+
+        let (_, err) = execute_todo_write(&args_with(json!([
+            {"content": "readable task", "status": "pending", "activeForm": "T"},
+        ])));
+        assert!(!err);
+
+        let (msg, is_err) = execute_todo_read();
+        assert!(!is_err);
+        assert!(
+            msg.contains("readable task"),
+            "read must show written content; got: {msg}"
+        );
+    }
+
+    /// Contract: `SessionIdGuard` clears the session on drop even under panic
+    /// (RAII). After the inner scope drops, the outer session key is active again.
+    #[test]
+    fn session_id_guard_restores_on_drop() {
+        let _lock = task_lock();
+
+        let _outer = SessionIdGuard::set("outer-session");
+        assert_eq!(current_session_key(), "outer-session");
+        {
+            let _inner = SessionIdGuard::set("inner-session");
+            assert_eq!(current_session_key(), "inner-session");
+        }
+        assert_eq!(
+            current_session_key(),
+            "outer-session",
+            "guard drop must restore outer session key"
+        );
+    }
+
+    /// Contract: without any guard, the key falls back to DEFAULT_SESSION_KEY.
+    #[test]
+    fn session_key_defaults_without_guard() {
+        // No guard active in this thread at entry.
+        // (We cannot guarantee other tests haven't left a guard, so we only
+        // assert the format contract — it must be a non-empty string.)
+        let key = current_session_key();
+        assert!(!key.is_empty(), "session key must never be empty");
+    }
 }

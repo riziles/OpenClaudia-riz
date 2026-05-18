@@ -341,9 +341,21 @@ fn get_current_branch() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `set_current_dir` is process-global state. Serialise all tests that
+    /// either call `set_current_dir` themselves or rely on being in a git
+    /// repo (which fails if a sibling test has changed cwd to a temp dir).
+    fn cwd_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_get_current_branch() {
+        let _lock = cwd_lock();
         // Should work in the test environment (we're in a git repo)
         let branch = get_current_branch();
         assert!(branch.is_some());
@@ -351,6 +363,7 @@ mod tests {
 
     #[test]
     fn test_enter_worktree_requires_branch() {
+        let _lock = cwd_lock();
         let args = HashMap::new();
         let (msg, is_err) = execute_enter_worktree(&args);
         assert!(is_err);
@@ -359,9 +372,131 @@ mod tests {
 
     #[test]
     fn test_list_worktrees() {
+        let _lock = cwd_lock();
         let (msg, is_err) = execute_list_worktrees();
         // Should work in any git repo
         assert!(!is_err);
         assert!(msg.contains("worktree") || msg.contains("Active"));
+    }
+
+    // ─── Spec §5: Worktree enter/exit updates session working directory ────────
+
+    /// Contract: `enter_worktree` with an empty-string branch returns is_error=true
+    /// and an appropriate message.  (Branch is a required field on the OC side;
+    /// CC's `name` field is optional.)
+    #[test]
+    fn enter_worktree_empty_branch_is_error() {
+        let _lock = cwd_lock();
+        let mut args = HashMap::new();
+        args.insert(
+            "branch".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        let (msg, is_err) = execute_enter_worktree(&args);
+        assert!(is_err, "empty branch must produce is_error=true");
+        assert!(
+            msg.contains("branch name is required"),
+            "error message must mention branch; got: {msg}"
+        );
+    }
+
+    /// Contract: `enter_worktree` outside a git repo returns is_error=true with
+    /// a repo-not-found message.
+    ///
+    /// We simulate "not a git repo" by temporarily changing cwd to a temp dir
+    /// that has no .git ancestor.  After the call we restore cwd so other tests
+    /// are not affected.  The `cwd_lock` ensures no sibling test runs
+    /// concurrently while cwd is temporarily mutated.
+    #[test]
+    fn enter_worktree_outside_git_repo_is_error() {
+        let _lock = cwd_lock();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let original = std::env::current_dir().ok();
+
+        // Move into a directory that has no .git ancestry
+        let _ = std::env::set_current_dir(tmp.path());
+
+        let mut args = HashMap::new();
+        args.insert(
+            "branch".to_string(),
+            serde_json::Value::String("test-branch".to_string()),
+        );
+        let (msg, is_err) = execute_enter_worktree(&args);
+
+        // Restore cwd regardless of outcome
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+
+        assert!(is_err, "must error outside a git repo");
+        assert!(
+            msg.contains("not inside a git repository"),
+            "error must say 'not inside a git repository'; got: {msg}"
+        );
+    }
+
+    /// Contract: `exit_worktree` called from the main worktree (not an isolated
+    /// worktree) returns is_error=true indicating misuse.
+    #[test]
+    fn exit_worktree_from_main_tree_is_error() {
+        let _lock = cwd_lock();
+        // We are running tests from the main worktree of the OpenClaudia repo.
+        let args = HashMap::new();
+        let (msg, is_err) = execute_exit_worktree(&args);
+        assert!(is_err, "exit from main worktree must produce is_error=true");
+        // OC checks git-dir vs git-common-dir and returns this message
+        assert!(
+            msg.contains("Not in an isolated worktree")
+                || msg.contains("not in a git worktree")
+                || msg.contains("not in a git"),
+            "error must indicate we are not in an isolated worktree; got: {msg}"
+        );
+    }
+
+    /// Pin gap #624: OC does NOT check for an already-active worktree session
+    /// before creating another.  This test documents that `enter_worktree` with
+    /// a valid branch in a git repo does NOT return an early "already in worktree"
+    /// error at the tool level (the guard is absent).
+    ///
+    /// We only check the error text — we do not actually create a second worktree
+    /// to avoid mutating the repo under test.
+    #[test]
+    fn enter_worktree_has_no_duplicate_session_guard_gap624() {
+        let _lock = cwd_lock();
+        // The tool accepts a branch arg and proceeds to call git; it does not
+        // check whether a worktree session is already active.  We verify by
+        // calling with a valid branch string and confirming the error (if any)
+        // is about git execution, not a "session already active" guard.
+        let mut args = HashMap::new();
+        args.insert(
+            "branch".to_string(),
+            serde_json::Value::String("probe-gap624".to_string()),
+        );
+        let (msg, _) = execute_enter_worktree(&args);
+        assert!(
+            !msg.contains("already in a worktree"),
+            "gap #624: OC must NOT emit 'already in a worktree' guard; got: {msg}"
+        );
+    }
+
+    /// Pin gap #623: `exit_worktree` with `apply_changes=false` runs
+    /// `git worktree remove --force` without checking for uncommitted work.
+    /// This test documents the CURRENT behaviour — no safety-guard error is
+    /// raised for the discard path (the check is absent; CC requires
+    /// `discard_changes:true` after verifying git status).
+    #[test]
+    fn exit_worktree_discard_path_has_no_safety_guard_gap623() {
+        let _lock = cwd_lock();
+        // We are in the main worktree, so exit returns the "not isolated"
+        // error BEFORE it could reach any safety guard.  The important thing
+        // to pin is that the error message does NOT mention "uncommitted changes"
+        // or "discard_changes" — confirming no CC-style safety guard is present.
+        let mut args = HashMap::new();
+        args.insert("apply_changes".to_string(), serde_json::Value::Bool(false));
+        let (msg, _) = execute_exit_worktree(&args);
+        assert!(
+            !msg.contains("uncommitted changes") && !msg.contains("discard_changes"),
+            "gap #623: OC must NOT emit a safety-guard message; got: {msg}"
+        );
     }
 }

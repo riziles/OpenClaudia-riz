@@ -2035,3 +2035,584 @@ fn parse_axis_overrides(parts: &[&str]) -> Option<SlashCommandResult> {
 
     Some(SlashCommandResult::SetBehaviorMode(mode))
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+//
+// These tests pin the *current* OC contracts against the Phase 1 spec (#539).
+// They document divergences from CC reference behavior (filed as gap issues
+// #653, #657, #659, #662, #663, #666).  Do NOT fix the divergences here —
+// fixing is Phase 3+ work.  If a test starts failing, the production behavior
+// changed and the pin should be updated consciously.
+//
+// Test layout:
+//   - spec_compact_*      — §1 /compact
+//   - spec_resume_*       — §2 /continue|/load|/resume
+//   - spec_effort_*       — §3 /effort
+//   - spec_plan_*         — §4 /plan
+//   - spec_model_*        — §5 /model
+//   - spec_cost_*         — §6 /cost
+//   - spec_agents_*       — §7 /agents
+//   - spec_skill_*        — §8 /skill|/skills
+//   - spec_unknown_*      — §9 unknown command
+//   - gap_missing_*       — Commands entirely absent from OC (gap A–F)
+//
+#[cfg(test)]
+mod tests {
+    use super::{handle_slash_command, SlashCommandResult};
+
+    /// Convenience: empty message vec, dummy provider + model.
+    fn ctx() -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    // ── §1 /compact ──────────────────────────────────────────────────────────
+
+    /// OC: `/compact` and `/summarize` both return `SlashCommandResult::Compact`.
+    /// CC parity: both aliases should trigger compaction.
+    #[test]
+    fn spec_compact_bare_returns_compact() {
+        let result = handle_slash_command("/compact", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Compact)),
+            "/compact must return Compact"
+        );
+    }
+
+    #[test]
+    fn spec_compact_summarize_alias_returns_compact() {
+        let result = handle_slash_command("/summarize", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Compact)),
+            "/summarize alias must return Compact"
+        );
+    }
+
+    /// Pinned divergence: OC ignores the free-text argument; CC passes it as
+    /// `customInstructions`.  The current OC contract is: still returns Compact,
+    /// arg silently dropped.  Test documents this, not fixes it.
+    #[test]
+    fn spec_compact_arg_ignored_returns_compact() {
+        let result = handle_slash_command(
+            "/compact write tests first",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Compact)),
+            "/compact with custom-instructions arg must still return Compact (arg is currently dropped)"
+        );
+    }
+
+    // ── §2 /continue | /load | /resume ───────────────────────────────────────
+
+    /// OC: bare `/resume` with no sessions returns `Handled` (not an interactive
+    /// picker as CC does).
+    #[test]
+    fn spec_resume_bare_no_sessions_returns_handled() {
+        // list_chat_sessions() reads from disk; in test environment it should
+        // return an empty list unless the dev machine has sessions.  We only
+        // assert on the return type, not whether a session was loaded.
+        let result = handle_slash_command("/resume", &mut ctx(), "anthropic", "claude-sonnet");
+        // Either Handled (no sessions) or LoadSession (sessions exist on disk).
+        // Both are valid OC behaviors; neither matches CC's interactive picker.
+        assert!(
+            matches!(
+                result,
+                Some(SlashCommandResult::Handled) | Some(SlashCommandResult::LoadSession(_))
+            ),
+            "bare /resume must return Handled or LoadSession, never None"
+        );
+    }
+
+    /// OC: `/resume <non-numeric>` prints usage and returns Handled.
+    /// CC: would treat the arg as a search term / UUID.  Pinned divergence.
+    #[test]
+    fn spec_resume_non_numeric_arg_rejected() {
+        let result = handle_slash_command(
+            "/resume some-title-search",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/resume <non-numeric> must return Handled (not LoadSession) — OC only accepts numeric index (gap)"
+        );
+    }
+
+    /// OC: `/resume <UUID>` is rejected (UUID is non-numeric).
+    /// CC: would load the session by UUID.  Pinned divergence.
+    #[test]
+    fn spec_resume_uuid_arg_rejected() {
+        let result = handle_slash_command(
+            "/resume 550e8400-e29b-41d4-a716-446655440000",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/resume <UUID> must return Handled — OC rejects non-numeric args (gap)"
+        );
+    }
+
+    /// `/continue` is an alias for `/resume` — same behavior.
+    #[test]
+    fn spec_resume_continue_alias_non_numeric_rejected() {
+        let result = handle_slash_command(
+            "/continue fuzzy-search-term",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/continue <non-numeric> must return Handled"
+        );
+    }
+
+    /// `/load` is an alias for `/resume` — same behavior.
+    #[test]
+    fn spec_resume_load_alias_non_numeric_rejected() {
+        let result =
+            handle_slash_command("/load my-session", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/load <non-numeric> must return Handled"
+        );
+    }
+
+    // ── §3 /effort ───────────────────────────────────────────────────────────
+
+    /// OC: `/effort low` returns `SetEffort("low")`.
+    #[test]
+    fn spec_effort_low_returns_set_effort() {
+        let result = handle_slash_command("/effort low", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "low"),
+            "/effort low must return SetEffort(\"low\")"
+        );
+    }
+
+    /// OC: `/effort l` (short alias) returns `SetEffort("low")`.
+    #[test]
+    fn spec_effort_short_alias_l() {
+        let result = handle_slash_command("/effort l", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "low"),
+            "/effort l alias must return SetEffort(\"low\")"
+        );
+    }
+
+    /// OC: `/effort medium` returns `SetEffort("medium")`.
+    #[test]
+    fn spec_effort_medium_returns_set_effort() {
+        let result =
+            handle_slash_command("/effort medium", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "medium"),
+            "/effort medium must return SetEffort(\"medium\")"
+        );
+    }
+
+    /// OC: `/effort high` returns `SetEffort("high")`.
+    #[test]
+    fn spec_effort_high_returns_set_effort() {
+        let result = handle_slash_command("/effort high", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "high"),
+            "/effort high must return SetEffort(\"high\")"
+        );
+    }
+
+    /// OC: bare `/effort` returns `CycleEffort`.
+    /// CC: bare `/effort` shows current value (no cycling).  Pinned divergence.
+    #[test]
+    fn spec_effort_bare_cycles_not_shows_current() {
+        let result = handle_slash_command("/effort", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::CycleEffort)),
+            "bare /effort must return CycleEffort (OC diverges from CC — CC shows current value)"
+        );
+    }
+
+    /// OC: `/effort max` is not a valid level — returns `Handled` (usage printed).
+    /// CC: `/effort max` is a valid session-only level.  Pinned divergence.
+    #[test]
+    fn spec_effort_max_not_supported_returns_handled() {
+        let result = handle_slash_command("/effort max", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/effort max must return Handled — OC does not support max level (gap)"
+        );
+    }
+
+    /// OC: `/effort auto` is not a valid level — returns `Handled`.
+    /// CC: `/effort auto` clears effort level.  Pinned divergence.
+    #[test]
+    fn spec_effort_auto_not_supported_returns_handled() {
+        let result = handle_slash_command("/effort auto", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/effort auto must return Handled — OC does not support auto/unset (gap)"
+        );
+    }
+
+    // ── §4 /plan ─────────────────────────────────────────────────────────────
+
+    /// OC: `/plan` returns `ToggleMode` (unconditionally toggles Build↔Plan).
+    /// CC: `/plan` only ever enters plan mode; second invocation shows current plan.
+    /// Pinned divergence.
+    #[test]
+    fn spec_plan_bare_returns_toggle_mode() {
+        let result = handle_slash_command("/plan", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::ToggleMode)),
+            "/plan must return ToggleMode (OC toggles both ways; CC only enables)"
+        );
+    }
+
+    /// OC: `/plan open` is not a special sub-command — still returns `ToggleMode`
+    /// (the arg is ignored).  CC: `/plan open` opens the plan file in $EDITOR.
+    /// Pinned divergence.
+    #[test]
+    fn spec_plan_open_arg_ignored_returns_toggle_mode() {
+        let result = handle_slash_command("/plan open", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::ToggleMode)),
+            "/plan open must return ToggleMode — OC ignores args (gap: CC opens $EDITOR)"
+        );
+    }
+
+    /// OC: `/plan <description>` ignores the description and returns `ToggleMode`.
+    /// CC: passes description to trigger an immediate LLM query.  Pinned divergence.
+    #[test]
+    fn spec_plan_description_arg_ignored_returns_toggle_mode() {
+        let result = handle_slash_command(
+            "/plan design the new API",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::ToggleMode)),
+            "/plan <description> must return ToggleMode — OC ignores description arg (gap)"
+        );
+    }
+
+    // ── §5 /model ────────────────────────────────────────────────────────────
+
+    /// OC: bare `/model` prints current model and returns `Handled`.
+    /// CC: bare `/model` opens an interactive TUI picker.  Pinned divergence.
+    #[test]
+    fn spec_model_bare_returns_handled_not_picker() {
+        let result = handle_slash_command("/model", &mut ctx(), "anthropic", "claude-sonnet-4-5");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "bare /model must return Handled (OC shows info; CC shows interactive picker)"
+        );
+    }
+
+    /// OC: `/model list` returns `Handled` (prints static list).
+    #[test]
+    fn spec_model_list_returns_handled() {
+        let result =
+            handle_slash_command("/model list", &mut ctx(), "anthropic", "claude-sonnet-4-5");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/model list must return Handled"
+        );
+    }
+
+    /// OC: `/models` is an alias that lists models (returns `Handled`).
+    #[test]
+    fn spec_models_alias_returns_handled() {
+        let result = handle_slash_command("/models", &mut ctx(), "anthropic", "claude-sonnet-4-5");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/models must return Handled"
+        );
+    }
+
+    /// OC: `/model <name>` returns `SwitchModel` when a non-empty name is given.
+    /// The OC validation logic switches if `available.contains(&name) || !available.is_empty()`,
+    /// which always passes when the provider has any models.  Pin current contract.
+    #[test]
+    fn spec_model_switch_returns_switch_model() {
+        let result = handle_slash_command(
+            "/model claude-opus-4-5",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet-4-5",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::SwitchModel(_))),
+            "/model <name> must return SwitchModel"
+        );
+    }
+
+    /// OC: `/model default` is treated as a model name (not a reset).
+    /// CC: `/model default` resets to the default model.  Pinned divergence.
+    #[test]
+    fn spec_model_default_treated_as_name_not_reset() {
+        let result = handle_slash_command(
+            "/model default",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet-4-5",
+        );
+        // OC routes `/model default` to the switch-model branch, not a reset.
+        assert!(
+            matches!(
+                result,
+                Some(SlashCommandResult::SwitchModel(_)) | Some(SlashCommandResult::Handled)
+            ),
+            "/model default must not return None (OC treats it as a name, not a reset)"
+        );
+    }
+
+    // ── §6 /cost ─────────────────────────────────────────────────────────────
+
+    /// OC: `/cost` prints token estimate + dollar figure and returns `Handled`.
+    /// Estimation is over concatenated message content strings (not actual billed
+    /// tokens).  Pin: always returns `Handled`.
+    #[test]
+    fn spec_cost_returns_handled() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "user", "content": "hello world"}),
+            serde_json::json!({"role": "assistant", "content": "hi there"}),
+        ];
+        let result = handle_slash_command("/cost", &mut msgs, "anthropic", "claude-sonnet-4-5");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/cost must return Handled"
+        );
+    }
+
+    /// OC: `/cost` with empty message list still returns `Handled` (zero tokens).
+    #[test]
+    fn spec_cost_empty_messages_returns_handled() {
+        let result = handle_slash_command("/cost", &mut ctx(), "anthropic", "claude-sonnet-4-5");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/cost on empty conversation must return Handled"
+        );
+    }
+
+    // ── §7 /agents ───────────────────────────────────────────────────────────
+
+    /// OC: `/agents` prints a static list of `AgentType::ALL` and returns `Handled`.
+    /// CC: renders an interactive `AgentsMenu` TUI component.  Pinned divergence.
+    #[test]
+    fn spec_agents_returns_handled_not_interactive() {
+        let result = handle_slash_command("/agents", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/agents must return Handled (OC is non-interactive; CC renders TUI)"
+        );
+    }
+
+    // ── §8 /skill | /skills ──────────────────────────────────────────────────
+
+    /// OC: bare `/skill` lists skills from disk and returns `Handled`.
+    #[test]
+    fn spec_skill_bare_returns_handled() {
+        let result = handle_slash_command("/skill", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "bare /skill must return Handled"
+        );
+    }
+
+    /// OC: `/skills` is an alias for `/skill` bare — returns `Handled`.
+    #[test]
+    fn spec_skills_alias_returns_handled() {
+        let result = handle_slash_command("/skills", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/skills alias must return Handled"
+        );
+    }
+
+    /// OC: `/skill <unknown-name>` returns `Handled` (skill not found path).
+    /// The `eprintln!` fires; result is still Handled.
+    #[test]
+    fn spec_skill_unknown_name_returns_handled() {
+        let result = handle_slash_command(
+            "/skill oc-test-nonexistent-skill-xyz",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/skill <unknown> must return Handled"
+        );
+    }
+
+    // ── §9 Unknown slash command ──────────────────────────────────────────────
+
+    /// OC: any unrecognised command returns `Some(Handled)` (with `eprintln!`).
+    /// CC: the UI layer returns `undefined` / null; the message is the caller's
+    /// responsibility.  OC inlines the error message.  Acceptable divergence.
+    #[test]
+    fn spec_unknown_command_returns_handled() {
+        let result = handle_slash_command(
+            "/xyzzy_unknown_cmd",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "unknown command must return Some(Handled)"
+        );
+    }
+
+    /// OC: unknown command never returns None (which would mean "not a slash command").
+    #[test]
+    fn spec_unknown_command_never_none() {
+        let result = handle_slash_command(
+            "/totally_bogus_command",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            result.is_some(),
+            "unknown slash command must not return None"
+        );
+    }
+
+    // ── Gap A–F: Commands absent from OC (pin unknown-command path) ──────────
+    //
+    // These tests document that the commands from CC gap issues #653, #657,
+    // #659, #662, #663, #666 currently fall through to the unknown-command arm
+    // and return Handled.  If any of these start returning something else, a
+    // Phase 3 implementation landed and this pin must be updated.
+
+    /// Gap A (#653): `/rewind` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_rewind_returns_handled() {
+        let result = handle_slash_command("/rewind", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/rewind must return Handled — command not yet implemented (gap #653)"
+        );
+    }
+
+    /// Gap A (#653): `/checkpoint` (alias for /rewind in CC) also absent.
+    #[test]
+    fn gap_missing_checkpoint_returns_handled() {
+        let result = handle_slash_command("/checkpoint", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/checkpoint must return Handled — command not yet implemented (gap #653)"
+        );
+    }
+
+    /// Gap B (#657): `/teleport` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_teleport_returns_handled() {
+        let result = handle_slash_command("/teleport", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/teleport must return Handled — command not yet implemented (gap #657)"
+        );
+    }
+
+    /// Gap C (#659): `/thinkback` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_thinkback_returns_handled() {
+        let result = handle_slash_command("/thinkback", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/thinkback must return Handled — command not yet implemented (gap #659)"
+        );
+    }
+
+    /// Gap D (#662): `/fast` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_fast_returns_handled() {
+        let result = handle_slash_command("/fast", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/fast must return Handled — command not yet implemented (gap #662)"
+        );
+    }
+
+    /// Gap E (#663): `/mcp` — OC has no `/mcp` command at all.
+    #[test]
+    fn gap_missing_mcp_returns_handled() {
+        let result = handle_slash_command("/mcp", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/mcp must return Handled — command not yet implemented (gap #663)"
+        );
+    }
+
+    /// Gap E (#663): `/mcp add <server>` — same unknown-command path.
+    #[test]
+    fn gap_missing_mcp_add_returns_handled() {
+        let result = handle_slash_command(
+            "/mcp add my-server",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/mcp add must return Handled — command not yet implemented (gap #663)"
+        );
+    }
+
+    /// Gap F (#666): `/hooks` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_hooks_returns_handled() {
+        let result = handle_slash_command("/hooks", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/hooks must return Handled — command not yet implemented (gap #666)"
+        );
+    }
+
+    /// Gap F (#666): `/permissions` does not exist in OC → unknown-command path.
+    #[test]
+    fn gap_missing_permissions_returns_handled() {
+        let result = handle_slash_command("/permissions", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/permissions must return Handled — command not yet implemented (gap #666)"
+        );
+    }
+
+    // ── Input-parsing invariants ──────────────────────────────────────────────
+
+    /// Non-slash input must return None (not a slash command).
+    #[test]
+    fn non_slash_input_returns_none() {
+        let result = handle_slash_command("just text", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(result.is_none(), "non-slash input must return None");
+    }
+
+    /// Commands are case-normalised: `/COMPACT` behaves like `/compact`.
+    #[test]
+    fn command_case_normalised() {
+        let result = handle_slash_command("/COMPACT", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Compact)),
+            "/COMPACT must be treated the same as /compact (case-insensitive)"
+        );
+    }
+
+    /// Commands are case-normalised: `/Effort High` behaves like `/effort high`.
+    #[test]
+    fn effort_case_normalised() {
+        let result = handle_slash_command("/Effort High", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "high"),
+            "/Effort High must be case-insensitive"
+        );
+    }
+}
