@@ -131,7 +131,11 @@ fn sources_match(candidate: &MarketplaceSource, rule: &MarketplaceSource) -> boo
                 git_ref: ref2,
                 path: p2,
             },
-        ) => r1.eq_ignore_ascii_case(r2) && wild_match_opt(ref1.as_ref(), ref2.as_ref()) && wild_match_opt(p1.as_ref(), p2.as_ref()),
+        ) => {
+            r1.eq_ignore_ascii_case(r2)
+                && wild_match_opt(ref1.as_ref(), ref2.as_ref())
+                && wild_match_opt(p1.as_ref(), p2.as_ref())
+        }
         (
             MarketplaceSource::Git {
                 url: u1,

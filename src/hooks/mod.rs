@@ -1107,10 +1107,7 @@ mod tests {
     #[test]
     fn test_hook_error_display() {
         let timeout_err = HookError::Timeout(30);
-        assert_eq!(
-            format!("{timeout_err}"),
-            "Hook timed out after 30 seconds"
-        );
+        assert_eq!(format!("{timeout_err}"), "Hook timed out after 30 seconds");
 
         let cmd_err = HookError::CommandFailed("Process exited with code 1".to_string());
         assert_eq!(
@@ -1131,10 +1128,7 @@ mod tests {
         );
 
         let matcher_err = HookError::InvalidMatcher("(unclosed".to_string());
-        assert_eq!(
-            format!("{matcher_err}"),
-            "Invalid matcher regex: (unclosed"
-        );
+        assert_eq!(format!("{matcher_err}"), "Invalid matcher regex: (unclosed");
     }
 
     // ========================================================================

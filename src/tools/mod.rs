@@ -1849,10 +1849,7 @@ mod tests {
         args.insert("new_source".to_string(), json!("new code\nline 2"));
 
         let (output, is_error) = file::execute_notebook_edit(&args);
-        assert!(
-            !is_error,
-            "notebook_edit replace should succeed: {output}"
-        );
+        assert!(!is_error, "notebook_edit replace should succeed: {output}");
         assert!(output.contains("Replaced cell 0"));
 
         // Verify the file was updated
@@ -2460,7 +2457,9 @@ mod tests {
                     r.content
                 );
             }
-            other @ ExecutionOutcome::NeedsPrompt { .. } => panic!("expected Result(Denied), got {other:?}"),
+            other @ ExecutionOutcome::NeedsPrompt { .. } => {
+                panic!("expected Result(Denied), got {other:?}")
+            }
         }
     }
 
@@ -2490,7 +2489,9 @@ mod tests {
                     r.content
                 );
             }
-            other @ ExecutionOutcome::NeedsPrompt { .. } => panic!("expected Result(Allowed-executed), got {other:?}"),
+            other @ ExecutionOutcome::NeedsPrompt { .. } => {
+                panic!("expected Result(Allowed-executed), got {other:?}")
+            }
         }
     }
 

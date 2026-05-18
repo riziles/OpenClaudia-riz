@@ -544,7 +544,9 @@ mod tests {
         // OC: execution_count and outputs are preserved (not reset to null/[])
         // CC parity: CC would reset both. Pinned as current OC behavior.
         assert!(
-            !cells[0]["outputs"].as_array().is_none_or(std::vec::Vec::is_empty),
+            !cells[0]["outputs"]
+                .as_array()
+                .is_none_or(std::vec::Vec::is_empty),
             "OC does NOT clear outputs on replace (CC parity gap — CC clears them)"
         );
         assert!(

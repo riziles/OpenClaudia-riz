@@ -210,7 +210,6 @@ impl ToolInterceptor {
         // Remove <function_results>...</function_results> or <function_results>...</function_calls>
         // (models sometimes hallucinate the wrong closing tag)
         while let Some(start) = self.buffer.find("<function_results>") {
-
             // Prefer proper closing tag; fall back to </function_calls> (common hallucination)
             let end = if let Some(rel) = self.buffer[start..].find("</function_results>") {
                 start + rel + "</function_results>".len()

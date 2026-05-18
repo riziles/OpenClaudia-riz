@@ -74,7 +74,9 @@ fn handle_plan_edit(
     use std::io::{self, Write};
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
-    let edit_result = std::process::Command::new(&editor).arg(&plan_state.plan_file).status();
+    let edit_result = std::process::Command::new(&editor)
+        .arg(&plan_state.plan_file)
+        .status();
     match edit_result {
         Ok(status) if status.success() => {
             let edited_content = fs::read_to_string(&plan_state.plan_file).unwrap_or_default();
@@ -106,13 +108,23 @@ fn handle_plan_edit(
                 ("Plan edited and approved by user. Full tool access restored. Proceed with implementation according to the edited plan.".to_string(), true)
             } else {
                 println!("\n\x1b[1;31m>> Plan Rejected - Staying in Plan Mode\x1b[0m\n");
-                ("Edited plan rejected by user. Still in plan mode. Revise and try again.".to_string(), false)
+                (
+                    "Edited plan rejected by user. Still in plan mode. Revise and try again."
+                        .to_string(),
+                    false,
+                )
             }
         }
-        Ok(_) => ("Editor exited with error. Plan unchanged. Still in plan mode.".to_string(), false),
+        Ok(_) => (
+            "Editor exited with error. Plan unchanged. Still in plan mode.".to_string(),
+            false,
+        ),
         Err(e) => {
             println!("\x1b[31mFailed to open editor '{editor}': {e}\x1b[0m");
-            ("Failed to open editor. Still in plan mode.".to_string(), false)
+            (
+                "Failed to open editor. Still in plan mode.".to_string(),
+                false,
+            )
         }
     }
 }

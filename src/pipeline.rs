@@ -148,8 +148,10 @@ pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str)
 /// Build a Google Gemini-format request body.
 #[must_use]
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Value {
-    static EMPTY_STR: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| serde_json::json!(""));
-    static EMPTY_OBJ: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| serde_json::json!({}));
+    static EMPTY_STR: std::sync::LazyLock<Value> =
+        std::sync::LazyLock::new(|| serde_json::json!(""));
+    static EMPTY_OBJ: std::sync::LazyLock<Value> =
+        std::sync::LazyLock::new(|| serde_json::json!({}));
     let openai_tools = tools::get_all_tool_definitions(true);
     let tools_vec = openai_tools.as_array().cloned().unwrap_or_default();
     let functions: Vec<Value> = tools_vec
@@ -304,7 +306,18 @@ pub struct RunTurnParams<'a> {
 ///
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
 pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
-    let RunTurnParams { client, endpoint, headers, request_body, provider, memory_db, permission_mgr, hook_engine, session_id, tx } = p;
+    let RunTurnParams {
+        client,
+        endpoint,
+        headers,
+        request_body,
+        provider,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        session_id,
+        tx,
+    } = p;
     tracing::info!(
         endpoint,
         model = request_body
@@ -426,7 +439,10 @@ async fn handle_google_response(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
-        let code = error.get("code").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         return Err(format!("Gemini API error ({code}): {msg}"));
     }
 
@@ -447,8 +463,10 @@ async fn handle_google_response(
                 .filter_map(|p| {
                     let fc = p.get("functionCall")?;
                     let name = fc.get("name")?.as_str()?.to_string();
-                    let args = fc
-                        .get("args").map_or_else(|| "{}".to_string(), |a| serde_json::to_string(a).unwrap_or_default());
+                    let args = fc.get("args").map_or_else(
+                        || "{}".to_string(),
+                        |a| serde_json::to_string(a).unwrap_or_default(),
+                    );
                     Some(ToolCall {
                         id: format!("call_{}", uuid::Uuid::new_v4()),
                         call_type: "function".to_string(),
@@ -663,10 +681,11 @@ pub fn process_sse_event(
             && json
                 .get("content_block")
                 .and_then(|b| b.get("type"))
-                .and_then(|t| t.as_str()) == Some("thinking")
-            {
-                return SseAction::ThinkingStart;
-            }
+                .and_then(|t| t.as_str())
+                == Some("thinking")
+        {
+            return SseAction::ThinkingStart;
+        }
         if event_type == "content_block_stop" && in_thinking_block {
             return SseAction::ThinkingEnd;
         }
@@ -763,8 +782,14 @@ fn check_tool_permission(
     tx: &mpsc::Sender<AppEvent>,
 ) -> PermissionOutcome {
     if always_denied.contains(tool_name) {
-        let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied (always deny for this session)".to_string() });
-        return PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission for this tool.", "is_error": true }));
+        let _ = tx.send(AppEvent::ToolDone {
+            name: tool_name.to_string(),
+            success: false,
+            content: "Denied (always deny for this session)".to_string(),
+        });
+        return PermissionOutcome::DeniedWithResult(
+            serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission for this tool.", "is_error": true }),
+        );
     }
     if always_allowed.contains(tool_name) {
         return PermissionOutcome::Allowed;
@@ -775,7 +800,14 @@ fn check_tool_permission(
         arguments.to_string()
     };
     let (reply_tx, reply_rx) = mpsc::channel();
-    if tx.send(AppEvent::PermissionRequest { tool_name: tool_name.to_string(), tool_args: args_preview, reply: reply_tx }).is_err() {
+    if tx
+        .send(AppEvent::PermissionRequest {
+            tool_name: tool_name.to_string(),
+            tool_args: args_preview,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
         return PermissionOutcome::ChannelBroken;
     }
     match reply_rx.recv() {
@@ -786,12 +818,24 @@ fn check_tool_permission(
         }
         Ok(PermissionResponse::AlwaysDeny) => {
             always_denied.insert(tool_name.to_string());
-            let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied (always deny)".to_string() });
-            PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }))
+            let _ = tx.send(AppEvent::ToolDone {
+                name: tool_name.to_string(),
+                success: false,
+                content: "Denied (always deny)".to_string(),
+            });
+            PermissionOutcome::DeniedWithResult(
+                serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }),
+            )
         }
         Ok(PermissionResponse::Deny) | Err(_) => {
-            let _ = tx.send(AppEvent::ToolDone { name: tool_name.to_string(), success: false, content: "Denied by user".to_string() });
-            PermissionOutcome::DeniedWithResult(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }))
+            let _ = tx.send(AppEvent::ToolDone {
+                name: tool_name.to_string(),
+                success: false,
+                content: "Denied by user".to_string(),
+            });
+            PermissionOutcome::DeniedWithResult(
+                serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission.", "is_error": true }),
+            )
         }
     }
 }
@@ -817,34 +861,88 @@ async fn execute_single_tool(
         tools::execute_tool_with_memory(&tool_call_clone, mem_db.as_deref(), perm_mgr.as_deref())
     })
     .await
-    .unwrap_or_else(|e| tools::ToolResult { tool_call_id: tool_call.id.clone(), content: format!("Tool execution panicked: {e}"), is_error: true });
+    .unwrap_or_else(|e| tools::ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content: format!("Tool execution panicked: {e}"),
+        is_error: true,
+    });
 
-    if tx.send(AppEvent::ToolDone { name: tool_name.clone(), success: !result.is_error, content: result.content.clone() }).is_err() {
+    if tx
+        .send(AppEvent::ToolDone {
+            name: tool_name.clone(),
+            success: !result.is_error,
+            content: result.content.clone(),
+        })
+        .is_err()
+    {
         return None;
     }
     if let Some(engine) = hook_engine {
-        let tool_input: Value = serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
-        engine.fire_post_tool(!result.is_error, tool_name, tool_input, &result.content, session_id).await;
+        let tool_input: Value =
+            serde_json::from_str(&tool_call.function.arguments).unwrap_or(Value::Null);
+        engine
+            .fire_post_tool(
+                !result.is_error,
+                tool_name,
+                tool_input,
+                &result.content,
+                session_id,
+            )
+            .await;
     }
-    let result_content = if result.is_error { format!("[ERROR] {}", result.content) } else { result.content };
-    Some(serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }))
+    let result_content = if result.is_error {
+        format!("[ERROR] {}", result.content)
+    } else {
+        result.content
+    };
+    Some(
+        serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }),
+    )
 }
 
 /// Build a human-readable one-line description of what a tool call will do.
 fn describe_tool_call(tool_name: &str, arguments: &str) -> String {
     let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
     match tool_name {
-        "read_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Reading file".to_string(), |p| format!("Reading {p}")),
-        "write_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Writing file".to_string(), |p| format!("Writing {p}")),
-        "edit_file" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Editing file".to_string(), |p| format!("Editing {p}")),
-        "bash" => args.get("command").and_then(|v| v.as_str()).map_or_else(|| "Running command".to_string(), |c| {
-            let truncated = if c.len() > 80 { crate::tools::safe_truncate(c, 77) } else { c };
-            format!("$ {truncated}")
-        }),
-        "list_files" => args.get("path").and_then(|v| v.as_str()).map_or_else(|| "Listing files".to_string(), |p| format!("Listing {p}")),
-        "web_search" => args.get("query").and_then(|v| v.as_str()).map_or_else(|| "Searching web".to_string(), |q| format!("Searching: {q}")),
-        "web_fetch" => args.get("url").and_then(|v| v.as_str()).map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
-        "chainlink" => args.get("args").and_then(|v| v.as_str()).map_or_else(|| "Running crosslink".to_string(), |a| format!("crosslink {a}")),
+        "read_file" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "Reading file".to_string(), |p| format!("Reading {p}")),
+        "write_file" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "Writing file".to_string(), |p| format!("Writing {p}")),
+        "edit_file" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "Editing file".to_string(), |p| format!("Editing {p}")),
+        "bash" => args.get("command").and_then(|v| v.as_str()).map_or_else(
+            || "Running command".to_string(),
+            |c| {
+                let truncated = if c.len() > 80 {
+                    crate::tools::safe_truncate(c, 77)
+                } else {
+                    c
+                };
+                format!("$ {truncated}")
+            },
+        ),
+        "list_files" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "Listing files".to_string(), |p| format!("Listing {p}")),
+        "web_search" => args.get("query").and_then(|v| v.as_str()).map_or_else(
+            || "Searching web".to_string(),
+            |q| format!("Searching: {q}"),
+        ),
+        "web_fetch" => args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
+        "chainlink" => args.get("args").and_then(|v| v.as_str()).map_or_else(
+            || "Running crosslink".to_string(),
+            |a| format!("crosslink {a}"),
+        ),
         _ => format!("Running {tool_name}"),
     }
 }
@@ -896,7 +994,14 @@ async fn execute_tool_calls_for_tui(
 
         // Permission check for write/destructive tools
         if tool_needs_permission(tool_name) {
-            match check_tool_permission(tool_name, &tool_call.id, &tool_call.function.arguments, &mut always_allowed, &mut always_denied, tx) {
+            match check_tool_permission(
+                tool_name,
+                &tool_call.id,
+                &tool_call.function.arguments,
+                &mut always_allowed,
+                &mut always_denied,
+                tx,
+            ) {
                 PermissionOutcome::Allowed => {}
                 PermissionOutcome::DeniedWithResult(result_json) => {
                     results.push(result_json);
@@ -907,9 +1012,23 @@ async fn execute_tool_calls_for_tui(
         }
 
         let args_desc = describe_tool_call(tool_name, &tool_call.function.arguments);
-        send_event_or_break!(tx, AppEvent::ToolStart { name: tool_name.clone(), description: args_desc });
+        send_event_or_break!(
+            tx,
+            AppEvent::ToolStart {
+                name: tool_name.clone(),
+                description: args_desc
+            }
+        );
 
-        let tool_result = execute_single_tool(tool_call, memory_db.clone(), permission_mgr.clone(), session_id, hook_engine.as_ref().map(Arc::as_ref), tx).await;
+        let tool_result = execute_single_tool(
+            tool_call,
+            memory_db.clone(),
+            permission_mgr.clone(),
+            session_id,
+            hook_engine.as_ref().map(Arc::as_ref),
+            tx,
+        )
+        .await;
         match tool_result {
             None => break, // channel broken
             Some(result_json) => results.push(result_json),

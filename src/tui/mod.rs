@@ -869,7 +869,9 @@ pub struct WelcomeScreen {
 impl WelcomeScreen {
     #[must_use]
     pub fn new(version: &str, provider: &str, model: &str) -> Self {
-        let cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| {
+        let cwd = std::env::current_dir().map_or_else(
+            |_| ".".to_string(),
+            |p| {
                 // Shorten home dir to ~
                 if let Some(home) = dirs::home_dir() {
                     if let Ok(rel) = p.strip_prefix(&home) {
@@ -877,7 +879,8 @@ impl WelcomeScreen {
                     }
                 }
                 p.display().to_string()
-            });
+            },
+        );
 
         Self {
             version: version.to_string(),

@@ -274,12 +274,17 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
     }
 
     let Some(provider) = config.active_provider() else {
-        eprintln!("No provider configured for target '{}'", config.proxy.target);
+        eprintln!(
+            "No provider configured for target '{}'",
+            config.proxy.target
+        );
         return Ok(());
     };
 
-    let Some(ChatAuth { api_key, claude_code_token }) =
-        resolve_chat_auth(&config.proxy.target, provider).await?
+    let Some(ChatAuth {
+        api_key,
+        claude_code_token,
+    }) = resolve_chat_auth(&config.proxy.target, provider).await?
     else {
         return Ok(());
     };
@@ -295,7 +300,11 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
         &config.proxy.target,
         api_key.as_ref(),
         claude_code_token.as_deref(),
-        &provider.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+        &provider
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>(),
     );
 
     guardrails::configure(&config.guardrails);
@@ -336,11 +345,21 @@ fn tui_launch(
     let rules_content = {
         let extensions: Vec<&str> = vec!["rs", "py", "ts", "js", "go", "java", "rb", "md"];
         let content = rules_engine.get_combined_rules(&extensions);
-        if content.is_empty() { None } else { Some(content) }
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        }
     };
 
     let mut app = tui::app::App::new(model, &config.proxy.target);
-    app.set_api_config(endpoint, headers, system_prompt, Some(tui_prompt_blocks), claude_code_token);
+    app.set_api_config(
+        endpoint,
+        headers,
+        system_prompt,
+        Some(tui_prompt_blocks),
+        claude_code_token,
+    );
     app.hook_engine = Some(hook_engine);
     app.memory_db = memory_db.map(std::sync::Arc::new);
     app.rules_content = rules_content;
@@ -868,7 +887,10 @@ async fn run_vdd_review(
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .unwrap_or("");
 
-    match engine.review_text(content, user_task, target, api_key).await {
+    match engine
+        .review_text(content, user_task, target, api_key)
+        .await
+    {
         Ok(result) => {
             if result.findings.is_empty() {
                 println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
@@ -889,7 +911,10 @@ async fn run_vdd_review(
                         vdd::FindingStatus::FalsePositive => "✗",
                         vdd::FindingStatus::Disputed => "?",
                     };
-                    println!("  {} [{}] {}", status_icon, finding.severity, finding.description);
+                    println!(
+                        "  {} [{}] {}",
+                        status_icon, finding.severity, finding.description
+                    );
                 }
                 if !result.context_injection.is_empty() {
                     messages.push(serde_json::json!({
@@ -1499,7 +1524,8 @@ async fn cmd_chat(
                         SlashCommandResult::SideQuestion(question) => {
                             // Save history, run aside turn, restore history.
                             let saved = chat_session.messages.clone();
-                            chat_session.messages = vec![serde_json::json!({"role":"user","content":question})];
+                            chat_session.messages =
+                                vec![serde_json::json!({"role":"user","content":question})];
                             eprintln!("\x1b[90m[/btw aside — main flow will be restored]\x1b[0m");
                             chat_session.messages.extend(saved);
                             // Fall through to normal API call.
@@ -1874,13 +1900,13 @@ async fn cmd_chat(
                                                                 .get("name")?
                                                                 .as_str()?
                                                                 .to_string();
-                                                            let args = fc
-                                                                .get("args").map_or_else(|| {
-                                                                    "{}".to_string()
-                                                                }, |a| {
+                                                            let args = fc.get("args").map_or_else(
+                                                                || "{}".to_string(),
+                                                                |a| {
                                                                     serde_json::to_string(a)
                                                                         .unwrap_or_default()
-                                                                });
+                                                                },
+                                                            );
                                                             Some(tools::ToolCall {
                                                                 id: format!(
                                                                     "call_{}",
@@ -2015,8 +2041,20 @@ async fn cmd_chat(
                                                 }
 
                                                 // Permission check before execution
-                                                let tool_args_val: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(serde_json::Map::default()) });
+                                                let tool_args_val: serde_json::Value =
+                                                    serde_json::from_str(
+                                                        &tool_call.function.arguments,
+                                                    )
+                                                    .unwrap_or_else(|e| {
+                                                        tracing::warn!(
+                                                            "Malformed tool arguments for '{}': {}",
+                                                            tool_call.function.name,
+                                                            e
+                                                        );
+                                                        serde_json::Value::Object(
+                                                            serde_json::Map::default(),
+                                                        )
+                                                    });
                                                 match check_tool_permission_interactive(
                                                     &tool_call.function.name,
                                                     &tool_args_val,
@@ -2065,16 +2103,20 @@ async fn cmd_chat(
                                                 let _session_guard =
                                                     tools::SessionIdGuard::set(&chat_session.id);
                                                 let result = memory_db.as_ref().map_or_else(
-                                                    || tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        None,
-                                                        Some(&permission_mgr),
-                                                    ),
-                                                    |db| tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        Some(db),
-                                                        Some(&permission_mgr),
-                                                    ),
+                                                    || {
+                                                        tools::execute_tool_with_memory(
+                                                            tool_call,
+                                                            None,
+                                                            Some(&permission_mgr),
+                                                        )
+                                                    },
+                                                    |db| {
+                                                        tools::execute_tool_with_memory(
+                                                            tool_call,
+                                                            Some(db),
+                                                            Some(&permission_mgr),
+                                                        )
+                                                    },
                                                 );
 
                                                 // Auto-learn from tool result
@@ -2163,16 +2205,25 @@ async fn cmd_chat(
                                                 .as_array()
                                                 .cloned()
                                                 .unwrap_or_default();
-                                            let functions: Vec<serde_json::Value> = tools_vec.iter().filter_map(|tool| {
-                                            let func = tool.get("function")?;
-                                            let description = func.get("description").cloned().unwrap_or_else(|| serde_json::json!(""));
-                                            let parameters = func.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({}));
-                                            Some(serde_json::json!({
-                                                "name": func.get("name")?,
-                                                "description": description,
-                                                "parameters": parameters
-                                            }))
-                                        }).collect();
+                                            let functions: Vec<serde_json::Value> = tools_vec
+                                                .iter()
+                                                .filter_map(|tool| {
+                                                    let func = tool.get("function")?;
+                                                    let description = func
+                                                        .get("description")
+                                                        .cloned()
+                                                        .unwrap_or_else(|| serde_json::json!(""));
+                                                    let parameters = func
+                                                        .get("parameters")
+                                                        .cloned()
+                                                        .unwrap_or_else(|| serde_json::json!({}));
+                                                    Some(serde_json::json!({
+                                                        "name": func.get("name")?,
+                                                        "description": description,
+                                                        "parameters": parameters
+                                                    }))
+                                                })
+                                                .collect();
 
                                             let mut followup_req = serde_json::json!({
                                                 "contents": gemini_contents,
@@ -2718,8 +2769,20 @@ async fn cmd_chat(
                                                 }
 
                                                 // Permission check
-                                                let tool_args_val2: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                                                    .unwrap_or_else(|e| { tracing::warn!("Malformed tool arguments for '{}': {}", tool_call.function.name, e); serde_json::Value::Object(serde_json::Map::default()) });
+                                                let tool_args_val2: serde_json::Value =
+                                                    serde_json::from_str(
+                                                        &tool_call.function.arguments,
+                                                    )
+                                                    .unwrap_or_else(|e| {
+                                                        tracing::warn!(
+                                                            "Malformed tool arguments for '{}': {}",
+                                                            tool_call.function.name,
+                                                            e
+                                                        );
+                                                        serde_json::Value::Object(
+                                                            serde_json::Map::default(),
+                                                        )
+                                                    });
                                                 match check_tool_permission_interactive(
                                                     &tool_call.function.name,
                                                     &tool_args_val2,
@@ -2759,16 +2822,20 @@ async fn cmd_chat(
                                                 let _session_guard =
                                                     tools::SessionIdGuard::set(&chat_session.id);
                                                 let result = memory_db.as_ref().map_or_else(
-                                                    || tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        None,
-                                                        Some(&permission_mgr),
-                                                    ),
-                                                    |db| tools::execute_tool_with_memory(
-                                                        tool_call,
-                                                        Some(db),
-                                                        Some(&permission_mgr),
-                                                    ),
+                                                    || {
+                                                        tools::execute_tool_with_memory(
+                                                            tool_call,
+                                                            None,
+                                                            Some(&permission_mgr),
+                                                        )
+                                                    },
+                                                    |db| {
+                                                        tools::execute_tool_with_memory(
+                                                            tool_call,
+                                                            Some(db),
+                                                            Some(&permission_mgr),
+                                                        )
+                                                    },
                                                 );
 
                                                 // Auto-learn from tool result
@@ -3396,7 +3463,9 @@ async fn cmd_chat(
                                                         tool_call.function.name,
                                                         e
                                                     );
-                                                    serde_json::Value::Object(serde_json::Map::default())
+                                                    serde_json::Value::Object(
+                                                        serde_json::Map::default(),
+                                                    )
                                                 });
                                         match check_tool_permission_interactive(
                                             &tool_call.function.name,
@@ -3427,16 +3496,20 @@ async fn cmd_chat(
                                         let _session_guard =
                                             tools::SessionIdGuard::set(&chat_session.id);
                                         let result = memory_db.as_ref().map_or_else(
-                                            || tools::execute_tool_with_memory(
-                                                tool_call,
-                                                None,
-                                                Some(&permission_mgr),
-                                            ),
-                                            |db| tools::execute_tool_with_memory(
-                                                tool_call,
-                                                Some(db),
-                                                Some(&permission_mgr),
-                                            ),
+                                            || {
+                                                tools::execute_tool_with_memory(
+                                                    tool_call,
+                                                    None,
+                                                    Some(&permission_mgr),
+                                                )
+                                            },
+                                            |db| {
+                                                tools::execute_tool_with_memory(
+                                                    tool_call,
+                                                    Some(db),
+                                                    Some(&permission_mgr),
+                                                )
+                                            },
                                         );
 
                                         // Auto-learn from tool result
@@ -3471,46 +3544,54 @@ async fn cmd_chat(
 
                                         // Log activity for short-term memory
                                         if let Some(ref db) = memory_db {
-                                            let activity_type =
-                                                match tool_call.function.name.as_str() {
-                                                    "read_file" => "file_read",
-                                                    "write_file" => "file_write",
-                                                    "edit_file" => "file_edit",
-                                                    "bash" => "bash_command",
-                                                    "chainlink" => {
-                                                        // Parse chainlink subcommand
-                                                        serde_json::from_str::<serde_json::Value>(
-                                                            &tool_call.function.arguments,
-                                                        ).map_or("chainlink", |args| {
-                                                            args.get("command")
-                                                                .and_then(|v| v.as_str())
-                                                                .map_or("chainlink", |cmd| {
-                                                                    if cmd.starts_with("create") {
-                                                                        "issue_created"
-                                                                    } else if cmd.starts_with("close") {
-                                                                        "issue_closed"
-                                                                    } else if cmd.starts_with("comment") {
-                                                                        "issue_comment"
-                                                                    } else {
-                                                                        "chainlink"
-                                                                    }
-                                                                })
-                                                        })
-                                                    }
-                                                    other => other,
-                                                };
+                                            let activity_type = match tool_call
+                                                .function
+                                                .name
+                                                .as_str()
+                                            {
+                                                "read_file" => "file_read",
+                                                "write_file" => "file_write",
+                                                "edit_file" => "file_edit",
+                                                "bash" => "bash_command",
+                                                "chainlink" => {
+                                                    // Parse chainlink subcommand
+                                                    serde_json::from_str::<serde_json::Value>(
+                                                        &tool_call.function.arguments,
+                                                    )
+                                                    .map_or("chainlink", |args| {
+                                                        args.get("command")
+                                                            .and_then(|v| v.as_str())
+                                                            .map_or("chainlink", |cmd| {
+                                                                if cmd.starts_with("create") {
+                                                                    "issue_created"
+                                                                } else if cmd.starts_with("close") {
+                                                                    "issue_closed"
+                                                                } else if cmd.starts_with("comment")
+                                                                {
+                                                                    "issue_comment"
+                                                                } else {
+                                                                    "chainlink"
+                                                                }
+                                                            })
+                                                    })
+                                                }
+                                                other => other,
+                                            };
 
                                             // Extract target from args
                                             let target = serde_json::from_str::<serde_json::Value>(
                                                 &tool_call.function.arguments,
-                                            ).map_or_else(
+                                            )
+                                            .map_or_else(
                                                 |_| tool_call.function.name.clone(),
-                                                |args| args.get("path")
-                                                    .or_else(|| args.get("file_path"))
-                                                    .or_else(|| args.get("command"))
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or(&tool_call.function.name)
-                                                    .to_string(),
+                                                |args| {
+                                                    args.get("path")
+                                                        .or_else(|| args.get("file_path"))
+                                                        .or_else(|| args.get("command"))
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or(&tool_call.function.name)
+                                                        .to_string()
+                                                },
                                             );
 
                                             let _ = db.log_activity(

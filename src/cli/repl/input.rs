@@ -151,21 +151,22 @@ pub fn open_external_editor() -> Option<String> {
     let status = Command::new(&editor).arg(&temp_file).status();
 
     match status {
-        Ok(s) if s.success() => {
-            fs::read_to_string(&temp_file).map_or_else(
-                |_| { println!("No content entered.\n"); None },
-                |content| {
-                    let _ = fs::remove_file(&temp_file);
-                    let trimmed = content.trim().to_string();
-                    if trimmed.is_empty() {
-                        println!("Editor closed with empty content.\n");
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
-                },
-            )
-        }
+        Ok(s) if s.success() => fs::read_to_string(&temp_file).map_or_else(
+            |_| {
+                println!("No content entered.\n");
+                None
+            },
+            |content| {
+                let _ = fs::remove_file(&temp_file);
+                let trimmed = content.trim().to_string();
+                if trimmed.is_empty() {
+                    println!("Editor closed with empty content.\n");
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            },
+        ),
         Ok(_) => {
             eprintln!("Editor exited with error.\n");
             let _ = fs::remove_file(&temp_file);

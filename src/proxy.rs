@@ -626,7 +626,10 @@ async fn record_turn_estimate(state: &ProxyState, request: &ChatCompletionReques
     );
     let context_window = crate::compaction::get_context_window(&request.model);
     // Integer-safe utilization computation.
-    let utilization_pct_x10 = estimated_input.saturating_mul(1000).checked_div(context_window).unwrap_or(0);
+    let utilization_pct_x10 = estimated_input
+        .saturating_mul(1000)
+        .checked_div(context_window)
+        .unwrap_or(0);
     #[allow(clippy::cast_possible_truncation)]
     let usage_pct_f64 = f64::from(utilization_pct_x10 as u32) / 10.0;
 
@@ -799,7 +802,10 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
             }
             state
                 .hook_engine
-                .fire_notification("compaction", serde_json::json!({ "summary_length": summary_len }))
+                .fire_notification(
+                    "compaction",
+                    serde_json::json!({ "summary_length": summary_len }),
+                )
                 .await;
         }
         Ok(_) => {}
@@ -812,12 +818,146 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
     }
 }
 
+/// Resolve the target provider, its configuration, and the API key for a
+/// chat-completion request.
+///
+/// Returns `(provider_name, provider_config, api_key)`. The provider config is
+/// borrowed from `state.config`; callers must hold `state` across the
+/// returned reference's lifetime.
+///
+/// # Errors
+///
+/// - [`ProxyError::ProviderNotConfigured`] if the resolved provider name has
+///   no entry in `state.config.providers`.
+/// - [`ProxyError::NoApiKey`] if neither the request headers nor the provider
+///   config supply an API key.
+fn resolve_provider<'a>(
+    state: &'a ProxyState,
+    headers: &HeaderMap,
+    model: &str,
+) -> Result<(String, &'a ProviderConfig, ApiKey), ProxyError> {
+    let provider_name = determine_provider(model, &state.config);
+    let provider = state
+        .config
+        .get_provider(&provider_name)
+        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
+    let api_key = extract_api_key(headers)
+        .or_else(|| provider.api_key.clone())
+        .ok_or_else(|| ProxyError::NoApiKey(provider_name.clone()))?;
+    Ok((provider_name, provider, api_key))
+}
+
+/// Increment the active session's request counter, if one exists.
+///
+/// Holds the session-manager write lock for the smallest possible scope.
+async fn bump_session_request_count(state: &ProxyState) {
+    let mut sm = state.session_manager.write().await;
+    if let Some(session) = sm.get_session_mut() {
+        session.increment_requests();
+    }
+}
+
+/// For OpenAI-compatible streaming requests, inject `stream_options` so the
+/// upstream includes a final usage event we can attribute to the session.
+///
+/// No-op for Anthropic-style providers (their streaming protocol carries
+/// usage in `message_delta`/`message_start` events instead) and for any
+/// payload that already specifies `stream_options`.
+fn inject_stream_options_if_needed(
+    transformed_request: &mut Value,
+    is_stream: bool,
+    provider_name: &str,
+) {
+    if !is_stream || provider_name.contains("anthropic") {
+        return;
+    }
+    if let Some(obj) = transformed_request.as_object_mut() {
+        if !obj.contains_key("stream_options") {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+    }
+}
+
+/// Apply the provider adapter's request transform (with thinking config),
+/// inject OpenAI-style `stream_options` when applicable, and forward the
+/// request upstream.
+///
+/// # Errors
+///
+/// - [`ProxyError::InvalidBody`] if the adapter's transform fails.
+/// - Any [`ProxyError`] surfaced by [`forward_to_provider_raw_reqwest`].
+async fn transform_and_forward(
+    state: &ProxyState,
+    provider: &ProviderConfig,
+    provider_name: &str,
+    api_key: &ApiKey,
+    request: &ChatCompletionRequest,
+    is_stream: bool,
+) -> Result<reqwest::Response, ProxyError> {
+    let adapter = get_adapter(provider_name);
+    debug!(provider = adapter.name(), "Using provider adapter");
+
+    let mut transformed_request = adapter
+        .transform_request_with_thinking(request, &provider.thinking)
+        .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
+
+    inject_stream_options_if_needed(&mut transformed_request, is_stream, provider_name);
+
+    forward_to_provider_raw_reqwest(
+        &state.client,
+        provider,
+        api_key,
+        &adapter.chat_endpoint(&request.model),
+        &transformed_request,
+        is_stream,
+        adapter.get_headers(api_key),
+    )
+    .await
+}
+
+/// Record an upstream-reported token usage tally against the active session
+/// and optionally log it at `info`.
+///
+/// The session write lock is held only for the mutation itself; logging
+/// happens after the lock is released to minimize contention. Logging is
+/// gated on both the `log_usage` config flag and the existence of a session
+/// (matching the original inline behavior).
+async fn record_actual_usage_for_session(state: &ProxyState, usage: TokenUsage) {
+    // Snapshot of values needed for logging, captured before releasing the
+    // lock so we can drop the guard before doing any I/O.
+    let input_tokens = usage.input_tokens;
+    let output_tokens = usage.output_tokens;
+    let cache_read_tokens = usage.cache_read_tokens;
+    let cache_write_tokens = usage.cache_write_tokens;
+
+    let recorded = {
+        let mut sm = state.session_manager.write().await;
+        sm.get_session_mut().is_some_and(|session| {
+            session.record_actual_usage(usage);
+            true
+        })
+    };
+
+    if recorded && state.config.session.token_tracking.log_usage {
+        info!(
+            input = input_tokens,
+            output = output_tokens,
+            cache_read = cache_read_tokens,
+            cache_write = cache_write_tokens,
+            "Actual token usage from provider"
+        );
+    }
+}
+
 async fn proxy_chat_completions(
     State(state): State<ProxyState>,
     headers: HeaderMap,
     body: String,
 ) -> Result<Response, ProxyError> {
-    let request: ChatCompletionRequest =
+    let mut request: ChatCompletionRequest =
         serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
 
     info!(
@@ -826,35 +966,13 @@ async fn proxy_chat_completions(
         "Proxying chat completion request"
     );
 
-    // Determine target provider from model or config
-    let provider_name = determine_provider(&request.model, &state.config);
-    let provider = state
-        .config
-        .get_provider(&provider_name)
-        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
+    let (provider_name, provider, api_key) = resolve_provider(&state, &headers, &request.model)?;
 
-    // Get API key from header or config
-    let api_key = extract_api_key(&headers)
-        .or_else(|| provider.api_key.clone())
-        .ok_or_else(|| ProxyError::NoApiKey(provider_name.clone()))?;
-
-    // Track request in session
-    {
-        let mut sm = state.session_manager.write().await;
-        if let Some(session) = sm.get_session_mut() {
-            session.increment_requests();
-        }
-    }
+    bump_session_request_count(&state).await;
 
     // Prepare request: run hooks, inject context, rules, MCP tools, VDD
-    let mut request = request;
     prepare_request_context(&mut request, &state).await?;
-
     compact_request_context(&mut request, &state).await;
-
-    // Get the provider adapter for request transformation
-    let adapter = get_adapter(&provider_name);
-    debug!(provider = adapter.name(), "Using provider adapter");
 
     // Pre-request token estimation and tracking
     let token_tracking_enabled = state.config.session.token_tracking.enabled;
@@ -863,34 +981,13 @@ async fn proxy_chat_completions(
     }
 
     let is_stream = request.stream.unwrap_or(false);
-
-    // Transform request to provider format with thinking config
-    let mut transformed_request = adapter
-        .transform_request_with_thinking(&request, &provider.thinking)
-        .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
-
-    // For OpenAI-compatible streaming requests, inject stream_options to
-    // include usage in the final SSE event so we can track token costs.
-    if is_stream && !provider_name.contains("anthropic") {
-        if let Some(obj) = transformed_request.as_object_mut() {
-            if !obj.contains_key("stream_options") {
-                obj.insert(
-                    "stream_options".to_string(),
-                    serde_json::json!({"include_usage": true}),
-                );
-            }
-        }
-    }
-
-    // Forward to provider with transformed request
-    let raw_response = forward_to_provider_raw_reqwest(
-        &state.client,
+    let raw_response = transform_and_forward(
+        &state,
         provider,
+        &provider_name,
         &api_key,
-        &adapter.chat_endpoint(&request.model),
-        &transformed_request,
+        &request,
         is_stream,
-        adapter.get_headers(&api_key),
     )
     .await?;
 
@@ -898,28 +995,11 @@ async fn proxy_chat_completions(
     if token_tracking_enabled && !is_stream {
         let (response_value, usage) = convert_response_with_usage(raw_response).await?;
         if let Some(usage) = usage {
-            let mut sm = state.session_manager.write().await;
-            if let Some(session) = sm.get_session_mut() {
-                if state.config.session.token_tracking.log_usage {
-                    info!(
-                        input = usage.input_tokens,
-                        output = usage.output_tokens,
-                        cache_read = usage.cache_read_tokens,
-                        cache_write = usage.cache_write_tokens,
-                        "Actual token usage from provider"
-                    );
-                }
-                session.record_actual_usage(usage);
-            }
+            record_actual_usage_for_session(&state, usage).await;
         }
-
-        let response_value =
-            apply_vdd_review(response_value, &state, &request, &provider_name, &api_key).await?;
-
-        Ok(response_value)
+        apply_vdd_review(response_value, &state, &request, &provider_name, &api_key).await
     } else {
-        let response = convert_response(raw_response).await?;
-        Ok(response)
+        convert_response(raw_response).await
     }
 }
 

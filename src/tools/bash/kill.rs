@@ -32,7 +32,8 @@ pub fn terminate_process_tree(pid: u32) {
 
         // libc::pid_t is i32; cast is safe because u32::MAX/2 > any realistic PID.
         // POSIX guarantees pid_t fits in i32 and process-group IDs share the range.
-        let signed_pid = pid as libc::pid_t;
+        let signed_pid = i32::try_from(pid)
+            .expect("INVARIANT: PID fits in i32 per POSIX (pid_t guarantees i32 range)");
         // Negative pid targets the entire process group (POSIX kill(2)).
         let process_group_id = -signed_pid;
 

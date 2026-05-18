@@ -497,9 +497,7 @@ fn web_search_domain_filter_blocks_blocked_domain() {
         .into_iter()
         .filter(|r| {
             let host = host_of_test(&r.url);
-            host.is_none_or(|h| {
-                !blocked.iter().any(|d| domain_matches_test(&h, d))
-            })
+            host.is_none_or(|h| !blocked.iter().any(|d| domain_matches_test(&h, d)))
         })
         .collect();
 

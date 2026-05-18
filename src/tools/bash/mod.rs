@@ -555,7 +555,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let contains = shells.contains_key(&id);
             drop(shells);
-            assert!(!contains, "b2_kill_running: entry must be removed after kill");
+            assert!(
+                !contains,
+                "b2_kill_running: entry must be removed after kill"
+            );
         }
     }
 

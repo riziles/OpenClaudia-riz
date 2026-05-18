@@ -179,7 +179,9 @@ impl Overlay for LogSelector {
                 }
                 OverlayAction::Consumed
             }
-            KeyCode::Enter => self.selected_id().map_or(OverlayAction::Close, OverlayAction::ResumeSession),
+            KeyCode::Enter => self
+                .selected_id()
+                .map_or(OverlayAction::Close, OverlayAction::ResumeSession),
             _ => OverlayAction::Consumed,
         }
     }

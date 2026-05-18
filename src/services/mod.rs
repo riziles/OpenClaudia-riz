@@ -17,9 +17,11 @@
 //! real implementation.
 
 pub mod analytics;
+pub mod background;
 pub mod feature_flags;
 
 pub use analytics::{AnalyticsEvent, AnalyticsSink, NoopAnalytics, TracingAnalytics};
+pub use background::{BackgroundJob, JobOutcome, JobScheduler, MemoryConsolidationJob};
 pub use feature_flags::{FeatureFlagSource, StaticFlags};
 
 use std::sync::Arc;

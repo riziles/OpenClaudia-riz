@@ -141,20 +141,22 @@ fn resolve_path(path: &str) -> Result<PathBuf, String> {
     // the chain to the first existing ancestor, canonicalize THAT, then
     // rejoin the virtual suffix — this closes the symlink-escape-on-read hole
     // while still supporting `write_file path/to/newly/created/file.txt`.
-    let canonical = if let Ok(c) = absolute.canonicalize() { c } else {
+    let canonical = if let Ok(c) = absolute.canonicalize() {
+        c
+    } else {
         let mut ancestor = absolute.as_path();
         let mut suffix_components: Vec<&std::ffi::OsStr> = Vec::new();
         let canonical_ancestor = loop {
-            if let Ok(c) = ancestor.canonicalize() { break c; }
+            if let Ok(c) = ancestor.canonicalize() {
+                break c;
+            }
             let file_name = ancestor.file_name().ok_or_else(|| {
-                format!(
-                    "Cannot resolve any ancestor of '{path}' — reached filesystem root"
-                )
+                format!("Cannot resolve any ancestor of '{path}' — reached filesystem root")
             })?;
             suffix_components.push(file_name);
-            ancestor = ancestor.parent().ok_or_else(|| {
-                format!("Cannot resolve parent while walking up '{path}'")
-            })?;
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| format!("Cannot resolve parent while walking up '{path}'"))?;
         };
         let mut built = canonical_ancestor;
         for comp in suffix_components.iter().rev() {

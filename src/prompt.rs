@@ -163,7 +163,10 @@ pub fn build_system_prompt_blocks(
         suffix.push_str("## Environment\n");
         let _ = writeln!(suffix, "- Working directory: {cwd}");
         suffix.push_str("- All file paths (read_file, write_file, edit_file, notebook_edit) must use **absolute paths**\n");
-        let _ = writeln!(suffix, "- When referring to files in the project, use the full path starting with {cwd}/");
+        let _ = writeln!(
+            suffix,
+            "- When referring to files in the project, use the full path starting with {cwd}/"
+        );
         suffix.push_str(
             "- Relative paths will be resolved against the working directory, but prefer absolute paths\n",
         );
@@ -179,7 +182,12 @@ pub fn build_system_prompt_blocks(
         suffix.push_str("The following skills are available. When the user asks you to run a skill or mentions a /<skill-name>, inject the skill's prompt as your next action.\n\n");
         for skill in &skills {
             use std::fmt::Write as _;
-            let _ = writeln!(suffix, "- `/{name}` — {desc}", name = skill.name, desc = skill.description);
+            let _ = writeln!(
+                suffix,
+                "- `/{name}` — {desc}",
+                name = skill.name,
+                desc = skill.description
+            );
         }
     }
 

@@ -206,7 +206,8 @@ mod file_tools {
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let read_call =
+            make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
         let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
@@ -241,7 +242,8 @@ mod file_tools {
         let file_path = dir.path().join("test.txt");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let read_call =
+            make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
         let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
@@ -391,7 +393,11 @@ mod file_tools {
         let file_path = dir.path().join("large.txt");
 
         // Create a large file (10000 lines)
-        let content: String = (0..10000).fold(String::new(), |mut s, i| { use std::fmt::Write as _; let _ = writeln!(s, "Line {i}"); s });
+        let content: String = (0..10000).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "Line {i}");
+            s
+        });
         fs::write(&file_path, &content).expect("Failed to write large file");
 
         let tool_call = make_tool_call(
@@ -419,7 +425,11 @@ mod file_tools {
         let dir = TempDir::new().expect("Failed to create temp dir");
         let file_path = dir.path().join("large_limit.txt");
 
-        let content: String = (0..1000).fold(String::new(), |mut s, i| { use std::fmt::Write as _; let _ = writeln!(s, "Line {i}"); s });
+        let content: String = (0..1000).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "Line {i}");
+            s
+        });
         fs::write(&file_path, &content).expect("Failed to write");
 
         let tool_call = make_tool_call(
@@ -451,7 +461,8 @@ mod file_tools {
         fs::write(&file_path, original).expect("Failed to write");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let read_call =
+            make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
         let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
@@ -489,7 +500,8 @@ mod file_tools {
         fs::write(&file_path, original).expect("Failed to write");
 
         // Read the file first (required before editing)
-        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let read_call =
+            make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
         let _ = execute_tool(&read_call);
 
         let tool_call = make_tool_call(
@@ -673,7 +685,8 @@ mod file_tools {
         fs::write(&file_path, "some content here").expect("Failed to write");
 
         // Read first
-        let read_call = make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
+        let read_call =
+            make_tool_call("read_file", &json!({ "path": file_path.to_string_lossy() }));
         let _ = execute_tool(&read_call);
 
         // Edit with same old and new string
@@ -1269,7 +1282,10 @@ mod web_tools {
         // This is a real network call - might fail in CI/offline environments
         // We check if it either succeeded or failed gracefully
         if !result.is_error {
-            assert!(!result.content.is_empty(), "Should return content from fetch");
+            assert!(
+                !result.content.is_empty(),
+                "Should return content from fetch"
+            );
         }
     }
 
@@ -1424,7 +1440,10 @@ mod auto_learn_integration {
 
         // Use absolute paths to avoid canonicalization mismatches
         // (normalize_path canonicalizes real files but keeps fictitious ones as-is)
-        let abs_a = std::fs::canonicalize("src/main.rs").map_or_else(|_| "/tmp/test_a.rs".to_string(), |p| p.to_string_lossy().to_string());
+        let abs_a = std::fs::canonicalize("src/main.rs").map_or_else(
+            |_| "/tmp/test_a.rs".to_string(),
+            |p| p.to_string_lossy().to_string(),
+        );
         let abs_b = "/tmp/nonexistent_test_b.rs".to_string();
 
         let args_a = json!({"path": &abs_a});
@@ -2418,14 +2437,8 @@ mod token_tracking {
             summary.contains("Output tokens: 1200"),
             "Summary: {summary}"
         );
-        assert!(
-            summary.contains("Cache read:    300"),
-            "Summary: {summary}"
-        );
-        assert!(
-            summary.contains("Cache write:   100"),
-            "Summary: {summary}"
-        );
+        assert!(summary.contains("Cache read:    300"), "Summary: {summary}");
+        assert!(summary.contains("Cache write:   100"), "Summary: {summary}");
         assert!(summary.contains("Last turn #1"), "Summary: {summary}");
         assert!(
             summary.contains("actual 4800in/1200out"),
@@ -2447,10 +2460,7 @@ mod token_tracking {
         let handoff = session.generate_handoff();
 
         assert!(handoff.contains("### Token Usage"), "Handoff: {handoff}");
-        assert!(
-            handoff.contains("Input: 4800 tokens"),
-            "Handoff: {handoff}"
-        );
+        assert!(handoff.contains("Input: 4800 tokens"), "Handoff: {handoff}");
         assert!(
             handoff.contains("Output: 1200 tokens"),
             "Handoff: {handoff}"

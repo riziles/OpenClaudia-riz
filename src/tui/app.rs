@@ -606,17 +606,29 @@ impl App {
             }
             Ok(AppEvent::ToolStart { name, description }) => {
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(), content: description,
-                    tool_name: Some(name), is_error: false, is_thinking: false,
+                    role: "tool".to_string(),
+                    content: description,
+                    tool_name: Some(name),
+                    is_error: false,
+                    is_thinking: false,
                 });
             }
-            Ok(AppEvent::ToolDone { name, success, content }) => {
+            Ok(AppEvent::ToolDone {
+                name,
+                success,
+                content,
+            }) => {
                 let preview = if content.len() > 300 {
                     format!("{}...", crate::tools::safe_truncate(&content, 297))
-                } else { content };
+                } else {
+                    content
+                };
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(), content: preview,
-                    tool_name: Some(name), is_error: !success, is_thinking: false,
+                    role: "tool".to_string(),
+                    content: preview,
+                    tool_name: Some(name),
+                    is_error: !success,
+                    is_thinking: false,
                 });
             }
             Ok(AppEvent::ResponseDone) => {
@@ -634,17 +646,32 @@ impl App {
             Ok(AppEvent::ApiError(msg)) => {
                 self.messages.finish_streaming();
                 self.messages.add(DisplayMessage {
-                    role: "system".to_string(), content: format!("Error: {msg}"),
-                    tool_name: None, is_error: true, is_thinking: false,
+                    role: "system".to_string(),
+                    content: format!("Error: {msg}"),
+                    tool_name: None,
+                    is_error: true,
+                    is_thinking: false,
                 });
                 self.is_waiting = false;
                 self.fire_notification_hook(&format!("API error: {msg}"), "error");
             }
             Ok(AppEvent::Resize(_, _)) => {}
-            Ok(AppEvent::FollowUp) => { self.spawn_api_turn(); }
-            Ok(AppEvent::SyncMessages(messages)) => { self.session_messages = messages; }
-            Ok(AppEvent::PermissionRequest { tool_name, tool_args, reply }) => {
-                self.pending_permission = Some(PendingPermission { tool_name, tool_args, reply });
+            Ok(AppEvent::FollowUp) => {
+                self.spawn_api_turn();
+            }
+            Ok(AppEvent::SyncMessages(messages)) => {
+                self.session_messages = messages;
+            }
+            Ok(AppEvent::PermissionRequest {
+                tool_name,
+                tool_args,
+                reply,
+            }) => {
+                self.pending_permission = Some(PendingPermission {
+                    tool_name,
+                    tool_args,
+                    reply,
+                });
             }
             Err(_) => return false,
         }
@@ -717,7 +744,10 @@ impl App {
                     role: "system".to_string(),
                     content: format!("{label}: {}", perm.tool_name),
                     tool_name: None,
-                    is_error: matches!(resp, PermissionResponse::Deny | PermissionResponse::AlwaysDeny),
+                    is_error: matches!(
+                        resp,
+                        PermissionResponse::Deny | PermissionResponse::AlwaysDeny
+                    ),
                     is_thinking: false,
                 });
                 let _ = perm.reply.send(resp);
@@ -789,10 +819,34 @@ impl App {
         if text == "/sessions" || text == "/list" {
             let sessions = list_sessions();
             if sessions.is_empty() {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "No saved sessions.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "No saved sessions.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             } else {
-                let list = sessions.iter().take(10).map(|s| format!("  {} — {} ({})", &s.id[..8], s.title, s.updated_at.format("%Y-%m-%d %H:%M"))).collect::<Vec<_>>().join("\n");
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Saved sessions:\n{list}\n\nUse /load <id> to resume."), tool_name: None, is_error: false, is_thinking: false });
+                let list = sessions
+                    .iter()
+                    .take(10)
+                    .map(|s| {
+                        format!(
+                            "  {} — {} ({})",
+                            &s.id[..8],
+                            s.title,
+                            s.updated_at.format("%Y-%m-%d %H:%M")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("Saved sessions:\n{list}\n\nUse /load <id> to resume."),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             }
             return true;
         }
@@ -808,21 +862,47 @@ impl App {
         if text == "/undo" {
             if self.chat_session.undo() {
                 self.session_messages = self.chat_session.messages.clone();
-                if self.messages.len() >= 2 { self.messages.pop_last(2); }
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Undone last message pair.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                if self.messages.len() >= 2 {
+                    self.messages.pop_last(2);
+                }
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Undone last message pair.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
                 let _ = save_session(&self.chat_session);
             } else {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to undo.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Nothing to undo.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             }
             return true;
         }
         if text == "/redo" {
             if self.chat_session.redo() {
                 self.session_messages = self.chat_session.messages.clone();
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Redone last undone messages.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Redone last undone messages.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
                 let _ = save_session(&self.chat_session);
             } else {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to redo.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Nothing to redo.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             }
             return true;
         }
@@ -840,31 +920,69 @@ impl App {
                 if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
                     turn_num += 1;
                     let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let preview = if content.len() > 60 { format!("{}...", crate::tools::safe_truncate(content, 57)) } else { content.to_string() };
+                    let preview = if content.len() > 60 {
+                        format!("{}...", crate::tools::safe_truncate(content, 57))
+                    } else {
+                        content.to_string()
+                    };
                     let _ = writeln!(turn_list, "  {turn_num}. {preview}");
                 }
             }
-            if turn_list.is_empty() { turn_list = "  (no conversation turns yet)\n".to_string(); }
+            if turn_list.is_empty() {
+                turn_list = "  (no conversation turns yet)\n".to_string();
+            }
             self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Conversation has {turn_num} turn(s):\n{turn_list}\nUse /rewind N to undo the last N turns."), tool_name: None, is_error: false, is_thinking: false });
         } else if let Ok(n) = arg.parse::<usize>() {
             if n == 0 {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to rewind (0 turns).".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Nothing to rewind (0 turns).".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             } else {
                 let mut rewound = 0;
-                for _ in 0..n { if self.chat_session.undo() { rewound += 1; } else { break; } }
+                for _ in 0..n {
+                    if self.chat_session.undo() {
+                        rewound += 1;
+                    } else {
+                        break;
+                    }
+                }
                 if rewound > 0 {
                     self.session_messages = self.chat_session.messages.clone();
                     let to_remove = rewound * 2;
-                    if self.messages.len() >= to_remove { self.messages.pop_last(to_remove); }
-                    self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Rewound {rewound} turn(s)."), tool_name: None, is_error: false, is_thinking: false });
+                    if self.messages.len() >= to_remove {
+                        self.messages.pop_last(to_remove);
+                    }
+                    self.messages.add(DisplayMessage {
+                        role: "system".to_string(),
+                        content: format!("Rewound {rewound} turn(s)."),
+                        tool_name: None,
+                        is_error: false,
+                        is_thinking: false,
+                    });
                     let _ = save_session(&self.chat_session);
                     self.persist_transcript_tail();
                 } else {
-                    self.messages.add(DisplayMessage { role: "system".to_string(), content: "Nothing to rewind.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                    self.messages.add(DisplayMessage {
+                        role: "system".to_string(),
+                        content: "Nothing to rewind.".to_string(),
+                        tool_name: None,
+                        is_error: false,
+                        is_thinking: false,
+                    });
                 }
             }
         } else {
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: "Usage: /rewind [N] — rewind N turns, or show turn list".to_string(), tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: "Usage: /rewind [N] — rewind N turns, or show turn list".to_string(),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
         }
     }
 
@@ -873,17 +991,37 @@ impl App {
         if text == "/export" {
             use std::fmt::Write as _;
             let mut md = format!("# {}\n\n", self.chat_session.title);
-            let _ = write!(md, "Model: {} · Provider: {} · {}\n\n---\n\n", self.model, self.provider, self.chat_session.created_at.format("%Y-%m-%d %H:%M"));
+            let _ = write!(
+                md,
+                "Model: {} · Provider: {} · {}\n\n---\n\n",
+                self.model,
+                self.provider,
+                self.chat_session.created_at.format("%Y-%m-%d %H:%M")
+            );
             for msg in &self.session_messages {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if role == "system" { continue; }
+                if role == "system" {
+                    continue;
+                }
                 let _ = write!(md, "**{role}:**\n{content}\n\n");
             }
             let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
             match std::fs::write(&export_path, &md) {
-                Ok(()) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Exported to {export_path}"), tool_name: None, is_error: false, is_thinking: false }),
-                Err(e) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Export failed: {e}"), tool_name: None, is_error: true, is_thinking: false }),
+                Ok(()) => self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("Exported to {export_path}"),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                }),
+                Err(e) => self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("Export failed: {e}"),
+                    tool_name: None,
+                    is_error: true,
+                    is_thinking: false,
+                }),
             }
             return true;
         }
@@ -891,11 +1029,23 @@ impl App {
             let parts: Vec<&str> = text.splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let level = parts[1].trim();
-                if matches!(level, "low" | "medium" | "high") { self.effort_level = level.to_string(); }
+                if matches!(level, "low" | "medium" | "high") {
+                    self.effort_level = level.to_string();
+                }
             } else {
-                self.effort_level = match self.effort_level.as_str() { "low" => "medium".to_string(), "medium" => "high".to_string(), _ => "low".to_string() };
+                self.effort_level = match self.effort_level.as_str() {
+                    "low" => "medium".to_string(),
+                    "medium" => "high".to_string(),
+                    _ => "low".to_string(),
+                };
             }
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Effort level: {}", self.effort_level), tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: format!("Effort level: {}", self.effort_level),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
             return true;
         }
         false
@@ -1020,8 +1170,15 @@ impl App {
             text.strip_prefix('/').unwrap_or("")
         };
         if let Some(skill) = crate::skills::get_skill(skill_name) {
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Running skill: /{}", skill.name), tool_name: None, is_error: false, is_thinking: false });
-            self.session_messages.push(serde_json::json!({ "role": "user", "content": skill.prompt }));
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: format!("Running skill: /{}", skill.name),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
+            self.session_messages
+                .push(serde_json::json!({ "role": "user", "content": skill.prompt }));
             self.is_waiting = true;
             self.spawn_api_turn();
             return;
@@ -1029,18 +1186,38 @@ impl App {
         if text.starts_with("/rename ") {
             let new_title = text.strip_prefix("/rename ").unwrap_or("").trim();
             if new_title.is_empty() {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Usage: /rename <new title>".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Usage: /rename <new title>".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             } else {
                 self.chat_session.title = new_title.to_string();
                 self.chat_session.touch();
                 let _ = save_session(&self.chat_session);
                 self.persist_transcript_tail();
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Session renamed to: {new_title}"), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("Session renamed to: {new_title}"),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             }
             return;
         }
-        if self.handle_diagnostic_slash(text) { return; }
-        self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Unknown command: {text}. Type /help for commands."), tool_name: None, is_error: false, is_thinking: false });
+        if self.handle_diagnostic_slash(text) {
+            return;
+        }
+        self.messages.add(DisplayMessage {
+            role: "system".to_string(),
+            content: format!("Unknown command: {text}. Type /help for commands."),
+            tool_name: None,
+            is_error: false,
+            is_thinking: false,
+        });
     }
 
     /// Handle diagnostic/info slash commands. Returns true if handled.
@@ -1051,10 +1228,18 @@ impl App {
             let cost = match self.model.as_str() {
                 m if m.contains("opus") => tokens_f64.mul_add(0.000_015, tokens_f64 * 0.000_075),
                 m if m.contains("sonnet") => tokens_f64.mul_add(0.000_003, tokens_f64 * 0.000_015),
-                m if m.contains("haiku") => tokens_f64.mul_add(0.000_000_25, tokens_f64 * 0.000_001_25),
+                m if m.contains("haiku") => {
+                    tokens_f64.mul_add(0.000_000_25, tokens_f64 * 0.000_001_25)
+                }
                 _ => 0.0,
             };
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"), tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: format!("Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
             return true;
         }
         if text == "/files" || text.starts_with("/files ") {
@@ -1062,24 +1247,59 @@ impl App {
             let dir = if dir.is_empty() { "." } else { dir };
             match std::fs::read_dir(dir) {
                 Ok(entries) => {
-                    let mut items: Vec<String> = entries.flatten().map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) { "/" } else { "" };
-                        format!("  {name}{suffix}")
-                    }).collect();
+                    let mut items: Vec<String> = entries
+                        .flatten()
+                        .map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                                "/"
+                            } else {
+                                ""
+                            };
+                            format!("  {name}{suffix}")
+                        })
+                        .collect();
                     items.sort();
-                    self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Files in {dir}:\n{}", items.join("\n")), tool_name: None, is_error: false, is_thinking: false });
+                    self.messages.add(DisplayMessage {
+                        role: "system".to_string(),
+                        content: format!("Files in {dir}:\n{}", items.join("\n")),
+                        tool_name: None,
+                        is_error: false,
+                        is_thinking: false,
+                    });
                 }
-                Err(e) => self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Failed to list {dir}: {e}"), tool_name: None, is_error: true, is_thinking: false }),
+                Err(e) => self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: format!("Failed to list {dir}: {e}"),
+                    tool_name: None,
+                    is_error: true,
+                    is_thinking: false,
+                }),
             }
             return true;
         }
         if text == "/diff" {
-            let content = match std::process::Command::new("git").args(["diff", "--stat"]).output() {
-                Ok(out) => { let s = String::from_utf8_lossy(&out.stdout); if s.is_empty() { "No uncommitted changes.".to_string() } else { format!("Uncommitted changes:\n{s}") } }
+            let content = match std::process::Command::new("git")
+                .args(["diff", "--stat"])
+                .output()
+            {
+                Ok(out) => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    if s.is_empty() {
+                        "No uncommitted changes.".to_string()
+                    } else {
+                        format!("Uncommitted changes:\n{s}")
+                    }
+                }
                 Err(e) => format!("Failed to run git diff: {e}"),
             };
-            self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content,
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
             return true;
         }
         if text == "/context" {
@@ -1090,39 +1310,86 @@ impl App {
         }
         if text == "/doctor" {
             let checks = [
-                match crate::config::load_config() { Ok(_) => "✓ Config: loaded".to_string(), Err(e) => format!("✗ Config: {e}") },
+                match crate::config::load_config() {
+                    Ok(_) => "✓ Config: loaded".to_string(),
+                    Err(e) => format!("✗ Config: {e}"),
+                },
                 format!("✓ Provider: {}", self.provider),
                 format!("✓ Model: {}", self.model),
                 format!("✓ Endpoint: {}", self.endpoint),
                 format!("✓ Skills: {} loaded", crate::skills::load_skills().len()),
-                if self.memory_db.is_some() { "✓ Memory DB: connected".to_string() } else { "✗ Memory DB: not available".to_string() },
+                if self.memory_db.is_some() {
+                    "✓ Memory DB: connected".to_string()
+                } else {
+                    "✗ Memory DB: not available".to_string()
+                },
             ];
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Diagnostics:\n{}", checks.join("\n")), tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content: format!("Diagnostics:\n{}", checks.join("\n")),
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
             return true;
         }
         if text == "/review" || text.starts_with("/review ") {
-            let content = match std::process::Command::new("git").args(["diff", "HEAD"]).output() {
+            let content = match std::process::Command::new("git")
+                .args(["diff", "HEAD"])
+                .output()
+            {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    if stdout.is_empty() { "No changes to review.".to_string() } else {
+                    if stdout.is_empty() {
+                        "No changes to review.".to_string()
+                    } else {
                         let lines: Vec<&str> = stdout.lines().take(100).collect();
-                        if stdout.lines().count() > 100 { format!("{}\n... (truncated, {} total lines)", lines.join("\n"), stdout.lines().count()) } else { lines.join("\n") }
+                        if stdout.lines().count() > 100 {
+                            format!(
+                                "{}\n... (truncated, {} total lines)",
+                                lines.join("\n"),
+                                stdout.lines().count()
+                            )
+                        } else {
+                            lines.join("\n")
+                        }
                     }
                 }
                 Err(e) => format!("Failed to run git diff: {e}"),
             };
-            self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage {
+                role: "system".to_string(),
+                content,
+                tool_name: None,
+                is_error: false,
+                is_thinking: false,
+            });
             return true;
         }
         if text == "/init" {
             if crate::config::config_file_exists() {
-                self.messages.add(DisplayMessage { role: "system".to_string(), content: "Config already exists. Use /doctor to check it.".to_string(), tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content: "Config already exists. Use /doctor to check it.".to_string(),
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             } else {
-                let content = match std::process::Command::new("openclaudia").arg("init").output() {
+                let content = match std::process::Command::new("openclaudia")
+                    .arg("init")
+                    .output()
+                {
                     Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
                     Err(e) => format!("Init failed: {e}"),
                 };
-                self.messages.add(DisplayMessage { role: "system".to_string(), content, tool_name: None, is_error: false, is_thinking: false });
+                self.messages.add(DisplayMessage {
+                    role: "system".to_string(),
+                    content,
+                    tool_name: None,
+                    is_error: false,
+                    is_thinking: false,
+                });
             }
             return true;
         }
@@ -1250,9 +1517,20 @@ impl App {
         let session_messages = self.session_messages.clone();
 
         handle.spawn(run_api_turn_async(ApiTurnParams {
-            session_messages, client, endpoint, headers, provider, model,
-            effort_level, claude_code_token, prompt_blocks, memory_db,
-            permission_mgr, hook_engine, session_id: session_id_for_task, tx,
+            session_messages,
+            client,
+            endpoint,
+            headers,
+            provider,
+            model,
+            effort_level,
+            claude_code_token,
+            prompt_blocks,
+            memory_db,
+            permission_mgr,
+            hook_engine,
+            session_id: session_id_for_task,
+            tx,
         }));
     }
 
@@ -1339,7 +1617,9 @@ impl App {
 
     /// Render the permission-prompt dialog when one is pending.
     fn draw_permission_overlay(&self, frame: &mut Frame) {
-        let Some(ref perm) = self.pending_permission else { return; };
+        let Some(ref perm) = self.pending_permission else {
+            return;
+        };
         let area = frame.area();
         let dialog_width = area.width.min(70);
         let dialog_height = 7u16;
@@ -1354,18 +1634,40 @@ impl App {
             perm.tool_args.clone()
         };
         let prompt_text = vec![
-            Line::from(Span::styled(format!("  Tool: {}", perm.tool_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled(format!("  Args: {args_preview}"), Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                format!("  Tool: {}", perm.tool_name),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  Args: {args_preview}"),
+                Style::default().fg(Color::DarkGray),
+            )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  [y] ", Style::default().fg(Color::Green)), Span::raw("Allow  "),
-                Span::styled("[n] ", Style::default().fg(Color::Red)), Span::raw("Deny  "),
-                Span::styled("[a] ", Style::default().fg(Color::Cyan)), Span::raw("Always  "),
-                Span::styled("[d] ", Style::default().fg(Color::Yellow)), Span::raw("Never"),
+                Span::styled("  [y] ", Style::default().fg(Color::Green)),
+                Span::raw("Allow  "),
+                Span::styled("[n] ", Style::default().fg(Color::Red)),
+                Span::raw("Deny  "),
+                Span::styled("[a] ", Style::default().fg(Color::Cyan)),
+                Span::raw("Always  "),
+                Span::styled("[d] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Never"),
             ]),
         ];
         let dialog = Paragraph::new(prompt_text)
-            .block(Block::default().title(" Permission Required ").title_style(Style::default().fg(Color::Rgb(218, 165, 32)).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(218, 165, 32))))
+            .block(
+                Block::default()
+                    .title(" Permission Required ")
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Rgb(218, 165, 32))
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(218, 165, 32))),
+            )
             .style(Style::default().bg(Color::Black));
         frame.render_widget(dialog, dialog_area);
     }
@@ -1411,14 +1713,17 @@ impl App {
         } else {
             format!("Welcome back, {username}!")
         };
-        let cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| {
+        let cwd = std::env::current_dir().map_or_else(
+            |_| ".".to_string(),
+            |p| {
                 if let Some(home) = dirs::home_dir() {
                     if let Ok(rel) = p.strip_prefix(&home) {
                         return format!("~/{}", rel.display());
                     }
                 }
                 p.display().to_string()
-            });
+            },
+        );
 
         let left = Paragraph::new(vec![
             Line::from(Span::styled(
@@ -1489,15 +1794,42 @@ struct ApiTurnParams {
 /// follow-up loop when tool calls are present.
 async fn run_api_turn_async(p: ApiTurnParams) {
     const MAX_ITER: u32 = 25;
-    let ApiTurnParams { mut session_messages, client, endpoint, headers, provider, model, effort_level, claude_code_token, prompt_blocks, memory_db, permission_mgr, hook_engine, session_id, tx } = p;
+    let ApiTurnParams {
+        mut session_messages,
+        client,
+        endpoint,
+        headers,
+        provider,
+        model,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        session_id,
+        tx,
+    } = p;
     if let Some(ref engine) = hook_engine {
-        let user_prompt = session_messages.last()
-            .and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("").to_string();
-        let hook_input = crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit).with_prompt(&user_prompt);
-        let hook_result = engine.run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input).await;
+        let user_prompt = session_messages
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let hook_input = crate::hooks::HookInput::new(crate::hooks::HookEvent::UserPromptSubmit)
+            .with_prompt(&user_prompt);
+        let hook_result = engine
+            .run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
+            .await;
         if !hook_result.allowed {
-            let reason = hook_result.errors.first().map_or_else(|| "Hook blocked the request".to_string(), std::string::ToString::to_string);
-            let _ = tx.send(super::events::AppEvent::ApiError(format!("Blocked by hook: {reason}")));
+            let reason = hook_result.errors.first().map_or_else(
+                || "Hook blocked the request".to_string(),
+                std::string::ToString::to_string,
+            );
+            let _ = tx.send(super::events::AppEvent::ApiError(format!(
+                "Blocked by hook: {reason}"
+            )));
             return;
         }
         for output in &hook_result.outputs {
@@ -1506,29 +1838,93 @@ async fn run_api_turn_async(p: ApiTurnParams) {
             }
         }
     }
-    let request_body = crate::pipeline::build_request(&provider, &model, &session_messages, &effort_level, claude_code_token.as_deref(), prompt_blocks.as_ref());
-    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams { client: &client, endpoint: &endpoint, headers: &headers, request_body: &request_body, provider: &provider, memory_db: memory_db.clone(), permission_mgr: permission_mgr.clone(), hook_engine: hook_engine.clone(), session_id: Some(session_id.clone()), tx: tx.clone() }).await {
+    let request_body = crate::pipeline::build_request(
+        &provider,
+        &model,
+        &session_messages,
+        &effort_level,
+        claude_code_token.as_deref(),
+        prompt_blocks.as_ref(),
+    );
+    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
+        client: &client,
+        endpoint: &endpoint,
+        headers: &headers,
+        request_body: &request_body,
+        provider: &provider,
+        memory_db: memory_db.clone(),
+        permission_mgr: permission_mgr.clone(),
+        hook_engine: hook_engine.clone(),
+        session_id: Some(session_id.clone()),
+        tx: tx.clone(),
+    })
+    .await
+    {
         Ok(turn_result) => {
-            tracing::debug!(content_len = turn_result.content.len(), tool_calls = turn_result.tool_calls.len(), needs_followup = turn_result.needs_followup, "Turn result");
+            tracing::debug!(
+                content_len = turn_result.content.len(),
+                tool_calls = turn_result.tool_calls.len(),
+                needs_followup = turn_result.needs_followup,
+                "Turn result"
+            );
             if turn_result.needs_followup {
-                let asst = crate::pipeline::build_assistant_message_with_tools(&turn_result.content, &turn_result.tool_calls, &provider);
+                let asst = crate::pipeline::build_assistant_message_with_tools(
+                    &turn_result.content,
+                    &turn_result.tool_calls,
+                    &provider,
+                );
                 session_messages.push(asst);
                 session_messages.extend(turn_result.tool_results.iter().cloned());
-                tracing::info!(tool_count = turn_result.tool_calls.len(), result_count = turn_result.tool_results.len(), "Starting agentic follow-up loop");
+                tracing::info!(
+                    tool_count = turn_result.tool_calls.len(),
+                    result_count = turn_result.tool_results.len(),
+                    "Starting agentic follow-up loop"
+                );
                 let mut iteration = 0u32;
                 loop {
                     iteration += 1;
                     tracing::debug!(iteration, "Agentic loop iteration");
                     if iteration > MAX_ITER {
-                        let _ = tx.send(super::events::AppEvent::ApiError("Reached maximum tool iterations (25)".to_string()));
+                        let _ = tx.send(super::events::AppEvent::ApiError(
+                            "Reached maximum tool iterations (25)".to_string(),
+                        ));
                         break;
                     }
-                    let body = crate::pipeline::build_request(&provider, &model, &session_messages, &effort_level, claude_code_token.as_deref(), prompt_blocks.as_ref());
-                    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams { client: &client, endpoint: &endpoint, headers: &headers, request_body: &body, provider: &provider, memory_db: memory_db.clone(), permission_mgr: permission_mgr.clone(), hook_engine: hook_engine.clone(), session_id: Some(session_id.clone()), tx: tx.clone() }).await {
+                    let body = crate::pipeline::build_request(
+                        &provider,
+                        &model,
+                        &session_messages,
+                        &effort_level,
+                        claude_code_token.as_deref(),
+                        prompt_blocks.as_ref(),
+                    );
+                    match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
+                        client: &client,
+                        endpoint: &endpoint,
+                        headers: &headers,
+                        request_body: &body,
+                        provider: &provider,
+                        memory_db: memory_db.clone(),
+                        permission_mgr: permission_mgr.clone(),
+                        hook_engine: hook_engine.clone(),
+                        session_id: Some(session_id.clone()),
+                        tx: tx.clone(),
+                    })
+                    .await
+                    {
                         Ok(followup) => {
-                            tracing::debug!(content_len = followup.content.len(), tool_calls = followup.tool_calls.len(), needs_followup = followup.needs_followup, "Follow-up result");
+                            tracing::debug!(
+                                content_len = followup.content.len(),
+                                tool_calls = followup.tool_calls.len(),
+                                needs_followup = followup.needs_followup,
+                                "Follow-up result"
+                            );
                             if followup.needs_followup {
-                                let asst = crate::pipeline::build_assistant_message_with_tools(&followup.content, &followup.tool_calls, &provider);
+                                let asst = crate::pipeline::build_assistant_message_with_tools(
+                                    &followup.content,
+                                    &followup.tool_calls,
+                                    &provider,
+                                );
                                 session_messages.push(asst);
                                 session_messages.extend(followup.tool_results.iter().cloned());
                             } else {
@@ -1548,11 +1944,14 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                 let _ = tx.send(super::events::AppEvent::SyncMessages(session_messages));
                 let _ = tx.send(super::events::AppEvent::ResponseDone);
             } else if !turn_result.content.is_empty() {
-                session_messages.push(serde_json::json!({ "role": "assistant", "content": turn_result.content }));
+                session_messages.push(
+                    serde_json::json!({ "role": "assistant", "content": turn_result.content }),
+                );
                 let _ = tx.send(super::events::AppEvent::SyncMessages(session_messages));
             }
         }
-        Err(e) => { let _ = tx.send(super::events::AppEvent::ApiError(e)); }
+        Err(e) => {
+            let _ = tx.send(super::events::AppEvent::ApiError(e));
+        }
     }
 }
-

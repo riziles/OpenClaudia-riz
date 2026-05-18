@@ -1,3 +1,4 @@
+pub mod command_registry;
 pub mod input;
 pub mod keybindings;
 pub mod models;

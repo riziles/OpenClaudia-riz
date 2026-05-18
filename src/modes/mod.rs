@@ -287,7 +287,7 @@ impl fmt::Display for BehaviorMode {
 
 impl BehaviorMode {
     /// Create a mode from a preset, optionally overriding individual axes.
-    #[must_use] 
+    #[must_use]
     pub fn from_preset(preset: Preset) -> Self {
         let (agency, quality, scope, modifiers) = match preset {
             Preset::Create => (
@@ -361,7 +361,7 @@ impl BehaviorMode {
 
     /// Try to find a matching preset name for the current configuration.
     /// Returns `None` if no built-in preset matches exactly.
-    #[must_use] 
+    #[must_use]
     pub fn matching_preset(&self) -> Option<Preset> {
         let presets = [
             Preset::Create,
@@ -377,7 +377,7 @@ impl BehaviorMode {
     }
 
     /// Human-readable description of the mode for status displays.
-    #[must_use] 
+    #[must_use]
     pub fn description(&self) -> String {
         self.matching_preset().map_or_else(
             || format!("custom: {self}"),
@@ -398,16 +398,17 @@ impl BehaviorMode {
     }
 
     /// Short display name — preset name if matching, otherwise axis summary.
-    #[must_use] 
+    #[must_use]
     pub fn display_name(&self) -> String {
-        self.matching_preset().map_or_else(|| self.to_string(), |p| p.to_string())
+        self.matching_preset()
+            .map_or_else(|| self.to_string(), |p| p.to_string())
     }
 
     /// Assemble the complete behavioral prompt fragment for this mode.
     ///
     /// Returns the assembled string of all axis + modifier fragments,
     /// ready to be inserted into the system prompt.
-    #[must_use] 
+    #[must_use]
     pub fn assemble_behavioral_prompt(&self) -> String {
         let mut sections: Vec<&str> = Vec::with_capacity(6);
 
@@ -426,7 +427,7 @@ impl BehaviorMode {
 }
 
 /// List all available preset names with their descriptions.
-#[must_use] 
+#[must_use]
 pub fn list_presets() -> Vec<(&'static str, &'static str)> {
     vec![
         (
@@ -465,7 +466,7 @@ pub fn list_presets() -> Vec<(&'static str, &'static str)> {
 }
 
 /// List all available modifier names with their descriptions.
-#[must_use] 
+#[must_use]
 pub fn list_modifiers() -> Vec<(&'static str, &'static str)> {
     vec![
         ("bold", "Confident, idiomatic code — no hedging"),
@@ -950,7 +951,10 @@ mod tests {
     #[test]
     fn list_presets_covers_all_variants() {
         let listed: HashSet<String> = list_presets().iter().map(|(n, _)| n.to_string()).collect();
-        let expected: HashSet<String> = ALL_PRESETS.iter().map(std::string::ToString::to_string).collect();
+        let expected: HashSet<String> = ALL_PRESETS
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         assert_eq!(listed, expected, "list_presets() doesn't match ALL_PRESETS");
     }
 
