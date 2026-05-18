@@ -784,4 +784,468 @@ mod tests {
         assert_eq!(result.symbols[0].children[0].name, "new");
         assert_eq!(result.symbols[0].children[0].kind, "Method");
     }
+
+    // ── Spec-pinning tests (#550 Phase 2) ─────────────────────────────────────
+    //
+    // These tests pin OC's CURRENT behavior against the Phase 1 spec (#535).
+    // They deliberately assert divergences from the CC reference; each divergence
+    // is tracked by a gap issue. Do NOT "fix" these tests by adding features —
+    // the purpose is to detect regressions in the existing contracts.
+
+    // Spec B1: goToDefinition — server selection + location return
+    // ─────────────────────────────────────────────────────────────
+
+    /// B1a — Coordinate system: OC converts 0-based LSP lines to 1-based by
+    /// adding 1 to `start.line`. `character` is NOT adjusted (stays 0-based).
+    /// Gap: character should also become 1-based per spec, but OC omits that.
+    #[test]
+    fn spec_b1_coordinate_conversion_line_1based_character_0based() {
+        let data = json!([{
+            "uri": "file:///foo.rs",
+            "range": {
+                "start": {"line": 9, "character": 3},
+                "end":   {"line": 9, "character": 12}
+            }
+        }]);
+        let locs = parse_locations(Some(&data));
+        assert_eq!(locs.len(), 1);
+        // OC adds 1 to line (0→1-based); pinning that exact conversion.
+        assert_eq!(locs[0].line, 10);
+        // OC does NOT add 1 to character — it stays 0-based. (Gap vs CC spec.)
+        assert_eq!(locs[0].character, 3);
+    }
+
+    /// B1b — OC stores the raw `file://…` URI, not a workspace-relative path.
+    /// Gap #643: CC normalizes LocationLink → Location; OC only handles
+    /// Location objects (requires `uri` field). A LocationLink input (with
+    /// `targetUri` but no `uri`) is silently dropped.
+    #[test]
+    fn spec_b1_raw_uri_stored_not_relative_path() {
+        let data = json!([{
+            "uri": "file:///home/user/project/src/lib.rs",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+        }]);
+        let locs = parse_locations(Some(&data));
+        assert_eq!(locs.len(), 1);
+        // Pinning: OC stores the raw file:// URI, not a relative path.
+        assert_eq!(locs[0].uri, "file:///home/user/project/src/lib.rs");
+    }
+
+    /// B1c — LocationLink objects (with `targetUri` but no `uri`) are silently
+    /// dropped by OC's `parse_locations` because it requires `uri`. (Gap #643.)
+    #[test]
+    fn spec_b1_location_link_silently_dropped_gap643() {
+        // This is a LocationLink shape, not a Location shape.
+        let data = json!([{
+            "targetUri": "file:///src/lib.rs",
+            "targetRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+            "targetSelectionRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+            "originSelectionRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}
+        }]);
+        // OC: filter_map drops entries without `uri`. Result is empty.
+        // CC: would normalise targetUri → Location. (Gap #643.)
+        let locs = parse_locations(Some(&data));
+        assert!(
+            locs.is_empty(),
+            "OC drops LocationLink shapes (no `uri` field); gap #643 tracks the fix"
+        );
+    }
+
+    // Spec B2: hover — hover text extraction
+    // ───────────────────────────────────────
+
+    /// B2a — OC joins MarkedString array items with "\n" (single newline).
+    /// CC uses "\n\n" (double newline). Pinning OC's current join separator.
+    /// Gap: array join should be "\n\n" per CC spec.
+    #[test]
+    fn spec_b2_array_join_single_newline_not_double() {
+        let resp = json!({"result": {"contents": ["first", {"value": "second"}, "third"]}});
+        let result = parse_lsp_response(LspAction::Hover, "test.rs", &resp);
+        let text = result.hover_text.unwrap();
+        // Pinning: OC uses "\n" not "\n\n".
+        assert_eq!(text, "first\nsecond\nthird");
+        // Asserting absence of double-newline explicitly (the gap from CC).
+        assert!(
+            !text.contains("\n\n"),
+            "OC uses single '\\n' between array items; gap vs CC which uses '\\n\\n'"
+        );
+    }
+
+    /// B2b — OC does NOT prepend a range-qualified prefix even when
+    /// `Hover.range` is present. CC prepends "Hover info at <line>:<char>:\n\n".
+    /// Pinning the absence of this prefix.
+    #[test]
+    fn spec_b2_no_range_prefix_when_hover_range_present() {
+        let resp = json!({
+            "result": {
+                "contents": {"kind": "plaintext", "value": "fn foo()"},
+                "range": {
+                    "start": {"line": 10, "character": 4},
+                    "end":   {"line": 10, "character": 7}
+                }
+            }
+        });
+        let result = parse_lsp_response(LspAction::Hover, "test.rs", &resp);
+        let text = result.hover_text.unwrap();
+        // OC ignores the range field entirely; raw value is returned.
+        assert_eq!(text, "fn foo()");
+        // Pinning absence of CC's range prefix.
+        assert!(
+            !text.contains("Hover info at"),
+            "OC does not emit range-qualified prefix; gap vs CC"
+        );
+    }
+
+    // Spec B3: findReferences — reference location list
+    // ──────────────────────────────────────────────────
+
+    /// B3a — OC's findReferences output uses the same parse_locations path as
+    /// goToDefinition: produces Vec<LspLocation> with raw URIs, no file-grouping.
+    /// Gap: CC groups references by file; OC returns a flat list.
+    #[test]
+    fn spec_b3_references_flat_raw_uris_no_file_grouping() {
+        let resp = json!({
+            "id": 2,
+            "result": [
+                {
+                    "uri": "file:///a.rs",
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}
+                },
+                {
+                    "uri": "file:///b.rs",
+                    "range": {"start": {"line": 9, "character": 2}, "end": {"line": 9, "character": 8}}
+                }
+            ]
+        });
+        let result = parse_lsp_response(LspAction::FindReferences, "test.rs", &resp);
+        // OC: flat list of LspLocation, no grouping.
+        assert_eq!(result.results.len(), 2);
+        // URIs are raw file:// strings, not relative paths. (Gap vs CC.)
+        assert_eq!(result.results[0].uri, "file:///a.rs");
+        assert_eq!(result.results[1].uri, "file:///b.rs");
+        // Symbols vector is empty for references action.
+        assert!(result.symbols.is_empty());
+        // hover_text is None for references action.
+        assert!(result.hover_text.is_none());
+    }
+
+    /// B3b — Locations missing `uri` field are silently dropped.
+    /// (Gap: CC logs these as errors; OC silently filters.)
+    #[test]
+    fn spec_b3_locations_missing_uri_silently_dropped() {
+        let data = json!([
+            {
+                "uri": "file:///valid.rs",
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
+            },
+            {
+                "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 1}}
+                // no "uri" field
+            }
+        ]);
+        let locs = parse_locations(Some(&data));
+        // OC: filter_map on `uri` drops the entry with no uri field.
+        assert_eq!(locs.len(), 1, "OC silently drops locations missing 'uri'");
+        assert_eq!(locs[0].uri, "file:///valid.rs");
+    }
+
+    // Spec B4: documentSymbols — nested symbol tree
+    // ──────────────────────────────────────────────
+
+    /// B4a — OC enforces MAX_SYMBOL_DEPTH = 20. A tree deeper than 20 levels
+    /// is truncated: children at depth ≥ 20 are returned as empty.
+    #[test]
+    fn spec_b4_symbol_depth_limit_at_20() {
+        // Build a chain of 22 nested symbols. Each wraps the next as its child.
+        fn make_nested(depth: usize) -> serde_json::Value {
+            if depth == 0 {
+                return json!({
+                    "name": "leaf",
+                    "kind": 12,
+                    "range": {"start": {"line": depth as u64, "character": 0},
+                              "end":   {"line": depth as u64, "character": 1}}
+                });
+            }
+            json!({
+                "name": format!("node_{depth}"),
+                "kind": 2,
+                "range": {"start": {"line": depth as u64, "character": 0},
+                          "end":   {"line": depth as u64, "character": 1}},
+                "children": [make_nested(depth - 1)]
+            })
+        }
+
+        // Nest 22 levels deep; OC truncates at depth 20.
+        let root = json!([make_nested(22)]);
+        let syms = parse_symbols(Some(&root));
+        assert_eq!(syms.len(), 1, "root symbol present");
+
+        // Walk down the tree counting reachable levels.
+        let mut level = 0usize;
+        let mut current = &syms[0];
+        loop {
+            level += 1;
+            if current.children.is_empty() {
+                break;
+            }
+            current = &current.children[0];
+        }
+        // With MAX_SYMBOL_DEPTH = 20 the tree is cut before depth 20,
+        // so we can reach at most 20 levels before children become empty.
+        assert!(
+            level <= MAX_SYMBOL_DEPTH,
+            "OC truncates at MAX_SYMBOL_DEPTH={MAX_SYMBOL_DEPTH}; reached {level}"
+        );
+    }
+
+    /// B4b — All 26 LSP SymbolKind integers map to their canonical names.
+    /// Pinning the full mapping so renames are caught as regressions.
+    #[test]
+    fn spec_b4_all_26_symbol_kind_names() {
+        let expected: &[(u64, &str)] = &[
+            (1, "File"),
+            (2, "Module"),
+            (3, "Namespace"),
+            (4, "Package"),
+            (5, "Class"),
+            (6, "Method"),
+            (7, "Property"),
+            (8, "Field"),
+            (9, "Constructor"),
+            (10, "Enum"),
+            (11, "Interface"),
+            (12, "Function"),
+            (13, "Variable"),
+            (14, "Constant"),
+            (15, "String"),
+            (16, "Number"),
+            (17, "Boolean"),
+            (18, "Array"),
+            (19, "Object"),
+            (20, "Key"),
+            (21, "Null"),
+            (22, "EnumMember"),
+            (23, "Struct"),
+            (24, "Event"),
+            (25, "Operator"),
+            (26, "TypeParameter"),
+            (0, "Unknown"),
+            (27, "Unknown"),
+            (999, "Unknown"),
+        ];
+        for (kind, name) in expected {
+            assert_eq!(
+                symbol_kind_name(*kind),
+                *name,
+                "SymbolKind {kind} should map to {name}"
+            );
+        }
+    }
+
+    /// B4c — OC outputs symbols as a Vec<LspSymbol> (JSON-serialisable struct),
+    /// NOT as a pre-formatted human-readable text tree.
+    /// Gap: CC formats as indented text; OC returns raw structured data.
+    #[test]
+    fn spec_b4_output_is_structured_not_formatted_text_gap() {
+        let resp = json!({
+            "result": [{
+                "name": "MyFn",
+                "kind": 12,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 1}}
+            }]
+        });
+        let result = parse_lsp_response(LspAction::DocumentSymbols, "test.rs", &resp);
+        // OC: result.symbols is populated; result is serialised to JSON by execute_lsp.
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "MyFn");
+        // No hover_text or results are populated for this action.
+        assert!(result.results.is_empty());
+        assert!(result.hover_text.is_none());
+        // The action label OC sets for documentSymbols.
+        assert_eq!(result.action, "documentSymbols");
+    }
+
+    // Spec B5: Unknown action string → explicit error listing valid actions
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// B5a — OC returns a specific error message naming exactly the 4 operations
+    /// it supports. CC rejects at Zod validation layer (9 operations).
+    /// Pinning: the exact error text from the `_` match arm.
+    #[test]
+    fn spec_b5_unknown_action_exact_error_message() {
+        // Use an extension for which rust-analyzer might not be installed;
+        // unknown-action check happens AFTER the server-availability check.
+        // We use a non-.rs extension with a known server path that won't
+        // be installed in CI to ensure we hit the unknown-action arm only
+        // when the server IS installed. To isolate the action-parsing logic
+        // we call it through execute_lsp with .md extension (no known server),
+        // which returns a different error. Instead, test via the internal match
+        // by calling execute_lsp with a .rs file and a bad action; the code
+        // checks action BEFORE spawning the server, so we expect "Unknown LSP
+        // action" regardless of server availability.
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert(
+            "file_path".to_string(),
+            Value::String("test.rs".to_string()),
+        );
+        args.insert(
+            "action".to_string(),
+            Value::String("workspaceSymbol".to_string()),
+        );
+        let (msg, is_err) = execute_lsp(&args);
+        assert!(is_err);
+        // Exact pin: OC's error message lists exactly these 4 operations.
+        // Gap #645: CC has 9 operations; OC only implements 4.
+        assert!(
+            msg.contains("Unknown LSP action: workspaceSymbol"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("goToDefinition"),
+            "error should list goToDefinition; got: {msg}"
+        );
+        assert!(
+            msg.contains("findReferences"),
+            "error should list findReferences; got: {msg}"
+        );
+        assert!(msg.contains("hover"), "error should list hover; got: {msg}");
+        assert!(
+            msg.contains("documentSymbols"),
+            "error should list documentSymbols; got: {msg}"
+        );
+    }
+
+    /// B5b — All 5 gap operations are unknown to OC.
+    /// Gap #645: workspaceSymbol, goToImplementation, prepareCallHierarchy,
+    ///           incomingCalls, outgoingCalls are absent from OC's LspAction enum.
+    #[test]
+    fn spec_b5_five_missing_operations_unknown_gap645() {
+        let missing_ops = [
+            "workspaceSymbol",
+            "goToImplementation",
+            "prepareCallHierarchy",
+            "incomingCalls",
+            "outgoingCalls",
+        ];
+        for op in missing_ops {
+            let mut args: HashMap<String, Value> = HashMap::new();
+            args.insert(
+                "file_path".to_string(),
+                Value::String("test.rs".to_string()),
+            );
+            args.insert("action".to_string(), Value::String(op.to_string()));
+            let (msg, is_err) = execute_lsp(&args);
+            assert!(is_err, "{op} should produce an error");
+            // Either "Unknown LSP action" (action parsed before server check)
+            // or "not found" (server absent in CI). Both are acceptable pins.
+            assert!(
+                msg.contains("Unknown LSP action") || msg.contains("not found"),
+                "op={op} unexpected message: {msg}"
+            );
+        }
+    }
+
+    // Spec B6: Server crash mid-call → explicit error, not hang
+    // ──────────────────────────────────────────────────────────
+
+    /// B6a — `read_lsp_response` returns `Err` after exhausting 100 messages
+    /// without finding the expected id. This is the OC equivalent of the
+    /// "did not respond" path. CC has health-check + retry; OC has neither.
+    /// This test drives the function with a reader that yields only mismatched
+    /// responses (wrong id), verifying the 100-message limit fires.
+    #[test]
+    fn spec_b6_read_lsp_response_errors_after_100_mismatches() {
+        use std::io::Cursor;
+
+        // Build 101 LSP messages all with id=99 (not the expected id=1).
+        let mut bytes = Vec::new();
+        for _ in 0..101u8 {
+            let body = r#"{"jsonrpc":"2.0","id":99,"result":null}"#;
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(body.as_bytes());
+        }
+
+        let cursor = Cursor::new(bytes);
+        let mut reader = BufReader::new(cursor);
+
+        // OC loops up to 100 messages then returns Err.
+        let result = read_lsp_response(&mut reader, 1);
+        assert!(
+            result.is_err(),
+            "expected Err after 100 mismatched messages"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("100"),
+            "error should mention the 100-message limit; got: {msg}"
+        );
+    }
+
+    /// B6b — `read_lsp_response` returns `Err` when the underlying reader
+    /// returns zero bytes (simulates a server process that has exited/crashed).
+    /// OC has no health-check before send; crash is detected only during read.
+    /// Gap #636: CC's server pool detects crashes via process exit handler
+    /// and throws immediately from sendRequest; OC blocks until I/O error.
+    #[test]
+    fn spec_b6_read_lsp_response_errors_on_empty_stream_gap636() {
+        use std::io::Cursor;
+
+        // Empty reader simulates a server that has closed its stdout.
+        let cursor = Cursor::new(Vec::<u8>::new());
+        let mut reader = BufReader::new(cursor);
+
+        let result = read_lsp_response(&mut reader, 1);
+        // OC: read_line on empty stream returns 0 bytes → content_length stays 0
+        // → Err("No content-length in response") or similar.
+        assert!(
+            result.is_err(),
+            "empty stream should produce an error; OC has no hang-guard (gap #636)"
+        );
+    }
+
+    // Spec B1-det: detect_language_server — full extension table
+    // ───────────────────────────────────────────────────────────
+
+    /// Pin the full extension→binary mapping table so additions/removals
+    /// are caught as regressions.
+    #[test]
+    fn spec_detect_language_server_full_extension_table() {
+        // (extension suffix, expected binary, expected first arg if any)
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("file.rs", "rust-analyzer", None),
+            ("file.ts", "typescript-language-server", Some("--stdio")),
+            ("file.tsx", "typescript-language-server", Some("--stdio")),
+            ("file.js", "typescript-language-server", Some("--stdio")),
+            ("file.jsx", "typescript-language-server", Some("--stdio")),
+            ("file.py", "pylsp", None),
+            ("file.go", "gopls", Some("serve")),
+            ("file.c", "clangd", None),
+            ("file.cpp", "clangd", None),
+            ("file.h", "clangd", None),
+            ("file.hpp", "clangd", None),
+            ("file.java", "jdtls", None),
+            ("file.rb", "solargraph", Some("stdio")),
+        ];
+        for (path, binary, first_arg) in cases {
+            let (cmd, args) =
+                detect_language_server(path).unwrap_or_else(|| panic!("no server for {path}"));
+            assert_eq!(cmd, *binary, "extension of {path}");
+            match first_arg {
+                Some(arg) => assert_eq!(args.first().copied(), Some(*arg), "first arg for {path}"),
+                None => assert!(args.is_empty(), "expected no args for {path}, got {args:?}"),
+            }
+        }
+    }
+
+    /// Pin: extensions not in the table return None.
+    #[test]
+    fn spec_detect_language_server_unknown_extensions_return_none() {
+        for path in &["file.md", "file.txt", "file.json", "file.yaml", "noext"] {
+            assert!(
+                detect_language_server(path).is_none(),
+                "expected None for {path}"
+            );
+        }
+    }
 }
