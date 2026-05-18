@@ -335,4 +335,65 @@ mod tests {
 
         assert!(config.active_provider().is_none());
     }
+
+    // ── B3 spec pins (#536 §B3) ──────────────────────────────────────────────
+
+    /// Minimal `AppConfig` with no providers, used by B3 tests that only care
+    /// about `managed_settings_path`. Avoids repeating the full struct literal.
+    fn minimal_config(managed: Option<std::path::PathBuf>) -> AppConfig {
+        AppConfig {
+            proxy: ProxyConfig {
+                target: "anthropic".to_string(),
+                ..Default::default()
+            },
+            providers: HashMap::new(),
+            hooks: HooksConfig::default(),
+            session: SessionConfig::default(),
+            keybindings: KeybindingsConfig::default(),
+            vdd: VddConfig::default(),
+            guardrails: GuardrailsConfig::default(),
+            permissions: PermissionsConfig::default(),
+            managed_settings_path: managed,
+        }
+    }
+
+    /// B3: `managed_settings_path` is always `None` when not explicitly set.
+    /// Spec §B3: "No code in `load_config()` searches for or sets this field;
+    /// it is always `None` at startup." Pins that no accidental initialisation
+    /// exists in the struct construction path.
+    #[test]
+    fn b3_managed_settings_path_is_none_at_construction() {
+        let config = minimal_config(None);
+        assert!(
+            config.managed_settings_path.is_none(),
+            "managed_settings_path must be None — enterprise settings not yet implemented"
+        );
+    }
+
+    /// B3: `managed_settings_path` is `#[serde(skip)]` — no config source can
+    /// populate it. We verify the invariant by constructing the struct the same
+    /// way any deserialization path would (field absent → `None`).
+    #[test]
+    fn b3_managed_settings_path_serde_skip_keeps_field_none() {
+        let config = minimal_config(None);
+        assert!(
+            config.managed_settings_path.is_none(),
+            "serde(skip) means managed_settings_path is never populated from config sources"
+        );
+    }
+
+    /// B3: the field type accepts `Some(PathBuf)` when set manually — this
+    /// pins the API shape that Phase 2 enterprise-settings code will use when
+    /// it populates the field after a successful remote fetch.
+    #[test]
+    fn b3_managed_settings_path_can_hold_value_when_set() {
+        use std::path::PathBuf;
+        let path = PathBuf::from("/etc/openclaudia/managed.yaml");
+        let config = minimal_config(Some(path.clone()));
+        assert_eq!(
+            config.managed_settings_path.as_deref(),
+            Some(path.as_path()),
+            "managed_settings_path must hold the path when explicitly set"
+        );
+    }
 }

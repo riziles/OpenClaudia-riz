@@ -181,4 +181,78 @@ mod tests {
         let flags = StaticFlags::new().with("map_only", true);
         assert!(flags.is_enabled("map_only"));
     }
+
+    // ── B2 spec pins (#536 §B2) ──────────────────────────────────────────────
+
+    /// B2: env var key is `OPENCLAUDIA_FEATURE_` + uppercased flag name.
+    /// snake_case names must be uppercased exactly. Pins the key-construction
+    /// logic in `env_override` (`feature_flags.rs` lines 57-65).
+    #[test]
+    fn b2_env_var_key_is_prefix_plus_upper_name() {
+        let _lock = env_lock();
+        let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_SNAKE_CASE_FLAG", "1");
+        unsafe {
+            std::env::remove_var("OPENCLAUDIA_FEATURE_snake_case_flag");
+        }
+        let flags = StaticFlags::new();
+        assert!(
+            flags.is_enabled("snake_case_flag"),
+            "env key must be OPENCLAUDIA_FEATURE_SNAKE_CASE_FLAG"
+        );
+    }
+
+    /// B2: empty-string env var evaluates to `false` (not a fall-through to
+    /// the map). Spec §B2 edge-case: empty string is not in the truthy set
+    /// `{1, true, on, yes}`, so `env_override` returns `Some(false)` which
+    /// takes precedence over any map entry. Pins the CURRENT behaviour; if the
+    /// impl is changed to treat `""` as absent, update this test and the spec.
+    #[test]
+    fn b2_empty_env_var_evaluates_to_false_not_fallthrough() {
+        let _lock = env_lock();
+        let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_EMPTY_VAR_FLAG", "");
+        // Map has `true`; env var is `""` (not truthy) → env wins with false.
+        let flags = StaticFlags::new().with("empty_var_flag", true);
+        assert!(
+            !flags.is_enabled("empty_var_flag"),
+            "empty env var must evaluate to false, not fall through to map=true"
+        );
+    }
+
+    /// B2: `with()` builder is chainable and last write wins for the same key.
+    #[test]
+    fn b2_with_builder_is_chainable_and_last_write_wins() {
+        let _lock = env_lock();
+        unsafe {
+            std::env::remove_var("OPENCLAUDIA_FEATURE_OVERWRITTEN");
+        }
+        let flags = StaticFlags::new()
+            .with("overwritten", false)
+            .with("overwritten", true);
+        assert!(flags.is_enabled("overwritten"));
+    }
+
+    /// B2: falsy env var overrides a map `true` entry — the spec states "env
+    /// var wins" unconditionally (§B2, resolution order step 1).
+    #[test]
+    fn b2_env_false_overrides_map_true() {
+        let _lock = env_lock();
+        let flags = StaticFlags::new().with("env_wins_flag", true);
+        let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_ENV_WINS_FLAG", "0");
+        assert!(
+            !flags.is_enabled("env_wins_flag"),
+            "falsy env var must override map=true"
+        );
+    }
+
+    /// B2: unknown flag with no env var always returns `false` — matches
+    /// Claude Code's opt-in semantic (unknown → disabled by default).
+    #[test]
+    fn b2_unknown_flag_no_env_var_returns_false() {
+        let _lock = env_lock();
+        unsafe {
+            std::env::remove_var("OPENCLAUDIA_FEATURE_TOTALLY_UNKNOWN_XYZ");
+        }
+        let flags = StaticFlags::new();
+        assert!(!flags.is_enabled("totally_unknown_xyz"));
+    }
 }

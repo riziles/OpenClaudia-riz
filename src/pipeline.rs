@@ -1202,6 +1202,207 @@ mod tests {
         }
     }
 
+    // ── Phase 2 spec-pinning tests (#552 / spec #537) ────────────────────────
+
+    /// B2 — medium effort DOES NOT attach thinking parameters.
+    ///
+    /// CURRENT CONTRACT: OC only enables thinking for "high"/"max".
+    /// Gap #599 tracks enabling adaptive thinking by default (CC behaviour).
+    #[test]
+    fn b2_medium_effort_no_thinking_pin_gap_599() {
+        let prev = std::env::var("MAX_THINKING_TOKENS").ok();
+        // SAFETY: single-threaded test, no concurrent writers.
+        unsafe {
+            std::env::remove_var("MAX_THINKING_TOKENS");
+        }
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        // OC does NOT enable thinking for medium — gap #599: CC uses adaptive thinking
+        assert!(
+            req.get("thinking").is_none(),
+            "medium effort must not attach thinking block (gap #599 tracks adaptive default)"
+        );
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("MAX_THINKING_TOKENS", v);
+            }
+        }
+    }
+
+    /// B2 — high effort attaches `thinking.type = "enabled"` with budget > 0.
+    ///
+    /// Pins the exact budget constant (31999 = CC's ULTRATHINK_BUDGET_TOKENS).
+    #[test]
+    fn b2_high_effort_attaches_thinking_budget() {
+        let prev = std::env::var("MAX_THINKING_TOKENS").ok();
+        // SAFETY: single-threaded test, no concurrent writers.
+        unsafe {
+            std::env::remove_var("MAX_THINKING_TOKENS");
+        }
+        let messages = vec![serde_json::json!({"role": "user", "content": "think"})];
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "high", None, None);
+        assert_eq!(
+            req["thinking"]["type"], "enabled",
+            "high effort must set thinking.type = enabled"
+        );
+        // Budget must be CC's ULTRATHINK constant (31999)
+        let budget = req["thinking"]["budget_tokens"].as_u64().unwrap_or(0);
+        assert_eq!(
+            budget,
+            u64::from(crate::thinking::ULTRATHINK_BUDGET_TOKENS),
+            "budget_tokens must equal ULTRATHINK_BUDGET_TOKENS"
+        );
+        // max_tokens must exceed budget_tokens (OC uses 40000)
+        let max = req["max_tokens"].as_u64().unwrap_or(0);
+        assert!(
+            max > budget,
+            "max_tokens ({max}) must be > budget_tokens ({budget})"
+        );
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("MAX_THINKING_TOKENS", v);
+            }
+        }
+    }
+
+    /// B2 — Google request attaches `thinkingConfig.thinkingBudget` for high effort.
+    ///
+    /// Gemini 2.5 thinking is capped at 24576.
+    #[test]
+    fn b2_google_request_thinking_budget_capped() {
+        let prev = std::env::var("MAX_THINKING_TOKENS").ok();
+        // SAFETY: single-threaded test, no concurrent writers.
+        unsafe {
+            std::env::remove_var("MAX_THINKING_TOKENS");
+        }
+        let messages = vec![serde_json::json!({"role": "user", "content": "think"})];
+        let req = build_google_request(&messages, "high");
+        let budget = req["generationConfig"]["thinkingConfig"]["thinkingBudget"]
+            .as_u64()
+            .unwrap_or(0);
+        const GEMINI_CAP: u64 = 24_576;
+        assert!(budget > 0, "high effort must set thinkingBudget > 0");
+        assert!(
+            budget <= GEMINI_CAP,
+            "thinkingBudget ({budget}) must not exceed Gemini cap ({GEMINI_CAP})"
+        );
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("MAX_THINKING_TOKENS", v);
+            }
+        }
+    }
+
+    /// B5 — `TurnResult.needs_followup` is `true` iff tool calls were accumulated.
+    ///
+    /// Pure-logic check via `process_sse_event` + `AnthropicToolAccumulator`.
+    /// The `needs_followup` field drives whether the caller re-enters the agentic loop.
+    #[test]
+    fn b5_needs_followup_reflects_tool_accumulator_state() {
+        let mut ant = tools::AnthropicToolAccumulator::new();
+        let mut oai = tools::ToolCallAccumulator::new();
+
+        // No tool events → no tool use
+        let no_tool: serde_json::Value = serde_json::json!({
+            "type": "content_block_start",
+            "content_block": { "type": "text" }
+        });
+        let _ = process_sse_event(&no_tool, false, &mut ant, &mut oai);
+        // simulate stop with end_turn
+        let end_event: serde_json::Value = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" }
+        });
+        let _ = process_sse_event(&end_event, false, &mut ant, &mut oai);
+        assert!(
+            !ant.has_tool_use(),
+            "no tool blocks → needs_followup must be false"
+        );
+
+        // Now simulate a tool_use block
+        let mut ant2 = tools::AnthropicToolAccumulator::new();
+        let mut oai2 = tools::ToolCallAccumulator::new();
+        for raw in &[
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"c1","name":"bash"}}"#,
+            r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ] {
+            let ev: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let _ = process_sse_event(&ev, false, &mut ant2, &mut oai2);
+        }
+        assert!(
+            ant2.has_tool_use(),
+            "tool_use stop_reason → needs_followup must be true"
+        );
+    }
+
+    /// B6 — `SSE_STREAM_TIMEOUT_SECS` is pinned at 30 seconds.
+    ///
+    /// Increasing this without a gap issue would silently change user-visible
+    /// latency characteristics. Stream timeout appends inline text (gap #600
+    /// tracks upgrading to a structured error event like CC does).
+    #[test]
+    fn b6_stream_timeout_constant_is_30s() {
+        // Pin current value — gap #600 tracks upgrading to structured error
+        assert_eq!(
+            crate::proxy::SSE_STREAM_TIMEOUT_SECS,
+            30,
+            "SSE_STREAM_TIMEOUT_SECS must stay at 30s until gap #600 is addressed"
+        );
+    }
+
+    /// B1 — retry loop only covers 429, 503, 529 (NOT 408 — gap #597).
+    ///
+    /// This tests the request-builder side: a 200 response contains `stream: true`.
+    #[test]
+    fn b1_build_request_stream_flag_always_set() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let req = build_openai_request("gpt-4", &messages, "medium");
+        assert_eq!(
+            req["stream"], true,
+            "stream must always be true in OC requests"
+        );
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        assert_eq!(req["stream"], true);
+        let req = build_google_request(&messages, "medium");
+        // Google request body doesn't include "stream" — it's a separate code path
+        // The absence is the contract (Gemini uses non-streaming JSON — gap #602)
+        assert!(
+            req.get("stream").is_none(),
+            "Google request must NOT have stream field (non-streaming path — gap #602)"
+        );
+    }
+
+    /// B3 — `process_sse_event` returns `SseAction::None` for unknown event types.
+    #[test]
+    fn b3_process_sse_event_unknown_type_returns_none() {
+        let event: serde_json::Value = serde_json::json!({"type": "ping"});
+        let mut ant = tools::AnthropicToolAccumulator::new();
+        let mut oai = tools::ToolCallAccumulator::new();
+        let action = process_sse_event(&event, false, &mut ant, &mut oai);
+        assert!(
+            matches!(action, SseAction::None),
+            "unknown SSE event type must return SseAction::None"
+        );
+    }
+
+    /// B3 — `tool_needs_permission` classifies read-only tools as safe.
+    #[test]
+    fn b3_tool_needs_permission_safe_list() {
+        assert!(!tool_needs_permission("read_file"), "read_file is safe");
+        assert!(!tool_needs_permission("list_files"), "list_files is safe");
+        assert!(!tool_needs_permission("grep"), "grep is safe");
+        assert!(
+            tool_needs_permission("write_file"),
+            "write_file needs permission"
+        );
+        assert!(tool_needs_permission("bash"), "bash needs permission");
+        assert!(
+            tool_needs_permission("edit_file"),
+            "edit_file needs permission"
+        );
+    }
+
     #[test]
     fn ultrathink_keyword_promotes_anthropic_thinking() {
         let prev = (

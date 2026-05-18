@@ -691,4 +691,177 @@ mod tests {
             .create_task("Test".to_string(), "Test task".to_string(), None);
         assert_eq!(manager.task_manager.list_tasks().len(), 1);
     }
+
+    // ── Phase 2 spec-pinning tests (#552 / spec #537 B-session) ──────────────
+
+    /// Spec — `TokenUsage::total()` is input + output (not cache tokens).
+    #[test]
+    fn token_usage_total_excludes_cache() {
+        let u = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 200,
+            cache_write_tokens: 300,
+        };
+        assert_eq!(u.total(), 150, "total() must be input + output only");
+    }
+
+    /// Spec — `TokenUsage::accumulate` sums all four fields independently.
+    #[test]
+    fn token_usage_accumulate_sums_all_fields() {
+        let mut acc = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 20,
+            cache_write_tokens: 30,
+        };
+        let delta = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 200,
+            cache_write_tokens: 300,
+        };
+        acc.accumulate(&delta);
+        assert_eq!(acc.input_tokens, 110);
+        assert_eq!(acc.output_tokens, 55);
+        assert_eq!(acc.cache_read_tokens, 220);
+        assert_eq!(acc.cache_write_tokens, 330);
+    }
+
+    /// Spec — `record_actual_usage` feeds into `cumulative_usage` and `total_tokens`.
+    #[test]
+    fn session_record_actual_usage_accumulates() {
+        let mut session = Session::new_initializer();
+
+        // Simulate a turn estimate first (required before actual usage)
+        session.record_turn_estimate(1000, 100, 80, 20);
+
+        let usage = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 250,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        session.record_actual_usage(usage);
+
+        assert_eq!(session.cumulative_usage.input_tokens, 500);
+        assert_eq!(session.cumulative_usage.output_tokens, 250);
+        // total_tokens legacy field also updated
+        assert_eq!(
+            session.total_tokens, 750,
+            "legacy total_tokens must equal input+output"
+        );
+
+        // Second turn
+        session.record_turn_estimate(800, 90, 70, 20);
+        session.record_actual_usage(TokenUsage {
+            input_tokens: 300,
+            output_tokens: 100,
+            cache_read_tokens: 50,
+            cache_write_tokens: 0,
+        });
+        assert_eq!(session.cumulative_usage.input_tokens, 800);
+        assert_eq!(session.cumulative_usage.output_tokens, 350);
+        assert_eq!(session.cumulative_usage.cache_read_tokens, 50);
+        assert_eq!(session.total_tokens, 1150);
+    }
+
+    /// Spec — `record_turn_estimate` assigns monotonically increasing turn numbers.
+    #[test]
+    fn session_turn_numbers_monotonically_increasing() {
+        let mut session = Session::new_initializer();
+        let t1 = session.record_turn_estimate(100, 10, 8, 2);
+        let t2 = session.record_turn_estimate(200, 20, 16, 4);
+        let t3 = session.record_turn_estimate(300, 30, 24, 6);
+        assert_eq!(t1, 1);
+        assert_eq!(t2, 2);
+        assert_eq!(t3, 3);
+        assert_eq!(session.turn_metrics.len(), 3);
+    }
+
+    /// Spec — `get_session_context` returns initializer context for first session.
+    #[test]
+    fn session_context_initializer_mode() {
+        let session = Session::new_initializer();
+        let ctx = get_session_context(&session);
+        assert!(
+            ctx.contains("Initializer"),
+            "initializer mode context must identify the agent role"
+        );
+    }
+
+    /// Spec — `get_session_context` returns coding context including parent ID.
+    #[test]
+    fn session_context_coding_mode_includes_parent() {
+        let session = Session::new_coding("parent-abc");
+        let ctx = get_session_context(&session);
+        assert!(
+            ctx.contains("Coding") || ctx.contains("continuing"),
+            "coding mode context must identify continuation"
+        );
+        assert!(
+            ctx.contains("parent-abc"),
+            "coding mode context must include parent session ID"
+        );
+    }
+
+    /// Spec — `add_modified_file` is idempotent (no duplicates).
+    #[test]
+    fn add_modified_file_is_idempotent() {
+        let mut session = Session::new_initializer();
+        session.add_modified_file("src/main.rs");
+        session.add_modified_file("src/main.rs");
+        session.add_modified_file("src/main.rs");
+        assert_eq!(
+            session.progress.files_modified.len(),
+            1,
+            "duplicate file paths must not be added"
+        );
+    }
+
+    /// Spec — `SessionManager::start_initializer` always creates an initializer
+    /// session regardless of any persisted history.
+    #[test]
+    fn start_initializer_overrides_history() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+
+        // Create and persist a session so there IS history
+        manager.get_or_create_session();
+        manager.end_session(None);
+
+        // Force an initializer even though history exists
+        let session = manager.start_initializer().clone();
+        assert_eq!(
+            session.mode,
+            SessionMode::Initializer,
+            "start_initializer must override history detection"
+        );
+        assert!(
+            session.parent_session_id.is_none(),
+            "forced initializer must have no parent"
+        );
+    }
+
+    /// Spec — VDD context round-trips through store/take.
+    #[test]
+    fn vdd_context_store_and_take() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+
+        assert!(
+            manager.take_vdd_context().is_none(),
+            "initially no VDD context"
+        );
+
+        manager.store_vdd_context("advisory: review tool calls".to_string());
+        let ctx = manager.take_vdd_context();
+        assert_eq!(ctx.as_deref(), Some("advisory: review tool calls"));
+
+        // take is destructive — second take returns None
+        assert!(
+            manager.take_vdd_context().is_none(),
+            "take_vdd_context must be destructive"
+        );
+    }
 }

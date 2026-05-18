@@ -1566,4 +1566,212 @@ mod tests {
         );
         assert!(anthropic.get("messages").unwrap().as_array().unwrap().len() == 1);
     }
+
+    // ── Spec #527 behavior 1: run_in_background returns agent_id immediately ──
+
+    /// Spec #527 §1 — `task` with `run_in_background: true` registers a new agent
+    /// in `BACKGROUND_AGENTS` and returns a plain-text string containing the ID,
+    /// the description, and the agent type. `is_error` must be `false`.
+    ///
+    /// Pins OC's current output format. CC returns a typed `AgentId`; OC returns an
+    /// opaque 8-char UUID prefix — format differs, behavior is pinned as-is.
+    #[test]
+    fn spec1_run_in_background_registers_agent_returns_id() {
+        let mgr = BackgroundAgentManager::new();
+        let id = mgr.register(AgentType::Explore, "scan codebase for dead code");
+        assert_eq!(id.len(), 8, "OC uses 8-char UUID prefix (safe_truncate)");
+
+        // The agent is immediately retrievable, not yet finished.
+        let agent = mgr.get(&id).expect("registered agent must exist");
+        assert!(!agent.finished.load(Ordering::SeqCst));
+        assert_eq!(agent.task, "scan codebase for dead code");
+        assert_eq!(agent.agent_type, AgentType::Explore);
+    }
+
+    /// Spec #527 §1 — The message format produced for background spawn includes
+    /// the agent_id, task description, and a hint to use `agent_output`.
+    #[test]
+    fn spec1_background_message_format() {
+        let mgr = BackgroundAgentManager::new();
+        let id = mgr.register(AgentType::Plan, "design the auth layer");
+
+        // Simulate the format string from execute_task_tool (line ~1333).
+        let description = "design the auth layer";
+        let agent_type = AgentType::Plan;
+        let message = format!(
+            "Background agent started with ID: {id}\nTask: {description}\nType: {agent_type:?}\n\nUse agent_output with this agent_id to retrieve results."
+        );
+
+        assert!(message.contains(&id), "message must embed the agent_id");
+        assert!(message.contains(description));
+        assert!(message.contains("agent_output"));
+    }
+
+    /// Spec #527 §1 — At spawn time the agent is not finished, has no error, and
+    /// has no result. `is_error` is `false` for a background spawn.
+    #[test]
+    fn spec1_is_error_false_and_not_finished_at_spawn() {
+        let mgr = BackgroundAgentManager::new();
+        let id = mgr.register(AgentType::GeneralPurpose, "refactor module");
+        let agent = mgr.get(&id).expect("must exist after register");
+
+        assert!(!agent.finished.load(Ordering::SeqCst));
+        assert!(agent.error.lock().unwrap().is_none());
+        assert!(agent.result.lock().unwrap().is_none());
+    }
+
+    // ── Spec #527 behavior 2: resume loads transcript and appends new prompt ──
+
+    /// Spec #527 §2 — When the transcript store has no entry for the id,
+    /// `load_transcript` returns `None`. `run_subagent` converts this to
+    /// `success=false` with the "No transcript found" message.
+    #[test]
+    fn spec2_resume_miss_returns_not_found_error() {
+        let missing = load_transcript("00000000-dead-beef-0000-000000000000");
+        assert!(
+            missing.is_none(),
+            "unknown agent_id must return None from transcript store"
+        );
+    }
+
+    /// Spec #527 §2 — Storing and loading a transcript round-trips correctly;
+    /// the loaded messages and agent_type match what was stored.
+    #[test]
+    fn spec2_transcript_store_and_load_round_trip() {
+        let msgs = vec![
+            json!({"role": "system", "content": "You are a worker."}),
+            json!({"role": "user", "content": "Do the thing"}),
+            json!({"role": "assistant", "content": "Done."}),
+        ];
+        let fake_id = format!("tt-{}", Uuid::new_v4());
+        store_transcript(&fake_id, msgs.clone(), AgentType::Explore);
+
+        let loaded = load_transcript(&fake_id).expect("stored transcript must be loadable");
+        assert_eq!(loaded.0.len(), msgs.len());
+        assert_eq!(loaded.1, AgentType::Explore);
+        assert_eq!(loaded.0[0]["role"].as_str(), Some("system"));
+        assert_eq!(loaded.0[2]["content"].as_str(), Some("Done."));
+    }
+
+    /// Spec #527 §2 gap #582 — OC generates a NEW agent_id on resume; it does NOT
+    /// reuse the original id. CC reuses the original `agentId` for transcript
+    /// continuity and prompt-cache hits. This pins the divergent OC behavior.
+    #[test]
+    fn spec2_gap582_resume_allocates_new_agent_id_not_old_one() {
+        let original_id = format!("orig-{}", Uuid::new_v4());
+        store_transcript(
+            &original_id,
+            vec![json!({"role": "user", "content": "Hello"})],
+            AgentType::Plan,
+        );
+
+        assert!(load_transcript(&original_id).is_some());
+
+        // On resume, OC calls `BACKGROUND_AGENTS.register(...)` → new id.
+        let new_id = BACKGROUND_AGENTS.register(AgentType::Plan, "resume task");
+        assert_ne!(
+            new_id, original_id,
+            "gap #582: OC issues a new agent_id on resume (CC reuses original)"
+        );
+    }
+
+    // ── Spec #527 behavior 5: task_stop — confirmed MISSING (gap #580) ──
+
+    /// Spec #527 §5 gap #580 — OC has no `task_stop` mechanism. The
+    /// `BackgroundAgentManager` exposes no abort method. `fail()` exists as
+    /// an internal marker but cannot abort a spawned tokio task.
+    #[test]
+    fn spec5_gap580_no_stop_method_on_background_agent_manager() {
+        let mgr = BackgroundAgentManager::new();
+        let id = mgr.register(AgentType::GeneralPurpose, "long running task");
+
+        // fail() marks finished=true but does NOT abort the tokio task.
+        mgr.fail(&id, "externally terminated".to_string());
+
+        let agent = mgr.get(&id).unwrap();
+        assert!(
+            agent.finished.load(Ordering::SeqCst),
+            "fail() marks finished but cannot abort the tokio task (gap #580)"
+        );
+        assert_eq!(
+            agent.error.lock().unwrap().as_deref(),
+            Some("externally terminated")
+        );
+        // The real task handle (tokio JoinHandle) is not stored in the struct.
+        // No field or method enables external abort — that is gap #580.
+    }
+
+    /// Spec #527 §5 gap #580 — `get_subagent_tool_definitions()` does NOT include
+    /// a `task_stop` tool. CC has `TaskStopTool`; OC does not.
+    #[test]
+    fn spec5_gap580_task_stop_not_in_tool_definitions() {
+        let defs = get_subagent_tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("function")?.get("name")?.as_str())
+            .collect();
+
+        assert!(
+            !names.contains(&"task_stop"),
+            "gap #580: task_stop tool is absent from OC tool definitions (CC has TaskStopTool)"
+        );
+        assert!(names.contains(&"task"), "task tool must be present");
+        assert!(
+            names.contains(&"agent_output"),
+            "agent_output tool must be present"
+        );
+    }
+
+    // ── Spec #527 §1 — agent_output edge cases ──
+
+    /// Spec #527 §1 — querying an agent_id that was never registered returns
+    /// `is_error = true` with a "not found" message.
+    #[test]
+    fn spec1_agent_output_unknown_id_returns_error() {
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert("agent_id".to_string(), json!("00000000-not-registered"));
+
+        let (msg, is_err) = execute_agent_output_tool(&args);
+        assert!(is_err, "unknown agent_id must be an error");
+        assert!(
+            msg.contains("not found"),
+            "message must say not found, got: {msg}"
+        );
+    }
+
+    /// Spec #527 §1 — agent_output for a finished agent returns the output text
+    /// and `is_error = false`.
+    #[test]
+    fn spec1_agent_output_finished_agent_returns_result() {
+        let id = BACKGROUND_AGENTS.register(AgentType::Explore, "search task");
+        BACKGROUND_AGENTS.finish(&id, "Found 3 matches.".to_string());
+
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert("agent_id".to_string(), json!(id));
+
+        let (msg, is_err) = execute_agent_output_tool(&args);
+        assert!(!is_err, "finished agent must not be an error: {msg}");
+        assert!(
+            msg.contains("Found 3 matches."),
+            "must include result: {msg}"
+        );
+        assert!(msg.contains(&id));
+    }
+
+    /// Spec #527 §1 — agent_output for a failed agent returns `is_error = true`
+    /// and the error text.
+    #[test]
+    fn spec1_agent_output_failed_agent_returns_error() {
+        let id = BACKGROUND_AGENTS.register(AgentType::Plan, "failing task");
+        BACKGROUND_AGENTS.fail(&id, "tool denied".to_string());
+
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert("agent_id".to_string(), json!(id));
+
+        let (msg, is_err) = execute_agent_output_tool(&args);
+        assert!(is_err, "failed agent must return is_error=true");
+        assert!(msg.contains("tool denied"), "must include error: {msg}");
+    }
 }

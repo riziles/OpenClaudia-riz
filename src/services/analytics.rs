@@ -217,4 +217,85 @@ mod tests {
             other => panic!("expected ToolUsed, got {other:?}"),
         }
     }
+
+    // ── B4 spec pins (#536 §B4) ──────────────────────────────────────────────
+
+    /// B4: `AnalyticsSink` is `Send + Sync` — the trait bound is required so
+    /// the sink can live behind `Arc<dyn AnalyticsSink>` and cross thread /
+    /// task boundaries. This compile-time pin verifies the bound; if the
+    /// trait loses `Send + Sync`, the Arc construction below stops compiling.
+    #[test]
+    fn b4_analytics_sink_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoopAnalytics>();
+        assert_send_sync::<TracingAnalytics>();
+        // Arc<dyn AnalyticsSink> is the shape ServiceRegistry holds.
+        let _: std::sync::Arc<dyn AnalyticsSink> = std::sync::Arc::new(NoopAnalytics);
+        let _: std::sync::Arc<dyn AnalyticsSink> = std::sync::Arc::new(TracingAnalytics);
+    }
+
+    /// B4: `NoopAnalytics::record` is callable unconditionally — callers are
+    /// NOT required to do an `Option` check before calling. Exercises every
+    /// variant through the noop sink to confirm none panics (spec §B4:
+    /// "Must not panic").
+    #[test]
+    fn b4_noop_analytics_accepts_all_variants_without_panic() {
+        let sink = NoopAnalytics;
+        sink.record(AnalyticsEvent::SessionStart {
+            session_id: "s1".to_string(),
+        });
+        sink.record(AnalyticsEvent::SessionEnd {
+            session_id: "s1".to_string(),
+            messages: 0,
+        });
+        sink.record(AnalyticsEvent::ToolUsed {
+            tool: "bash".to_string(),
+            success: false,
+        });
+        sink.record(AnalyticsEvent::PromptSubmitted { prompt_chars: 0 });
+        sink.record(AnalyticsEvent::ContextCompacted {
+            trigger: "manual",
+            tokens_freed: 0,
+        });
+        sink.record(AnalyticsEvent::ApiRequest {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-6".to_string(),
+        });
+        sink.record(AnalyticsEvent::ThinkingEmitted { budget: 0 });
+    }
+
+    /// B4 / gap #649: pin that `AnalyticsEvent` does NOT have a `CostTracked`
+    /// variant yet. CC fires per-request cost metrics via `getCostCounter().add()`
+    /// (`cost-tracker.ts` line 291); OC has no equivalent (filed as #649).
+    ///
+    /// The exhaustive match below compiles only while the 7 known variants are
+    /// the only ones. Adding `CostTracked` without updating the match causes a
+    /// compile error — the intended sentinel behaviour.
+    #[test]
+    fn b4_cost_tracked_variant_not_yet_present_gap649() {
+        let event = AnalyticsEvent::ThinkingEmitted { budget: 1 };
+        let _ = match event {
+            AnalyticsEvent::SessionStart { .. }
+            | AnalyticsEvent::SessionEnd { .. }
+            | AnalyticsEvent::ToolUsed { .. }
+            | AnalyticsEvent::PromptSubmitted { .. }
+            | AnalyticsEvent::ContextCompacted { .. }
+            | AnalyticsEvent::ApiRequest { .. }
+            | AnalyticsEvent::ThinkingEmitted { .. } => "no CostTracked yet — see gap #649",
+        };
+    }
+
+    /// B4: `Arc<dyn AnalyticsSink>` can be cloned and sent across a thread.
+    /// Confirms that `Send + Sync` is sufficient for the `ServiceRegistry`
+    /// arc-clone-then-spawn pattern.
+    #[test]
+    fn b4_arc_sink_clone_crosses_thread_boundary() {
+        let sink: std::sync::Arc<dyn AnalyticsSink> = std::sync::Arc::new(NoopAnalytics);
+        let sink2 = std::sync::Arc::clone(&sink);
+        let handle = std::thread::spawn(move || {
+            sink2.record(AnalyticsEvent::PromptSubmitted { prompt_chars: 7 });
+        });
+        handle.join().expect("thread must not panic");
+        sink.record(AnalyticsEvent::PromptSubmitted { prompt_chars: 3 });
+    }
 }

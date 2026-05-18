@@ -365,3 +365,192 @@ mod tests {
         assert_eq!(q.len(), 2);
     }
 }
+
+/// Phase 2 spec pins — #532 behavioral contracts for [`TaskQueue`].
+///
+/// Each test is labelled with the spec behavior it pins (B1 / B5).
+/// Do NOT remove or weaken these tests to fix a queue bug — file a
+/// gap issue instead so the spec and code stay in sync.
+#[cfg(test)]
+mod phase2_spec_pins {
+    use super::*;
+    use crate::subagent::AgentType;
+
+    fn t(label: &str) -> Task {
+        Task::new(AgentType::Explore, label)
+    }
+
+    // ── B1: dependency semantics ─────────────────────────────────────
+
+    /// B1a: task with empty depends_on is immediately eligible (#532
+    /// B1 edge-case: "empty depends_on vec is immediately eligible").
+    #[test]
+    fn b1_no_deps_task_immediately_ready() {
+        let mut q = TaskQueue::new();
+        q.submit(t("standalone")).unwrap();
+        assert!(
+            q.next_ready().is_some(),
+            "task with no deps must be ready immediately",
+        );
+    }
+
+    /// B1b: TaskId(0) is the sentinel used by Task::new before submit;
+    /// submit always returns an id >= 1 (#532 B1).
+    #[test]
+    fn b1_submitted_id_never_zero() {
+        let mut q = TaskQueue::new();
+        let id = q.submit(t("first")).unwrap();
+        assert!(id.raw() >= 1, "submit must never return TaskId(0)");
+    }
+
+    /// B1c: Running dep does NOT unblock a dependent task — only Done
+    /// does (#532 B1, OC task_queue.rs:232).
+    #[test]
+    fn b1_running_dep_still_blocks_dependent() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        q.submit(Task::new(AgentType::Plan, "b").depends_on(vec![a]))
+            .unwrap();
+
+        // Mark `a` Running (not Done).
+        q.get_mut(a).unwrap().state = TaskState::Running;
+
+        // `b` must still be blocked; next_ready must return None
+        // because `a` is Running, not Done.
+        assert!(
+            q.next_ready().is_none(),
+            "Running dep must not unblock a dependent task — only Done does",
+        );
+    }
+
+    /// B1d: submit with an unknown dep id returns UnknownTask and
+    /// does NOT insert the task (#532 B1).
+    #[test]
+    fn b1_submit_unknown_dep_not_inserted() {
+        let mut q = TaskQueue::new();
+        let ghost = TaskId(42);
+        let err = q.submit(t("bad").depends_on(vec![ghost])).unwrap_err();
+        assert_eq!(
+            err,
+            TaskQueueError::UnknownTask { missing: ghost },
+            "wrong error variant",
+        );
+        // Queue must be empty — the task was not inserted.
+        assert_eq!(q.len(), 0, "failed submit must not insert the task");
+    }
+
+    /// B1e: ids are monotonically increasing across multiple submits
+    /// (#532 B1: "monotonically increasing, starting at 1").
+    #[test]
+    fn b1_ids_monotonically_increasing() {
+        let mut q = TaskQueue::new();
+        let ids: Vec<u64> = (0..5)
+            .map(|i| q.submit(t(&format!("t{i}"))).unwrap().raw())
+            .collect();
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "ids must be strictly monotone: {ids:?}");
+        }
+    }
+
+    /// B1f: len() counts tasks in ALL states, not just Pending
+    /// (#532 B1 edge-case).
+    #[test]
+    fn b1_len_counts_all_states_exhaustive() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        let b = q.submit(t("b")).unwrap();
+        let c = q.submit(t("c")).unwrap();
+        let d = q.submit(t("d")).unwrap();
+
+        q.get_mut(a).unwrap().state = TaskState::Pending;
+        q.get_mut(b).unwrap().state = TaskState::Running;
+        q.get_mut(c).unwrap().state = TaskState::Done("ok".into());
+        q.get_mut(d).unwrap().state = TaskState::Failed("err".into());
+
+        assert_eq!(q.len(), 4, "len must count Pending+Running+Done+Failed");
+    }
+
+    // ── B5: cycle detection ──────────────────────────────────────────
+
+    /// B5a: add_dependency with unknown `from` returns UnknownTask
+    /// (#532 B5).
+    #[test]
+    fn b5_add_dep_unknown_from_rejected() {
+        let mut q = TaskQueue::new();
+        let b = q.submit(t("b")).unwrap();
+        let ghost = TaskId(999);
+        let err = q.add_dependency(ghost, b).unwrap_err();
+        assert_eq!(err, TaskQueueError::UnknownTask { missing: ghost });
+    }
+
+    /// B5b: add_dependency with unknown `to` returns UnknownTask
+    /// (#532 B5).
+    #[test]
+    fn b5_add_dep_unknown_to_rejected() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        let ghost = TaskId(999);
+        let err = q.add_dependency(a, ghost).unwrap_err();
+        assert_eq!(err, TaskQueueError::UnknownTask { missing: ghost });
+    }
+
+    /// B5c: on cycle-detection error the queue is NOT mutated — the
+    /// edge is not partially inserted (#532 B5 side-effect clause).
+    #[test]
+    fn b5_cycle_error_leaves_queue_unchanged() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        let b = q
+            .submit(Task::new(AgentType::Plan, "b").depends_on(vec![a]))
+            .unwrap();
+
+        let deps_before = q.get(a).unwrap().depends_on.clone();
+
+        // Adding a → b would cycle: b already depends on a.
+        let err = q.add_dependency(a, b).unwrap_err();
+        assert!(matches!(err, TaskQueueError::CycleDetected { from, to } if from == a && to == b));
+
+        // `a`'s depends_on must be exactly what it was before.
+        assert_eq!(
+            q.get(a).unwrap().depends_on,
+            deps_before,
+            "queue must be unchanged after cycle rejection",
+        );
+    }
+
+    /// B5d: CycleDetected carries the correct from/to ids (#532 B5
+    /// error-format clause).
+    #[test]
+    fn b5_cycle_detected_error_format() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        let b = q
+            .submit(Task::new(AgentType::GeneralPurpose, "b").depends_on(vec![a]))
+            .unwrap();
+
+        match q.add_dependency(a, b) {
+            Err(TaskQueueError::CycleDetected { from, to }) => {
+                assert_eq!(from, a, "from must be the originating node");
+                assert_eq!(to, b, "to must be the node that closes the cycle");
+            }
+            other => panic!("expected CycleDetected, got {other:?}"),
+        }
+    }
+
+    /// B5e: non-cycling add_dependency succeeds and the edge is
+    /// appended to depends_on (#532 B5 Ok-path).
+    #[test]
+    fn b5_valid_add_dependency_appended() {
+        let mut q = TaskQueue::new();
+        let a = q.submit(t("a")).unwrap();
+        let b = q.submit(t("b")).unwrap();
+        let c = q.submit(t("c")).unwrap();
+
+        q.add_dependency(a, b).unwrap();
+        q.add_dependency(a, c).unwrap();
+
+        let deps = &q.get(a).unwrap().depends_on;
+        assert!(deps.contains(&b), "b must be in a.depends_on");
+        assert!(deps.contains(&c), "c must be in a.depends_on");
+    }
+}

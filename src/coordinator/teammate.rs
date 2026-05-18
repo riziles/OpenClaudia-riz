@@ -207,3 +207,178 @@ mod tests {
         assert!(!tm.state.is_available());
     }
 }
+
+/// Phase 2 spec pins — #532 behavioral contracts for [`Teammate`] /
+/// [`AgentColor`] / [`TeammateState`].
+///
+/// B3 pins the struct field invariants set at construction.
+/// B4 pins the palette cycling behavior.
+/// Tests must not be weakened to accommodate a future refactor —
+/// file a gap issue instead.
+#[cfg(test)]
+mod phase2_spec_pins {
+    use super::*;
+    use crate::subagent::AgentType;
+
+    // ── B3: Teammate struct field invariants ─────────────────────────
+
+    /// B3a: session_id and transcript_path are stored exactly as
+    /// supplied (#532 B3 field table).
+    #[test]
+    fn b3_fields_stored_as_supplied() {
+        let session = "ses-abc-123";
+        let path = PathBuf::from("/var/log/teammate.jsonl");
+        let tm = Teammate::new(AgentType::Plan, 1, session, path.clone());
+
+        assert_eq!(tm.session_id, session, "session_id must be stored verbatim");
+        assert_eq!(
+            tm.transcript_path, path,
+            "transcript_path must be stored verbatim",
+        );
+    }
+
+    /// B3b: agent_type is stored as supplied (#532 B3).
+    #[test]
+    fn b3_agent_type_stored_as_supplied() {
+        let tm = Teammate::new(AgentType::GeneralPurpose, 0, "s", PathBuf::from("/t"));
+        assert!(
+            matches!(tm.agent_type, AgentType::GeneralPurpose),
+            "agent_type must round-trip through Teammate::new",
+        );
+    }
+
+    /// B3c: id is a UUID v4 string (36 chars, 4 hyphens) — never
+    /// empty, never the same across two calls (#532 B3).
+    #[test]
+    fn b3_teammate_id_is_unique_uuid() {
+        let a = Teammate::new(AgentType::Explore, 0, "s1", PathBuf::from("/a"));
+        let b = Teammate::new(AgentType::Explore, 0, "s2", PathBuf::from("/b"));
+
+        assert_ne!(a.id, b.id, "each Teammate must receive a unique id");
+        // UUID v4 canonical text form is always 36 characters.
+        assert_eq!(
+            a.id.as_str().len(),
+            36,
+            "TeammateId must be 36-char UUID string",
+        );
+        assert_eq!(
+            a.id.as_str().chars().filter(|&c| c == '-').count(),
+            4,
+            "UUID must contain exactly 4 hyphens",
+        );
+    }
+
+    /// B3d: initial state is Spawning — not Running, not Idle
+    /// (#532 B3 lifecycle table).
+    #[test]
+    fn b3_initial_state_is_spawning_not_running_or_idle() {
+        let tm = Teammate::new(AgentType::Guide, 3, "s", PathBuf::from("/t"));
+        assert!(
+            matches!(tm.state, TeammateState::Spawning),
+            "Teammate::new must produce TeammateState::Spawning",
+        );
+        assert!(tm.state.is_alive(), "Spawning must be alive");
+        assert!(!tm.state.is_available(), "Spawning must not be available");
+    }
+
+    /// B3e: only Idle satisfies is_available; all other alive states
+    /// do not (#532 B3 is_available contract).
+    #[test]
+    fn b3_is_available_only_for_idle() {
+        assert!(!TeammateState::Spawning.is_available());
+        assert!(!TeammateState::Running.is_available());
+        assert!(TeammateState::Idle.is_available());
+        assert!(!TeammateState::Dead("reason".into()).is_available());
+    }
+
+    /// B3f: Dead is the only state where is_alive returns false
+    /// (#532 B3 is_alive contract).
+    #[test]
+    fn b3_is_alive_false_only_for_dead() {
+        assert!(TeammateState::Spawning.is_alive());
+        assert!(TeammateState::Running.is_alive());
+        assert!(TeammateState::Idle.is_alive());
+        assert!(!TeammateState::Dead(String::new()).is_alive());
+    }
+
+    // ── B4: AgentColor palette cycling ──────────────────────────────
+
+    /// B4a: explicit slot-by-slot mapping for all 7 palette positions
+    /// (#532 B4 contract table).
+    #[test]
+    fn b4_palette_slot_by_slot() {
+        assert_eq!(AgentColor::for_index(0), AgentColor::Red);
+        assert_eq!(AgentColor::for_index(1), AgentColor::Orange);
+        assert_eq!(AgentColor::for_index(2), AgentColor::Yellow);
+        assert_eq!(AgentColor::for_index(3), AgentColor::Green);
+        assert_eq!(AgentColor::for_index(4), AgentColor::Blue);
+        assert_eq!(AgentColor::for_index(5), AgentColor::Indigo);
+        assert_eq!(AgentColor::for_index(6), AgentColor::Violet);
+    }
+
+    /// B4b: palette length is exactly 7 (#532 B4 invariant).
+    #[test]
+    fn b4_palette_len_is_seven() {
+        assert_eq!(AgentColor::PALETTE.len(), 7);
+    }
+
+    /// B4c: for_index(n % 7) == for_index(n) for representative
+    /// values (#532 B4 invariant).
+    #[test]
+    fn b4_for_index_modular_identity() {
+        for n in [0usize, 7, 14, 100, 1_000_007] {
+            assert_eq!(
+                AgentColor::for_index(n),
+                AgentColor::for_index(n % 7),
+                "for_index({n}) != for_index({} % 7)",
+                n,
+            );
+        }
+    }
+
+    /// B4d: usize::MAX does not panic (#532 B4 no-OOB invariant).
+    #[test]
+    fn b4_usize_max_does_not_panic() {
+        // Just calling it is the assertion — no panic == pass.
+        let _ = AgentColor::for_index(usize::MAX);
+    }
+
+    /// B4e: AgentColor serializes to lowercase strings per serde attr
+    /// (#532 B4 serde round-trip).
+    #[test]
+    fn b4_serde_round_trip_lowercase() {
+        let cases = [
+            (AgentColor::Red, "\"red\""),
+            (AgentColor::Orange, "\"orange\""),
+            (AgentColor::Yellow, "\"yellow\""),
+            (AgentColor::Green, "\"green\""),
+            (AgentColor::Blue, "\"blue\""),
+            (AgentColor::Indigo, "\"indigo\""),
+            (AgentColor::Violet, "\"violet\""),
+        ];
+        for (color, expected_json) in cases {
+            let serialized = serde_json::to_string(&color).expect("AgentColor must serialize");
+            assert_eq!(
+                serialized, expected_json,
+                "AgentColor::{color:?} must serialize to {expected_json}",
+            );
+            let round: AgentColor =
+                serde_json::from_str(&serialized).expect("AgentColor must deserialize");
+            assert_eq!(round, color, "round-trip failed for {color:?}");
+        }
+    }
+
+    /// B4f: color assigned via Teammate::new matches for_index(ordinal)
+    /// (#532 B3 field table: color set via AgentColor::for_index).
+    #[test]
+    fn b4_teammate_color_matches_for_index() {
+        for ordinal in 0..14usize {
+            let tm = Teammate::new(AgentType::Explore, ordinal, "s", PathBuf::from("/t"));
+            assert_eq!(
+                tm.color,
+                AgentColor::for_index(ordinal),
+                "ordinal {ordinal}: Teammate color must equal AgentColor::for_index(ordinal)",
+            );
+        }
+    }
+}

@@ -1770,3 +1770,224 @@ pub async fn start_server_with_shutdown(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `AppConfig` suitable for unit tests.
+    /// `AppConfig` does not implement `Default`; we deserialise from a
+    /// minimal JSON value that satisfies every required field.
+    fn minimal_config(target: &str) -> crate::config::AppConfig {
+        serde_json::from_value(serde_json::json!({
+            "proxy": { "port": 8080, "host": "127.0.0.1", "target": target },
+            "providers": {}
+        }))
+        .expect("minimal_config must deserialise")
+    }
+
+    // ── Phase 2 spec-pinning tests (#552 / spec #537 B-proxy) ────────────────
+
+    /// Spec — `normalize_base_url` strips trailing slashes and `/v1` suffix.
+    /// Prevents double `/v1/v1` when endpoint paths include the prefix.
+    #[test]
+    fn normalize_base_url_strips_v1_and_slash() {
+        assert_eq!(
+            normalize_base_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com"),
+            "https://api.openai.com"
+        );
+        // URL with no /v1 and no trailing slash is unchanged
+        assert_eq!(
+            normalize_base_url("http://localhost:8080"),
+            "http://localhost:8080"
+        );
+    }
+
+    /// Spec — `determine_provider` maps model prefixes to the right provider name.
+    #[test]
+    fn determine_provider_model_prefix_routing() {
+        let config = minimal_config("anthropic");
+
+        assert_eq!(determine_provider("claude-opus-4", &config), "anthropic");
+        assert_eq!(
+            determine_provider("claude-sonnet-4-6", &config),
+            "anthropic"
+        );
+        assert_eq!(
+            determine_provider("anthropic/claude-3", &config),
+            "anthropic"
+        );
+
+        assert_eq!(determine_provider("gpt-4", &config), "openai");
+        assert_eq!(determine_provider("gpt-4o", &config), "openai");
+        assert_eq!(determine_provider("o1-preview", &config), "openai");
+        assert_eq!(determine_provider("o3-mini", &config), "openai");
+        assert_eq!(determine_provider("o4-pro", &config), "openai");
+
+        assert_eq!(determine_provider("gemini-2.5-pro", &config), "google");
+        assert_eq!(determine_provider("gemini-flash", &config), "google");
+
+        assert_eq!(determine_provider("deepseek-r1", &config), "deepseek");
+
+        assert_eq!(determine_provider("qwen-long", &config), "qwen");
+        assert_eq!(determine_provider("qwq-32b", &config), "qwen");
+        assert_eq!(determine_provider("qvq-72b", &config), "qwen");
+
+        assert_eq!(determine_provider("glm-4", &config), "zai");
+    }
+
+    /// Spec — unknown model prefix falls back to `config.proxy.target`.
+    #[test]
+    fn determine_provider_unknown_model_uses_target() {
+        let config = minimal_config("deepseek");
+        assert_eq!(
+            determine_provider("some-unknown-model-xyz", &config),
+            "deepseek"
+        );
+    }
+
+    // ── Usage extraction (B1-adjacent: token tracking in proxy) ──────────────
+
+    /// Spec — `extract_usage_from_sse_event` handles Anthropic `message_start`.
+    #[test]
+    fn extract_usage_message_start_anthropic() {
+        let event = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 42,
+                    "cache_read_input_tokens": 10,
+                    "cache_creation_input_tokens": 5
+                }
+            }
+        });
+        let usage = extract_usage_from_sse_event(&event).expect("must extract usage");
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.cache_read_tokens, 10);
+        assert_eq!(usage.cache_write_tokens, 5);
+        assert_eq!(usage.output_tokens, 0);
+    }
+
+    /// Spec — `extract_usage_from_sse_event` handles Anthropic `message_delta`.
+    #[test]
+    fn extract_usage_message_delta_anthropic() {
+        let event = serde_json::json!({
+            "type": "message_delta",
+            "usage": { "output_tokens": 75 }
+        });
+        let usage = extract_usage_from_sse_event(&event).expect("must extract output usage");
+        assert_eq!(usage.output_tokens, 75);
+        assert_eq!(usage.input_tokens, 0);
+    }
+
+    /// Spec — `extract_usage_from_sse_event` handles OpenAI final chunk with `usage`.
+    #[test]
+    fn extract_usage_openai_final_chunk() {
+        let event = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50
+            },
+            "choices": []
+        });
+        let usage = extract_usage_from_sse_event(&event).expect("must extract OpenAI usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    /// Spec — `extract_usage_from_sse_event` returns `None` for non-usage events.
+    #[test]
+    fn extract_usage_returns_none_for_non_usage_events() {
+        let event = serde_json::json!({
+            "type": "content_block_start",
+            "content_block": { "type": "text" }
+        });
+        assert!(
+            extract_usage_from_sse_event(&event).is_none(),
+            "non-usage events must return None"
+        );
+    }
+
+    /// Spec — `extract_usage_from_sse_event` returns `None` when all counts are zero.
+    #[test]
+    fn extract_usage_returns_none_for_all_zero_counts() {
+        let event = serde_json::json!({
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0 }
+        });
+        // OpenAI zero-usage chunk must not produce Some(zero)
+        assert!(
+            extract_usage_from_sse_event(&event).is_none(),
+            "all-zero usage must return None"
+        );
+    }
+
+    /// Spec — `SSE_STREAM_TIMEOUT_SECS` constant is 30 (pin; gap #600 tracks upgrade).
+    #[test]
+    fn sse_stream_timeout_constant_pinned_at_30() {
+        assert_eq!(
+            SSE_STREAM_TIMEOUT_SECS, 30,
+            "SSE_STREAM_TIMEOUT_SECS must stay at 30s until gap #600 is resolved"
+        );
+    }
+
+    /// Spec — `ProxyError::HookBlocked` maps to 403 Forbidden.
+    #[test]
+    fn proxy_error_hook_blocked_is_403() {
+        let err = ProxyError::HookBlocked("dangerous tool".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Spec — `ProxyError::NoApiKey` maps to 401 Unauthorized.
+    #[test]
+    fn proxy_error_no_api_key_is_401() {
+        let err = ProxyError::NoApiKey("anthropic".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Spec — `strip_cache_control_ttl` removes `ttl` from nested `cache_control`.
+    ///
+    /// Anthropic's API rejects `ttl` in `cache_control` when using OAuth credentials.
+    #[test]
+    fn strip_cache_control_ttl_removes_nested_ttl() {
+        let mut value = serde_json::json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": { "type": "ephemeral", "ttl": 3600 }
+                }
+            ]
+        });
+        strip_cache_control_ttl(&mut value);
+        let cc = &value["system"][0]["cache_control"];
+        assert_eq!(cc["type"], "ephemeral", "type must be preserved");
+        assert!(
+            cc.get("ttl").is_none(),
+            "ttl must be stripped from cache_control"
+        );
+    }
+
+    /// Spec — `strip_cache_control_ttl` is a no-op when there is no `ttl`.
+    #[test]
+    fn strip_cache_control_ttl_noop_when_no_ttl() {
+        let mut value = serde_json::json!({
+            "cache_control": { "type": "ephemeral" }
+        });
+        strip_cache_control_ttl(&mut value);
+        assert_eq!(value["cache_control"]["type"], "ephemeral");
+    }
+}

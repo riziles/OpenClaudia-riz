@@ -620,4 +620,167 @@ mod tests {
         assert!(summary.contains("Fix bug"));
         assert!(summary.contains("Fixing bug"));
     }
+
+    // ── Phase 2 spec-pinning tests (#552 / spec #537 B-session/task) ─────────
+
+    /// Spec — `TaskStatus::Display` renders the canonical strings used by the
+    /// tool layer and the session summary.
+    #[test]
+    fn task_status_display_strings() {
+        assert_eq!(TaskStatus::Pending.to_string(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TaskStatus::Completed.to_string(), "completed");
+    }
+
+    /// Spec — creating a task always starts it as `Pending`.
+    #[test]
+    fn new_task_starts_pending() {
+        let mut tm = TaskManager::new();
+        let t = tm.create_task("Deploy".to_string(), "desc".to_string(), None);
+        assert_eq!(t.status, TaskStatus::Pending);
+    }
+
+    /// Spec — setting a second task to `InProgress` demotes the current one to
+    /// `Pending`. Enforces the single-in-progress invariant.
+    #[test]
+    fn single_in_progress_invariant() {
+        let mut tm = TaskManager::new();
+        tm.create_task("A".to_string(), "d".to_string(), None);
+        tm.create_task("B".to_string(), "d".to_string(), None);
+        tm.create_task("C".to_string(), "d".to_string(), None);
+
+        tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tm.update_task(
+            "task-3",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Only task-3 should be InProgress; task-1 and task-2 must be Pending.
+        assert_eq!(tm.get_task("task-1").unwrap().status, TaskStatus::Pending);
+        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
+        assert_eq!(
+            tm.get_task("task-3").unwrap().status,
+            TaskStatus::InProgress
+        );
+
+        // `current_task()` reflects the single in-progress entry.
+        let cur = tm.current_task().unwrap();
+        assert_eq!(cur.id, "task-3");
+    }
+
+    /// Spec — updating a non-existent task returns `Err`.
+    #[test]
+    fn update_nonexistent_task_returns_err() {
+        let mut tm = TaskManager::new();
+        let res = tm.update_task("task-99", TaskUpdateParams::default());
+        assert!(res.is_err());
+    }
+
+    /// Spec — `Deleted` status removes the task from the list and returns `Ok(None)`.
+    #[test]
+    fn delete_removes_task_returns_ok_none() {
+        let mut tm = TaskManager::new();
+        tm.create_task("X".to_string(), "d".to_string(), None);
+        let res = tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::Deleted),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none(), "Deleted must return Ok(None)");
+        assert!(tm.list_tasks().is_empty(), "task must be gone from list");
+    }
+
+    /// Spec — cycle detection: A blocks B, then adding B blocks A must fail.
+    #[test]
+    fn cycle_detection_rejects_circular_dependency() {
+        let mut tm = TaskManager::new();
+        tm.create_task("A".to_string(), "d".to_string(), None);
+        tm.create_task("B".to_string(), "d".to_string(), None);
+
+        // task-1 blocks task-2
+        tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                add_blocks: Some(vec!["task-2".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Now try to make task-2 block task-1 — should be rejected as a cycle
+        let res = tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                add_blocks: Some(vec!["task-1".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_err(), "circular dependency must be rejected");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("circular") || msg.contains("cycle"),
+            "error must mention circularity, got: {msg}"
+        );
+    }
+
+    /// Spec — `add_blocks` syncs the reverse `blocked_by` on the target task.
+    #[test]
+    fn add_blocks_syncs_reverse_blocked_by() {
+        let mut tm = TaskManager::new();
+        tm.create_task("First".to_string(), "d".to_string(), None);
+        tm.create_task("Second".to_string(), "d".to_string(), None);
+
+        tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                add_blocks: Some(vec!["task-2".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let t2 = tm.get_task("task-2").unwrap();
+        assert!(
+            t2.blocked_by.contains(&"task-1".to_string()),
+            "task-2.blocked_by must contain task-1 after add_blocks"
+        );
+    }
+
+    /// Spec — `format_task_detail` contains all key fields.
+    #[test]
+    fn format_task_detail_contains_required_fields() {
+        let mut tm = TaskManager::new();
+        let task = tm.create_task(
+            "Write tests".to_string(),
+            "Full description here".to_string(),
+            Some("Writing tests".to_string()),
+        );
+        let detail = TaskManager::format_task_detail(task);
+        assert!(detail.contains("Write tests"));
+        assert!(detail.contains("Full description here"));
+        assert!(detail.contains("Writing tests"));
+        assert!(detail.contains("pending"), "detail must include status");
+    }
 }
