@@ -521,6 +521,75 @@ async fn handle_google_response(
     })
 }
 
+/// Outcome of enforcing the per-line SSE buffer cap.
+///
+/// SSE frames are line-delimited. A hostile or broken upstream that
+/// streams bytes without ever emitting `\n` would otherwise grow the
+/// accumulator without bound until the process OOMs (crosslink #695).
+/// This enum records the action taken by [`enforce_sse_line_cap`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SseLineCapOutcome {
+    /// Buffer is within the cap; nothing was discarded.
+    WithinCap,
+    /// Buffer exceeded [`proxy::MAX_SSE_LINE_BYTES`] without a newline.
+    /// The accumulator was reset; the caller should log a warning.
+    /// Carries the number of bytes discarded for forensic reporting.
+    Exceeded {
+        /// Number of bytes dropped from the accumulator.
+        discarded_bytes: usize,
+    },
+}
+
+/// Enforce the per-line SSE buffer cap.
+///
+/// If `buffer` already contains a newline, the in-flight line is bounded
+/// by the next `find('\n')` and we leave the accumulator untouched —
+/// existing drain logic will consume it. Otherwise, if the unterminated
+/// remainder has grown past [`proxy::MAX_SSE_LINE_BYTES`] we clear the
+/// buffer and report the discard so the caller can warn.
+///
+/// Pure function — no I/O, no allocation when within cap, fully testable.
+pub fn enforce_sse_line_cap(buffer: &mut String) -> SseLineCapOutcome {
+    if buffer.contains('\n') {
+        return SseLineCapOutcome::WithinCap;
+    }
+    if buffer.len() < proxy::MAX_SSE_LINE_BYTES {
+        return SseLineCapOutcome::WithinCap;
+    }
+    let discarded_bytes = buffer.len();
+    buffer.clear();
+    SseLineCapOutcome::Exceeded { discarded_bytes }
+}
+
+/// Enforce the SSE line cap and forward an `ApiError` event on overflow.
+///
+/// Thin wrapper around [`enforce_sse_line_cap`] that handles the
+/// side-effecting reporting path (tracing + channel emit). Keeps
+/// the streaming loop body small enough to satisfy clippy's
+/// `too_many_lines` ceiling.
+///
+/// Returns `Err` only when the channel is closed; otherwise `Ok(())`.
+fn enforce_sse_line_cap_with_report(
+    buffer: &mut String,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<(), String> {
+    if let SseLineCapOutcome::Exceeded { discarded_bytes } = enforce_sse_line_cap(buffer) {
+        let cap = proxy::MAX_SSE_LINE_BYTES;
+        tracing::warn!(
+            discarded_bytes,
+            cap,
+            "SSE line exceeded {cap} bytes without newline; resetting accumulator (crosslink #695)"
+        );
+        send_event!(
+            tx,
+            AppEvent::ApiError(format!(
+                "SSE line exceeded {cap} bytes without newline; accumulator reset"
+            ))
+        );
+    }
+    Ok(())
+}
+
 /// Stream an SSE response (Anthropic or `OpenAI` format), sending events to the TUI.
 async fn stream_sse_response(
     response: reqwest::Response,
@@ -554,6 +623,11 @@ async fn stream_sse_response(
             Ok(chunk) => {
                 last_data_time = std::time::Instant::now();
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Crosslink #695: cap the per-line accumulator. A hostile
+                // upstream that never emits `\n` would otherwise grow
+                // `buffer` unboundedly until OOM.
+                enforce_sse_line_cap_with_report(&mut buffer, tx)?;
 
                 while let Some(line_end) = buffer.find('\n') {
                     let line = buffer[..line_end].trim().to_string();
@@ -1474,5 +1548,148 @@ mod tests {
                 std::env::set_var("CLAUDE_CODE_EFFORT_LEVEL", v);
             }
         }
+    }
+
+    // ─── Crosslink #695: SSE line-cap forensic evidence ──────────────────
+    //
+    // The SSE reader in `stream_sse_response` previously accumulated upstream
+    // bytes into an unbounded `String` until a `\n` was found. A hostile or
+    // broken upstream that streams payloads without newlines could grow the
+    // accumulator until OOM. `enforce_sse_line_cap` is the pure-function
+    // guard that backs the fix; these tests pin its contract.
+
+    /// #695 — `MAX_SSE_LINE_BYTES` constant is pinned at 1 MiB.
+    ///
+    /// Raising this without an explicit gap issue weakens the OOM defense.
+    /// Lowering it could split legitimately-long SSE frames.
+    #[test]
+    fn issue_695_max_sse_line_bytes_constant_is_1mib() {
+        assert_eq!(
+            crate::proxy::MAX_SSE_LINE_BYTES,
+            1024 * 1024,
+            "MAX_SSE_LINE_BYTES must remain at 1 MiB until a gap issue revises it"
+        );
+    }
+
+    /// #695 — small newline-free buffer stays untouched (no false trip).
+    ///
+    /// A partial frame mid-flight is normal: the accumulator must hold
+    /// pending bytes until the terminator arrives.
+    #[test]
+    fn issue_695_enforce_sse_line_cap_small_buffer_is_no_op() {
+        let mut buffer = "data: {\"partial\":\"frame".to_string();
+        let original_len = buffer.len();
+        let outcome = enforce_sse_line_cap(&mut buffer);
+        assert_eq!(outcome, SseLineCapOutcome::WithinCap);
+        assert_eq!(
+            buffer.len(),
+            original_len,
+            "within-cap buffer must not be mutated"
+        );
+    }
+
+    /// #695 — the buffer is bounded against an unbounded newline-free
+    /// upstream simulation.
+    ///
+    /// Forensic invariant: no matter how many chunks the helper sees,
+    /// the buffer size after enforcement never exceeds `MAX_SSE_LINE_BYTES`.
+    /// This mirrors the OOM attack scenario described in the issue.
+    #[test]
+    fn issue_695_enforce_sse_line_cap_bounds_unbounded_input() {
+        let mut buffer = String::new();
+        // Simulate 8 chunks of 256 KiB of newline-free bytes — together
+        // 2 MiB, double the cap.
+        let chunk = "A".repeat(256 * 1024);
+        let mut total_discarded = 0usize;
+        let mut times_tripped = 0usize;
+        for _ in 0..8 {
+            buffer.push_str(&chunk);
+            match enforce_sse_line_cap(&mut buffer) {
+                SseLineCapOutcome::WithinCap => {}
+                SseLineCapOutcome::Exceeded { discarded_bytes } => {
+                    total_discarded += discarded_bytes;
+                    times_tripped += 1;
+                    // The cap MUST have reset the buffer.
+                    assert!(
+                        buffer.is_empty(),
+                        "Exceeded outcome must leave the buffer empty (was {} bytes)",
+                        buffer.len()
+                    );
+                }
+            }
+            // After every iteration the live buffer must respect the cap.
+            assert!(
+                buffer.len() < crate::proxy::MAX_SSE_LINE_BYTES,
+                "buffer.len() = {} must stay below MAX_SSE_LINE_BYTES = {}",
+                buffer.len(),
+                crate::proxy::MAX_SSE_LINE_BYTES
+            );
+        }
+        assert!(
+            times_tripped >= 1,
+            "2 MiB of newline-free input must trip the cap at least once (tripped {times_tripped} times)"
+        );
+        let cap = crate::proxy::MAX_SSE_LINE_BYTES;
+        assert!(
+            total_discarded >= cap,
+            "expected at least {cap} bytes discarded in aggregate, got {total_discarded}"
+        );
+    }
+
+    /// #695 — when a buffer contains a newline the cap MUST NOT fire,
+    /// even if total length exceeds the cap.
+    ///
+    /// The cap only targets unterminated runaway lines; a legitimate
+    /// frame larger than the cap is still routed to the line drainer
+    /// (it terminates on its own `\n`). This guards against false
+    /// positives that would silently drop valid SSE frames.
+    #[test]
+    fn issue_695_enforce_sse_line_cap_skips_when_newline_present() {
+        let mut buffer = String::with_capacity(2 * 1024 * 1024);
+        buffer.push_str(&"x".repeat(2 * 1024 * 1024));
+        buffer.push('\n');
+        let pre_len = buffer.len();
+        let outcome = enforce_sse_line_cap(&mut buffer);
+        assert_eq!(
+            outcome,
+            SseLineCapOutcome::WithinCap,
+            "newline-terminated frames are the drainer's job, not the cap's"
+        );
+        assert_eq!(
+            buffer.len(),
+            pre_len,
+            "newline-terminated buffer must not be cleared"
+        );
+    }
+
+    /// #695 — buffer reset is total: a newline-free overflow is
+    /// discarded in full, not truncated.
+    ///
+    /// Forensic invariant: after the cap trips, the next valid frame
+    /// arriving on the wire parses cleanly. Truncation (keeping a
+    /// suffix) would corrupt the next line.
+    #[test]
+    fn issue_695_enforce_sse_line_cap_reset_is_total() {
+        let mut buffer = "B".repeat(crate::proxy::MAX_SSE_LINE_BYTES + 7);
+        let pre_len = buffer.len();
+        let outcome = enforce_sse_line_cap(&mut buffer);
+        assert_eq!(
+            outcome,
+            SseLineCapOutcome::Exceeded {
+                discarded_bytes: pre_len
+            },
+            "discarded count must equal the full pre-reset buffer length"
+        );
+        assert_eq!(
+            buffer.len(),
+            0,
+            "buffer must be fully cleared, not truncated"
+        );
+
+        // After reset, a fresh valid frame must drain normally.
+        buffer.push_str("data: {\"ok\":true}\n");
+        assert!(buffer.contains('\n'));
+        let post_outcome = enforce_sse_line_cap(&mut buffer);
+        assert_eq!(post_outcome, SseLineCapOutcome::WithinCap);
     }
 }

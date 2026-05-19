@@ -1611,6 +1611,13 @@ pub fn extract_usage_from_sse_event(json: &Value) -> Option<TokenUsage> {
 /// the stream is considered stalled.
 pub const SSE_STREAM_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum bytes the SSE per-line accumulator may hold without a `\n`.
+///
+/// Caps memory against a hostile or broken upstream that streams payloads
+/// without newlines. When exceeded, the accumulator is dropped and a
+/// warning is logged. See crosslink #695.
+pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 /// Forward request to upstream provider.
 ///
 /// `api_key` is an [`ApiKey`] newtype — the raw secret only leaves it at

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{
     BlastRadiusConfig, DiffMonitorConfig, GuardrailAction, GuardrailMode, GuardrailsConfig,
@@ -488,7 +488,42 @@ impl QualityGateRunner {
     }
 }
 
-/// Run a shell command synchronously with timeout.
+/// Run a quality-gate command synchronously with an optional wall-clock
+/// timeout.
+///
+/// # Security
+///
+/// The `command` string is parsed with POSIX `shlex` into argv tokens and
+/// executed via `Command::new(argv[0]).args(&argv[1..])` — **no shell is
+/// invoked**. Previously this function built `format!("timeout {N} {cmd}")`
+/// and fed it to `bash -c`, allowing any quality-gate author (or anyone
+/// who could influence the config-loaded `QualityCheck.command` field) to
+/// inject arbitrary shell metacharacters (`$(...)`, `` ` ` ``, `;`, `&&`,
+/// `|`, redirections, env-var expansion, etc.). See crosslink #700.
+///
+/// Pipelines, redirections, and `&&`/`||` are therefore **no longer
+/// supported** in this entry point; quality-gate authors that need them
+/// must compose subprocess invocations at the Rust level or split the
+/// pipeline into separate checks.
+///
+/// # Timeout strategy
+///
+/// On Unix, when `timeout_seconds > 0`, the `timeout(1)` coreutils binary
+/// is prepended as a real argv prefix: `["timeout", "<secs>", program,
+/// arg1, ...]`. This is exec'd directly — no shell intermediary — so the
+/// command tokens remain inert literals.
+///
+/// On Windows, `timeout.exe` semantics differ (it sleeps rather than
+/// supervising a child), so we exec the tokenised command directly with
+/// no timeout wrapper. A non-positive `timeout_seconds` skips the wrapper
+/// on all platforms.
+///
+/// # Audit logging
+///
+/// Every invocation emits a structured `info!` event containing the full
+/// argv (program + arguments) and the wall-clock timeout before the
+/// process is spawned. Tokenisation failures and spawn errors are logged
+/// at `error!` level.
 fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> (i32, String, String) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         warn!(
@@ -498,34 +533,54 @@ fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> (i32, String, 
         std::path::PathBuf::from(".")
     });
 
-    // Wrap command with timeout if a positive timeout is specified
-    let actual_command = if timeout_seconds > 0 {
-        format!("timeout {timeout_seconds} {command}")
-    } else {
-        command.to_string()
+    // POSIX-tokenise the user-supplied command into an argv. No shell is
+    // ever invoked, so $(...), `...`, ;, &&, |, > etc. survive as inert
+    // string arguments to the program.
+    let mut argv: Vec<String> = match shlex::split(command) {
+        Some(t) if !t.is_empty() => t,
+        Some(_) => {
+            error!(command = %command, "Quality gate: empty command after tokenisation");
+            return (-1, String::new(), "Empty command".to_string());
+        }
+        None => {
+            error!(
+                command = %command,
+                "Quality gate: could not tokenise command (unbalanced quotes?)"
+            );
+            return (
+                -1,
+                String::new(),
+                "Could not parse command (unbalanced quotes or unsupported escape)".to_string(),
+            );
+        }
     };
 
-    #[cfg(windows)]
-    let output = {
-        let paths = [
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\bin\bash.exe",
-        ];
-        let bash = paths
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .map(|&p| std::path::PathBuf::from(p))
-            .unwrap_or_else(|| std::path::PathBuf::from("bash"));
-
-        Command::new(bash)
-            .args(["-c", &actual_command])
-            .current_dir(&cwd)
-            .output()
-    };
-
+    // Prepend `timeout <secs>` as a real argv prefix on Unix so the
+    // coreutils `timeout(1)` binary supervises the child. On Windows the
+    // built-in `timeout.exe` sleeps rather than supervising, so we skip
+    // the wrapper and exec directly.
     #[cfg(not(windows))]
-    let output = Command::new("bash")
-        .args(["-c", &actual_command])
+    if timeout_seconds > 0 {
+        let mut wrapped = Vec::with_capacity(argv.len() + 2);
+        wrapped.push("timeout".to_string());
+        wrapped.push(timeout_seconds.to_string());
+        wrapped.append(&mut argv);
+        argv = wrapped;
+    }
+
+    let (program, cmd_args) = argv.split_first().expect("non-empty argv");
+
+    // Structured audit log of the exact argv about to be spawned.
+    info!(
+        program = %program,
+        args = ?cmd_args,
+        timeout_seconds = timeout_seconds,
+        cwd = %cwd.display(),
+        "Quality gate: spawning command (argv-level, no shell)"
+    );
+
+    let output = Command::new(program)
+        .args(cmd_args)
         .current_dir(&cwd)
         .output();
 
@@ -536,7 +591,10 @@ fn run_shell_command_sync(command: &str, timeout_seconds: u64) -> (i32, String, 
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             (exit_code, stdout, stderr)
         }
-        Err(e) => (-1, String::new(), format!("Failed to execute: {e}")),
+        Err(e) => {
+            error!(program = %program, error = %e, "Quality gate: spawn failed");
+            (-1, String::new(), format!("Failed to execute: {e}"))
+        }
     }
 }
 
@@ -1068,17 +1126,21 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
         assert_eq!(results[0].exit_code, 0);
+        assert!(results[0].stdout.contains("ok"));
     }
 
     #[test]
     fn test_quality_gate_failing_command() {
+        // `false` is a real binary on every POSIX system that exits 1.
+        // The previous `exit 1` test relied on bash -c being invoked, which
+        // is exactly the vulnerability crosslink #700 closes.
         let config = QualityGatesConfig {
             enabled: true,
             run_after: crate::config::RunAfter::EveryTurn,
             fail_action: GuardrailAction::Warn,
             checks: vec![QualityCheck {
                 name: "fail".to_string(),
-                command: "exit 1".to_string(),
+                command: "false".to_string(),
                 required: false,
             }],
             timeout_seconds: 30,
@@ -1088,6 +1150,166 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
+        assert_ne!(results[0].exit_code, 0);
+    }
+
+    // ====== Quality-gate shell-injection tests (crosslink #700) ======
+    //
+    // These tests pin the post-fix behaviour: the runner MUST NOT route
+    // through `bash -c` / `sh -c`. Shell metacharacters in the command
+    // string must survive as inert literal argv tokens to the program.
+
+    #[test]
+    fn test_quality_gate_shell_metacharacters_are_literal_args() {
+        // Pre-fix: `echo a; rm -rf /tmp/openclaudia-#700-sentinel` would be
+        // split by bash into TWO commands and the `rm` would actually run.
+        // Post-fix: `;` is a literal argument to `echo`, so the sentinel
+        // file must still exist after the gate runs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sentinel = dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"do-not-delete").unwrap();
+
+        let injection = format!("echo a; rm -rf {}", sentinel.display());
+        let config = QualityGatesConfig {
+            enabled: true,
+            run_after: crate::config::RunAfter::EveryTurn,
+            fail_action: GuardrailAction::Warn,
+            checks: vec![QualityCheck {
+                name: "inject-semicolon".to_string(),
+                command: injection,
+                required: false,
+            }],
+            timeout_seconds: 30,
+        };
+        let runner = QualityGateRunner::new(config);
+        let results = runner.run();
+
+        assert_eq!(results.len(), 1);
+        // The sentinel file MUST still exist. If the runner shelled out
+        // via `bash -c`, the `;` would have terminated the echo and run
+        // `rm -rf <sentinel>`, deleting it.
+        assert!(
+            sentinel.exists(),
+            "shell injection succeeded: sentinel was deleted (bash -c regression)"
+        );
+        // And the echo argument list must contain the literal `;` and
+        // `rm` tokens as data.
+        assert!(results[0].stdout.contains(';'));
+        assert!(results[0].stdout.contains("rm"));
+    }
+
+    #[test]
+    fn test_quality_gate_command_substitution_is_literal() {
+        // Pre-fix: `echo $(whoami)` under bash -c would expand to the
+        // current user's name. Post-fix: `$(whoami)` is a literal arg.
+        let config = QualityGatesConfig {
+            enabled: true,
+            run_after: crate::config::RunAfter::EveryTurn,
+            fail_action: GuardrailAction::Warn,
+            checks: vec![QualityCheck {
+                name: "inject-cmdsub".to_string(),
+                command: "echo $(whoami)".to_string(),
+                required: false,
+            }],
+            timeout_seconds: 30,
+        };
+        let runner = QualityGateRunner::new(config);
+        let results = runner.run();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed);
+        // Literal `$(whoami)` must appear in stdout, NOT the resolved
+        // user name. (We don't know what the test user is named, but we
+        // do know `$(whoami)` is the precise input string.)
+        assert!(
+            results[0].stdout.contains("$(whoami)"),
+            "command substitution was evaluated by a shell: stdout = {:?}",
+            results[0].stdout
+        );
+    }
+
+    #[test]
+    fn test_quality_gate_timeout_enforced_on_long_running_command() {
+        // `sleep 30` with a 1-second timeout must exit non-zero in well
+        // under 30 seconds. This pins the argv-level `timeout 1 sleep 30`
+        // wrapper produced by run_shell_command_sync.
+        #[cfg(not(windows))]
+        {
+            let config = QualityGatesConfig {
+                enabled: true,
+                run_after: crate::config::RunAfter::EveryTurn,
+                fail_action: GuardrailAction::Warn,
+                checks: vec![QualityCheck {
+                    name: "sleeper".to_string(),
+                    command: "sleep 30".to_string(),
+                    required: false,
+                }],
+                timeout_seconds: 1,
+            };
+            let runner = QualityGateRunner::new(config);
+            let start = std::time::Instant::now();
+            let results = runner.run();
+            let elapsed = start.elapsed();
+
+            assert_eq!(results.len(), 1);
+            assert!(
+                !results[0].passed,
+                "long-running command was not killed by timeout wrapper"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "timeout did not fire: elapsed = {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quality_gate_rejects_malformed_command() {
+        // Unbalanced quotes must surface as a structured failure (exit
+        // code -1 with a non-empty stderr) rather than being passed to
+        // a shell that would silently mangle the argv.
+        let config = QualityGatesConfig {
+            enabled: true,
+            run_after: crate::config::RunAfter::EveryTurn,
+            fail_action: GuardrailAction::Warn,
+            checks: vec![QualityCheck {
+                name: "broken".to_string(),
+                command: "echo 'unterminated".to_string(),
+                required: false,
+            }],
+            timeout_seconds: 30,
+        };
+        let runner = QualityGateRunner::new(config);
+        let results = runner.run();
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert_eq!(results[0].exit_code, -1);
+        assert!(!results[0].stderr.is_empty());
+    }
+
+    #[test]
+    fn test_quality_gate_valid_multi_arg_command_executes() {
+        // Confirms the happy path: a multi-argument command tokenises
+        // correctly and runs as the real binary with the expected argv.
+        let config = QualityGatesConfig {
+            enabled: true,
+            run_after: crate::config::RunAfter::EveryTurn,
+            fail_action: GuardrailAction::Warn,
+            checks: vec![QualityCheck {
+                name: "printf".to_string(),
+                command: "printf %s hello".to_string(),
+                required: true,
+            }],
+            timeout_seconds: 30,
+        };
+        let runner = QualityGateRunner::new(config);
+        let results = runner.run();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed);
+        assert_eq!(results[0].exit_code, 0);
+        assert_eq!(results[0].stdout, "hello");
     }
 
     // ====== Language detection tests ======

@@ -168,9 +168,18 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
 
     // Load from environment variables with OPENCLAUDIA_ prefix
     // e.g., OPENCLAUDIA_PROXY_PORT=9090, OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY=sk-...
+    //
+    // `ignore_empty(true)` ensures that an exported-but-empty env var
+    // (`export OPENCLAUDIA_PROVIDERS_ANTHROPIC_API_KEY=""`) does NOT
+    // silently overwrite a value that came from a config file. Without this,
+    // `Environment` forwards the empty string to the builder and the loaded
+    // config value is replaced with `""`, which then fails `ApiKey`
+    // deserialization (or, for non-`ApiKey` fields, simply blanks the slot).
+    // Closes crosslink #696.
     builder = builder.add_source(
         Environment::with_prefix("OPENCLAUDIA")
             .separator("_")
+            .ignore_empty(true)
             .try_parsing(true),
     );
 
@@ -403,5 +412,162 @@ mod tests {
             Some(path.as_path()),
             "managed_settings_path must hold the path when explicitly set"
         );
+    }
+
+    // ── crosslink #696: empty env vars must not overwrite loaded config ───────
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: env-mutation is serialized under `ENV_LOCK`; no other
+            // thread reads or writes env in the locked critical section.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: see `set` above.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above.
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Build a `Config` mirroring `load_config()`'s env source, seeded with
+    /// a value at `proxy.target`. We use `proxy.target` (a single-segment
+    /// leaf) rather than `providers.anthropic.api_key` because the
+    /// `Environment` source uses `_` as a path separator and would split
+    /// `API_KEY` into `api.key`. The `proxy.target` slot avoids that
+    /// ambiguity so the test isolates the empty-skip behaviour from the
+    /// separate separator-overlap concern flagged in #696.
+    fn build_with_env_source(ignore_empty: bool) -> Result<Config, ConfigError> {
+        let env = Environment::with_prefix("OPENCLAUDIA")
+            .separator("_")
+            .ignore_empty(ignore_empty)
+            .try_parsing(true);
+        Config::builder()
+            .set_default("proxy.target", "anthropic")?
+            .add_source(env)
+            .build()
+    }
+
+    /// #696 case 1: empty env var must NOT overwrite the loaded value.
+    /// This is the regression. Pre-fix (`ignore_empty(false)`) the empty
+    /// string would land in `proxy.target`; post-fix it is filtered out.
+    #[test]
+    fn issue_696_empty_env_does_not_overwrite_loaded_key() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "");
+        let cfg = build_with_env_source(true).expect("build ok");
+        let v: String = cfg.get("proxy.target").expect("slot present");
+        assert_eq!(
+            v, "anthropic",
+            "empty env must not overwrite loaded config (#696)"
+        );
+    }
+
+    /// #696 case 2: non-empty env var DOES override the loaded value.
+    /// Pins that `ignore_empty(true)` only filters empty strings.
+    #[test]
+    fn issue_696_non_empty_env_does_override_loaded_key() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "openai");
+        let cfg = build_with_env_source(true).expect("build ok");
+        let v: String = cfg.get("proxy.target").expect("slot present");
+        assert_eq!(
+            v, "openai",
+            "non-empty env must still override (#696 regression guard)"
+        );
+    }
+
+    /// #696 case 3: unset env var preserves the loaded value.
+    #[test]
+    fn issue_696_unset_env_preserves_loaded_key() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvGuard::unset("OPENCLAUDIA_PROXY_TARGET");
+        let cfg = build_with_env_source(true).expect("build ok");
+        let v: String = cfg.get("proxy.target").expect("slot present");
+        assert_eq!(
+            v, "anthropic",
+            "unset env must leave loaded config untouched (#696)"
+        );
+    }
+
+    /// #696 forensic-evidence pin: pre-fix behaviour. With `ignore_empty(false)`
+    /// — the state of `load_config()` before this fix — an empty env var
+    /// silently blanks the loaded slot. This test reproduces the bug to make
+    /// the regression visible if anyone ever reverts the fix.
+    #[test]
+    fn issue_696_forensic_evidence_pre_fix_behaviour() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvGuard::set("OPENCLAUDIA_PROXY_TARGET", "");
+        // Pre-fix: ignore_empty defaulted to false.
+        let cfg = build_with_env_source(false).expect("build ok");
+        let v: String = cfg.get("proxy.target").expect("slot present");
+        assert_eq!(
+            v, "",
+            "FORENSIC: without ignore_empty, empty env DOES blank the slot — this is the bug fixed by #696"
+        );
+    }
+
+    /// #696 helper pin: `maybe_set_api_key` skips empty AND whitespace.
+    #[test]
+    fn issue_696_maybe_set_api_key_skips_empty_and_whitespace() {
+        let builder = Config::builder()
+            .set_default("providers.anthropic.api_key", "sk-loaded-ZZZZ")
+            .expect("default");
+
+        let after_empty = maybe_set_api_key(builder, "providers.anthropic.api_key", String::new())
+            .expect("empty is a no-op");
+        let cfg = after_empty.build_cloned().expect("build");
+        let key: String = cfg.get("providers.anthropic.api_key").expect("key present");
+        assert_eq!(key, "sk-loaded-ZZZZ", "empty bare-env no-op (#696)");
+
+        let builder2 = Config::builder()
+            .set_default("providers.anthropic.api_key", "sk-loaded-ZZZZ")
+            .expect("default");
+        let after_ws = maybe_set_api_key(
+            builder2,
+            "providers.anthropic.api_key",
+            "   \t  ".to_string(),
+        )
+        .expect("whitespace is a no-op");
+        let cfg2 = after_ws.build().expect("build");
+        let key2: String = cfg2
+            .get("providers.anthropic.api_key")
+            .expect("key present");
+        assert_eq!(key2, "sk-loaded-ZZZZ", "whitespace bare-env no-op (#696)");
     }
 }

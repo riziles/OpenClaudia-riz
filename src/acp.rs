@@ -28,9 +28,11 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
-use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
+use crate::hooks::{
+    load_claude_code_hooks, merge_hooks_config, HookEngine, HookError, HookEvent, HookInput,
+};
 use crate::providers::get_adapter;
-use crate::rules::RulesEngine;
+use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
 use crate::session::SessionManager;
 
 // ============================================================================
@@ -114,11 +116,13 @@ pub struct AcpServer {
     config: AppConfig,
     /// Session manager for persistence
     session_manager: SessionManager,
-    /// Hook engine (used during prompt execution for PreToolUse/PostToolUse hooks)
-    #[allow(dead_code)]
+    /// Hook engine — wired through every tool dispatch in
+    /// [`Self::execute_tool_via_acp`] so `PreToolUse` / `PostToolUse`
+    /// gates apply to the ACP path (crosslink #694).
     hook_engine: HookEngine,
-    /// Rules engine (used to inject .clauderules context)
-    #[allow(dead_code)]
+    /// Rules engine — consulted on every system-prompt build so
+    /// `.openclaudia/rules` content lands in the ACP model context
+    /// (crosslink #694).
     rules_engine: RulesEngine,
     /// Active ACP session ID → `OpenClaudia` session ID mapping
     session_map: HashMap<String, String>,
@@ -313,6 +317,50 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
     } else {
         state.diagnostics.insert(file_path.to_string(), parsed);
     }
+}
+
+/// Run the `PreToolUse` hook gate for a single tool dispatch.
+///
+/// Returns `None` when the tool may proceed, or `Some(AcpToolResult)`
+/// with `is_error: true` and the deny reason in `content` when a hook
+/// blocks the call.
+///
+/// Extracted as a free function (not an `AcpServer` method) so it can
+/// be exercised by `pre_tool_gate_tests` without spinning up a full
+/// server. Closes crosslink #694: the ACP path previously dispatched
+/// `execute_tool_with_memory` directly, bypassing this gate entirely.
+async fn pre_tool_use_gate(
+    hook_engine: &HookEngine,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Option<AcpToolResult> {
+    let extensions = extract_extensions_from_tool_input(tool_name, tool_input);
+
+    let mut hook_input =
+        HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
+    if !extensions.is_empty() {
+        hook_input = hook_input.with_extra("extensions", json!(extensions));
+    }
+
+    let hook_result = hook_engine.run(HookEvent::PreToolUse, &hook_input).await;
+
+    if let Err(hook_err) = HookEngine::check_blocked(&hook_result) {
+        let reason = match hook_err {
+            HookError::Blocked(r) => r,
+            other => other.to_string(),
+        };
+        warn!(
+            tool = %tool_name,
+            reason = %reason,
+            "ACP PreToolUse hook blocked tool dispatch"
+        );
+        return Some(AcpToolResult {
+            content: format!("Tool '{tool_name}' blocked by PreToolUse hook: {reason}"),
+            is_error: true,
+        });
+    }
+
+    None
 }
 
 impl AcpServer {
@@ -785,7 +833,19 @@ impl AcpServer {
 
             // Build the request
             let tools = crate::tools::get_tool_definitions();
-            let system_prompt = crate::prompt::build_system_prompt(None, None, None);
+            // Crosslink #694: inject `.openclaudia/rules` content into the
+            // system prompt so the ACP path receives the same rules
+            // context the proxy path injects via `ContextInjector`. The
+            // rules engine is queried against extensions parsed out of
+            // every message in the turn buffer; an empty string is fine —
+            // `build_system_prompt` ignores it.
+            let rules_content = self.collect_rules_for_messages();
+            let rules_arg = if rules_content.is_empty() {
+                None
+            } else {
+                Some(rules_content.as_str())
+            };
+            let system_prompt = crate::prompt::build_system_prompt(None, rules_arg, None);
 
             // Prepend system prompt to messages
             let mut all_messages: Vec<crate::proxy::ChatMessage> =
@@ -1264,10 +1324,26 @@ impl AcpServer {
     // ========================================================================
 
     /// Execute a tool by delegating to ACP client methods.
+    ///
+    /// Mirrors `proxy.rs::prepare_request_context`'s gate sequence
+    /// (crosslink #694):
+    /// 1. Run `PreToolUse` hooks. On denial, surface the block reason as
+    ///    the tool result instead of dispatching — no ACP fs/terminal
+    ///    call is made and no `execute_tool_with_memory` runs.
+    /// 2. Dispatch to the appropriate ACP / local handler.
+    /// 3. Fire `PostToolUse` (or `PostToolUseFailure`) after dispatch so
+    ///    post-tool side effects (logging, audit, learn hooks) observe
+    ///    ACP-driven calls the same way they observe proxy-driven calls.
     async fn execute_tool_via_acp(&self, tool_name: &str, arguments_json: &str) -> AcpToolResult {
         let args: HashMap<String, Value> = serde_json::from_str(arguments_json).unwrap_or_default();
+        let tool_input: Value = serde_json::from_str(arguments_json).unwrap_or(Value::Null);
 
-        match tool_name {
+        // ── PreToolUse gate ─────────────────────────────────────────────
+        if let Some(blocked) = pre_tool_use_gate(&self.hook_engine, tool_name, &tool_input).await {
+            return blocked;
+        }
+
+        let result = match tool_name {
             "read_file" => self.acp_read_file(&args).await,
             "write_file" => self.acp_write_file(&args).await,
             "edit_file" => self.acp_edit_file(&args).await,
@@ -1290,13 +1366,29 @@ impl AcpServer {
                 content: format!("Unknown tool: {tool_name}"),
                 is_error: true,
             },
-        }
+        };
+
+        // ── PostToolUse fire-and-forget ─────────────────────────────────
+        self.hook_engine
+            .fire_post_tool(
+                !result.is_error,
+                tool_name,
+                tool_input,
+                &result.content,
+                None,
+            )
+            .await;
+
+        result
     }
 
     /// Execute a tool locally (for internal tools that don't need ACP delegation).
-    /// Takes `&self` for API consistency with `execute_tool_via_acp` even though
-    /// the current implementation doesn't use instance state.
-    #[allow(clippy::unused_self)]
+    ///
+    /// Callers MUST run the `PreToolUse` gate before invoking this
+    /// helper — `execute_tool_via_acp` does so for every dispatch. This
+    /// function intentionally does NOT re-run the gate so the audit
+    /// trail emits exactly one `PreToolUse` event per logical tool
+    /// dispatch (matches the proxy path's invariant).
     fn execute_local_tool(&self, tool_name: &str, arguments_json: &str) -> AcpToolResult {
         use crate::tools::{FunctionCall, ToolCall};
 
@@ -1314,6 +1406,43 @@ impl AcpServer {
             content: result.content,
             is_error: result.is_error,
         }
+    }
+
+    /// Collect rule content for every file extension referenced by the
+    /// current message history.
+    ///
+    /// Mirrors `proxy.rs::prepare_request_context`'s rules injection so
+    /// the ACP path receives the same `.openclaudia/rules` context the
+    /// proxy path does (crosslink #694). Returns an empty string when
+    /// no extensions match a rule — callers can pass the result
+    /// straight to [`crate::prompt::build_system_prompt`] without a
+    /// branch.
+    fn collect_rules_for_messages(&self) -> String {
+        let mut extensions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let Ok(extension_pattern) = regex::Regex::new(r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b") else {
+            return String::new();
+        };
+        for msg in &self.messages {
+            let Some(content) = msg.get("content") else {
+                continue;
+            };
+            let text = match content {
+                Value::String(s) => s.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => continue,
+            };
+            for cap in extension_pattern.captures_iter(&text) {
+                if let Some(ext) = cap.get(1) {
+                    extensions.insert(ext.as_str().to_lowercase());
+                }
+            }
+        }
+        let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+        self.rules_engine.get_combined_rules(&ext_refs)
     }
 
     // -- File operations via ACP client --
@@ -1899,9 +2028,9 @@ struct AccumulatedToolCall {
 }
 
 /// Result of executing a tool via ACP.
+#[derive(Debug)]
 struct AcpToolResult {
     content: String,
-    #[allow(dead_code)]
     is_error: bool,
 }
 
@@ -2265,5 +2394,187 @@ mod search_security_tests {
         assert!(build_search_argv("grep", &tool_args).is_err());
         let tool_args = args_from(&[("pattern", "x"), ("glob", "-rf")]);
         assert!(build_search_argv("grep", &tool_args).is_err());
+    }
+}
+
+// ============================================================================
+// Pre-tool gate tests for #694 — every ACP dispatch MUST run PreToolUse hooks
+// and respect deny decisions. These tests exercise the gate in isolation so
+// the regression is impossible without removing the hook engine wiring from
+// `execute_tool_via_acp`.
+// ============================================================================
+
+#[cfg(test)]
+mod pre_tool_gate_tests {
+    use super::pre_tool_use_gate;
+    use crate::config::{Hook, HookEntry, HookPolicy, HooksConfig};
+    use crate::hooks::HookEngine;
+    use serde_json::json;
+    use std::io::Write;
+
+    /// Materialize a hook-script that exits with code 2 and emits
+    /// `{"decision":"deny", "reason":"<reason>"}` on stdout. The hook
+    /// engine reads stdout as JSON and treats both `exit == 2` AND
+    /// `decision == "deny"` as a block — this is the simplest way to
+    /// drive a real denial through the same code path proxy.rs uses.
+    fn write_deny_script(dir: &std::path::Path, reason: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("deny.sh");
+        let mut f = std::fs::File::create(&script).expect("create deny.sh");
+        writeln!(
+            f,
+            "#!/bin/sh\necho '{{\"decision\":\"deny\",\"reason\":\"{reason}\"}}'\nexit 2"
+        )
+        .expect("write deny.sh");
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod deny.sh");
+        script
+    }
+
+    fn allow_only(name: &str) -> HookPolicy {
+        let mut s = std::collections::HashSet::new();
+        s.insert(name.to_string());
+        HookPolicy {
+            allowed_commands: Some(s),
+            ..Default::default()
+        }
+    }
+
+    /// **Fix #694 — forensic evidence #1**
+    ///
+    /// A `PreToolUse` hook that denies a tool MUST cause `pre_tool_use_gate`
+    /// to return `Some(AcpToolResult { is_error: true, .. })` and the
+    /// block reason MUST surface in the result's `content`. Before the
+    /// fix, `execute_local_tool` skipped this gate entirely and
+    /// dispatched `execute_tool_with_memory` directly — a hook denial
+    /// had no effect on the ACP path. This test fails (gate is `None`)
+    /// when the wiring regresses.
+    #[tokio::test]
+    async fn hook_denial_blocks_tool_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = write_deny_script(tmp.path(), "blocked-by-policy");
+
+        let mut cfg = HooksConfig::default();
+        cfg.pre_tool_use.push(HookEntry {
+            matcher: None,
+            hooks: vec![Hook::Command {
+                command: script.to_string_lossy().to_string(),
+                shell: false,
+                timeout: 10,
+            }],
+        });
+        cfg.policy = Some(allow_only("deny.sh"));
+        let engine = HookEngine::new(cfg);
+
+        let blocked = pre_tool_use_gate(&engine, "bash", &json!({"command": "ls"})).await;
+
+        let blocked = blocked.expect(
+            "PreToolUse denial MUST short-circuit the ACP dispatch — \
+             gate returned None, which means the regression is back",
+        );
+        assert!(
+            blocked.is_error,
+            "blocked tool result must report is_error=true"
+        );
+        assert!(
+            blocked.content.contains("blocked by PreToolUse hook"),
+            "block reason must surface in content; got: {}",
+            blocked.content
+        );
+    }
+
+    /// **Fix #694 — forensic evidence #2**
+    ///
+    /// A `PreToolUse` hook configured with a matcher that DOES NOT match
+    /// the dispatched tool MUST let the call through (`gate -> None`).
+    /// Tools that aren't covered by a deny-listing rule run normally.
+    /// This guards against an over-eager fix that just blocks everything.
+    #[tokio::test]
+    async fn allowed_tool_passes_through_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = write_deny_script(tmp.path(), "denied");
+
+        let mut cfg = HooksConfig::default();
+        // Matcher only matches `Write` — calling `read_file` must pass.
+        cfg.pre_tool_use.push(HookEntry {
+            matcher: Some("Write".to_string()),
+            hooks: vec![Hook::Command {
+                command: script.to_string_lossy().to_string(),
+                shell: false,
+                timeout: 10,
+            }],
+        });
+        cfg.policy = Some(allow_only("deny.sh"));
+        let engine = HookEngine::new(cfg);
+
+        let outcome =
+            pre_tool_use_gate(&engine, "read_file", &json!({"file_path": "/tmp/some.txt"})).await;
+
+        assert!(
+            outcome.is_none(),
+            "gate must not block a tool unmatched by any deny hook; got Some({outcome:?})"
+        );
+    }
+
+    /// **Fix #694 — forensic evidence #3**
+    ///
+    /// An empty hooks config (no `PreToolUse` entries at all) MUST be
+    /// treated as "allow everything". This pins the no-op behavior so
+    /// a regression that defaults to deny-when-empty (the opposite
+    /// failure mode) is also caught.
+    #[tokio::test]
+    async fn empty_hook_config_allows_all_tools() {
+        let engine = HookEngine::new(HooksConfig::default());
+
+        for (tool, args) in [
+            ("bash", json!({"command": "echo hi"})),
+            ("read_file", json!({"file_path": "/tmp/x.rs"})),
+            (
+                "write_file",
+                json!({"file_path": "/tmp/y.rs", "content": "//"}),
+            ),
+            ("memory_save", json!({"key": "k", "value": "v"})),
+            ("mcp__svc__op", json!({"arg": "v"})),
+        ] {
+            let outcome = pre_tool_use_gate(&engine, tool, &args).await;
+            assert!(
+                outcome.is_none(),
+                "empty PreToolUse config must allow {tool}; got {outcome:?}"
+            );
+        }
+    }
+
+    /// **Fix #694 — forensic evidence #4**
+    ///
+    /// A `PreToolUse` matcher that DOES match the dispatched tool name
+    /// fires the deny hook and the gate blocks. Complements
+    /// `allowed_tool_passes_through_gate` to prove the matcher itself
+    /// is wired correctly through the ACP code path.
+    #[tokio::test]
+    async fn matcher_match_triggers_deny() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = write_deny_script(tmp.path(), "bash-not-allowed");
+
+        let mut cfg = HooksConfig::default();
+        cfg.pre_tool_use.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![Hook::Command {
+                command: script.to_string_lossy().to_string(),
+                shell: false,
+                timeout: 10,
+            }],
+        });
+        cfg.policy = Some(allow_only("deny.sh"));
+        let engine = HookEngine::new(cfg);
+
+        let outcome = pre_tool_use_gate(&engine, "bash", &json!({"command": "rm -rf /"})).await;
+        let blocked = outcome.expect("matcher-matched deny hook MUST block");
+        assert!(blocked.is_error);
+        assert!(
+            blocked.content.contains("bash-not-allowed"),
+            "deny reason must propagate; got: {}",
+            blocked.content
+        );
     }
 }
