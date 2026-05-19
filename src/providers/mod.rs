@@ -18,6 +18,7 @@ mod deepseek;
 mod google;
 mod ollama;
 mod openai;
+mod openai_compat;
 mod qwen;
 mod zai;
 

@@ -206,6 +206,7 @@ impl MemoryDb {
     /// # Errors
     ///
     /// Returns an error if the SQL execution fails or the mutex is poisoned.
+    #[cfg(test)]
     pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
         let conn = self.lock_conn()?;
         conn.execute_batch(sql).with_context(|| {

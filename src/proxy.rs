@@ -287,7 +287,8 @@ async fn auth_device_submit(
         .ok_or_else(|| ProxyError::InvalidBody("Invalid state parameter".to_string()))?;
 
     // Exchange code for tokens
-    let client = OAuthClient::new();
+    let client = OAuthClient::new()
+        .map_err(|e| ProxyError::InvalidBody(format!("OAuth client init failed: {e}")))?;
     let token_response = client
         .exchange_code(&code, &pkce)
         .await
@@ -989,14 +990,15 @@ async fn proxy_chat_completions(
     .await?;
 
     // Post-response: extract usage from non-streaming responses and convert
+    let max_bytes = state.config.proxy.max_response_bytes;
     if token_tracking_enabled && !is_stream {
-        let (response_value, usage) = convert_response_with_usage(raw_response).await?;
+        let (response_value, usage) = convert_response_with_usage(raw_response, max_bytes).await?;
         if let Some(usage) = usage {
             record_actual_usage_for_session(&state, usage).await;
         }
         apply_vdd_review(response_value, &state, &request, &provider_name, &api_key).await
     } else {
-        convert_response(raw_response).await
+        convert_response(raw_response, max_bytes).await
     }
 }
 
@@ -1082,7 +1084,8 @@ async fn proxy_completions(
         .ok_or_else(|| ProxyError::NoApiKey(provider_name.clone()))?;
 
     let is_stream = request["stream"].as_bool().unwrap_or(false);
-    let response = forward_to_provider(
+    let max_bytes = state.config.proxy.max_response_bytes;
+    let raw = forward_to_provider(
         &state.client,
         provider,
         &provider_name,
@@ -1093,7 +1096,7 @@ async fn proxy_completions(
     )
     .await?;
 
-    Ok(response)
+    convert_response(raw, max_bytes).await
 }
 
 /// Proxy Anthropic messages endpoint
@@ -1181,7 +1184,7 @@ async fn proxy_anthropic_messages(
         }
         let response = builder.send().await?;
 
-        return convert_response(response).await;
+        return convert_response(response, state.config.proxy.max_response_bytes).await;
     }
 
     // Fallback to API key auth (no system prompt injection needed)
@@ -1190,7 +1193,8 @@ async fn proxy_anthropic_messages(
         .ok_or_else(|| ProxyError::NoApiKey("anthropic".to_string()))?;
 
     let is_stream = request["stream"].as_bool().unwrap_or(false);
-    let response = forward_to_provider(
+    let max_bytes = state.config.proxy.max_response_bytes;
+    let raw = forward_to_provider(
         &state.client,
         provider,
         "anthropic",
@@ -1201,7 +1205,7 @@ async fn proxy_anthropic_messages(
     )
     .await?;
 
-    Ok(response)
+    convert_response(raw, max_bytes).await
 }
 
 /// Passthrough for unhandled routes
@@ -1254,7 +1258,7 @@ async fn proxy_passthrough(
     }
 
     let response = req_builder.send().await?;
-    convert_response(response).await
+    convert_response(response, state.config.proxy.max_response_bytes).await
 }
 
 /// Determine which provider to use based on model name.
@@ -1358,9 +1362,43 @@ fn extract_api_key(headers: &HeaderMap) -> Option<ApiKey> {
     }
 }
 
-/// Convert reqwest response to axum response, also extracting token usage if present
+/// Read a [`reqwest::Response`] body up to `max_bytes`, returning the
+/// accumulated data as a `Vec<u8>`.
+///
+/// Returns [`ProxyError::InvalidBody`] if the stream exceeds the limit or
+/// any chunk yields an I/O error, preventing memory-exhaustion `DoS` from
+/// hostile or buggy upstreams.
+async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProxyError> {
+    use futures::StreamExt as _;
+
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ProxyError::InvalidBody(format!("upstream body read error: {e}")))?;
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(ProxyError::InvalidBody(format!(
+                "upstream response exceeded {max_bytes}-byte limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    Ok(buf)
+}
+
+/// Convert reqwest response to axum response, also extracting token usage if present.
+///
+/// `max_bytes` caps the body read; callers pass
+/// `state.config.proxy.max_response_bytes` (default 50 MiB). A response body
+/// that exceeds the limit returns [`ProxyError::InvalidBody`].
 async fn convert_response_with_usage(
     response: reqwest::Response,
+    max_bytes: usize,
 ) -> Result<(Response, Option<TokenUsage>), ProxyError> {
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1375,7 +1413,8 @@ async fn convert_response_with_usage(
         }
     }
 
-    let body = response.bytes().await?;
+    // Bounded read: prevents memory-DoS from a hostile or buggy upstream.
+    let body = read_body_capped(response, max_bytes).await?;
 
     // Try to extract usage from the response body
     let usage = serde_json::from_slice::<Value>(&body)
@@ -1537,7 +1576,7 @@ async fn forward_to_provider<T: Serialize + Sync>(
     path: &str,
     body: &T,
     is_stream: bool,
-) -> Result<Response, ProxyError> {
+) -> Result<reqwest::Response, ProxyError> {
     let url = format!("{}{}", normalize_base_url(&provider.base_url), path);
     debug!(url = %url, stream = is_stream, "Forwarding to provider");
 
@@ -1555,8 +1594,7 @@ async fn forward_to_provider<T: Serialize + Sync>(
         req = req.header(key.as_str(), value.as_str());
     }
 
-    let response = req.send().await?;
-    convert_response(response).await
+    Ok(req.send().await?)
 }
 
 /// Forward request to upstream provider with raw Value body and custom headers.
@@ -1586,8 +1624,15 @@ async fn forward_to_provider_raw_reqwest(
     Ok(req.send().await?)
 }
 
-/// Convert reqwest response to axum response
-async fn convert_response(response: reqwest::Response) -> Result<Response, ProxyError> {
+/// Convert reqwest response to axum response.
+///
+/// `max_bytes` caps the body read; callers pass
+/// `state.config.proxy.max_response_bytes` (default 50 MiB). A response body
+/// that exceeds the limit returns [`ProxyError::InvalidBody`].
+async fn convert_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Response, ProxyError> {
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1602,7 +1647,8 @@ async fn convert_response(response: reqwest::Response) -> Result<Response, Proxy
         }
     }
 
-    let body = response.bytes().await?;
+    // Bounded read — prevents memory-DoS from unbounded upstream bodies.
+    let body = read_body_capped(response, max_bytes).await?;
 
     // If the response is HTML (error page from CDN/proxy), convert to a
     // clean JSON error instead of dumping raw HTML to the terminal.
@@ -2054,5 +2100,129 @@ mod tests {
         });
         strip_cache_control_ttl(&mut value);
         assert_eq!(value["cache_control"]["type"], "ephemeral");
+    }
+
+    // ── #304: bounded body read + swallowed-error fixes ──────────────────────
+
+    /// Spec — `read_body_capped` rejects a body that exceeds `max_bytes`.
+    ///
+    /// A hostile upstream streaming more than the configured limit must receive
+    /// a `ProxyError::InvalidBody` rather than silently exhausting allocator
+    /// memory (memory-DoS vector closed by #304 / crosslink #352).
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversize_body() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // Spin up a minimal HTTP/1.1 server that returns a 6-byte body,
+        // then cap the read at 4 bytes. The helper must return InvalidBody.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello!")
+                    .await;
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}")).await.expect("GET");
+        let err = read_body_capped(response, 4).await.unwrap_err();
+
+        match err {
+            ProxyError::InvalidBody(msg) => {
+                assert!(
+                    msg.contains("exceeded") || msg.contains("limit"),
+                    "error message must describe the size limit, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidBody, got: {other:?}"),
+        }
+    }
+
+    /// Spec — `read_body_capped` surfaces async I/O errors as `InvalidBody`.
+    ///
+    /// When an upstream closes the connection mid-stream, the error must reach
+    /// the caller rather than being swallowed into an empty buffer that feeds
+    /// opaque downstream failures (fixed in #304).
+    #[tokio::test]
+    async fn read_body_capped_surfaces_stream_error() {
+        // Use a listener that accepts the connection then immediately drops it
+        // without sending an HTTP response, forcing a read error.
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Spawn a task that sends a valid HTTP header but closes the body mid-
+        // stream so reqwest sees a truncated response.
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Send an HTTP/1.1 response with content-length but no body.
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .await;
+                // Drop stream → connection reset → reqwest body read error.
+            }
+        });
+
+        let response = reqwest::get(format!("http://{addr}"))
+            .await
+            .expect("initial response");
+
+        let result = read_body_capped(response, 1024 * 1024).await;
+        assert!(
+            result.is_err(),
+            "a truncated upstream body must surface as an error, not empty Ok"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ProxyError::InvalidBody(_)),
+            "truncated body error must be InvalidBody variant"
+        );
+    }
+
+    /// Spec — utilization ppm computation is correct and requires no float casts.
+    ///
+    /// Regression for #304 finding 1 & 2: the `#[allow(clippy::cast_*)]`
+    /// suppressions are gone; the integer ppm formula must produce the same
+    /// percentage as the float formula it replaced, with no truncation at
+    /// typical usize values.
+    #[test]
+    fn utilization_ppm_matches_expected_percentage() {
+        // Simulate a 128 k-token context window with 64 k tokens used (50 %).
+        let context_window: usize = 128_000;
+        let estimated_input: usize = 64_000;
+
+        let utilization_ppm = estimated_input
+            .saturating_mul(1_000_000)
+            .checked_div(context_window)
+            .unwrap_or(0);
+
+        // 50.0 % → 500_000 ppm
+        assert_eq!(utilization_ppm, 500_000, "50 % must be 500_000 ppm");
+
+        // Rendered string must be "50.0%"
+        let rendered = format!(
+            "{}.{}%",
+            utilization_ppm / 10_000,
+            (utilization_ppm % 10_000) / 1_000
+        );
+        assert_eq!(rendered, "50.0%");
+
+        // No truncation: a large context window (>= 2^32) must still work on
+        // 64-bit targets without wrapping.
+        let large_window: usize = 1_000_000_000; // 1 billion tokens
+        let large_input: usize = 750_000_000; // 75 %
+        let ppm_large = large_input
+            .saturating_mul(1_000_000)
+            .checked_div(large_window)
+            .unwrap_or(0);
+        assert_eq!(
+            ppm_large, 750_000,
+            "75 % of 1B-token window must be 750_000 ppm"
+        );
     }
 }

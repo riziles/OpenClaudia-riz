@@ -94,6 +94,9 @@ pub enum SlashCommandResult {
     /// Add a working directory to the session scope (#176)
     AddWorkingDir(std::path::PathBuf),
     /// Branch conversation at current point, saving snapshot under the given name (#177)
+    // The inner name is matched in test assertions; production code uses a `_`
+    // catch-all because branch-session handling is a planned follow-up (#177).
+    #[allow(dead_code)]
     BranchSession(String),
     /// Ask a side question without disturbing main conversation flow (#179)
     SideQuestion(String),

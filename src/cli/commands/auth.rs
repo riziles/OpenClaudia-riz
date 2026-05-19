@@ -116,7 +116,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
 
     println!("\nExchanging code for tokens...");
 
-    let client = OAuthClient::new();
+    let client = OAuthClient::new()?;
     let token_response = client.exchange_code(&code, &pkce).await?;
 
     let mut session = openclaudia::oauth::OAuthSession::from_token_response(token_response);

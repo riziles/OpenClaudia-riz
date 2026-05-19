@@ -584,23 +584,22 @@ pub struct OAuthClient {
     http: reqwest::Client,
 }
 
-impl Default for OAuthClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl OAuthClient {
-    #[must_use]
-    pub fn new() -> Self {
-        // Build client with Claude Code User-Agent (critical for OAuth)
+    /// Build an `OAuthClient` with the `Claude Code/1.0` User-Agent and a
+    /// 30-second timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`reqwest::Error`] if the underlying TLS backend fails to
+    /// initialise. Without the `Claude Code/1.0` User-Agent the Anthropic
+    /// OAuth endpoint rejects all token exchanges, so a builder failure must
+    /// be surfaced rather than silently falling back to a plain client.
+    pub fn new() -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .user_agent("Claude Code/1.0")
             .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        Self { http }
+            .build()?;
+        Ok(Self { http })
     }
 
     /// Exchange authorization code for tokens
@@ -698,12 +697,15 @@ impl OAuthClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            // Anthropic's OAuth endpoint echoes submitted `refresh_token` /
-            // `code` values inside error bodies. Log the raw body at debug!
-            // (operator-only) and propagate only the sanitized form to the
-            // caller — otherwise the bail! string lands in an axum response
-            // body (proxy.rs:297) and ships to the client. See crosslink #263.
+            // Read the error body to include in the diagnostic log. Propagate
+            // a read error rather than silently defaulting to an empty string,
+            // which would produce a useless "Token exchange failed (N): "
+            // message. The raw body is logged at debug! only (not forwarded to
+            // callers) because it may echo submitted credentials. See #263.
+            let body = response
+                .text()
+                .await
+                .context("Failed to read token-exchange error body")?;
             debug!("token_exchange_failed body (not shipped to caller): {body}");
             anyhow::bail!(
                 "Token exchange failed ({status}): {}",
@@ -765,7 +767,12 @@ impl OAuthClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // Propagate read errors rather than silently producing an empty
+            // diagnostic. Raw body is debug!-only (not forwarded). See #263.
+            let body = response
+                .text()
+                .await
+                .context("Failed to read API-key creation error body")?;
             debug!("api_key_creation_failed body (not shipped to caller): {body}");
             anyhow::bail!(
                 "API key creation failed ({status}): {}",

@@ -1,21 +1,33 @@
-//! `DeepSeek` API adapter (OpenAI-compatible with thinking support).
+//! `DeepSeek` API adapter (OpenAI-compatible with `enable_thinking` toggle).
+//!
+//! Thin newtype around [`OpenAiCompatibleAdapter`]. The only
+//! `DeepSeek`-specific behaviour is injecting `enable_thinking: true` when
+//! thinking mode is enabled; when disabled, no field is written (matching
+//! the prior bespoke adapter).
+//!
+//! See crosslink #281.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tracing::debug;
+use serde_json::Value;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
 
-use super::{ProviderAdapter, ProviderError};
+use super::openai_compat::{OpenAiCompatibleAdapter, ThinkingInjector};
+use super::{ApiKey, ProviderAdapter, ProviderError};
 
-/// `DeepSeek` API adapter (OpenAI-compatible with thinking support)
-pub struct DeepSeekAdapter;
+/// `DeepSeek` API adapter (OpenAI-compatible with thinking support).
+pub struct DeepSeekAdapter(OpenAiCompatibleAdapter);
 
 impl DeepSeekAdapter {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self(OpenAiCompatibleAdapter::new(
+            "deepseek",
+            "/v1/chat/completions",
+            ThinkingInjector::DeepSeekEnableThinking,
+            false,
+        ))
     }
 }
 
@@ -27,12 +39,12 @@ impl Default for DeepSeekAdapter {
 
 #[async_trait]
 impl ProviderAdapter for DeepSeekAdapter {
-    fn name(&self) -> &'static str {
-        "deepseek"
+    fn name(&self) -> &str {
+        self.0.name()
     }
 
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
-        serde_json::to_value(request).map_err(|e| ProviderError::RequestFailed(e.to_string()))
+        self.0.transform_request(request)
     }
 
     fn transform_request_with_thinking(
@@ -40,35 +52,22 @@ impl ProviderAdapter for DeepSeekAdapter {
         request: &ChatCompletionRequest,
         thinking: &ThinkingConfig,
     ) -> Result<Value, ProviderError> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        // Add DeepSeek R1 thinking params if enabled
-        // See: https://api-docs.deepseek.com/guides/reasoning_model
-        if thinking.enabled {
-            body["enable_thinking"] = json!(true);
-            debug!("Added DeepSeek thinking params: enable_thinking=true");
-        }
-
-        Ok(body)
+        self.0.transform_request_with_thinking(request, thinking)
     }
 
-    fn transform_response(&self, response: Value, _stream: bool) -> Result<Value, ProviderError> {
-        // Response is OpenAI format, reasoning_content contains thinking
-        Ok(response)
+    fn transform_response(&self, response: Value, stream: bool) -> Result<Value, ProviderError> {
+        self.0.transform_response(response, stream)
     }
 
-    fn chat_endpoint(&self, _model: &str) -> String {
-        "/v1/chat/completions".to_string()
+    fn chat_endpoint(&self, model: &str) -> String {
+        self.0.chat_endpoint(model)
     }
 
-    fn get_headers(&self, api_key: &super::ApiKey) -> Vec<(String, String)> {
-        vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", api_key.as_str()),
-            ),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
+        self.0.get_headers(api_key)
+    }
+
+    fn supports_model_listing(&self) -> bool {
+        self.0.supports_model_listing()
     }
 }

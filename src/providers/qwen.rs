@@ -1,21 +1,32 @@
-//! Qwen/Alibaba API adapter (OpenAI-compatible with thinking support).
+//! Qwen/Alibaba API adapter (OpenAI-compatible with `enable_thinking` toggle).
+//!
+//! Thin newtype around [`OpenAiCompatibleAdapter`]. Qwen always writes an
+//! explicit `enable_thinking: true|false` (unlike `DeepSeek`, which omits
+//! the field when disabled).
+//!
+//! See crosslink #281.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-use tracing::debug;
+use serde_json::Value;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
 
-use super::{ProviderAdapter, ProviderError};
+use super::openai_compat::{OpenAiCompatibleAdapter, ThinkingInjector};
+use super::{ApiKey, ProviderAdapter, ProviderError};
 
-/// Qwen/Alibaba API adapter (OpenAI-compatible with thinking support)
-pub struct QwenAdapter;
+/// Qwen/Alibaba API adapter (OpenAI-compatible with thinking support).
+pub struct QwenAdapter(OpenAiCompatibleAdapter);
 
 impl QwenAdapter {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self(OpenAiCompatibleAdapter::new(
+            "qwen",
+            "/v1/chat/completions",
+            ThinkingInjector::QwenEnableThinking,
+            false,
+        ))
     }
 }
 
@@ -27,12 +38,12 @@ impl Default for QwenAdapter {
 
 #[async_trait]
 impl ProviderAdapter for QwenAdapter {
-    fn name(&self) -> &'static str {
-        "qwen"
+    fn name(&self) -> &str {
+        self.0.name()
     }
 
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
-        serde_json::to_value(request).map_err(|e| ProviderError::RequestFailed(e.to_string()))
+        self.0.transform_request(request)
     }
 
     fn transform_request_with_thinking(
@@ -40,37 +51,22 @@ impl ProviderAdapter for QwenAdapter {
         request: &ChatCompletionRequest,
         thinking: &ThinkingConfig,
     ) -> Result<Value, ProviderError> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
-
-        // Add Qwen QwQ thinking params if enabled
-        // See: https://help.aliyun.com/zh/model-studio/user-guide/qwq
-        if thinking.enabled {
-            body["enable_thinking"] = json!(true);
-            debug!("Added Qwen thinking params: enable_thinking=true");
-        } else {
-            body["enable_thinking"] = json!(false);
-        }
-
-        Ok(body)
+        self.0.transform_request_with_thinking(request, thinking)
     }
 
-    fn transform_response(&self, response: Value, _stream: bool) -> Result<Value, ProviderError> {
-        // Response is OpenAI format
-        Ok(response)
+    fn transform_response(&self, response: Value, stream: bool) -> Result<Value, ProviderError> {
+        self.0.transform_response(response, stream)
     }
 
-    fn chat_endpoint(&self, _model: &str) -> String {
-        "/v1/chat/completions".to_string()
+    fn chat_endpoint(&self, model: &str) -> String {
+        self.0.chat_endpoint(model)
     }
 
-    fn get_headers(&self, api_key: &super::ApiKey) -> Vec<(String, String)> {
-        vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", api_key.as_str()),
-            ),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
+        self.0.get_headers(api_key)
+    }
+
+    fn supports_model_listing(&self) -> bool {
+        self.0.supports_model_listing()
     }
 }

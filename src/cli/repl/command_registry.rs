@@ -55,7 +55,12 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     /// Look up a handler by name.
+    ///
+    /// Currently unused directly (dispatch is the primary entry point), but
+    /// retained as public API for callers that need to introspect the registry
+    /// without dispatching (e.g. tab-completion, help rendering).
     #[must_use]
+    #[allow(dead_code)] // public API; callers outside this binary will use it
     pub fn get(&self, name: &str) -> Option<&'static dyn CommandHandler> {
         self.handlers.get(name).copied()
     }
