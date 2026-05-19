@@ -345,11 +345,80 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Install a plugin from a marketplace, enforcing all [`PolicyAction`]s
-    /// including signature verification.
+    /// Build a [`MarketplaceSource`] from a per-plugin [`PluginSourceDef`],
+    /// suitable for re-running [`policy::check_marketplace_allowed`] against
+    /// the upstream URL the plugin will actually pull from. Returns `None`
+    /// for source variants (`npm` / `pip`) that don't carry a git/HTTP URL
+    /// the marketplace policy can enforce against — those are rejected later
+    /// by the base installer's match arm.
+    ///
+    /// Closes crosslink #729: the per-plugin source URL is now policy-checked
+    /// before any `git_clone` / `fs::copy` fires.
+    fn plugin_source_to_marketplace_source(def: &PluginSourceDef) -> Option<MarketplaceSource> {
+        match def {
+            PluginSourceDef::Url(UrlSource { url, git_ref }) => Some(MarketplaceSource::Git {
+                url: url.clone(),
+                git_ref: git_ref.clone(),
+                path: None,
+            }),
+            PluginSourceDef::GitHub(GitHubSource { repo, git_ref }) => {
+                Some(MarketplaceSource::GitHub {
+                    repo: repo.clone(),
+                    git_ref: git_ref.clone(),
+                    path: None,
+                })
+            }
+            // npm / pip carry no git URL — base installer rejects them with
+            // InvalidManifest. Returning None here means the policy gate
+            // doesn't fire and the existing rejection path handles them.
+            PluginSourceDef::Npm(_) | PluginSourceDef::Pip(_) => None,
+        }
+    }
+
+    /// Apply the marketplace-policy gate to a per-plugin source. Pure
+    /// function — extracted so unit tests can drive the #729 gate
+    /// without standing up a real marketplace on disk. Returns `Ok(())`
+    /// when the source is permitted (or when it has no upstream URL to
+    /// check), and [`PluginError::PolicyRejected`] when the policy
+    /// rejects the upstream.
     ///
     /// # Errors
     ///
+    /// [`PluginError::PolicyRejected`] when
+    /// [`policy::check_marketplace_allowed`] rejects the rebuilt source.
+    fn check_plugin_source_policy(
+        source: &PluginSource,
+        policy: &PluginPolicy,
+    ) -> Result<(), PluginError> {
+        let PluginSource::Structured(def) = source else {
+            return Ok(());
+        };
+        let Some(per_plugin_source) = Self::plugin_source_to_marketplace_source(def) else {
+            return Ok(());
+        };
+        match policy::check_marketplace_allowed(&per_plugin_source, policy) {
+            Ok(()) => Ok(()),
+            Err(rejection) => Err(Self::policy_rejection_to_error(rejection, policy)),
+        }
+    }
+
+    /// Install a plugin from a marketplace, enforcing all [`PolicyAction`]s
+    /// including signature verification AND re-validating the per-plugin
+    /// upstream source URL against `policy.strict_known_marketplaces` /
+    /// `policy.blocked_marketplaces` (crosslink #729).
+    ///
+    /// Without this re-validation, an allowlisted marketplace could ship a
+    /// `marketplace.json` whose plugin entries point at arbitrary upstream
+    /// URLs — silently downgrading the managed policy to advisory. This
+    /// method closes that gap by rebuilding a [`MarketplaceSource`] from
+    /// the resolved plugin's [`PluginSourceDef`] and running
+    /// [`policy::check_marketplace_allowed`] against it BEFORE any
+    /// `git_clone` / `fs::copy` side effects.
+    ///
+    /// # Errors
+    ///
+    /// - [`PluginError::PolicyRejected`] when the per-plugin upstream source
+    ///   URL is on the blocklist or not in the strict allowlist.
     /// - [`PluginError::UnsignedPlugin`] when policy requires a signature and
     ///   the manifest has none.
     /// - [`PluginError::UnknownSigner`] when the signature does not match any
@@ -363,6 +432,35 @@ impl PluginManager {
         marketplace_name: &str,
         policy: &PluginPolicy,
     ) -> Result<String, PluginError> {
+        // Per-plugin upstream URL policy check (crosslink #729). The
+        // marketplace itself was gated at `add_marketplace_*_with_policy`
+        // time, but the plugin entries inside it can name arbitrary upstream
+        // URLs that the policy never saw. Re-validate here BEFORE any
+        // filesystem side effects so a managed policy is actually enforcing.
+        {
+            let marketplaces = self.list_marketplaces();
+            let (_name, mp_manifest) = marketplaces
+                .iter()
+                .find(|(n, _)| n == marketplace_name)
+                .ok_or_else(|| {
+                    PluginError::NotFound(format!("Marketplace '{marketplace_name}' not found"))
+                })?;
+            let mp_plugin = mp_manifest
+                .plugins
+                .iter()
+                .find(|p| p.name == plugin_name)
+                .ok_or_else(|| {
+                    PluginError::NotFound(format!(
+                        "Plugin '{plugin_name}' not found in marketplace '{marketplace_name}'"
+                    ))
+                })?;
+            // `PluginSource::Path` is local to the (already-policy-checked)
+            // marketplace directory — no separate upstream URL to validate.
+            // The helper returns Ok(()) for Path / npm / pip and only gates
+            // structured Url / GitHub sources.
+            Self::check_plugin_source_policy(&mp_plugin.source, policy)?;
+        }
+
         // Only do the manifest-load + signature check when there are
         // RequireSignature actions to enforce — avoids double-loading otherwise.
         let has_sig_requirement = policy
@@ -1034,6 +1132,175 @@ mod policy_tests {
         let s = err.to_string();
         assert!(s.contains("block list"));
         assert!(s.contains("managed"));
+    }
+
+    // -----------------------------------------------------------------
+    // crosslink #729 — per-plugin upstream URL is policy-checked.
+    //
+    // These tests drive `check_plugin_source_policy` directly. That
+    // helper is the single gate `install_from_marketplace_with_policy`
+    // runs before any filesystem side effects, so exercising it is
+    // equivalent to exercising the install gate without needing a real
+    // marketplace at `~/.claude/marketplaces/...`.
+    // -----------------------------------------------------------------
+
+    fn url_plugin_source(url: &str) -> PluginSource {
+        PluginSource::Structured(PluginSourceDef::Url(super::super::marketplace::UrlSource {
+            url: url.to_string(),
+            git_ref: Some("v1".to_string()),
+        }))
+    }
+
+    fn github_plugin_source(repo: &str) -> PluginSource {
+        PluginSource::Structured(PluginSourceDef::GitHub(
+            super::super::marketplace::GitHubSource {
+                repo: repo.to_string(),
+                git_ref: Some("main".to_string()),
+            },
+        ))
+    }
+
+    #[test]
+    fn issue_729_blocklisted_per_plugin_url_is_rejected_with_reason() {
+        // Marketplace itself was previously allowlisted, but the plugin
+        // entry inside it points at a blocked upstream URL. Without the
+        // #729 fix this slips through; with it the install bails out
+        // before any git_clone.
+        let evil_url = "https://evil.example.com/payload.git";
+        let policy = PluginPolicy {
+            blocked_marketplaces: vec![MarketplaceSource::Git {
+                url: evil_url.to_string(),
+                git_ref: None,
+                path: None,
+            }],
+            managed: true,
+            ..PluginPolicy::default()
+        };
+        let source = url_plugin_source(evil_url);
+        let err = PluginManager::check_plugin_source_policy(&source, &policy)
+            .expect_err("blocked upstream URL must be rejected");
+        match err {
+            PluginError::PolicyRejected { scope, reason } => {
+                assert_eq!(scope, "managed");
+                assert!(
+                    reason.contains("block list"),
+                    "reason must surface the block-list cause, got: {reason}"
+                );
+            }
+            other => panic!("expected PolicyRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_729_per_plugin_url_not_in_allowlist_is_rejected() {
+        // strict_known_marketplaces names only the legitimate
+        // marketplace's source; the per-plugin entry resolves to an
+        // unrelated upstream. The gate must reject — otherwise the
+        // managed allowlist becomes advisory.
+        let policy = PluginPolicy {
+            strict_known_marketplaces: Some(vec![MarketplaceSource::GitHub {
+                repo: "trusted/marketplace".to_string(),
+                git_ref: None,
+                path: None,
+            }]),
+            ..PluginPolicy::default()
+        };
+        // The plugin's structured source points at a different GitHub
+        // repo, not on the allowlist.
+        let source = github_plugin_source("rogue/plugin-repo");
+        let err = PluginManager::check_plugin_source_policy(&source, &policy)
+            .expect_err("unlisted upstream must be rejected");
+        match err {
+            PluginError::PolicyRejected { scope, reason } => {
+                assert_eq!(scope, "user");
+                assert!(
+                    reason.contains("allowed list"),
+                    "reason must surface the allowlist cause, got: {reason}"
+                );
+            }
+            other => panic!("expected PolicyRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_729_allowlisted_per_plugin_url_proceeds() {
+        // Plugin's resolved upstream IS on the allowlist (matching by
+        // repo, with the rule's ref omitted wildcarding any candidate
+        // ref). The gate must return Ok so the install can proceed.
+        let policy = PluginPolicy {
+            strict_known_marketplaces: Some(vec![MarketplaceSource::GitHub {
+                repo: "trusted/plugin-repo".to_string(),
+                git_ref: None,
+                path: None,
+            }]),
+            ..PluginPolicy::default()
+        };
+        let source = github_plugin_source("trusted/plugin-repo");
+        PluginManager::check_plugin_source_policy(&source, &policy)
+            .expect("allowlisted upstream must be accepted");
+    }
+
+    #[test]
+    fn issue_729_path_source_bypasses_url_check_but_npm_pip_do_too() {
+        // PluginSource::Path is local to the marketplace — its
+        // containment was already validated when the marketplace was
+        // added. No upstream URL to re-validate, so the gate is a
+        // no-op. Likewise npm / pip carry no git URL that the
+        // marketplace allowlist could match; the base installer
+        // rejects them with InvalidManifest, not the policy gate.
+        let policy = PluginPolicy {
+            strict_known_marketplaces: Some(vec![]), // deny-all allowlist
+            managed: true,
+            ..PluginPolicy::default()
+        };
+        // Path source — gate returns Ok even under a deny-all allowlist.
+        let path_source = PluginSource::Path("./local-plugin".to_string());
+        PluginManager::check_plugin_source_policy(&path_source, &policy)
+            .expect("path source must not be gated by marketplace URL policy");
+
+        // npm source — gate returns Ok (no URL to check); rejection is
+        // the base installer's job.
+        let npm_source =
+            PluginSource::Structured(PluginSourceDef::Npm(super::super::marketplace::NpmSource {
+                package: "some-pkg".to_string(),
+                version: None,
+                registry: None,
+            }));
+        PluginManager::check_plugin_source_policy(&npm_source, &policy)
+            .expect("npm source must not be gated by marketplace URL policy");
+    }
+
+    #[test]
+    fn issue_729_url_source_blocklist_takes_precedence_over_allowlist() {
+        // Block list beats allow list — same semantics as
+        // check_marketplace_allowed. A plugin pointing at a URL that's
+        // BOTH allowlisted AND blocklisted must still be rejected
+        // (blocked wins), and the reason string must say so.
+        let url = "https://example.com/contested.git";
+        let policy = PluginPolicy {
+            strict_known_marketplaces: Some(vec![MarketplaceSource::Git {
+                url: url.to_string(),
+                git_ref: None,
+                path: None,
+            }]),
+            blocked_marketplaces: vec![MarketplaceSource::Git {
+                url: url.to_string(),
+                git_ref: None,
+                path: None,
+            }],
+            managed: true,
+            ..PluginPolicy::default()
+        };
+        let source = url_plugin_source(url);
+        let err = PluginManager::check_plugin_source_policy(&source, &policy)
+            .expect_err("blocked-and-allowlisted URL must still be rejected");
+        match err {
+            PluginError::PolicyRejected { scope, reason } => {
+                assert_eq!(scope, "managed");
+                assert!(reason.contains("block list"));
+            }
+            other => panic!("expected PolicyRejected, got {other:?}"),
+        }
     }
 }
 
