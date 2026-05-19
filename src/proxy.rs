@@ -783,7 +783,13 @@ async fn compact_request_context(request: &mut ChatCompletionRequest, state: &Pr
     };
 
     match compactor
-        .compact_with_hint(request, Some(&state.hook_engine), None, actual_token_hint)
+        .compact_with_hint(
+            request,
+            Some(&state.hook_engine),
+            None,
+            actual_token_hint,
+            None,
+        )
         .await
     {
         Ok(result) if result.compacted => {

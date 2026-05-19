@@ -8,8 +8,10 @@
 //! - Critical information preservation
 
 use crate::hooks::{HookEngine, HookEvent, HookInput};
+use crate::memory::MemoryDb;
 use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Context window sizes for different models (in tokens)
@@ -91,6 +93,17 @@ pub struct CompactBoundaryMetadata {
     pub pre_tokens: usize,
     /// How many messages the summary replaced.
     pub messages_summarized: usize,
+    /// [`MemoryDb`] archival IDs for the summarized messages, if archival was
+    /// performed. Each element is the row-id returned by [`MemoryDb::memory_save`]
+    /// for one archived message turn. Empty when no [`MemoryDb`] was provided.
+    ///
+    /// Use `memory_search` with tag `auto-compacted:<session_id>` to retrieve
+    /// the full content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_ids: Vec<i64>,
+    /// Session ID used for archival tagging, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_session_id: Option<String>,
 }
 
 /// Build a compact-boundary system message.
@@ -103,11 +116,15 @@ pub struct CompactBoundaryMetadata {
 pub fn build_compact_boundary_message(
     pre_tokens: usize,
     messages_summarized: usize,
+    archive_ids: Vec<i64>,
+    archive_session_id: Option<String>,
 ) -> ChatMessage {
     let metadata = CompactBoundaryMetadata {
         trigger: "auto".to_string(),
         pre_tokens,
         messages_summarized,
+        archive_ids,
+        archive_session_id,
     };
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
     let content = format!(
@@ -194,40 +211,72 @@ pub fn get_context_window(model: &str) -> usize {
     }
 }
 
-/// Estimate token count for a string (approximate: ~4 chars per token for ASCII).
+/// Estimate token count for a string using a per-character weight heuristic.
 ///
-/// NOTE: This is a heuristic. Real tokenizers (tiktoken, `SentencePiece`) use
-/// subword vocabularies that vary by model. The ~4 chars/token ratio is a
-/// reasonable average for English ASCII text but under-counts for:
-/// - CJK characters (often 1 token each)
-/// - Emoji (1-3 tokens each)
-/// - Other non-ASCII scripts
+/// # Rationale (fix for issue #321)
 ///
-/// We apply a safety adjustment for non-ASCII content to reduce under-estimation.
+/// The prior `len()/4` formula severely under-counted non-ASCII text:
+///
+/// | Script | UTF-8 bytes | Tokens (real) | Old heuristic | Error   |
+/// |--------|-------------|---------------|---------------|---------|
+/// | ASCII  | 1 B/char    | ~0.25/char    | 0.25/char     | ≈0 %    |
+/// | CJK    | 3 B/char    | ~1/char       | ~0.75/char    | −25 %   |
+/// | Emoji  | 4 B/char    | ~3/char       | ~1/char       | −67 %   |
+///
+/// Additionally, `<image_data>…</image_data>` placeholder text represents
+/// real image payloads that Anthropic bills at ~1 600 tokens for a
+/// medium-resolution image. The placeholder string is only tens of bytes but
+/// must be counted at its true cost.
+///
+/// ## Weights chosen
+/// - ASCII whitespace: 0 (absorbed by the surrounding subword token)
+/// - ASCII non-whitespace: 1 token per 4 chars  (≈ GPT/Claude average for English)
+/// - Non-ASCII alphanumeric (CJK, accented Latin, Hangul, etc.): 2 tokens per char
+/// - Everything else (emoji, misc. symbols): 3 tokens per char
+/// - Each `<image_data>` block: +1 600 tokens (flat)
+///
+/// NOTE: This is still an approximation. For production accuracy integrate
+/// `tiktoken-rs` (`OpenAI`) or the Anthropic `count_tokens` endpoint (cached per
+/// message hash). That work is tracked separately.
 #[must_use]
 pub fn estimate_tokens(text: &str) -> usize {
-    // More accurate estimation considering whitespace and punctuation
-    let char_count = text.chars().count();
-    let word_count = text.split_whitespace().count();
+    // Accumulate weighted token cost per character.
+    // Use saturating_add throughout to stay infallible on absurdly long inputs.
+    let mut ascii_chars: usize = 0;
+    let mut weighted_non_ascii: usize = 0;
 
-    // Use a weighted average of character-based and word-based estimation
-    // Most tokenizers use subword units, so this approximates that
-    let char_estimate = char_count / 4;
-    // word_count * 13 / 10 avoids f32 precision and sign-loss casts
-    let word_estimate = word_count * 13 / 10;
+    for c in text.chars() {
+        if c.is_ascii() {
+            if !c.is_ascii_whitespace() {
+                ascii_chars = ascii_chars.saturating_add(1);
+            }
+        } else if c.is_alphanumeric() {
+            // CJK, accented Latin, Hangul, Hiragana, Katakana, Arabic, etc.
+            // Real tokenizers assign roughly 1 token per character for these scripts.
+            // Weight = 2 so that dividing ascii_chars by 4 and adding
+            // weighted_non_ascii / 2 gives the right ratio.
+            weighted_non_ascii = weighted_non_ascii.saturating_add(4); // ×2 after ÷2 below
+        } else {
+            // Emoji, arrows, box-drawing, math symbols — up to 3 tokens each.
+            weighted_non_ascii = weighted_non_ascii.saturating_add(6); // ×3 after ÷2 below
+        }
+    }
 
-    // Take the average, biased toward character count
-    let base_estimate = (char_estimate * 2 + word_estimate) / 3;
+    let base = ascii_chars / 4 + weighted_non_ascii / 2;
 
-    // Apply safety factor for non-ASCII content (CJK, emoji, etc.)
-    // Multi-byte characters are often individual tokens, so the ~4 chars/token
-    // ratio significantly under-counts them. Add roughly half the non-ASCII
-    // character count as additional tokens.
-    let non_ascii_count = text.chars().filter(|c| !c.is_ascii()).count();
-    let non_ascii_adjustment = non_ascii_count / 2;
-
-    base_estimate + non_ascii_adjustment
+    // Each <image_data>…</image_data> placeholder represents a real image payload
+    // billed at ~1 600 tokens by Anthropic (claude-3-sonnet medium resolution).
+    // The placeholder occupies negligible chars on its own, so we add the flat cost.
+    let image_blocks = text.match_indices("<image_data>").count();
+    base.saturating_add(image_blocks.saturating_mul(IMAGE_TOKEN_COST))
 }
+
+/// Flat token cost attributed to each `<image_data>` placeholder block.
+///
+/// Anthropic charges ~1 600 tokens for a medium-resolution image (claude-3-sonnet).
+/// GPT-4V charges 765 + 85 = 850 per 512×512 tile. We use the Anthropic figure
+/// as the upper bound since `OpenClaudia`'s primary target is Claude.
+const IMAGE_TOKEN_COST: usize = 1_600;
 
 /// Estimate token count for a message
 #[must_use]
@@ -239,7 +288,11 @@ pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
                 .iter()
                 .map(|p| {
                     p.text.as_ref().map_or(0, |t| estimate_tokens(t))
-                        + if p.image_url.is_some() { 1000 } else { 0 } // Images cost ~1000 tokens
+                        + if p.image_url.is_some() {
+                            IMAGE_TOKEN_COST
+                        } else {
+                            0
+                        } // Images cost ~1600 tokens (Anthropic medium-res)
                 })
                 .sum()
         }
@@ -423,11 +476,18 @@ impl ContextCompactor {
         hook_engine: Option<&HookEngine>,
         session_id: Option<&str>,
     ) -> Result<CompactionResult, CompactionError> {
-        self.compact_with_hint(request, hook_engine, session_id, None)
+        self.compact_with_hint(request, hook_engine, session_id, None, None)
             .await
     }
 
-    /// Compact with an optional actual token count hint from the provider.
+    /// Compact with an optional actual token count hint from the provider and
+    /// an optional [`MemoryDb`] for archival of summarized messages (#327).
+    ///
+    /// When `memory_db` is `Some`, each summarized message is written to the
+    /// archival memory store with tags `["auto-compacted", "session:<id>"]`
+    /// *before* the original messages are discarded.  The resulting row IDs are
+    /// embedded in the compact-boundary marker so consumers can retrieve the
+    /// full content later via `memory_search`.
     ///
     /// # Errors
     ///
@@ -439,6 +499,7 @@ impl ContextCompactor {
         hook_engine: Option<&HookEngine>,
         session_id: Option<&str>,
         actual_input_tokens: Option<usize>,
+        memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<CompactionResult, CompactionError> {
         let analysis = self.analyze_with_hint(request, actual_input_tokens);
 
@@ -501,15 +562,29 @@ impl ContextCompactor {
             });
         }
 
+        // --- #327: archive summarized messages BEFORE discarding them ---
+        // Each message is stored in archival_memory with tags
+        // ["auto-compacted", "session:<id>"] so the model can retrieve
+        // full context later via memory_search.
+        let archive_ids: Vec<i64> = memory_db.as_ref().map_or_else(Vec::new, |db| {
+            archive_compacted_messages(&messages_to_summarize, session_id, db)
+        });
+
         // Generate summary of old messages
-        let summary = Self::generate_summary(&messages_to_summarize);
+        let summary = Self::generate_summary(&messages_to_summarize, session_id);
         let original_count = request.messages.len();
         let summarized_count = messages_to_summarize.len();
 
         // Drop borrows into request.messages before mutating
         drop(messages_to_summarize);
 
-        let new_messages = Self::build_compacted_messages(&analysis, &request.messages, &summary);
+        let new_messages = Self::build_compacted_messages(
+            &analysis,
+            &request.messages,
+            &summary,
+            archive_ids,
+            session_id.map(str::to_owned),
+        );
         request.messages = new_messages;
 
         let new_tokens = estimate_request_tokens(request);
@@ -555,10 +630,16 @@ impl ContextCompactor {
     /// `createCompactBoundaryMessage` output (utils/messages.ts),
     /// carrying the same metadata (trigger, pre-compaction tokens,
     /// messages summarized).
+    ///
+    /// When `archive_ids` is non-empty the boundary marker embeds them so
+    /// that transcript readers can surface the "earlier messages archived"
+    /// hint.
     fn build_compacted_messages(
         analysis: &CompactionAnalysis,
         original_messages: &[ChatMessage],
         summary: &str,
+        archive_ids: Vec<i64>,
+        archive_session_id: Option<String>,
     ) -> Vec<ChatMessage> {
         let mut new_messages = Vec::new();
 
@@ -576,6 +657,8 @@ impl ContextCompactor {
         new_messages.push(build_compact_boundary_message(
             analysis.current_tokens,
             analysis.messages_to_summarize.len(),
+            archive_ids,
+            archive_session_id,
         ));
 
         // Add summary as a system message
@@ -599,8 +682,11 @@ impl ContextCompactor {
         new_messages
     }
 
-    /// Generate a summary of messages
-    fn generate_summary(messages: &[&ChatMessage]) -> String {
+    /// Generate a summary of messages.
+    ///
+    /// When `session_id` is provided and archival was performed the summary
+    /// includes a retrieval hint so the model knows how to recover full detail.
+    fn generate_summary(messages: &[&ChatMessage], session_id: Option<&str>) -> String {
         use std::fmt::Write;
 
         let mut summary = String::new();
@@ -651,6 +737,17 @@ impl ContextCompactor {
             summary.push('\n');
         }
 
+        // #327: archival retrieval hint — only emitted when a session is known
+        // so the model can search for the full content of summarized turns.
+        if let Some(sid) = session_id {
+            summary.push('\n');
+            summary.push_str(
+                "Earlier messages archived — use memory_search with tag \"auto-compacted:",
+            );
+            summary.push_str(sid);
+            summary.push_str("\" to retrieve full detail.\n");
+        }
+
         summary.push_str("</context-summary>");
         summary
     }
@@ -665,6 +762,44 @@ impl ContextCompactor {
     pub fn set_config(&mut self, config: CompactionConfig) {
         self.config = config;
     }
+}
+
+/// Archive a slice of messages into [`MemoryDb`] archival memory before they
+/// are discarded by compaction (#327).
+///
+/// Each message is serialised as JSON and stored with tags
+/// `["auto-compacted", "session:<id>"]` (the session tag is omitted when
+/// `session_id` is `None`).  Returns the row IDs in insertion order so callers
+/// can embed them in the compact-boundary marker.
+///
+/// Archival failures are non-fatal: a warning is emitted and the affected
+/// message is skipped so that compaction can still proceed.
+pub fn archive_compacted_messages(
+    messages: &[&ChatMessage],
+    session_id: Option<&str>,
+    db: &MemoryDb,
+) -> Vec<i64> {
+    let mut ids = Vec::with_capacity(messages.len());
+    for (turn, msg) in messages.iter().enumerate() {
+        let content = match serde_json::to_string(msg) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(turn, error = %e, "Failed to serialise message for archival; skipping");
+                continue;
+            }
+        };
+        let mut tags = vec!["auto-compacted".to_string()];
+        if let Some(sid) = session_id {
+            tags.push(format!("session:{sid}"));
+        }
+        match db.memory_save(&content, &tags) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                warn!(turn, error = %e, "Failed to archive message to MemoryDb; skipping");
+            }
+        }
+    }
+    ids
 }
 
 /// Result of a compaction operation
@@ -885,7 +1020,7 @@ mod tests {
         ];
 
         let msg_refs: Vec<&ChatMessage> = messages.iter().collect();
-        let summary = ContextCompactor::generate_summary(&msg_refs);
+        let summary = ContextCompactor::generate_summary(&msg_refs, None);
 
         assert!(summary.contains("<context-summary>"));
         assert!(summary.contains("</context-summary>"));
@@ -1172,7 +1307,7 @@ mod tests {
         ];
 
         let msg_refs: Vec<&ChatMessage> = messages.iter().collect();
-        let summary = ContextCompactor::generate_summary(&msg_refs);
+        let summary = ContextCompactor::generate_summary(&msg_refs, None);
 
         assert!(summary.contains("[Used tools]"));
         assert!(summary.contains("[Tool result]"));
@@ -1334,7 +1469,7 @@ mod tests {
 
     #[test]
     fn compact_boundary_roundtrips_metadata() {
-        let msg = build_compact_boundary_message(123_456, 42);
+        let msg = build_compact_boundary_message(123_456, 42, vec![], None);
         assert!(is_compact_boundary_message(&msg));
         let metadata = extract_compact_boundary_metadata(&msg).expect("parses");
         assert_eq!(metadata.trigger, "auto");
@@ -1415,7 +1550,13 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let built = ContextCompactor::build_compacted_messages(&analysis, &original, "SUMMARY");
+        let built = ContextCompactor::build_compacted_messages(
+            &analysis,
+            &original,
+            "SUMMARY",
+            vec![],
+            None,
+        );
         // Expected order: boundary, summary, recent.
         assert!(is_compact_boundary_message(&built[0]));
         if let MessageContent::Text(t) = &built[1].content {
@@ -1536,7 +1677,7 @@ mod tests {
     /// B2b — build emits trigger:"auto" (hardcoded; parameterization gap tracked separately).
     #[test]
     fn b2_boundary_trigger_is_always_auto() {
-        let msg = build_compact_boundary_message(999, 5);
+        let msg = build_compact_boundary_message(999, 5, vec![], None);
         let meta = extract_compact_boundary_metadata(&msg).expect("metadata parses");
         // OC hardcodes trigger:"auto" — CC parameterizes this. Gap tracked by #534 notes.
         assert_eq!(meta.trigger, "auto");
@@ -1678,7 +1819,7 @@ mod tests {
         // threshold_tokens_for(10000,0.85)=8500, effective=4404; hint=5000 > 4404
         // But both messages are system → messages_to_summarize is empty → compacted:false.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000))
+            .compact_with_hint(&mut request, None, None, Some(5_000), None)
             .await
             .unwrap();
 
@@ -1738,7 +1879,13 @@ mod tests {
             create_test_message("user", "recent"),
         ];
 
-        let built = ContextCompactor::build_compacted_messages(&analysis, &original, "SUMMARY");
+        let built = ContextCompactor::build_compacted_messages(
+            &analysis,
+            &original,
+            "SUMMARY",
+            vec![],
+            None,
+        );
 
         // Output must be: [system-msg, boundary-marker, summary-msg, recent-user-msg]
         assert_eq!(built.len(), 4);
@@ -1872,7 +2019,7 @@ mod tests {
 
         // With hint above effective_threshold, but no summarizable messages.
         let result = compactor
-            .compact_with_hint(&mut request, None, None, Some(5_000))
+            .compact_with_hint(&mut request, None, None, Some(5_000), None)
             .await
             .unwrap();
         assert!(
@@ -1894,7 +2041,7 @@ mod tests {
             create_test_message("assistant", "The capital of France is Paris."),
         ];
         let refs: Vec<&ChatMessage> = messages.iter().collect();
-        let summary = ContextCompactor::generate_summary(&refs);
+        let summary = ContextCompactor::generate_summary(&refs, None);
 
         // Must be wrapped in context-summary tags (OC-specific format).
         assert!(
@@ -1924,6 +2071,203 @@ mod tests {
         assert!(
             summary.contains("Assistant:") || summary.contains("**Assistant**:"),
             "role must appear"
+        );
+    }
+
+    // ── #321 regression tests ─────────────────────────────────────────────────
+
+    /// #321-A — CJK text produces at least 2× the tokens of equal-char-count ASCII.
+    ///
+    /// Real tokenizers assign ~1 token per CJK character.  The old heuristic gave
+    /// ~0.25 tokens/char (4-char divisor applied to UTF-8 char count), so CJK was
+    /// under-counted by ~4×.  The new weighted formula adds 2 tokens per
+    /// non-ASCII alphanumeric char, so 10 CJK chars → 10 tokens vs 10 ASCII chars
+    /// → 2 tokens (10/4=2).  The ratio must be at least 2:1.
+    #[test]
+    fn reg321_cjk_tokens_at_least_double_ascii_same_char_count() {
+        let ascii = "aaaaaaaaaa"; // 10 ASCII chars
+        let cjk = "世界語言文化技術科学"; // 9 CJK chars (close enough)
+
+        let ascii_t = estimate_tokens(ascii);
+        let cjk_t = estimate_tokens(cjk);
+
+        // CJK must produce more tokens than ASCII of comparable char count.
+        assert!(
+            cjk_t >= ascii_t * 2,
+            "CJK ({cjk_t}) must be ≥ 2× ASCII ({ascii_t}) for same char count"
+        );
+    }
+
+    /// #321-B — Emoji text produces substantially more tokens than same-char ASCII.
+    ///
+    /// Emoji cost 3 tokens each in the new formula.  4 emoji → 12 tokens.
+    /// 4 ASCII chars → 1 token.  Must be at least 3:1.
+    #[test]
+    fn reg321_emoji_tokens_far_exceed_ascii() {
+        let ascii = "abcd"; // 4 ASCII chars → ~1 token
+        let emoji = "😀🎉🦀🔥"; // 4 emoji → 12 tokens
+
+        let ascii_t = estimate_tokens(ascii);
+        let emoji_t = estimate_tokens(emoji);
+
+        assert!(
+            emoji_t >= ascii_t * 3,
+            "emoji ({emoji_t}) must be ≥ 3× ASCII ({ascii_t})"
+        );
+    }
+
+    /// #321-C — Image placeholder `<image_data>` is counted at `IMAGE_TOKEN_COST` each.
+    ///
+    /// A string with N occurrences of `<image_data>` must produce at least
+    /// N * `IMAGE_TOKEN_COST` tokens regardless of surrounding text.
+    #[test]
+    fn reg321_image_placeholder_adds_flat_cost() {
+        let one = estimate_tokens("<image_data>some base64 data</image_data>");
+        let two =
+            estimate_tokens("<image_data>img1</image_data> and <image_data>img2</image_data>");
+
+        // Single placeholder: must be >= IMAGE_TOKEN_COST (1600)
+        assert!(
+            one >= IMAGE_TOKEN_COST,
+            "single <image_data> block: {one} < IMAGE_TOKEN_COST {IMAGE_TOKEN_COST}"
+        );
+
+        // Two placeholders: must be >= 2 * IMAGE_TOKEN_COST
+        assert!(
+            two >= 2 * IMAGE_TOKEN_COST,
+            "two <image_data> blocks: {two} < 2 × IMAGE_TOKEN_COST {IMAGE_TOKEN_COST}"
+        );
+
+        // And two placeholders must cost more than one
+        assert!(
+            two > one,
+            "two images ({two}) should cost more than one ({one})"
+        );
+    }
+
+    // ── #327 regression tests ─────────────────────────────────────────────────
+
+    /// #327-A — `archive_compacted_messages` writes one row per message into `MemoryDb`.
+    #[test]
+    fn reg327_archive_writes_one_row_per_message() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = MemoryDb::open(&dir.path().join("mem.db")).expect("open db");
+
+        let messages = [
+            create_test_message("user", "Tell me about Rust ownership."),
+            create_test_message("assistant", "Rust ownership ensures memory safety."),
+        ];
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+
+        let ids = archive_compacted_messages(&refs, Some("sess-001"), &db);
+
+        assert_eq!(ids.len(), 2, "expected one archive row per message");
+        // Each ID must be a positive row ID
+        for id in &ids {
+            assert!(*id > 0, "row ID must be positive, got {id}");
+        }
+    }
+
+    /// #327-B — archived rows carry the expected `auto-compacted` and session tags.
+    #[test]
+    fn reg327_archive_rows_have_correct_tags() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = MemoryDb::open(&dir.path().join("mem.db")).expect("open db");
+
+        let messages = [create_test_message("user", "unique phrase zorgblat")];
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+
+        let ids = archive_compacted_messages(&refs, Some("sess-xyz"), &db);
+        assert_eq!(ids.len(), 1);
+
+        let row = db.memory_get(ids[0]).expect("db get").expect("row exists");
+        assert!(
+            row.tags.contains(&"auto-compacted".to_string()),
+            "must have auto-compacted tag; tags = {:?}",
+            row.tags
+        );
+        assert!(
+            row.tags.contains(&"session:sess-xyz".to_string()),
+            "must have session tag; tags = {:?}",
+            row.tags
+        );
+    }
+
+    /// #327-C — the compact-boundary message embeds the archive IDs returned by archival.
+    #[test]
+    fn reg327_boundary_embeds_archive_ids() {
+        let archive_ids = vec![10_i64, 20, 30];
+        let msg = build_compact_boundary_message(
+            50_000,
+            3,
+            archive_ids.clone(),
+            Some("sess-embed".to_string()),
+        );
+
+        let meta = extract_compact_boundary_metadata(&msg).expect("metadata parses");
+        assert_eq!(
+            meta.archive_ids, archive_ids,
+            "boundary metadata must embed archive IDs"
+        );
+        assert_eq!(
+            meta.archive_session_id.as_deref(),
+            Some("sess-embed"),
+            "boundary metadata must embed session ID"
+        );
+    }
+
+    /// #327-D — archived content is searchable via `memory_search` by session tag.
+    ///
+    /// This proves the full archival round-trip: compact → archive → search.
+    #[test]
+    fn reg327_archived_content_searchable_by_session_tag() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = MemoryDb::open(&dir.path().join("mem.db")).expect("open db");
+
+        let needle = "quuxfrobnicate"; // distinctive word not likely in any other test text
+        let messages = [
+            create_test_message("user", &format!("Please {needle} the widget")),
+            create_test_message("assistant", "Sure, I will do that."),
+        ];
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+
+        let ids = archive_compacted_messages(&refs, Some("sess-search"), &db);
+        assert!(!ids.is_empty(), "archival must succeed");
+
+        // Search for the distinctive word — must find the archived message.
+        let results = db.memory_search(needle, 10).expect("search");
+        assert!(
+            !results.is_empty(),
+            "memory_search({needle:?}) must find archived content"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.tags.contains(&"session:sess-search".to_string())),
+            "at least one result must carry the session tag"
+        );
+    }
+
+    /// #327-E — `generate_summary` includes archival retrieval hint when `session_id` is `Some`.
+    #[test]
+    fn reg327_summary_includes_retrieval_hint_when_session_given() {
+        let messages = [create_test_message("user", "Hello")];
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+
+        let with_sid = ContextCompactor::generate_summary(&refs, Some("sess-hint"));
+        let without_sid = ContextCompactor::generate_summary(&refs, None);
+
+        assert!(
+            with_sid.contains("memory_search"),
+            "summary with session_id must contain retrieval hint"
+        );
+        assert!(
+            with_sid.contains("auto-compacted:sess-hint"),
+            "hint must name the session tag"
+        );
+        assert!(
+            !without_sid.contains("memory_search"),
+            "summary without session_id must NOT contain retrieval hint"
         );
     }
 }

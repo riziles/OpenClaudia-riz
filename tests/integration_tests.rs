@@ -2821,7 +2821,7 @@ mod token_tracking {
 
         // compact_with_hint with None behaves like compact
         let result = compactor
-            .compact_with_hint(&mut request, None, None, None)
+            .compact_with_hint(&mut request, None, None, None, None)
             .await
             .unwrap();
 
