@@ -124,7 +124,22 @@ pub struct MigrationReport {
 /// Never panics and never returns an error — individual migration
 /// failures are captured in the returned `Vec<MigrationReport>`.
 pub fn run_all(ctx: &MigrationContext) -> Vec<MigrationReport> {
-    let mut ledger = CompletionLedger::load(&ctx.ledger_path());
+    // load() now returns Result so corruption is no longer silently
+    // coerced to "empty" inside the ledger itself (#741b). We preserve
+    // run_all's contract (never panic, never bubble up) by logging the
+    // failure here and degrading to an empty ledger — the signal is
+    // emitted at the boundary, not swallowed at the source.
+    let mut ledger = match CompletionLedger::load(&ctx.ledger_path()) {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::warn!(
+                path = %ctx.ledger_path().display(),
+                error = %err,
+                "migration ledger unreadable; once-only migrations may replay"
+            );
+            CompletionLedger::default()
+        }
+    };
     let mut out = Vec::new();
     for migration in registry::all() {
         let id = migration.id();

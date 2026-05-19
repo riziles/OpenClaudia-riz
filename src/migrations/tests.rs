@@ -87,7 +87,7 @@ impl Migration for FakeOnceOnlyMigration {
 /// tests so we can assert ledger + policy behavior without depending
 /// on whatever real migrations exist today.
 fn run_fake(ctx: &MigrationContext, migrations: Vec<Box<dyn Migration>>) -> Vec<MigrationReport> {
-    let mut ledger = CompletionLedger::load(&ctx.ledger_path());
+    let mut ledger = CompletionLedger::load(&ctx.ledger_path()).unwrap_or_default();
     let mut out = Vec::new();
     for migration in migrations {
         let id = migration.id();
@@ -149,25 +149,201 @@ fn ledger_persists_across_processes() {
     let tc = TestContext::new();
     let ledger_path = tc.ctx.ledger_path();
 
-    let mut ledger = CompletionLedger::load(&ledger_path);
+    let mut ledger = CompletionLedger::load(&ledger_path).unwrap();
     assert!(!ledger.contains("abc"));
     ledger.mark("abc");
     ledger.save(&ledger_path).unwrap();
 
     // Simulate a new process: drop the old ledger, re-load from disk.
-    let fresh = CompletionLedger::load(&ledger_path);
+    let fresh = CompletionLedger::load(&ledger_path).unwrap();
     assert!(fresh.contains("abc"));
     assert!(!fresh.contains("xyz"));
 }
 
+// ---------------------------------------------------------------------------
+// #741 — atomic save (#741a) + corruption-surfacing load (#741b)
+// ---------------------------------------------------------------------------
+
+/// #741b regression: a corrupt ledger file must surface as `Err`, not be
+/// silently coerced to an empty ledger. Coercing-to-empty causes every
+/// once-only migration to replay on the next boot.
 #[test]
-fn corrupt_ledger_treated_as_empty() {
+fn fix741b_corrupt_ledger_surfaces_error_not_silent_empty() {
     let tc = TestContext::new();
     let ledger_path = tc.ctx.ledger_path();
     std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
     std::fs::write(&ledger_path, "{not valid json").unwrap();
-    let ledger = CompletionLedger::load(&ledger_path);
-    assert!(!ledger.contains("abc"));
+
+    let result = CompletionLedger::load(&ledger_path);
+    assert!(
+        result.is_err(),
+        "corrupt ledger must return Err — silent-empty would let once-only migrations replay"
+    );
+    let err = result.err().unwrap();
+    let chain: String = err
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    assert!(
+        chain.contains("corrupt") || chain.contains("expected") || chain.contains("EOF"),
+        "error chain must explain corruption, got: {chain}"
+    );
+
+    // Forensic preservation: the corrupt file must remain on disk for
+    // operator inspection. Silent overwrite-on-next-save destroys it.
+    assert!(
+        ledger_path.exists(),
+        "corrupt ledger file must remain on disk for forensic inspection"
+    );
+}
+
+/// #741b regression: a missing ledger file is the expected first-run
+/// state and must yield `Ok(default)`, not an error. ENOENT is not
+/// corruption.
+#[test]
+fn fix741b_missing_file_is_ok_empty_ledger() {
+    let tc = TestContext::new();
+    let ledger_path = tc.ctx.ledger_path();
+    assert!(
+        !ledger_path.exists(),
+        "preconditions: ledger must not exist"
+    );
+
+    let result = CompletionLedger::load(&ledger_path);
+    assert!(
+        result.is_ok(),
+        "missing ledger file is first-run state — must be Ok, got {result:?}"
+    );
+    let ledger = result.unwrap();
+    assert!(!ledger.contains("any-id"));
+}
+
+/// #741a sanity: state survives a save/load round-trip across the
+/// new atomic path. Locks in the contract that the rewrite preserves
+/// what the old `fs::write` path did.
+#[test]
+fn fix741a_save_load_round_trip_preserves_state() {
+    let tc = TestContext::new();
+    let ledger_path = tc.ctx.ledger_path();
+
+    let mut original = CompletionLedger::default();
+    original.mark("alpha");
+    original.mark("beta");
+    original.mark("gamma");
+    original.save(&ledger_path).unwrap();
+
+    let reloaded = CompletionLedger::load(&ledger_path).unwrap();
+    assert!(reloaded.contains("alpha"));
+    assert!(reloaded.contains("beta"));
+    assert!(reloaded.contains("gamma"));
+    assert!(!reloaded.contains("delta"));
+}
+
+/// #741a regression: 8 threads × 25 saves each must never leave the
+/// on-disk file in a state that fails to parse. The atomic
+/// write-temp-then-rename guarantees readers always see either a
+/// previous complete file or the new complete file — never a
+/// half-written intermediate, never a truncated zero-byte file.
+#[test]
+fn fix741a_concurrent_save_never_leaves_corrupt_file() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let tc = TestContext::new();
+    let ledger_path = Arc::new(tc.ctx.ledger_path());
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+
+    // Seed a baseline so the file exists when the reader starts.
+    CompletionLedger::default().save(&ledger_path).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_saw_corruption = Arc::new(AtomicBool::new(false));
+
+    // Reader thread spins polling the file. Every snapshot must parse.
+    let reader_handle = {
+        let path = Arc::clone(&ledger_path);
+        let stop = Arc::clone(&stop);
+        let saw_corruption = Arc::clone(&reader_saw_corruption);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if let Err(e) = CompletionLedger::load(&path) {
+                    eprintln!("reader saw corruption: {e:?}");
+                    saw_corruption.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        })
+    };
+
+    let mut writers = Vec::new();
+    for tid in 0..8u64 {
+        let path = Arc::clone(&ledger_path);
+        writers.push(std::thread::spawn(move || {
+            for i in 0..25u64 {
+                let mut l = CompletionLedger::default();
+                l.mark(&format!("t{tid}-i{i}"));
+                l.save(&path).expect("save must succeed");
+            }
+        }));
+    }
+    for w in writers {
+        w.join().unwrap();
+    }
+    stop.store(true, Ordering::SeqCst);
+    reader_handle.join().unwrap();
+
+    assert!(
+        !reader_saw_corruption.load(Ordering::SeqCst),
+        "concurrent saves left the file in a corrupt state — atomicity violated"
+    );
+
+    // Final file must still be parseable.
+    let _final = CompletionLedger::load(&ledger_path).expect("final file must parse");
+
+    // No stray temp files left behind.
+    let parent = ledger_path.parent().unwrap();
+    let strays: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains("migrations.tmp."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "save() left {} stray temp file(s) behind: {:?}",
+        strays.len(),
+        strays
+            .iter()
+            .map(std::fs::DirEntry::file_name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// #741a security: on Unix the saved file must be mode 0o600 — the
+/// ledger names internal migration IDs that we do not want exposed
+/// to other local users. The temp file is `chmod`-ed before the
+/// rename so the final inode is never world-readable.
+#[cfg(unix)]
+#[test]
+fn fix741a_saved_ledger_has_0o600_permissions_on_unix() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tc = TestContext::new();
+    let ledger_path = tc.ctx.ledger_path();
+
+    let mut l = CompletionLedger::default();
+    l.mark("perms-test");
+    l.save(&ledger_path).unwrap();
+
+    let mode = std::fs::metadata(&ledger_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "ledger file must be 0o600 (owner-rw only), got 0o{mode:o}"
+    );
 }
 
 #[test]

@@ -577,6 +577,52 @@ impl PermissionManager {
         self.consecutive_denials = 0;
         self.total_denials = 0;
     }
+
+    /// Record that the user selected "Always allow" for `tool_name` in the
+    /// interactive TUI permission prompt. The decision survives across
+    /// `execute_tool_calls_for_tui` batches for the rest of the session.
+    /// Parity target: CC session-scoped "always allow" cache. See crosslink #724.
+    pub fn tui_remember_always_allowed(&self, tool_name: String) {
+        let mut guard = self
+            .tui_always_allowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(tool_name);
+    }
+
+    /// Record that the user selected "Always deny" for `tool_name` in the
+    /// interactive TUI permission prompt. The decision survives across
+    /// `execute_tool_calls_for_tui` batches for the rest of the session.
+    /// See crosslink #724.
+    pub fn tui_remember_always_denied(&self, tool_name: String) {
+        let mut guard = self
+            .tui_always_denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(tool_name);
+    }
+
+    /// Whether the user has previously selected "Always allow" for `tool_name`
+    /// in this session. See crosslink #724.
+    #[must_use]
+    pub fn tui_is_always_allowed(&self, tool_name: &str) -> bool {
+        let guard = self
+            .tui_always_allowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.contains(tool_name)
+    }
+
+    /// Whether the user has previously selected "Always deny" for `tool_name`
+    /// in this session. See crosslink #724.
+    #[must_use]
+    pub fn tui_is_always_denied(&self, tool_name: &str) -> bool {
+        let guard = self
+            .tui_always_denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.contains(tool_name)
+    }
 }
 
 #[cfg(test)]
@@ -1490,6 +1536,96 @@ mod phase2_spec_pins {
         assert!(
             matches!(r, CheckResult::Denied(_)),
             "tool name matching must be case-insensitive"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // crosslink #724 — TUI session-scoped always-allow / always-deny cache
+    // ------------------------------------------------------------------
+
+    /// #724: `tui_remember_always_allowed` stores the decision so a follow-up
+    /// `tui_is_always_allowed` returns true.
+    #[test]
+    fn tui_724_remember_always_allowed_persists() {
+        let (mgr, _dir) = enabled(vec![]);
+        assert!(
+            !mgr.tui_is_always_allowed("Bash"),
+            "fresh manager must not have any always-allow entries"
+        );
+        mgr.tui_remember_always_allowed("Bash".to_string());
+        assert!(
+            mgr.tui_is_always_allowed("Bash"),
+            "#724: tui_remember_always_allowed must be visible to tui_is_always_allowed"
+        );
+        // Other tools remain unaffected.
+        assert!(!mgr.tui_is_always_allowed("Write"));
+    }
+
+    /// #724: `tui_remember_always_denied` stores the decision so a follow-up
+    /// `tui_is_always_denied` returns true.
+    #[test]
+    fn tui_724_remember_always_denied_persists() {
+        let (mgr, _dir) = enabled(vec![]);
+        assert!(
+            !mgr.tui_is_always_denied("Bash"),
+            "fresh manager must not have any always-deny entries"
+        );
+        mgr.tui_remember_always_denied("Bash".to_string());
+        assert!(
+            mgr.tui_is_always_denied("Bash"),
+            "#724: tui_remember_always_denied must be visible to tui_is_always_denied"
+        );
+        assert!(!mgr.tui_is_always_denied("Edit"));
+    }
+
+    /// #724: `tui_is_always_allowed` returns false for an unseen tool — guards
+    /// against an "everything is allowed" regression.
+    #[test]
+    fn tui_724_is_always_allowed_default_false() {
+        let (mgr, _dir) = enabled(vec![]);
+        assert!(!mgr.tui_is_always_allowed("Bash"));
+        assert!(!mgr.tui_is_always_allowed("Write"));
+        assert!(!mgr.tui_is_always_allowed("Edit"));
+    }
+
+    /// #724: `tui_is_always_denied` returns false for an unseen tool — and the
+    /// allow/deny caches are independent (remembering allow does not deny).
+    #[test]
+    fn tui_724_is_always_denied_default_false_and_caches_independent() {
+        let (mgr, _dir) = enabled(vec![]);
+        assert!(!mgr.tui_is_always_denied("Bash"));
+        // Recording allow must NOT flip is_always_denied to true.
+        mgr.tui_remember_always_allowed("Bash".to_string());
+        assert!(
+            !mgr.tui_is_always_denied("Bash"),
+            "#724: tui_always_allowed and tui_always_denied must be independent caches"
+        );
+        // And recording deny on a different tool must not affect Bash.
+        mgr.tui_remember_always_denied("Write".to_string());
+        assert!(mgr.tui_is_always_denied("Write"));
+        assert!(!mgr.tui_is_always_denied("Bash"));
+    }
+
+    /// #724: the `Mutex` is `Send + Sync`, so the cache survives being shared
+    /// across the `Arc<PermissionManager>` boundary that the TUI pipeline uses.
+    /// This test mimics the pipeline flow: clone an `Arc`, remember from one
+    /// handle, observe from the other.
+    #[test]
+    fn tui_724_decision_survives_arc_sharing() {
+        use std::sync::Arc;
+        let (mgr, _dir) = enabled(vec![]);
+        let shared = Arc::new(mgr);
+        let clone = Arc::clone(&shared);
+
+        // Batch 1 (clone): user picks "Always allow" for Bash.
+        clone.tui_remember_always_allowed("Bash".to_string());
+
+        // Batch 2 (shared): a later `execute_tool_calls_for_tui` invocation
+        // sees the decision without re-prompting.
+        assert!(
+            shared.tui_is_always_allowed("Bash"),
+            "#724: always-allow decision must persist across Arc handles \
+             (i.e. across execute_tool_calls_for_tui batches)"
         );
     }
 }

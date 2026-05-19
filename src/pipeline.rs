@@ -845,16 +845,21 @@ enum PermissionOutcome {
 
 /// Check whether a tool call is permitted in the current session.
 ///
-/// Consults `always_allowed`/`always_denied` session caches, then sends a
-/// `PermissionRequest` event and blocks for the user's decision if needed.
+/// Consults `always_allowed`/`always_denied` session caches (batch-scoped),
+/// then the `PermissionManager`'s session-scoped TUI always-allow/deny cache
+/// (crosslink #724 — persists across batches for the lifetime of the
+/// manager), then sends a `PermissionRequest` event and blocks for the
+/// user's decision if neither cache matches.
 fn check_tool_permission(
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
     always_allowed: &mut std::collections::HashSet<String>,
     always_denied: &mut std::collections::HashSet<String>,
+    permission_mgr: Option<&PermissionManager>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> PermissionOutcome {
+    // Batch-scoped cache (this invocation of execute_tool_calls_for_tui).
     if always_denied.contains(tool_name) {
         let _ = tx.send(AppEvent::ToolDone {
             name: tool_name.to_string(),
@@ -867,6 +872,22 @@ fn check_tool_permission(
     }
     if always_allowed.contains(tool_name) {
         return PermissionOutcome::Allowed;
+    }
+    // Session-scoped cache (crosslink #724 — survives across batches).
+    if let Some(mgr) = permission_mgr {
+        if mgr.tui_is_always_denied(tool_name) {
+            let _ = tx.send(AppEvent::ToolDone {
+                name: tool_name.to_string(),
+                success: false,
+                content: "Denied (always deny for this session)".to_string(),
+            });
+            return PermissionOutcome::DeniedWithResult(
+                serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "content": "[DENIED] User denied permission for this tool.", "is_error": true }),
+            );
+        }
+        if mgr.tui_is_always_allowed(tool_name) {
+            return PermissionOutcome::Allowed;
+        }
     }
     let args_preview = if arguments.len() > 200 {
         format!("{}...", crate::tools::safe_truncate(arguments, 197))
@@ -888,10 +909,18 @@ fn check_tool_permission(
         Ok(PermissionResponse::Allow) => PermissionOutcome::Allowed,
         Ok(PermissionResponse::AlwaysAllow) => {
             always_allowed.insert(tool_name.to_string());
+            // Persist for the rest of the session (crosslink #724).
+            if let Some(mgr) = permission_mgr {
+                mgr.tui_remember_always_allowed(tool_name.to_string());
+            }
             PermissionOutcome::Allowed
         }
         Ok(PermissionResponse::AlwaysDeny) => {
             always_denied.insert(tool_name.to_string());
+            // Persist for the rest of the session (crosslink #724).
+            if let Some(mgr) = permission_mgr {
+                mgr.tui_remember_always_denied(tool_name.to_string());
+            }
             let _ = tx.send(AppEvent::ToolDone {
                 name: tool_name.to_string(),
                 success: false,
@@ -1074,6 +1103,7 @@ async fn execute_tool_calls_for_tui(
                 &tool_call.function.arguments,
                 &mut always_allowed,
                 &mut always_denied,
+                permission_mgr.as_deref(),
                 tx,
             ) {
                 PermissionOutcome::Allowed => {}
@@ -1507,6 +1537,85 @@ mod tests {
         assert!(
             tool_needs_permission("edit_file"),
             "edit_file needs permission"
+        );
+    }
+
+    /// crosslink #724 — `check_tool_permission` consults the
+    /// `PermissionManager`'s session-scoped TUI cache and short-circuits to
+    /// `Allowed` without sending a `PermissionRequest` event. This is the
+    /// integration test that proves the cache survives across batches: a
+    /// fresh `execute_tool_calls_for_tui` invocation would see this state.
+    #[test]
+    fn issue_724_check_tool_permission_uses_session_always_allowed() {
+        use std::sync::mpsc as std_mpsc;
+
+        let mgr = PermissionManager::unrestricted();
+        // Simulate: in a prior batch, the user picked "Always allow" for Bash.
+        mgr.tui_remember_always_allowed("bash".to_string());
+
+        // Batch-scoped caches start empty (as they would on every new batch).
+        let mut always_allowed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let outcome = check_tool_permission(
+            "bash",
+            "call_1",
+            "{\"command\":\"ls\"}",
+            &mut always_allowed,
+            &mut always_denied,
+            Some(&mgr),
+            &tx,
+        );
+        assert!(
+            matches!(outcome, PermissionOutcome::Allowed),
+            "#724: a prior 'always allow' must short-circuit to Allowed without a prompt"
+        );
+        // No PermissionRequest event should have been emitted.
+        assert!(
+            rx.try_recv().is_err(),
+            "#724: no PermissionRequest event must be sent when the session cache allows"
+        );
+    }
+
+    /// crosslink #724 — symmetric to the above: a session-scoped "always deny"
+    /// short-circuits to `DeniedWithResult` without prompting the user again.
+    #[test]
+    fn issue_724_check_tool_permission_uses_session_always_denied() {
+        use std::sync::mpsc as std_mpsc;
+
+        let mgr = PermissionManager::unrestricted();
+        mgr.tui_remember_always_denied("bash".to_string());
+
+        let mut always_allowed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let outcome = check_tool_permission(
+            "bash",
+            "call_1",
+            "{\"command\":\"rm -rf /\"}",
+            &mut always_allowed,
+            &mut always_denied,
+            Some(&mgr),
+            &tx,
+        );
+        assert!(
+            matches!(outcome, PermissionOutcome::DeniedWithResult(_)),
+            "#724: a prior 'always deny' must short-circuit to Denied without a prompt"
+        );
+        // A ToolDone event is emitted to inform the TUI, but NOT a PermissionRequest.
+        let mut saw_perm_request = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, AppEvent::PermissionRequest { .. }) {
+                saw_perm_request = true;
+            }
+        }
+        assert!(
+            !saw_perm_request,
+            "#724: no PermissionRequest event must be sent when the session cache denies"
         );
     }
 
