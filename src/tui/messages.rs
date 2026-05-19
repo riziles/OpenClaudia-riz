@@ -1,5 +1,6 @@
 //! Scrollable message list for the TUI.
 
+use std::str::FromStr;
 use std::time::Instant;
 
 use ratatui::{
@@ -7,15 +8,295 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
+// ─── MessageKind ────────────────────────────────────────────────────────────
+
+/// The semantic kind of a [`DisplayMessage`].
+///
+/// Encodes what type of content the message carries and how it should be
+/// rendered. Replaces the previous twin-boolean `(is_error, is_thinking)` flags
+/// and the stringly-typed `role` field — invalid state combinations are now
+/// unrepresentable at the type level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageKind {
+    /// A message typed by the human user.
+    User,
+    /// A completed assistant response.
+    Assistant,
+    /// A collapsed thinking summary (e.g. "Thought for 1.2s").
+    Thinking,
+    /// An informational system message (no error).
+    SystemInfo,
+    /// An error-level system message.
+    SystemError,
+    /// Tool invocation header — the tool started but has not yet returned.
+    ToolStart {
+        /// Tool name shown in the header line.
+        name: String,
+    },
+    /// Tool completed successfully.
+    ToolOk {
+        /// Tool name shown in the result line.
+        name: String,
+    },
+    /// Tool completed with a failure / non-zero exit.
+    ToolErr {
+        /// Tool name shown in the result line.
+        name: String,
+    },
+}
+
+impl MessageKind {
+    /// Returns `true` when this kind renders with error styling.
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self, Self::SystemError | Self::ToolErr { .. })
+    }
+
+    /// Returns `true` when this kind carries thinking content.
+    #[must_use]
+    pub const fn is_thinking(&self) -> bool {
+        matches!(self, Self::Thinking)
+    }
+
+    /// Borrow the tool name when available, without allocating.
+    #[must_use]
+    pub const fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::ToolStart { name } | Self::ToolOk { name } | Self::ToolErr { name } => {
+                Some(name.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
+// ─── Role ───────────────────────────────────────────────────────────────────
+
+/// Wire-format role for session messages.
+///
+/// Used exclusively at the serde boundary (session JSON persistence and
+/// resume). Internal code compares against enum variants — no string literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+impl Role {
+    /// Return the lowercase wire-format string for this role.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+/// Parse a role from a wire-format string.
+///
+/// Unknown roles round-trip to `System` rather than failing, matching
+/// the previous fallback behaviour of the `_ =>` arm.
+impl FromStr for Role {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "tool" => Self::Tool,
+            _ => Self::System,
+        })
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ─── Mode ───────────────────────────────────────────────────────────────────
+
+/// The agent operating mode.
+///
+/// Replaces `TuiSession.mode: String` and `App.mode: String`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum Mode {
+    /// Full-access mode — the agent can write files, run commands, etc.
+    #[default]
+    Build,
+    /// Read-only suggestions-only mode.
+    Plan,
+}
+
+impl Mode {
+    /// Return the display name used in the status bar and system messages.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+        }
+    }
+
+    /// Return a one-line description shown in `/mode` system messages.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Build => "Full access — can make changes",
+            Self::Plan => "Read-only — suggestions only",
+        }
+    }
+
+    /// Toggle between `Build` and `Plan`.
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::Build,
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Mode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "Plan" => Self::Plan,
+            _ => Self::Build,
+        })
+    }
+}
+
+// ─── EffortLevel ────────────────────────────────────────────────────────────
+
+/// The reasoning-effort level forwarded to the provider.
+///
+/// Replaces `App.effort_level: String` and `ApiTurnParams.effort_level: String`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl EffortLevel {
+    /// Return the lowercase wire string expected by provider adapters.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Return the Unicode bullet symbol used in the status bar.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Low => "\u{25CB}",
+            Self::Medium => "\u{25D0}",
+            Self::High => "\u{25CF}",
+        }
+    }
+
+    /// Cycle through Low → Medium → High → Low.
+    #[must_use]
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EffortLevel {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "low" => Self::Low,
+            "high" => Self::High,
+            _ => Self::Medium,
+        })
+    }
+}
+
+// ─── DisplayMessage ──────────────────────────────────────────────────────────
+
 /// A single display message in the conversation.
+///
+/// The `kind` field carries all the semantic information that was previously
+/// split across `role: String`, `is_error: bool`, `is_thinking: bool`, and
+/// `tool_name: Option<String>`.
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
-    pub role: String,
+    pub kind: MessageKind,
     pub content: String,
-    pub tool_name: Option<String>,
-    pub is_error: bool,
-    pub is_thinking: bool,
 }
+
+impl DisplayMessage {
+    /// Convenience constructor for a `SystemInfo` message.
+    #[must_use]
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            kind: MessageKind::SystemInfo,
+            content: content.into(),
+        }
+    }
+
+    /// Convenience constructor for a `SystemError` message.
+    #[must_use]
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            kind: MessageKind::SystemError,
+            content: content.into(),
+        }
+    }
+
+    /// Convenience constructor for a `User` message.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            kind: MessageKind::User,
+            content: content.into(),
+        }
+    }
+
+    /// Convenience constructor for an `Assistant` message.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            kind: MessageKind::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+// ─── MessageList ────────────────────────────────────────────────────────────
 
 /// Scrollable message list with streaming support.
 pub struct MessageList {
@@ -71,11 +352,8 @@ impl MessageList {
             .thinking_start
             .map_or(0.0, |start| start.elapsed().as_secs_f64());
         self.messages.push(DisplayMessage {
-            role: "thinking".to_string(),
+            kind: MessageKind::Thinking,
             content: format!("Thought for {duration:.1}s"),
-            tool_name: None,
-            is_error: false,
-            is_thinking: true,
         });
         self.is_thinking_now = false;
         self.thinking_start = None;
@@ -115,11 +393,8 @@ impl MessageList {
     pub fn finish_streaming(&mut self) {
         if !self.streaming_text.is_empty() {
             self.messages.push(DisplayMessage {
-                role: "assistant".to_string(),
+                kind: MessageKind::Assistant,
                 content: std::mem::take(&mut self.streaming_text),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
             });
         }
         self.is_streaming = false;
@@ -196,8 +471,8 @@ impl MessageList {
 
     /// Append rendered lines for a tool-result message to `out`.
     fn append_tool_lines<'a>(out: &mut Vec<Line<'a>>, msg: &'a DisplayMessage) {
-        let tool_name = msg.tool_name.as_deref().unwrap_or("tool");
-        if msg.is_error {
+        let tool_name = msg.kind.tool_name().unwrap_or("tool");
+        if msg.kind.is_error() {
             out.push(Line::from(Span::styled(
                 format!("  \u{2717} {tool_name}"),
                 Style::default().fg(Color::Red),
@@ -224,9 +499,11 @@ impl MessageList {
 
     /// Append rendered lines for a single message to `out`.
     fn append_message_lines<'a>(out: &mut Vec<Line<'a>>, msg: &'a DisplayMessage) {
-        match msg.role.as_str() {
-            "system" => Self::append_system_lines(out, msg),
-            "user" => {
+        match &msg.kind {
+            MessageKind::SystemInfo | MessageKind::SystemError => {
+                Self::append_system_lines(out, msg);
+            }
+            MessageKind::User => {
                 out.push(Line::from(Span::styled(
                     "\u{203A} user",
                     Style::default()
@@ -238,26 +515,19 @@ impl MessageList {
                 }
                 out.push(Line::from(""));
             }
-            "assistant" => {
+            MessageKind::Assistant => {
                 out.push(Line::from(Span::styled(
                     "\u{23BF} Claudia",
                     Style::default()
                         .fg(Color::Rgb(147, 112, 219))
                         .add_modifier(Modifier::BOLD),
                 )));
-                let content_style = if msg.is_thinking {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC)
-                } else {
-                    Style::default()
-                };
                 for line in msg.content.lines() {
-                    out.push(Line::from(Span::styled(format!("  {line}"), content_style)));
+                    out.push(Line::from(format!("  {line}")));
                 }
                 out.push(Line::from(""));
             }
-            "thinking" => {
+            MessageKind::Thinking => {
                 out.push(Line::from(Span::styled(
                     format!("  \u{2234} {}", msg.content),
                     Style::default()
@@ -266,15 +536,10 @@ impl MessageList {
                 )));
                 out.push(Line::from(""));
             }
-            "tool" => Self::append_tool_lines(out, msg),
-            _ => {
-                for line in msg.content.lines() {
-                    out.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                out.push(Line::from(""));
+            MessageKind::ToolStart { .. }
+            | MessageKind::ToolOk { .. }
+            | MessageKind::ToolErr { .. } => {
+                Self::append_tool_lines(out, msg);
             }
         }
     }
@@ -364,16 +629,154 @@ impl Default for MessageList {
 mod tests {
     use super::*;
 
+    // ── MessageKind tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn message_kind_is_error_only_for_error_variants() {
+        assert!(!MessageKind::User.is_error());
+        assert!(!MessageKind::Assistant.is_error());
+        assert!(!MessageKind::Thinking.is_error());
+        assert!(!MessageKind::SystemInfo.is_error());
+        assert!(!MessageKind::ToolStart {
+            name: "bash".into()
+        }
+        .is_error());
+        assert!(!MessageKind::ToolOk {
+            name: "bash".into()
+        }
+        .is_error());
+
+        assert!(MessageKind::SystemError.is_error());
+        assert!(MessageKind::ToolErr {
+            name: "bash".into()
+        }
+        .is_error());
+    }
+
+    #[test]
+    fn message_kind_is_thinking_only_for_thinking_variant() {
+        assert!(MessageKind::Thinking.is_thinking());
+        assert!(!MessageKind::User.is_thinking());
+        assert!(!MessageKind::SystemError.is_thinking());
+    }
+
+    #[test]
+    fn message_kind_tool_name_accessor() {
+        assert_eq!(
+            MessageKind::ToolStart {
+                name: "read_file".into()
+            }
+            .tool_name(),
+            Some("read_file")
+        );
+        assert_eq!(
+            MessageKind::ToolOk {
+                name: "write_file".into()
+            }
+            .tool_name(),
+            Some("write_file")
+        );
+        assert_eq!(
+            MessageKind::ToolErr {
+                name: "bash".into()
+            }
+            .tool_name(),
+            Some("bash")
+        );
+        assert_eq!(MessageKind::User.tool_name(), None);
+        assert_eq!(MessageKind::SystemInfo.tool_name(), None);
+    }
+
+    // ── Role tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn role_round_trip_via_as_str_and_from_str() {
+        for (wire, expected) in [
+            ("user", Role::User),
+            ("assistant", Role::Assistant),
+            ("system", Role::System),
+            ("tool", Role::Tool),
+        ] {
+            let parsed: Role = wire.parse().unwrap();
+            assert_eq!(parsed, expected, "parse failed for {wire}");
+            assert_eq!(parsed.as_str(), wire, "as_str mismatch for {wire}");
+        }
+    }
+
+    #[test]
+    fn role_unknown_input_falls_back_to_system() {
+        let r: Role = "thinking".parse().unwrap();
+        assert_eq!(r, Role::System);
+        let r2: Role = "".parse().unwrap();
+        assert_eq!(r2, Role::System);
+    }
+
+    #[test]
+    fn role_display_matches_as_str() {
+        for role in [Role::User, Role::Assistant, Role::System, Role::Tool] {
+            assert_eq!(role.to_string(), role.as_str());
+        }
+    }
+
+    // ── Mode tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_toggle_is_involution() {
+        assert_eq!(Mode::Build.toggled(), Mode::Plan);
+        assert_eq!(Mode::Plan.toggled(), Mode::Build);
+    }
+
+    #[test]
+    fn mode_round_trip_from_str() {
+        assert_eq!("Build".parse::<Mode>().unwrap(), Mode::Build);
+        assert_eq!("Plan".parse::<Mode>().unwrap(), Mode::Plan);
+        // Unknown falls back to Build
+        assert_eq!("unknown".parse::<Mode>().unwrap(), Mode::Build);
+    }
+
+    #[test]
+    fn mode_display_matches_as_str() {
+        assert_eq!(Mode::Build.to_string(), "Build");
+        assert_eq!(Mode::Plan.to_string(), "Plan");
+    }
+
+    // ── EffortLevel tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn effort_level_cycle_is_periodic() {
+        assert_eq!(EffortLevel::Low.cycled(), EffortLevel::Medium);
+        assert_eq!(EffortLevel::Medium.cycled(), EffortLevel::High);
+        assert_eq!(EffortLevel::High.cycled(), EffortLevel::Low);
+    }
+
+    #[test]
+    fn effort_level_round_trip_from_str() {
+        assert_eq!("low".parse::<EffortLevel>().unwrap(), EffortLevel::Low);
+        assert_eq!(
+            "medium".parse::<EffortLevel>().unwrap(),
+            EffortLevel::Medium
+        );
+        assert_eq!("high".parse::<EffortLevel>().unwrap(), EffortLevel::High);
+        // Unknown falls back to Medium
+        assert_eq!(
+            "unknown".parse::<EffortLevel>().unwrap(),
+            EffortLevel::Medium
+        );
+    }
+
+    #[test]
+    fn effort_level_display_matches_as_str() {
+        for level in [EffortLevel::Low, EffortLevel::Medium, EffortLevel::High] {
+            assert_eq!(level.to_string(), level.as_str());
+        }
+    }
+
+    // ── MessageList integration tests ────────────────────────────────────────
+
     #[test]
     fn test_add_and_count() {
         let mut ml = MessageList::new();
-        ml.add(DisplayMessage {
-            role: "user".into(),
-            content: "hello".into(),
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        ml.add(DisplayMessage::user("hello"));
         assert_eq!(ml.messages.len(), 1);
     }
 
@@ -388,6 +791,7 @@ mod tests {
         assert!(!ml.is_streaming);
         assert_eq!(ml.messages.len(), 1);
         assert_eq!(ml.messages[0].content, "hello world");
+        assert_eq!(ml.messages[0].kind, MessageKind::Assistant);
     }
 
     #[test]
@@ -409,9 +813,8 @@ mod tests {
         assert!(!ml.is_thinking_now);
         assert!(ml.thinking_buffer.is_empty());
         assert_eq!(ml.messages.len(), 1);
-        assert_eq!(ml.messages[0].role, "thinking");
+        assert_eq!(ml.messages[0].kind, MessageKind::Thinking);
         assert!(ml.messages[0].content.starts_with("Thought for "));
-        assert!(ml.messages[0].is_thinking);
     }
 
     #[test]

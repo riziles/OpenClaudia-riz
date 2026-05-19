@@ -6,7 +6,7 @@
 
 use super::events::{AppEvent, EventHandler};
 use super::input::TextInput;
-use super::messages::{DisplayMessage, MessageList};
+use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use crossterm::{
     event::{KeyCode, KeyModifiers},
     execute,
@@ -33,7 +33,7 @@ pub struct TuiSession {
     pub model: String,
     pub provider: String,
     #[serde(default)]
-    pub mode: String,
+    pub mode: Mode,
     pub messages: Vec<serde_json::Value>,
     #[serde(default)]
     undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
@@ -49,7 +49,7 @@ impl TuiSession {
             updated_at: now,
             model: model.to_string(),
             provider: provider.to_string(),
-            mode: "Build".to_string(),
+            mode: Mode::Build,
             messages: Vec::new(),
             undo_stack: Vec::new(),
         }
@@ -75,18 +75,12 @@ impl TuiSession {
         }
     }
 
-    fn toggle_mode(&mut self) {
-        self.mode = match self.mode.as_str() {
-            "Build" => "Plan".to_string(),
-            _ => "Build".to_string(),
-        };
+    const fn toggle_mode(&mut self) {
+        self.mode = self.mode.toggled();
     }
 
-    fn mode_description(&self) -> &str {
-        match self.mode.as_str() {
-            "Plan" => "Read-only — suggestions only",
-            _ => "Full access — can make changes",
-        }
+    const fn mode_description(&self) -> &'static str {
+        self.mode.description()
     }
 
     fn undo(&mut self) -> bool {
@@ -126,21 +120,35 @@ impl TuiSession {
     }
 }
 
+/// Compiled regex for `@"quoted path"` and `@bare-path` file references.
+///
+/// The pattern is a hard-coded literal that must compile; `expect` is the
+/// correct idiom here (`unwrap` would give a less actionable panic message).
+static FILE_REF_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"@"([^"]+)"|@(\S+)"#)
+        .expect("FILE_REF_RE pattern is a hard-coded literal — must compile")
+});
+
 /// Expand @filename references in user input by inlining file contents.
 fn expand_file_refs(input: &str) -> String {
     if !input.contains('@') {
         return input.to_string();
     }
-    let re = regex::Regex::new(r#"@"([^"]+)"|@(\S+)"#).unwrap();
     let mut result = input.to_string();
     let mut replacements = Vec::new();
 
     // Get project root for path traversal validation
     let cwd = std::env::current_dir().unwrap_or_default();
 
-    for cap in re.captures_iter(input) {
-        let full_match = cap.get(0).unwrap().as_str();
-        let raw_path = cap.get(1).or_else(|| cap.get(2)).unwrap().as_str();
+    for cap in FILE_REF_RE.captures_iter(input) {
+        let full_match = match cap.get(0) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
+        let raw_path = match cap.get(1).or_else(|| cap.get(2)) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
 
         // Resolve and validate path — reject traversal attempts
         let resolved = if std::path::Path::new(raw_path).is_absolute() {
@@ -268,7 +276,7 @@ pub struct App {
     pub model: String,
     pub provider: String,
     pub tokens: usize,
-    pub mode: String,
+    pub mode: Mode,
     pub should_quit: bool,
     pub is_waiting: bool,
     spinner_frame: usize,
@@ -279,7 +287,7 @@ pub struct App {
     pub client: reqwest::Client,
     pub endpoint: String,
     pub headers: Vec<(String, String)>,
-    pub effort_level: String,
+    pub effort_level: EffortLevel,
     pub system_prompt: String,
     /// Split system prompt blocks for Anthropic cache efficiency.
     pub prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
@@ -337,7 +345,7 @@ impl App {
             model: model.to_string(),
             provider: provider.to_string(),
             tokens: 0,
-            mode: "Build".to_string(),
+            mode: Mode::Build,
             should_quit: false,
             is_waiting: false,
             spinner_frame: 0,
@@ -345,7 +353,7 @@ impl App {
             client: reqwest::Client::new(),
             endpoint: String::new(),
             headers: Vec::new(),
-            effort_level: "medium".to_string(),
+            effort_level: EffortLevel::Medium,
             system_prompt: String::new(),
             prompt_blocks: None,
             claude_code_token: None,
@@ -377,37 +385,43 @@ impl App {
     fn resume_session_by_id(&mut self, id: &str) {
         let sessions = list_sessions();
         let Some(loaded) = sessions.iter().find(|s| s.id.starts_with(id)).cloned() else {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("No session found with id prefix '{id}'."),
-                tool_name: None,
-                is_error: true,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::error(format!(
+                "No session found with id prefix '{id}'.",
+            )));
             return;
         };
         self.chat_session.clone_from(&loaded);
         self.session_messages.clone_from(&loaded.messages);
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
-        self.mode.clone_from(&loaded.mode);
+        self.mode = loaded.mode;
         self.tokens = self.chat_session.estimate_tokens();
         self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         self.transcript_watermark = self.session_messages.len();
         // Repaint the transcript.
         self.messages = super::messages::MessageList::new();
         for msg in &loaded.messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("system");
+            let role: super::messages::Role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("system")
+                .parse()
+                .unwrap_or(super::messages::Role::System);
             let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if role == "system" {
+            if role == super::messages::Role::System {
                 continue;
             }
+            let kind = match role {
+                super::messages::Role::User => MessageKind::User,
+                super::messages::Role::Assistant => MessageKind::Assistant,
+                super::messages::Role::Tool => MessageKind::ToolOk {
+                    name: String::new(),
+                },
+                super::messages::Role::System => MessageKind::SystemInfo,
+            };
             self.messages.add(DisplayMessage {
-                role: role.to_string(),
+                kind,
                 content: content.to_string(),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
             });
         }
     }
@@ -606,11 +620,8 @@ impl App {
             }
             Ok(AppEvent::ToolStart { name, description }) => {
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(),
+                    kind: MessageKind::ToolStart { name },
                     content: description,
-                    tool_name: Some(name),
-                    is_error: false,
-                    is_thinking: false,
                 });
             }
             Ok(AppEvent::ToolDone {
@@ -624,11 +635,12 @@ impl App {
                     content
                 };
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(),
+                    kind: if success {
+                        MessageKind::ToolOk { name }
+                    } else {
+                        MessageKind::ToolErr { name }
+                    },
                     content: preview,
-                    tool_name: Some(name),
-                    is_error: !success,
-                    is_thinking: false,
                 });
             }
             Ok(AppEvent::ResponseDone) => {
@@ -645,13 +657,8 @@ impl App {
             }
             Ok(AppEvent::ApiError(msg)) => {
                 self.messages.finish_streaming();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Error: {msg}"),
-                    tool_name: None,
-                    is_error: true,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::error(format!("Error: {msg}")));
                 self.is_waiting = false;
                 self.fire_notification_hook(&format!("API error: {msg}"), "error");
             }
@@ -740,15 +747,15 @@ impl App {
                     PermissionResponse::Deny => "Denied",
                     PermissionResponse::AlwaysDeny => "Always denied",
                 };
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("{label}: {}", perm.tool_name),
-                    tool_name: None,
-                    is_error: matches!(
-                        resp,
-                        PermissionResponse::Deny | PermissionResponse::AlwaysDeny
-                    ),
-                    is_thinking: false,
+                let denied = matches!(
+                    resp,
+                    PermissionResponse::Deny | PermissionResponse::AlwaysDeny
+                );
+                let content = format!("{label}: {}", perm.tool_name);
+                self.messages.add(if denied {
+                    DisplayMessage::error(content)
+                } else {
+                    DisplayMessage::system(content)
                 });
                 let _ = perm.reply.send(resp);
             }
@@ -762,13 +769,8 @@ impl App {
             if key.code == KeyCode::Esc {
                 self.is_waiting = false;
                 self.messages.finish_streaming();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "[Response interrupted]".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("[Response interrupted]"));
             }
             return;
         }
@@ -819,13 +821,8 @@ impl App {
         if text == "/sessions" || text == "/list" {
             let sessions = list_sessions();
             if sessions.is_empty() {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "No saved sessions.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("No saved sessions."));
             } else {
                 let list = sessions
                     .iter()
@@ -840,13 +837,9 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Saved sessions:\n{list}\n\nUse /load <id> to resume."),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages.add(DisplayMessage::system(format!(
+                    "Saved sessions:\n{list}\n\nUse /load <id> to resume."
+                )));
             }
             return true;
         }
@@ -865,44 +858,24 @@ impl App {
                 if self.messages.len() >= 2 {
                     self.messages.pop_last(2);
                 }
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Undone last message pair.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Undone last message pair."));
                 let _ = save_session(&self.chat_session);
             } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Nothing to undo.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Nothing to undo."));
             }
             return true;
         }
         if text == "/redo" {
             if self.chat_session.redo() {
                 self.session_messages = self.chat_session.messages.clone();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Redone last undone messages.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Redone last undone messages."));
                 let _ = save_session(&self.chat_session);
             } else {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Nothing to redo.".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Nothing to redo."));
             }
             return true;
         }
@@ -931,16 +904,11 @@ impl App {
             if turn_list.is_empty() {
                 turn_list = "  (no conversation turns yet)\n".to_string();
             }
-            self.messages.add(DisplayMessage { role: "system".to_string(), content: format!("Conversation has {turn_num} turn(s):\n{turn_list}\nUse /rewind N to undo the last N turns."), tool_name: None, is_error: false, is_thinking: false });
+            self.messages.add(DisplayMessage::system(format!("Conversation has {turn_num} turn(s):\n{turn_list}\nUse /rewind N to undo the last N turns.")));
         } else if let Ok(n) = arg.parse::<usize>() {
             if n == 0 {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Nothing to rewind (0 turns).".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Nothing to rewind (0 turns)."));
             } else {
                 let mut rewound = 0;
                 for _ in 0..n {
@@ -956,33 +924,20 @@ impl App {
                     if self.messages.len() >= to_remove {
                         self.messages.pop_last(to_remove);
                     }
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!("Rewound {rewound} turn(s)."),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
+                    self.messages.add(DisplayMessage::system(format!(
+                        "Rewound {rewound} turn(s)."
+                    )));
                     let _ = save_session(&self.chat_session);
                     self.persist_transcript_tail();
                 } else {
-                    self.messages.add(DisplayMessage {
-                        role: "system".to_string(),
-                        content: "Nothing to rewind.".to_string(),
-                        tool_name: None,
-                        is_error: false,
-                        is_thinking: false,
-                    });
+                    self.messages
+                        .add(DisplayMessage::system("Nothing to rewind."));
                 }
             }
         } else {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: "Usage: /rewind [N] — rewind N turns, or show turn list".to_string(),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(
+                "Usage: /rewind [N] — rewind N turns, or show turn list",
+            ));
         }
     }
 
@@ -1008,20 +963,12 @@ impl App {
             }
             let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
             match std::fs::write(&export_path, &md) {
-                Ok(()) => self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Exported to {export_path}"),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                }),
-                Err(e) => self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Export failed: {e}"),
-                    tool_name: None,
-                    is_error: true,
-                    is_thinking: false,
-                }),
+                Ok(()) => self
+                    .messages
+                    .add(DisplayMessage::system(format!("Exported to {export_path}"))),
+                Err(e) => self
+                    .messages
+                    .add(DisplayMessage::error(format!("Export failed: {e}"))),
             }
             return true;
         }
@@ -1029,23 +976,21 @@ impl App {
             let parts: Vec<&str> = text.splitn(2, ' ').collect();
             if parts.len() == 2 {
                 let level = parts[1].trim();
-                if matches!(level, "low" | "medium" | "high") {
-                    self.effort_level = level.to_string();
+                // FromStr for EffortLevel is Infallible; unknown strings map to Medium.
+                let parsed: EffortLevel = level.parse().unwrap_or(EffortLevel::Medium);
+                if matches!(
+                    parsed,
+                    EffortLevel::Low | EffortLevel::Medium | EffortLevel::High
+                ) {
+                    self.effort_level = parsed;
                 }
             } else {
-                self.effort_level = match self.effort_level.as_str() {
-                    "low" => "medium".to_string(),
-                    "medium" => "high".to_string(),
-                    _ => "low".to_string(),
-                };
+                self.effort_level = self.effort_level.cycled();
             }
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("Effort level: {}", self.effort_level),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(format!(
+                "Effort level: {}",
+                self.effort_level
+            )));
             return true;
         }
         false
@@ -1084,37 +1029,25 @@ impl App {
         }
 
         if text == "/status" {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
-                    self.model,
-                    self.provider,
-                    self.effort_level,
-                    self.session_messages.len(),
-                    self.tokens,
-                ),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(format!(
+                "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
+                self.model,
+                self.provider,
+                self.effort_level,
+                self.session_messages.len(),
+                self.tokens,
+            )));
             return true;
         }
 
         if text == "/mode" {
             self.chat_session.toggle_mode();
-            self.mode = self.chat_session.mode.clone();
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "Mode: {} — {}",
-                    self.chat_session.mode,
-                    self.chat_session.mode_description()
-                ),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.mode = self.chat_session.mode;
+            self.messages.add(DisplayMessage::system(format!(
+                "Mode: {} — {}",
+                self.chat_session.mode,
+                self.chat_session.mode_description()
+            )));
             return true;
         }
 
@@ -1129,26 +1062,17 @@ impl App {
         if text == "/skill" || text == "/skills" {
             let skills = crate::skills::load_skills();
             if skills.is_empty() {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "No skills found. Add .md files to .openclaudia/skills/".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages.add(DisplayMessage::system(
+                    "No skills found. Add .md files to .openclaudia/skills/",
+                ));
             } else {
                 let list = skills
                     .iter()
                     .map(|s| format!("  /{} — {}", s.name, s.description))
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Available skills:\n{list}"),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system(format!("Available skills:\n{list}")));
             }
             return true;
         }
@@ -1170,13 +1094,10 @@ impl App {
             text.strip_prefix('/').unwrap_or("")
         };
         if let Some(skill) = crate::skills::get_skill(skill_name) {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("Running skill: /{}", skill.name),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(format!(
+                "Running skill: /{}",
+                skill.name
+            )));
             self.session_messages
                 .push(serde_json::json!({ "role": "user", "content": skill.prompt }));
             self.is_waiting = true;
@@ -1186,38 +1107,25 @@ impl App {
         if text.starts_with("/rename ") {
             let new_title = text.strip_prefix("/rename ").unwrap_or("").trim();
             if new_title.is_empty() {
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: "Usage: /rename <new title>".to_string(),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages
+                    .add(DisplayMessage::system("Usage: /rename <new title>"));
             } else {
                 self.chat_session.title = new_title.to_string();
                 self.chat_session.touch();
                 let _ = save_session(&self.chat_session);
                 self.persist_transcript_tail();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Session renamed to: {new_title}"),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages.add(DisplayMessage::system(format!(
+                    "Session renamed to: {new_title}"
+                )));
             }
             return;
         }
         if self.handle_diagnostic_slash(text) {
             return;
         }
-        self.messages.add(DisplayMessage {
-            role: "system".to_string(),
-            content: format!("Unknown command: {text}. Type /help for commands."),
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::system(format!(
+            "Unknown command: {text}. Type /help for commands."
+        )));
     }
 
     /// Handle the `/cost` slash command.
@@ -1230,13 +1138,9 @@ impl App {
             m if m.contains("haiku") => tokens_f64.mul_add(0.000_000_25, tokens_f64 * 0.000_001_25),
             _ => 0.0,
         };
-        self.messages.add(DisplayMessage {
-            role: "system".to_string(),
-            content: format!("Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"),
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::system(format!(
+            "Session cost estimate:\n  ~{tokens} tokens\n  ~${cost:.4}"
+        )));
     }
 
     /// Handle the `/files [dir]` slash command.
@@ -1258,21 +1162,14 @@ impl App {
                     })
                     .collect();
                 items.sort();
-                self.messages.add(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("Files in {dir}:\n{}", items.join("\n")),
-                    tool_name: None,
-                    is_error: false,
-                    is_thinking: false,
-                });
+                self.messages.add(DisplayMessage::system(format!(
+                    "Files in {dir}:\n{}",
+                    items.join("\n")
+                )));
             }
-            Err(e) => self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!("Failed to list {dir}: {e}"),
-                tool_name: None,
-                is_error: true,
-                is_thinking: false,
-            }),
+            Err(e) => self
+                .messages
+                .add(DisplayMessage::error(format!("Failed to list {dir}: {e}"))),
         }
     }
 
@@ -1292,13 +1189,7 @@ impl App {
             }
             Err(e) => format!("Failed to run git diff: {e}"),
         };
-        self.messages.add(DisplayMessage {
-            role: "system".to_string(),
-            content,
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::system(content));
     }
 
     /// Handle the `/doctor` slash command (environment diagnostics).
@@ -1318,13 +1209,10 @@ impl App {
                 "✗ Memory DB: not available".to_string()
             },
         ];
-        self.messages.add(DisplayMessage {
-            role: "system".to_string(),
-            content: format!("Diagnostics:\n{}", checks.join("\n")),
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::system(format!(
+            "Diagnostics:\n{}",
+            checks.join("\n")
+        )));
     }
 
     /// Handle the `/review` slash command (shows truncated `git diff HEAD`).
@@ -1352,25 +1240,15 @@ impl App {
             }
             Err(e) => format!("Failed to run git diff: {e}"),
         };
-        self.messages.add(DisplayMessage {
-            role: "system".to_string(),
-            content,
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::system(content));
     }
 
     /// Handle the `/init` slash command (create config if absent).
     fn handle_slash_init(&mut self) {
         if crate::config::config_file_exists() {
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: "Config already exists. Use /doctor to check it.".to_string(),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(
+                "Config already exists. Use /doctor to check it.",
+            ));
         } else {
             let content = match std::process::Command::new("openclaudia")
                 .arg("init")
@@ -1379,13 +1257,7 @@ impl App {
                 Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
                 Err(e) => format!("Init failed: {e}"),
             };
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content,
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(content));
         }
     }
 
@@ -1406,16 +1278,10 @@ impl App {
         if text == "/context" {
             let msg_count = self.session_messages.len();
             let tokens = self.chat_session.estimate_tokens();
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}",
-                    self.model, self.provider
-                ),
-                tool_name: None,
-                is_error: false,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::system(format!(
+                "Context usage:\n  Messages: {msg_count}\n  Est. tokens: ~{tokens}\n  Model: {}\n  Provider: {}",
+                self.model, self.provider
+            )));
             return true;
         }
         if text == "/doctor" {
@@ -1460,20 +1326,24 @@ impl App {
                     result = "(no output)".to_string();
                 }
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(),
+                    kind: if out.status.success() {
+                        MessageKind::ToolOk {
+                            name: format!("$ {cmd}"),
+                        }
+                    } else {
+                        MessageKind::ToolErr {
+                            name: format!("$ {cmd}"),
+                        }
+                    },
                     content: result,
-                    tool_name: Some(format!("$ {cmd}")),
-                    is_error: !out.status.success(),
-                    is_thinking: false,
                 });
             }
             Err(e) => {
                 self.messages.add(DisplayMessage {
-                    role: "tool".to_string(),
+                    kind: MessageKind::ToolErr {
+                        name: format!("$ {cmd}"),
+                    },
                     content: format!("Failed: {e}"),
-                    tool_name: Some(format!("$ {cmd}")),
-                    is_error: true,
-                    is_thinking: false,
                 });
             }
         }
@@ -1483,13 +1353,7 @@ impl App {
     fn send_user_message(&mut self, text: String) {
         let expanded = expand_file_refs(&text);
 
-        self.messages.add(DisplayMessage {
-            role: "user".to_string(),
-            content: text,
-            tool_name: None,
-            is_error: false,
-            is_thinking: false,
-        });
+        self.messages.add(DisplayMessage::user(text));
 
         self.session_messages.push(serde_json::json!({
             "role": "user",
@@ -1522,13 +1386,9 @@ impl App {
     fn spawn_api_turn(&mut self) {
         let Some(ref handle) = self.runtime_handle else {
             // No async runtime — show fallback message
-            self.messages.add(DisplayMessage {
-                role: "system".to_string(),
-                content: "[No async runtime — cannot call API. Run with tokio.]".to_string(),
-                tool_name: None,
-                is_error: true,
-                is_thinking: false,
-            });
+            self.messages.add(DisplayMessage::error(
+                "[No async runtime — cannot call API. Run with tokio.]",
+            ));
             self.is_waiting = false;
             return;
         };
@@ -1543,7 +1403,7 @@ impl App {
         let headers = self.headers.clone();
         let provider = self.provider.clone();
         let model = self.model.clone();
-        let effort_level = self.effort_level.clone();
+        let effort_level = self.effort_level;
         let claude_code_token = self.claude_code_token.clone();
         let prompt_blocks = self.prompt_blocks.clone();
         let hook_engine = self.hook_engine.clone();
@@ -1619,11 +1479,7 @@ impl App {
 
         // ── Status bar ──
         let left_text = "? for shortcuts";
-        let effort_symbol = match self.effort_level.as_str() {
-            "low" => "\u{25CB}",
-            "high" => "\u{25CF}",
-            _ => "\u{25D0}",
-        };
+        let effort_symbol = self.effort_level.symbol();
         let right_text = format!("{effort_symbol} {} \u{00B7} /effort", self.effort_level);
 
         let bar_width = chunks[3].width as usize;
@@ -1817,7 +1673,7 @@ struct ApiTurnParams {
     headers: Vec<(String, String)>,
     provider: String,
     model: String,
-    effort_level: String,
+    effort_level: EffortLevel,
     claude_code_token: Option<String>,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
@@ -1978,7 +1834,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         &provider,
         &model,
         &session_messages,
-        &effort_level,
+        effort_level.as_str(),
         claude_code_token.as_deref(),
         prompt_blocks.as_ref(),
     );
@@ -2022,7 +1878,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     headers: &headers,
                     provider: &provider,
                     model: &model,
-                    effort_level: &effort_level,
+                    effort_level: effort_level.as_str(),
                     claude_code_token: claude_code_token.as_deref(),
                     prompt_blocks: prompt_blocks.as_ref(),
                     memory_db: memory_db.clone(),
@@ -2044,5 +1900,46 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         Err(e) => {
             let _ = tx.send(super::events::AppEvent::ApiError(e));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_file_refs;
+
+    // =========================================================================
+    // Behavior: expand_file_refs — panic-free regex handling (#292)
+    // =========================================================================
+
+    #[test]
+    fn expand_file_refs_no_at_sign_returns_input_unchanged() {
+        // Fast path: no '@' in input — function returns immediately without
+        // touching the regex.  Output must equal the input exactly.
+        let input = "hello world, no references here";
+        assert_eq!(expand_file_refs(input), input);
+    }
+
+    #[test]
+    fn expand_file_refs_double_at_does_not_panic() {
+        // Regression guard for the old `.unwrap()` on cap.get(0): a bare '@@'
+        // or '@ @' must not panic regardless of whether the regex matches.
+        let _ = expand_file_refs("@@");
+        let _ = expand_file_refs("@ @");
+        let _ = expand_file_refs("email@example.com and @another");
+    }
+
+    #[test]
+    fn expand_file_refs_unclosed_quote_does_not_panic() {
+        // A `@"` with no closing quote must not panic — the regex simply won't
+        // match group 1, and the `if let Some` guard skips it cleanly.
+        let _ = expand_file_refs(r#"@"unclosed"#);
+        let _ = expand_file_refs(r#"some text @"no end here and more text"#);
+    }
+
+    #[test]
+    fn expand_file_refs_many_at_signs_does_not_panic() {
+        // Stress: 1 000 '@' characters in a row must not panic or overflow.
+        let input = "@".repeat(1_000);
+        let _ = expand_file_refs(&input);
     }
 }

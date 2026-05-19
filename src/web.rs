@@ -16,6 +16,12 @@ use url::Url;
 /// Hostnames that always represent internal infrastructure, cloud metadata
 /// endpoints, or cluster control planes. Block by name even before DNS
 /// resolution — some of these resolve in odd ways across distros.
+///
+/// Alicloud metadata (`100.100.100.200`) and AWS IPv6 metadata
+/// (`fd00:ec2::254`) are already caught by the typed CIDR checks in
+/// `validate_resolved_ip`, but listing the literal IP string here adds a
+/// belt-and-suspenders layer for environments where DNS returns those names
+/// without resolving them.
 const DANGEROUS_HOSTNAMES: &[&str] = &[
     "localhost",
     "localhost.localdomain",
@@ -29,6 +35,8 @@ const DANGEROUS_HOSTNAMES: &[&str] = &[
     "metadata.tencentyun.com",
     "instance-data",
     "instance-data.ec2.internal",
+    // Alicloud ECS metadata service — IP literal in shared address space (100.64/10)
+    "100.100.100.200",
     // Kubernetes in-cluster endpoints
     "kubernetes",
     "kubernetes.default",
@@ -72,7 +80,7 @@ fn is_ipv6_forbidden(v6: &Ipv6Addr) -> bool {
         return is_ip_forbidden(&IpAddr::V4(v4));
     }
     let s = v6.segments();
-    // Unique-local fc00::/7
+    // Unique-local fc00::/7 — covers fd00:ec2::254 (AWS IPv6 metadata)
     if s[0] & 0xfe00 == 0xfc00 {
         return true;
     }
@@ -89,6 +97,49 @@ fn is_ipv6_forbidden(v6: &Ipv6Addr) -> bool {
         return true;
     }
     false
+}
+
+/// Validate that a resolved [`IpAddr`] is safe to connect to (SSRF guard).
+///
+/// Returns `Ok(())` for routable public addresses; returns `Err` with a
+/// human-readable explanation for any IANA-reserved, private, link-local,
+/// cloud-metadata, or otherwise non-public range.
+///
+/// Covered ranges (IPv4):
+/// - 0.0.0.0/8 (unspecified)
+/// - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC 1918 private)
+/// - 100.64.0.0/10 (RFC 6598 carrier-grade NAT / shared address space;
+///   covers Alicloud metadata 100.100.100.200)
+/// - 127.0.0.0/8 (loopback)
+/// - 169.254.0.0/16 (link-local / AWS + Azure + GCP metadata)
+/// - 192.0.0.0/24 (IETF protocol assignments)
+/// - 198.18.0.0/15 (RFC 2544 benchmarking)
+/// - 203.0.113.0/24, 198.51.100.0/24, 192.0.2.0/24 (documentation)
+/// - 224.0.0.0/4 (multicast)
+/// - 240.0.0.0/4 (reserved for future use)
+/// - 255.255.255.255/32 (broadcast)
+///
+/// Covered ranges (IPv6):
+/// - `::1/128` (loopback)
+/// - `::/128` (unspecified)
+/// - `::ffff:0:0/96` (IPv4-mapped — re-checked as IPv4)
+/// - `fc00::/7` (unique-local; covers `fd00:ec2::254` AWS IPv6 metadata)
+/// - `fe80::/10` (link-local)
+/// - `2002::/16` (6to4 tunnel)
+/// - `2001::/32` (Teredo tunnel)
+/// - `ff00::/8` (multicast)
+///
+/// # Errors
+///
+/// Returns `Err(String)` when `addr` falls in a reserved/internal range.
+pub(crate) fn validate_resolved_ip(addr: IpAddr) -> Result<(), String> {
+    if is_ip_forbidden(&addr) {
+        Err(format!(
+            "IP address {addr} is in a reserved/internal range and cannot be fetched"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// True if this IP is on any IANA-reserved, private, or otherwise non-public
@@ -108,6 +159,7 @@ fn is_ip_forbidden(ip: &IpAddr) -> bool {
             }
             let oct = v4.octets();
             // 100.64/10 shared address space (RFC 6598 / carrier-grade NAT)
+            // Covers Alicloud metadata 100.100.100.200 (oct[1]=100, in 64..=127).
             if oct[0] == 100 && (64..=127).contains(&oct[1]) {
                 return true;
             }
@@ -144,7 +196,8 @@ fn is_ip_forbidden(ip: &IpAddr) -> bool {
 ///     is rejected — full IPv4 + IPv6 matrix, not the prefix-string heuristic
 ///     the previous implementation used.
 ///  4. DNS resolution with `ToSocketAddrs`: hostnames are resolved and EVERY
-///     resolved IP is checked against the same forbidden-range matrix.
+///     resolved IP is checked against the same forbidden-range matrix via
+///     [`validate_resolved_ip`].
 ///
 /// Residual risk: a DNS-rebinding server that returns a public IP at
 /// validate time and a private IP at `reqwest`'s dial time still bypasses
@@ -172,12 +225,9 @@ fn validate_url(url_str: &str) -> Result<(), String> {
     // If the host parses as an IP literal (standard, decimal, hex, IPv6-brackets),
     // check it directly — no DNS needed.
     if let Some(ip) = parse_host_as_ip(&host_lower) {
-        if is_ip_forbidden(&ip) {
-            return Err(format!(
-                "URL points to reserved/internal IP address: {ip} (host was '{host}')"
-            ));
-        }
-        return Ok(());
+        return validate_resolved_ip(ip).map_err(|e| {
+            format!("URL points to reserved/internal IP address (host was '{host}'): {e}")
+        });
     }
 
     // Hostname → resolve and check each address.
@@ -190,12 +240,8 @@ fn validate_url(url_str: &str) -> Result<(), String> {
         return Err(format!("Host '{host}' did not resolve to any address"));
     }
     for sa in socket_addrs {
-        let ip = sa.ip();
-        if is_ip_forbidden(&ip) {
-            return Err(format!(
-                "URL host '{host}' resolves to reserved/internal IP {ip}"
-            ));
-        }
+        validate_resolved_ip(sa.ip())
+            .map_err(|e| format!("URL host '{host}' resolves to reserved/internal IP: {e}"))?;
     }
 
     Ok(())
@@ -551,6 +597,18 @@ pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>,
 
             // Skip if no valid URL
             if url.is_empty() || !url.starts_with("http") {
+                continue;
+            }
+
+            // SSRF guard (#610): validate every URL extracted from DDG HTML before
+            // returning it to the agent.  A malicious or compromised DDG response
+            // could embed private-IP / metadata URLs in result hrefs.
+            if let Err(reason) = validate_url(&url) {
+                tracing::debug!(
+                    url = %url,
+                    reason = %reason,
+                    "DDG result URL dropped by SSRF guard"
+                );
                 continue;
             }
 
@@ -966,5 +1024,137 @@ mod tests {
     #[test]
     fn ssrf_allows_public_ipv4() {
         assert!(validate_url("http://8.8.8.8/").is_ok());
+    }
+
+    // ── Forensic bypass-vector tests (crosslink #290) ────────────────────────
+    // Each test targets a specific encoding or protocol trick that the old
+    // prefix-string guard could not detect.
+
+    /// Bypass vector 1 — decimal-integer IPv4.
+    /// `http://2130706433/` encodes 127.0.0.1 as a 32-bit decimal integer.
+    /// Some HTTP stacks (curl, Python urllib) dereference this directly.
+    /// `parse_host_as_ip` decodes it; `validate_resolved_ip` blocks it.
+    #[test]
+    fn bypass_decimal_encoded_loopback() {
+        // 127 * 2^24 + 0 * 2^16 + 0 * 2^8 + 1 = 2130706433
+        let err = validate_url("http://2130706433/secret").unwrap_err();
+        assert!(
+            err.contains("reserved/internal") || err.contains("Invalid URL"),
+            "decimal-encoded 127.0.0.1 not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 2 — hex-integer IPv4.
+    /// `http://0x7f000001/` is the hex form of 127.0.0.1.
+    #[test]
+    fn bypass_hex_encoded_loopback() {
+        let err = validate_url("http://0x7f000001/admin").unwrap_err();
+        assert!(
+            err.contains("reserved/internal") || err.contains("Invalid URL"),
+            "hex-encoded 127.0.0.1 not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 3 — IPv6 short-form loopback `[::1]`.
+    /// The bracket-stripping in `parse_host_as_ip` must handle this form.
+    #[test]
+    fn bypass_ipv6_short_form_loopback() {
+        let err = validate_url("http://[::1]:9090/").unwrap_err();
+        assert!(
+            err.contains("reserved/internal"),
+            "IPv6 ::1 short-form loopback not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 4 — IPv4-mapped IPv6 loopback `::ffff:127.0.0.1`.
+    /// `is_ipv6_forbidden` unwraps via `to_ipv4_mapped()` and re-checks the
+    /// inner IPv4 address against `is_ip_forbidden`.
+    #[test]
+    fn bypass_ipv6_mapped_loopback() {
+        let err = validate_url("http://[::ffff:127.0.0.1]/").unwrap_err();
+        assert!(
+            err.contains("reserved/internal"),
+            "::ffff:127.0.0.1 (IPv4-mapped loopback) not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 5 — AWS EC2 instance metadata service (169.254.169.254).
+    /// This is the well-known link-local address served on every AWS/Azure/GCP
+    /// VM; `Ipv4Addr::is_link_local()` catches the entire 169.254/16 range.
+    #[test]
+    fn bypass_aws_metadata_ip() {
+        let err = validate_url("http://169.254.169.254/latest/meta-data/iam/").unwrap_err();
+        assert!(
+            err.contains("reserved/internal"),
+            "169.254.169.254 (AWS metadata) not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 6 — Alicloud ECS metadata (100.100.100.200).
+    /// Sits in RFC 6598 shared address space (100.64/10);
+    /// `(64..=127).contains(&oct[1])` blocks it. Belt-and-suspenders: also
+    /// listed literally in `DANGEROUS_HOSTNAMES`, so either message is valid.
+    #[test]
+    fn bypass_alicloud_metadata_ip() {
+        let err = validate_url("http://100.100.100.200/latest/meta-data/").unwrap_err();
+        assert!(
+            err.contains("reserved/internal") || err.contains("metadata endpoint"),
+            "100.100.100.200 (Alicloud metadata) not blocked: {err}"
+        );
+    }
+
+    /// Bypass vector 7 — AWS IPv6 metadata endpoint (`fd00:ec2::254`).
+    /// Lives in `fc00::/7` (unique-local); `is_ipv6_forbidden` blocks it via the
+    /// `s[0] & 0xfe00 == 0xfc00` check.
+    #[test]
+    fn bypass_aws_ipv6_metadata_ip() {
+        let err = validate_url("http://[fd00:ec2::254]/latest/meta-data/").unwrap_err();
+        assert!(
+            err.contains("reserved/internal"),
+            "fd00:ec2::254 (AWS IPv6 metadata) not blocked: {err}"
+        );
+    }
+
+    /// Positive case — a known public IP must NOT be rejected.
+    /// Regression guard against the old `172.2*` prefix bug that blocked
+    /// `172.200.x` (public address space).
+    #[test]
+    fn bypass_public_ipv4_is_allowed() {
+        assert!(
+            validate_url("http://172.200.0.1/public-resource").is_ok(),
+            "172.200.0.1 (public) was wrongly rejected"
+        );
+    }
+
+    /// Positive case — a public hostname must NOT be rejected.
+    /// Guards against over-blocking in the hostname denylist or resolver path.
+    #[test]
+    fn bypass_public_hostname_is_allowed() {
+        // example.com resolves to public addresses (93.184.216.34) and is
+        // the canonical safe hostname for tests.
+        assert!(
+            validate_url("https://example.com/").is_ok(),
+            "example.com (public hostname) was wrongly rejected"
+        );
+    }
+
+    /// Direct unit test for `validate_resolved_ip` — private RFC 1918 address.
+    #[test]
+    fn validate_resolved_ip_rejects_rfc1918() {
+        let private = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        assert!(
+            validate_resolved_ip(private).is_err(),
+            "192.168.1.100 (RFC1918) not rejected by validate_resolved_ip"
+        );
+    }
+
+    /// Direct unit test for `validate_resolved_ip` — public address passes.
+    #[test]
+    fn validate_resolved_ip_allows_public() {
+        let public = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(
+            validate_resolved_ip(public).is_ok(),
+            "8.8.8.8 (public) wrongly rejected by validate_resolved_ip"
+        );
     }
 }

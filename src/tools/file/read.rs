@@ -4,8 +4,55 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
+
+/// Hard cap on file size accepted by all read functions.  Prevents OOM via
+/// `/dev/zero` and similar unbounded sources.  10 MiB is generous for any
+/// text file an agent would realistically need to read in full; callers
+/// should use `offset`+`limit` or `grep` for larger artifacts.
+const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Return `(error_message, is_error=true)` if `path` is too large or is a
+/// special device file that bypasses the size check (e.g., `/dev/zero`
+/// reports `len()==0` but is effectively infinite).
+fn check_file_safety(path: &str) -> Option<(String, bool)> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return Some((format!("Cannot stat '{path}': {e}"), true)),
+    };
+
+    // On Unix, block character devices, block devices, FIFOs, and sockets —
+    // these can have metadata.len()==0 but produce unbounded data on read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let ft = meta.file_type();
+        if ft.is_char_device() || ft.is_block_device() || ft.is_fifo() || ft.is_socket() {
+            return Some((
+                format!(
+                    "File '{path}' is a special device (char/block/fifo/socket) and cannot be \
+                     read safely. Provide a regular file path."
+                ),
+                true,
+            ));
+        }
+    }
+
+    if meta.len() > MAX_FILE_SIZE_BYTES {
+        return Some((
+            format!(
+                "File '{path}' is too large ({} bytes; cap {MAX_FILE_SIZE_BYTES} bytes). \
+                 Use offset+limit for partial read or grep for search.",
+                meta.len()
+            ),
+            true,
+        ));
+    }
+
+    None
+}
 
 /// Supported file types for `read_file`
 pub enum FileType {
@@ -38,21 +85,29 @@ pub fn detect_file_type(path: &str) -> FileType {
 
 /// Read an image file, base64-encode it, and return a structured result
 pub fn read_image_file(path: &str, mime_type: &str) -> (String, bool) {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let file_size = bytes.len();
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let filename = Path::new(path)
-                .file_name()
-                .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
-
-            let result = format!(
-                "[Image: {filename} ({file_size} bytes, {mime_type}) - base64 data included for vision-capable models]\n{b64}"
-            );
-            (result, false)
-        }
-        Err(e) => (format!("Failed to read image file '{path}': {e}"), true),
+    if let Some(err) = check_file_safety(path) {
+        return err;
     }
+    let bytes = match fs::File::open(path) {
+        Ok(f) => {
+            let mut buf = Vec::new();
+            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_end(&mut buf) {
+                return (format!("Failed to read image file '{path}': {e}"), true);
+            }
+            buf
+        }
+        Err(e) => return (format!("Failed to read image file '{path}': {e}"), true),
+    };
+    let file_size = bytes.len();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let filename = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+
+    let result = format!(
+        "[Image: {filename} ({file_size} bytes, {mime_type}) - base64 data included for vision-capable models]\n{b64}"
+    );
+    (result, false)
 }
 
 /// Parse a page range string like "1-5", "3", or "10-20"
@@ -175,8 +230,17 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
 
 /// Read a Jupyter notebook (.ipynb) and format cells for display
 pub fn read_notebook_file(path: &str) -> (String, bool) {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
+    if let Some(err) = check_file_safety(path) {
+        return err;
+    }
+    let content = match fs::File::open(path) {
+        Ok(f) => {
+            let mut buf = String::new();
+            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_string(&mut buf) {
+                return (format!("Failed to read notebook '{path}': {e}"), true);
+            }
+            buf
+        }
         Err(e) => return (format!("Failed to read notebook '{path}': {e}"), true),
     };
 
@@ -271,6 +335,10 @@ pub fn read_notebook_file(path: &str) -> (String, bool) {
 }
 /// Read a plain text file with optional offset/limit
 pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, bool) {
+    if let Some(err) = check_file_safety(path) {
+        return err;
+    }
+
     // Get optional offset (1-indexed line number to start from)
     let offset = args
         .get("offset")
@@ -285,52 +353,58 @@ pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, boo
         .and_then(serde_json::Value::as_u64)
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
-    match fs::read_to_string(path) {
-        Ok(file_content) => {
-            let lines: Vec<&str> = file_content.lines().collect();
-            let total_lines = lines.len();
-
-            // Apply offset and limit
-            let selected_lines: Vec<(usize, &str)> = lines
-                .into_iter()
-                .enumerate()
-                .skip(offset)
-                .take(limit.unwrap_or(usize::MAX))
-                .collect();
-
-            // Add line numbers (original line numbers, not relative)
-            let numbered: Vec<String> = selected_lines
-                .iter()
-                .map(|(i, line)| format!("{:4}| {}", i + 1, line))
-                .collect();
-
-            let result = numbered.join("\n");
-
-            // Add context about what was shown
-            let suffix = if offset > 0 || limit.is_some() {
-                let shown_start = offset + 1;
-                let shown_end = offset + selected_lines.len();
-                format!("\n(showing lines {shown_start}-{shown_end} of {total_lines} total)")
-            } else {
-                String::new()
-            };
-
-            // Truncate if too long
-            if result.len() > 100_000 {
-                (
-                    format!(
-                        "{}...\n(file truncated, {} total chars){}",
-                        safe_truncate(&result, 100_000),
-                        result.len(),
-                        suffix
-                    ),
-                    false,
-                )
-            } else {
-                (format!("{result}{suffix}"), false)
+    let file_content = match fs::File::open(path) {
+        Ok(f) => {
+            let mut buf = String::new();
+            if let Err(e) = f.take(MAX_FILE_SIZE_BYTES).read_to_string(&mut buf) {
+                return (format!("Failed to read file '{path}': {e}"), true);
             }
+            buf
         }
-        Err(e) => (format!("Failed to read file '{path}': {e}"), true),
+        Err(e) => return (format!("Failed to read file '{path}': {e}"), true),
+    };
+
+    let lines: Vec<&str> = file_content.lines().collect();
+    let total_lines = lines.len();
+
+    // Apply offset and limit
+    let selected_lines: Vec<(usize, &str)> = lines
+        .into_iter()
+        .enumerate()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    // Add line numbers (original line numbers, not relative)
+    let numbered: Vec<String> = selected_lines
+        .iter()
+        .map(|(i, line)| format!("{:4}| {}", i + 1, line))
+        .collect();
+
+    let result = numbered.join("\n");
+
+    // Add context about what was shown
+    let suffix = if offset > 0 || limit.is_some() {
+        let shown_start = offset + 1;
+        let shown_end = offset + selected_lines.len();
+        format!("\n(showing lines {shown_start}-{shown_end} of {total_lines} total)")
+    } else {
+        String::new()
+    };
+
+    // Truncate if too long
+    if result.len() > 100_000 {
+        (
+            format!(
+                "{}...\n(file truncated, {} total chars){}",
+                safe_truncate(&result, 100_000),
+                result.len(),
+                suffix
+            ),
+            false,
+        )
+    } else {
+        (format!("{result}{suffix}"), false)
     }
 }
 
@@ -472,12 +546,14 @@ mod tests {
 
     #[test]
     fn read_text_missing_file_returns_error() {
-        // Behavior 1 error path: file not found
+        // Behavior 1 error path: file not found.
+        // check_file_safety now stats the file first, so the error comes from
+        // the stat call ("Cannot stat") rather than the open ("Failed to read").
         let args = HashMap::new();
         let (output, is_err) = read_text_file("/tmp/__oc_test_does_not_exist_xyz.txt", &args);
         assert!(is_err);
         assert!(
-            output.contains("Failed to read file"),
+            output.contains("Cannot stat") || output.contains("Failed to read file"),
             "error message: {output}"
         );
     }
@@ -534,10 +610,15 @@ mod tests {
 
     #[test]
     fn read_image_nonexistent_returns_error() {
-        // Behavior 2 error path: file not found
+        // Behavior 2 error path: file not found.
+        // check_file_safety stats first, so the message may be "Cannot stat"
+        // rather than "Failed to read image file".
         let (output, is_err) = read_image_file("/tmp/__oc_no_such_image.png", "image/png");
         assert!(is_err);
-        assert!(output.contains("Failed to read image file"));
+        assert!(
+            output.contains("Cannot stat") || output.contains("Failed to read image file"),
+            "error message: {output}"
+        );
     }
 
     // =========================================================================
@@ -627,6 +708,70 @@ mod tests {
         assert!(
             !output.contains("file truncated"),
             "no truncation note for small files"
+        );
+    }
+
+    // =========================================================================
+    // Behavior 9: MAX_FILE_SIZE_BYTES — OOM-safe size cap (#288)
+    // =========================================================================
+
+    /// Helper: write `size` bytes of 'a' to a temp file.
+    fn tmp_sized(size: usize) -> (NamedTempFile, String) {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        let buf = vec![b'a'; size];
+        f.write_all(&buf).expect("write");
+        let path = f.path().to_string_lossy().to_string();
+        (f, path)
+    }
+
+    #[test]
+    fn read_text_oversize_file_is_rejected_with_actionable_error() {
+        // Behavior 9: file exceeding MAX_FILE_SIZE_BYTES (10 MiB) is rejected.
+        // The error message must mention "too large" so the caller can act on it.
+        let size = (10 * 1024 * 1024) + 1; // 1 byte over the cap
+        let (_f, path) = tmp_sized(size);
+        let args = HashMap::new();
+        let (output, is_err) = read_text_file(&path, &args);
+        assert!(is_err, "oversized file must be an error: {output}");
+        assert!(
+            output.contains("too large"),
+            "error must mention 'too large': {output}"
+        );
+    }
+
+    #[test]
+    fn read_text_small_file_reads_cleanly() {
+        // Behavior 9: files well under the cap go through the bounded read path
+        // without any error or spurious truncation note.
+        let (_f, path) = tmp_text("hello world\n");
+        let args = HashMap::new();
+        let (output, is_err) = read_text_file(&path, &args);
+        assert!(!is_err, "small file must succeed: {output}");
+        assert!(output.contains("hello world"), "content present: {output}");
+    }
+
+    #[test]
+    fn read_text_empty_file_is_ok() {
+        // Behavior 9 edge: zero-byte regular file — not a device, not oversized.
+        // Must succeed with an empty body.
+        let f = NamedTempFile::new().expect("tempfile");
+        let path = f.path().to_string_lossy().to_string();
+        let args = HashMap::new();
+        let (output, is_err) = read_text_file(&path, &args);
+        assert!(!is_err, "empty file must not be an error: {output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_text_char_device_is_rejected() {
+        // Behavior 9 (Unix): /dev/null is a char device; metadata.len()==0 but
+        // check_file_safety must reject it before any read attempt.
+        let args = HashMap::new();
+        let (output, is_err) = read_text_file("/dev/null", &args);
+        assert!(is_err, "/dev/null (char device) must be rejected: {output}");
+        assert!(
+            output.contains("special device"),
+            "error must mention 'special device': {output}"
         );
     }
 }

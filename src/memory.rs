@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Memory database file name
 const MEMORY_DB_NAME: &str = "memory.db";
@@ -141,6 +141,21 @@ pub struct MemoryDb {
 }
 
 impl MemoryDb {
+    /// Acquire the connection lock, converting mutex-poison into an `anyhow` error.
+    ///
+    /// Callers **must** release the guard before any `.await` point.
+    /// All public synchronous methods use this helper so that a panicking
+    /// worker thread does not propagate an unwind into the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the internal mutex is poisoned (a previous holder panicked).
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory mutex poisoned"))
+    }
+
     /// Open or create memory database at the specified path.
     ///
     /// # Errors
@@ -190,13 +205,9 @@ impl MemoryDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if the SQL execution fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal connection mutex is poisoned.
+    /// Returns an error if the SQL execution fails or the mutex is poisoned.
     pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute_batch(sql).with_context(|| {
             format!(
                 "Failed to execute: {}",
@@ -213,13 +224,9 @@ impl MemoryDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying `DELETE` fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal connection mutex is poisoned.
+    /// Returns an error if the underlying `DELETE` fails or the mutex is poisoned.
     pub fn prune_auto_learn_table(&self, table: AutoLearnTable, keep: u32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         // SQLite does not support binding table names as parameters, so we
         // resolve the name through an exhaustive match — the compiler will
         // catch any future enum variant that has no corresponding arm.
@@ -432,16 +439,13 @@ impl MemoryDb {
 
     /// Save a new memory entry.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database insert fails.
+    /// Returns an error if the database insert fails or the mutex is poisoned.
     pub fn memory_save(&self, content: &str, tags: &[String]) -> Result<i64> {
         let tags_str = tags.join(",");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO archival_memory (content, tags) VALUES (?1, ?2)",
             params![content, tags_str],
@@ -451,18 +455,15 @@ impl MemoryDb {
 
     /// Search archival memory using full-text search.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
-    /// Returns an error if the FTS query or database read fails.
+    /// Returns an error if the FTS query or database read fails, or the mutex is poisoned.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn memory_search(&self, query: &str, limit: usize) -> Result<Vec<ArchivalMemory>> {
         let phrase_query = escape_fts5_phrase(query);
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT am.id, am.content, am.tags, am.created_at, am.updated_at,
                    bm25(archival_memory_fts) as rank
@@ -495,16 +496,13 @@ impl MemoryDb {
 
     /// Get a memory by ID.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
+    /// Returns an error if the database query fails or the mutex is poisoned.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn memory_get(&self, id: i64) -> Result<Option<ArchivalMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, content, tags, created_at, updated_at FROM archival_memory WHERE id = ?1",
         )?;
@@ -531,15 +529,12 @@ impl MemoryDb {
 
     /// Update an existing memory.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
     pub fn memory_update(&self, id: i64, content: &str) -> Result<bool> {
-        let rows = self.conn.lock().unwrap().execute(
+        let rows = self.lock_conn()?.execute(
             "UPDATE archival_memory SET content = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![content, id],
         )?;
@@ -548,27 +543,19 @@ impl MemoryDb {
 
     /// Delete a memory entry.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database delete fails.
     pub fn memory_delete(&self, id: i64) -> Result<bool> {
         let rows = self
-            .conn
-            .lock()
-            .unwrap()
+            .lock_conn()?
             .execute("DELETE FROM archival_memory WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
     /// List recent memories.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -576,7 +563,7 @@ impl MemoryDb {
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn memory_list(&self, limit: usize) -> Result<Vec<ArchivalMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, content, tags, created_at, updated_at FROM archival_memory ORDER BY updated_at DESC LIMIT ?1",
         )?;
@@ -603,15 +590,12 @@ impl MemoryDb {
 
     /// Get memory statistics.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn memory_stats(&self) -> Result<MemoryStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM archival_memory", [], |row| row.get(0))?;
         let total_size: i64 = conn.query_row(
@@ -636,16 +620,13 @@ impl MemoryDb {
 
     /// Get all core memory sections.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_core_memory(&self) -> Result<Vec<CoreMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt =
             conn.prepare("SELECT section, content, updated_at FROM core_memory ORDER BY section")?;
 
@@ -664,16 +645,13 @@ impl MemoryDb {
 
     /// Get a specific core memory section.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_core_memory_section(&self, section: &str) -> Result<Option<CoreMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare("SELECT section, content, updated_at FROM core_memory WHERE section = ?1")?;
 
@@ -692,15 +670,12 @@ impl MemoryDb {
 
     /// Update a core memory section.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database upsert fails.
     pub fn update_core_memory(&self, section: &str, content: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.lock_conn()?.execute(
             "INSERT OR REPLACE INTO core_memory (section, content, updated_at) VALUES (?1, ?2, datetime('now'))",
             params![section, content],
         )?;
@@ -728,18 +703,13 @@ impl MemoryDb {
 
     /// Clear all archival memory (keeps core memory).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database delete fails.
     pub fn clear_archival_memory(&self) -> Result<usize> {
         let rows = self
-            .conn
-            .lock()
-            .unwrap()
+            .lock_conn()?
             .execute("DELETE FROM archival_memory", [])?;
         Ok(rows)
     }
@@ -748,9 +718,6 @@ impl MemoryDb {
 
     /// Save a session summary when the session ends.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -765,7 +732,7 @@ impl MemoryDb {
     ) -> Result<i64> {
         let files_str = files_modified.join("\n");
         let issues_str = issues_worked.join("\n");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute(
             r"INSERT OR REPLACE INTO recent_sessions
                (session_id, summary, files_modified, issues_worked, started_at, ended_at)
@@ -777,9 +744,6 @@ impl MemoryDb {
 
     /// Get recent sessions (within expiry window).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -788,7 +752,7 @@ impl MemoryDb {
     pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<RecentSession>> {
         let expiry = format!("-{SHORT_TERM_EXPIRY_HOURS} hours");
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT id, session_id, summary, files_modified, issues_worked, started_at, ended_at
                FROM recent_sessions
@@ -825,9 +789,6 @@ impl MemoryDb {
 
     /// Log an activity (file read, file write, tool call, etc.).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -839,7 +800,7 @@ impl MemoryDb {
         target: &str,
         details: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO recent_activity (session_id, activity_type, target, details) VALUES (?1, ?2, ?3, ?4)",
             params![session_id, activity_type, target, details],
@@ -849,16 +810,13 @@ impl MemoryDb {
 
     /// Get recent activities for a session.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_session_activities(&self, session_id: &str) -> Result<Vec<RecentActivity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT id, session_id, activity_type, target, details, created_at
                FROM recent_activity WHERE session_id = ?1 ORDER BY created_at DESC",
@@ -882,16 +840,13 @@ impl MemoryDb {
 
     /// Get unique files modified in a session.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_session_files_modified(&self, session_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT DISTINCT target FROM recent_activity
                WHERE session_id = ?1 AND activity_type IN ('file_write', 'file_edit') ORDER BY target",
@@ -904,16 +859,13 @@ impl MemoryDb {
 
     /// Get unique issues worked on in a session.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_session_issues(&self, session_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT DISTINCT target FROM recent_activity
                WHERE session_id = ?1 AND activity_type IN ('issue_created', 'issue_closed', 'issue_comment') ORDER BY target",
@@ -926,16 +878,13 @@ impl MemoryDb {
 
     /// Clean up expired short-term memory entries.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database delete fails.
     pub fn cleanup_expired_short_term(&self) -> Result<(usize, usize)> {
         let expiry = format!("-{SHORT_TERM_EXPIRY_HOURS} hours");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let sessions_deleted = conn.execute(
             "DELETE FROM recent_sessions WHERE ended_at < datetime('now', ?1)",
             params![expiry],
@@ -984,9 +933,6 @@ impl MemoryDb {
 
     /// Save a coding pattern for a file glob.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -997,7 +943,7 @@ impl MemoryDb {
         pattern_type: &str,
         description: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM coding_patterns WHERE file_glob = ?1 AND pattern_type = ?2 AND description = ?3",
@@ -1016,16 +962,13 @@ impl MemoryDb {
 
     /// Get coding patterns matching a file path (checks against globs).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_patterns_for_file(&self, file_path: &str) -> Result<Vec<CodingPattern>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, file_glob, pattern_type, description, confidence, created_at, updated_at FROM coding_patterns ORDER BY confidence DESC",
         )?;
@@ -1054,9 +997,6 @@ impl MemoryDb {
 
     /// Record that two files were edited together (upsert).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -1067,7 +1007,7 @@ impl MemoryDb {
         } else {
             (file_b, file_a)
         };
-        self.conn.lock().unwrap().execute(
+        self.lock_conn()?.execute(
             r"INSERT INTO file_relationships (file_a, file_b) VALUES (?1, ?2)
                ON CONFLICT(file_a, file_b) DO UPDATE SET co_edit_count = co_edit_count + 1, last_seen = datetime('now')",
             params![fa, fb],
@@ -1077,16 +1017,13 @@ impl MemoryDb {
 
     /// Get files frequently co-edited with the given file.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_related_files(&self, file_path: &str) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT CASE WHEN file_a = ?1 THEN file_b ELSE file_a END as related, co_edit_count
                FROM file_relationships WHERE file_a = ?1 OR file_b = ?1
@@ -1102,9 +1039,6 @@ impl MemoryDb {
 
     /// Save or update an error pattern.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -1115,7 +1049,7 @@ impl MemoryDb {
         file_context: Option<&str>,
         resolution: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let existing: Option<(i64, Option<String>)> = conn
             .query_row(
                 "SELECT id, resolution FROM error_patterns WHERE error_signature = ?1 AND (file_context = ?2 OR (?2 IS NULL AND file_context IS NULL))",
@@ -1138,16 +1072,13 @@ impl MemoryDb {
 
     /// Get error patterns for a specific file.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_error_patterns_for_file(&self, file_path: &str) -> Result<Vec<ErrorPattern>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             r"SELECT id, error_signature, file_context, resolution, occurrences, created_at, updated_at
                FROM error_patterns WHERE file_context = ?1 ORDER BY occurrences DESC LIMIT 10",
@@ -1172,9 +1103,6 @@ impl MemoryDb {
 
     /// Update the resolution for an existing error pattern.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -1185,7 +1113,7 @@ impl MemoryDb {
         file_context: Option<&str>,
         resolution: &str,
     ) -> Result<bool> {
-        let rows = self.conn.lock().unwrap().execute(
+        let rows = self.lock_conn()?.execute(
             "UPDATE error_patterns SET resolution = ?1, updated_at = datetime('now') WHERE error_signature = ?2 AND (file_context = ?3 OR (?3 IS NULL AND file_context IS NULL)) AND resolution IS NULL",
             params![resolution, error_signature, file_context],
         )?;
@@ -1196,9 +1124,6 @@ impl MemoryDb {
 
     /// Save a learned user preference.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
@@ -1209,7 +1134,7 @@ impl MemoryDb {
         preference: &str,
         source: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM learned_preferences WHERE category = ?1 AND preference = ?2",
@@ -1229,16 +1154,13 @@ impl MemoryDb {
 
     /// Get all learned preferences.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn get_all_preferences(&self) -> Result<Vec<LearnedPreference>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, category, preference, source, confidence, created_at, updated_at FROM learned_preferences ORDER BY confidence DESC",
         )?;
@@ -1334,15 +1256,12 @@ impl MemoryDb {
 
     /// Get auto-learning statistics.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database queries fail.
     pub fn auto_learn_stats(&self) -> Result<AutoLearnStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let patterns: i64 =
             conn.query_row("SELECT COUNT(*) FROM coding_patterns", [], |row| row.get(0))?;
         let relationships: i64 =
@@ -1373,15 +1292,12 @@ impl MemoryDb {
 
     /// Reset everything including core memory, short-term memory, and auto-learning data.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal database mutex is poisoned.
     ///
     /// # Errors
     ///
     /// Returns an error if the database batch execution fails.
     pub fn reset_all(&self) -> Result<()> {
-        self.conn.lock().unwrap().execute_batch(
+        self.lock_conn()?.execute_batch(
             r"
             DELETE FROM archival_memory;
             DELETE FROM core_memory;
@@ -1889,5 +1805,84 @@ mod tests {
             let result = db.prune_auto_learn_table(table, 100);
             assert!(result.is_ok(), "prune on empty {table:?} must succeed");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #278 — MemoryDb ops are safe to call from async context via spawn_blocking.
+    //
+    // Forensic evidence: `MemoryDb` wrapped `rusqlite::Connection` in
+    // `std::sync::Mutex`.  Public methods called `.lock().unwrap()`, which
+    // (a) panics on mutex poison instead of returning `Err`, and
+    // (b) blocks the Tokio worker thread for the full duration of the SQLite
+    //     call when invoked from an async context without `spawn_blocking`.
+    //
+    // Fix applied: all `.lock().unwrap()` replaced with `lock_conn()?` which
+    // converts mutex poison into `anyhow::Error` via `map_err`.  The test
+    // below demonstrates the correct async call pattern: the `Arc<MemoryDb>`
+    // is moved into `spawn_blocking` so the synchronous SQLite I/O executes
+    // on a dedicated blocking thread and never occupies the async executor.
+    // -----------------------------------------------------------------------
+
+    /// #278: `MemoryDb` round-trip via `spawn_blocking` — save on blocking thread,
+    /// search on blocking thread, results visible across both calls.
+    #[tokio::test]
+    async fn issue_278_memory_db_round_trip_via_spawn_blocking() {
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(MemoryDb::open(&dir.path().join("test.db")).unwrap());
+
+        // Write: move Arc into blocking thread — guard dropped before .await.
+        let db_write = Arc::clone(&db);
+        let saved_id = tokio::task::spawn_blocking(move || {
+            db_write.memory_save("blocking thread write for #278", &["spawn_blocking".into()])
+        })
+        .await
+        .expect("spawn_blocking join must succeed")
+        .expect("memory_save must succeed");
+
+        assert!(saved_id > 0, "inserted row must have positive id");
+
+        // Read: separate spawn_blocking call — guard is fully released before .await.
+        let db_read = Arc::clone(&db);
+        let results = tokio::task::spawn_blocking(move || db_read.memory_search("blocking", 10))
+            .await
+            .expect("spawn_blocking join must succeed")
+            .expect("memory_search must succeed");
+
+        assert_eq!(results.len(), 1, "search must find exactly the saved entry");
+        assert_eq!(results[0].id, saved_id);
+        assert!(
+            results[0].content.contains("blocking thread write"),
+            "content must round-trip"
+        );
+    }
+
+    /// #278: `lock_conn` converts mutex poison into `Err` rather than panicking.
+    ///
+    /// We poison the mutex by spawning a thread that locks it and panics while
+    /// holding the guard, then verify that `memory_save` returns `Err` with a
+    /// message containing "poisoned" instead of unwinding the current thread.
+    #[test]
+    fn issue_278_poisoned_mutex_returns_err_not_panic() {
+        let dir = tempdir().unwrap();
+        let db = std::sync::Arc::new(MemoryDb::open(&dir.path().join("test.db")).unwrap());
+
+        // Poison the mutex by locking and panicking inside a scoped thread.
+        let db_poison = std::sync::Arc::clone(&db);
+        let _ = std::thread::spawn(move || {
+            let _guard = db_poison.conn.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join(); // join returns Err (thread panicked) — that's expected.
+
+        // After poisoning, lock_conn() must return Err, not panic.
+        let result = db.memory_save("should fail", &[]);
+        assert!(result.is_err(), "poisoned mutex must yield Err, not panic");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("poison"),
+            "error message must mention 'poison': {msg}"
+        );
     }
 }

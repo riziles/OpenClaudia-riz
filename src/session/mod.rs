@@ -28,6 +28,17 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// Maximum number of [`TurnMetrics`] entries retained in [`Session::turn_metrics`].
+///
+/// Once this cap is reached, `record_turn_estimate` evicts the oldest entry
+/// (index 0) before pushing the new one, so the vector never grows beyond
+/// `MAX_TURN_METRICS` elements.  The [`Session::cumulative_usage`] counter
+/// continues to accumulate across all turns regardless of eviction.
+///
+/// Chosen to cover ~2.8 hours of turns at 10 s/turn while keeping the
+/// serialised session JSON under ~500 KB for the default [`TurnMetrics`] size.
+pub const MAX_TURN_METRICS: usize = 1_000;
+
 /// Write data to a file atomically: write to a temp file, then rename.
 /// If the process crashes during the write, the original file is untouched.
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
@@ -95,9 +106,13 @@ pub struct Session {
     /// Cumulative token usage across all turns
     #[serde(default)]
     pub cumulative_usage: TokenUsage,
-    /// Per-turn metrics history
+    /// Per-turn metrics history (capped at [`MAX_TURN_METRICS`] entries)
     #[serde(default)]
     pub turn_metrics: Vec<TurnMetrics>,
+    /// Monotonically increasing count of all turns ever recorded, including
+    /// those evicted from the `turn_metrics` ring.  Never decremented.
+    #[serde(default)]
+    pub total_turns: u64,
 }
 
 impl Session {
@@ -116,6 +131,7 @@ impl Session {
             total_tokens: 0,
             cumulative_usage: TokenUsage::default(),
             turn_metrics: Vec::new(),
+            total_turns: 0,
         }
     }
 
@@ -134,6 +150,7 @@ impl Session {
             total_tokens: 0,
             cumulative_usage: TokenUsage::default(),
             turn_metrics: Vec::new(),
+            total_turns: 0,
         }
     }
 
@@ -154,7 +171,13 @@ impl Session {
         self.touch();
     }
 
-    /// Record metrics for an API turn (pre-request estimation)
+    /// Record metrics for an API turn (pre-request estimation).
+    ///
+    /// The in-memory ring is capped at [`MAX_TURN_METRICS`] entries: when the
+    /// vector is already at capacity the oldest entry is evicted before the new
+    /// one is pushed, so memory usage stays bounded regardless of session
+    /// length.  [`Session::cumulative_usage`] is **not** affected by eviction —
+    /// it continues to accumulate across all turns.
     pub fn record_turn_estimate(
         &mut self,
         estimated_input_tokens: usize,
@@ -162,7 +185,14 @@ impl Session {
         system_prompt_tokens: usize,
         tool_def_tokens: usize,
     ) -> u64 {
-        let turn_number = self.turn_metrics.len() as u64 + 1;
+        // Evict the oldest entry when at capacity so the vec stays bounded.
+        if self.turn_metrics.len() >= MAX_TURN_METRICS {
+            self.turn_metrics.remove(0);
+        }
+        // Use the cumulative turn counter so turn_number is monotonically
+        // increasing even after old entries are evicted from the ring.
+        self.total_turns += 1;
+        let turn_number = self.total_turns;
         self.turn_metrics.push(TurnMetrics {
             turn_number,
             estimated_input_tokens,
@@ -197,7 +227,7 @@ impl Session {
         let mut s = String::new();
         let _ = writeln!(s, "Session: {}", self.id);
         let _ = writeln!(s, "Mode: {:?}", self.mode);
-        let _ = writeln!(s, "Turns: {}", self.turn_metrics.len());
+        let _ = writeln!(s, "Turns: {}", self.total_turns);
         let _ = writeln!(s, "Requests: {}", self.request_count);
         let _ = writeln!(
             s,
@@ -340,7 +370,7 @@ impl Session {
                 "- Cache read: {} tokens",
                 self.cumulative_usage.cache_read_tokens
             );
-            let _ = writeln!(handoff, "- Turns: {}", self.turn_metrics.len());
+            let _ = writeln!(handoff, "- Turns: {}", self.total_turns);
         }
 
         handoff
@@ -862,6 +892,107 @@ mod tests {
         assert!(
             manager.take_vdd_context().is_none(),
             "take_vdd_context must be destructive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #285 — Session.turn_metrics grows unbounded — memory leak in long sessions
+    //
+    // Forensic evidence: every API turn called `session.record_turn_estimate()`
+    // which pushed a full `TurnMetrics` struct (11 fields, including
+    // `Option<TokenUsage>`) onto `Session.turn_metrics: Vec<TurnMetrics>` with
+    // no truncation.  For a 24-hour agent loop at 10 s/turn that is 8 640
+    // entries.  `Session` derives `Clone` and is cloned at multiple call sites,
+    // each clone duplicating the full history.  On `end_session` the entire vec
+    // is serialised to JSON and fsynced, growing proportionally.
+    //
+    // Fix applied: `MAX_TURN_METRICS = 1_000` cap.  When the vec is at capacity
+    // `record_turn_estimate` evicts the oldest entry (`remove(0)`) before
+    // pushing the new one.  A separate `total_turns: u64` field tracks the true
+    // cumulative turn count so `turn_number` stays monotonically increasing and
+    // `cumulative_usage` is unaffected by eviction.
+    // -----------------------------------------------------------------------
+
+    /// #285: push 10 000 turns — `turn_metrics` vec must never exceed
+    /// `MAX_TURN_METRICS` and `total_turns` must equal exactly 10 000.
+    #[test]
+    fn issue_285_turn_metrics_stays_bounded_under_push_pressure() {
+        let mut session = Session::new_initializer();
+
+        let pushes = MAX_TURN_METRICS * 10; // 10 000 turns
+        for _ in 0..pushes {
+            session.record_turn_estimate(1_000, 100, 80, 20);
+        }
+
+        assert_eq!(
+            session.turn_metrics.len(),
+            MAX_TURN_METRICS,
+            "turn_metrics.len() must be capped at MAX_TURN_METRICS after {pushes} pushes",
+        );
+        assert_eq!(
+            session.total_turns, pushes as u64,
+            "total_turns must equal the total number of record_turn_estimate calls"
+        );
+    }
+
+    /// #285: after eviction, `turn_number` in the remaining entries is still
+    /// monotonically increasing (oldest entries were evicted, not shuffled).
+    #[test]
+    fn issue_285_evicted_turn_numbers_remain_monotonic() {
+        let mut session = Session::new_initializer();
+
+        // Push cap + 5 entries so eviction has definitely happened.
+        let pushes = MAX_TURN_METRICS + 5;
+        for _ in 0..pushes {
+            session.record_turn_estimate(500, 50, 40, 10);
+        }
+
+        // The ring holds the most-recent MAX_TURN_METRICS entries.
+        // Their turn_numbers must be strictly increasing.
+        let nums: Vec<u64> = session.turn_metrics.iter().map(|t| t.turn_number).collect();
+        for window in nums.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "turn_numbers must be strictly increasing after eviction: {:?}",
+                &window
+            );
+        }
+
+        // The oldest retained entry's turn_number must be > the evicted count.
+        let evicted = (pushes - MAX_TURN_METRICS) as u64;
+        assert!(
+            nums[0] > evicted,
+            "first retained turn_number ({}) must be > evicted count ({})",
+            nums[0],
+            evicted
+        );
+    }
+
+    /// #285: `cumulative_usage` accumulates across all turns including evicted ones —
+    /// it must not be reset when the ring wraps.
+    #[test]
+    fn issue_285_cumulative_usage_unaffected_by_eviction() {
+        let mut session = Session::new_initializer();
+
+        // Push enough turns to trigger eviction, recording actual usage each time.
+        let turns = MAX_TURN_METRICS + 50;
+        for _ in 0..turns {
+            session.record_turn_estimate(100, 10, 8, 2);
+            session.record_actual_usage(crate::session::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        }
+
+        assert_eq!(
+            session.cumulative_usage.input_tokens, turns as u64,
+            "cumulative input_tokens must count all turns, not just retained ones"
+        );
+        assert_eq!(
+            session.cumulative_usage.output_tokens, turns as u64,
+            "cumulative output_tokens must count all turns, not just retained ones"
         );
     }
 }
