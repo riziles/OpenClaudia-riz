@@ -226,7 +226,7 @@ impl ChatRepl {
             ChatSession::new(&model, &config.proxy.target, initial_behavior_mode);
         maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
 
-        let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id);
+        let audit_logger = openclaudia::session::AuditLogger::new(&chat_session.id)?;
         let memory_db: Option<memory::MemoryDb> = init_memory_with_banner();
         let permission_mgr = init_permission_manager(&config);
         let vdd_engine: Option<vdd::VddEngine> = init_vdd_engine_if_enabled(&config);
@@ -1080,7 +1080,7 @@ impl ChatRepl {
         let (full_content, tool_calls) = Self::emit_gemini_initial_text_and_calls(&gemini_json);
         let (input_tokens, output_tokens) = gemini_extract_usage_tokens(&gemini_json);
 
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log(
             "model_response",
             &serde_json::json!({
                 "model": &self.model,
@@ -1088,7 +1088,9 @@ impl ChatRepl {
                 "tool_calls": tool_calls.len(),
                 "cancelled": false,
             }),
-        );
+        ) {
+            tracing::warn!("Audit log failed for model_response: {e}");
+        }
 
         let contents: Vec<serde_json::Value> = serde_json::from_value(
             request_body
@@ -1372,14 +1374,19 @@ impl ChatRepl {
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log_security(
             "tool_call",
             &serde_json::json!({
                 "name": &tool_call.function.name,
                 "arguments": &tool_call.function.arguments,
                 "id": &tool_call.id,
             }),
-        );
+        ) {
+            // log_security already emitted tracing::error!; surface to stderr
+            // so the user sees the failure mid-session, but continue (the
+            // session itself is not corrupted by an audit-write failure).
+            tracing::error!("Security audit failed for tool_call: {e}");
+        }
 
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
         let result = memory_db.map_or_else(
@@ -1513,13 +1520,15 @@ impl ChatRepl {
         let mut anthropic_accumulator = tools::AnthropicToolAccumulator::new();
         let mut stream_usage = openclaudia::session::TokenUsage::default();
 
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log(
             "model_request",
             &serde_json::json!({
                 "model": &self.model,
                 "provider": &self.config.proxy.target,
             }),
-        );
+        ) {
+            tracing::warn!("Audit log failed for model_request: {e}");
+        }
 
         let stream_result = self
             .consume_initial_stream(
@@ -1575,7 +1584,7 @@ impl ChatRepl {
         cancelled: bool,
         stream_usage: &openclaudia::session::TokenUsage,
     ) {
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log(
             "model_response",
             &serde_json::json!({
                 "model": &self.model,
@@ -1586,7 +1595,9 @@ impl ChatRepl {
                     "output_tokens": stream_usage.output_tokens,
                 },
             }),
-        );
+        ) {
+            tracing::warn!("Audit log failed for model_response: {e}");
+        }
     }
 
     /// Compute cost + tokens for the initial stream and render the
@@ -1969,7 +1980,7 @@ impl ChatRepl {
         );
         let final_is_error = if was_marker { false } else { result.is_error };
 
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log_security(
             "tool_result",
             &serde_json::json!({
                 "name": &tool_call.function.name,
@@ -1977,7 +1988,9 @@ impl ChatRepl {
                 "is_error": final_is_error,
                 "content_length": final_content.len(),
             }),
-        );
+        ) {
+            tracing::error!("Security audit failed for tool_result: {e}");
+        }
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
         self.push_tool_result_message(&result.tool_call_id, &final_content, final_is_error);
     }
@@ -2042,14 +2055,19 @@ impl ChatRepl {
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
-        self.audit_logger.log(
+        if let Err(e) = self.audit_logger.log_security(
             "tool_call",
             &serde_json::json!({
                 "name": &tool_call.function.name,
                 "arguments": &tool_call.function.arguments,
                 "id": &tool_call.id,
             }),
-        );
+        ) {
+            // log_security already emitted tracing::error!; surface to stderr
+            // so the user sees the failure mid-session, but continue (the
+            // session itself is not corrupted by an audit-write failure).
+            tracing::error!("Security audit failed for tool_call: {e}");
+        }
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
         let result = memory_db.map_or_else(
             || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),

@@ -188,47 +188,62 @@ where
 /// Parse YAML front matter from a markdown command file.
 /// Front matter is delimited by `---` on its own line at the start.
 /// Uses `serde_yaml` for robust parsing of the YAML block.
+///
+/// All slicing is done via `str::get` (panic-safe on non-char boundaries)
+/// even though the byte offsets here are produced from ASCII-only patterns
+/// (`"---"`, `"\n---"`) — this is defense-in-depth so future edits cannot
+/// regress into a panic on adversarial multibyte input. See crosslink #373.
 fn parse_command_front_matter(content: &str) -> CommandFrontMatter {
+    // Fallback body identical for every error/no-frontmatter branch.
+    let fallback = || CommandFrontMatter {
+        body: content.to_string(),
+        ..Default::default()
+    };
+
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return CommandFrontMatter {
-            body: content.to_string(),
-            ..Default::default()
-        };
+        return fallback();
     }
 
-    // Find the closing ---
-    let after_first = &trimmed[3..].trim_start_matches(['\r', '\n']);
-    after_first.find("\n---").map_or_else(
-        || {
-            // No closing ---, treat entire content as body
-            CommandFrontMatter {
-                body: content.to_string(),
-                ..Default::default()
-            }
-        },
-        |end_pos| {
-            let yaml_block = &after_first[..end_pos];
-            let body_start = end_pos + 4; // skip \n---
-            let body = after_first[body_start..]
-                .trim_start_matches(['\r', '\n'])
-                .to_string();
+    // Skip the opening "---" (3 ASCII bytes) and any leading CR/LF.
+    // `str::get` returns `None` on a non-char boundary instead of panicking.
+    let Some(after_open_marker) = trimmed.get(3..) else {
+        return fallback();
+    };
+    let after_first = after_open_marker.trim_start_matches(['\r', '\n']);
 
-            match serde_yaml::from_str::<CommandFrontMatter>(yaml_block) {
-                Ok(mut fm) => {
-                    fm.body = body;
-                    fm
-                }
-                Err(e) => {
-                    warn!("Failed to parse command front matter as YAML: {}", e);
-                    CommandFrontMatter {
-                        body: content.to_string(),
-                        ..Default::default()
-                    }
-                }
-            }
-        },
-    )
+    // Locate closing "\n---" (4 ASCII bytes).
+    let Some(end_pos) = after_first.find("\n---") else {
+        // No closing ---, treat entire content as body.
+        return fallback();
+    };
+
+    // Boundary-safe slice for the YAML block.
+    let Some(yaml_block) = after_first.get(..end_pos) else {
+        warn!("front matter YAML block slice landed on non-char boundary");
+        return fallback();
+    };
+
+    // body_start = end_pos + 4 (skip "\n---"). `find` guarantees
+    // end_pos + 4 <= after_first.len(), but use `get` so we never panic
+    // even if the invariant is later violated.
+    let body_start = end_pos.saturating_add(4);
+    let Some(body_slice) = after_first.get(body_start..) else {
+        warn!("front matter body slice landed on non-char boundary");
+        return fallback();
+    };
+    let body = body_slice.trim_start_matches(['\r', '\n']).to_string();
+
+    match serde_yaml::from_str::<CommandFrontMatter>(yaml_block) {
+        Ok(mut fm) => {
+            fm.body = body;
+            fm
+        }
+        Err(e) => {
+            warn!("Failed to parse command front matter as YAML: {}", e);
+            fallback()
+        }
+    }
 }
 
 /// A resolved MCP server from a plugin
@@ -1650,6 +1665,112 @@ Do something.
         assert!(fm.argument_hint.is_none());
         assert!(fm.model.is_none());
         assert_eq!(fm.body, content);
+    }
+
+    // ----- crosslink #373: panic-safety regression tests ---------------------
+    // The pre-fix implementation used raw byte slicing (`&s[..end]`,
+    // `&s[body_start..]`) into command markdown. While `find("\n---")` only
+    // ever returns ASCII-aligned offsets, defense-in-depth requires that no
+    // future edit can regress into a panic on multibyte input. These tests
+    // exercise emoji, CJK, mixed scripts, and adversarial truncation. The
+    // function must NEVER panic — it falls back to the raw body on any
+    // parse failure (matching the existing API contract).
+
+    /// Emoji (4-byte UTF-8) inside the YAML description must not panic and
+    /// must round-trip through `serde_yaml` unchanged.
+    #[test]
+    fn test_front_matter_emoji_in_yaml() {
+        let content = "---\ndescription: \"Deploy rocket \u{1F680} now\"\n---\n\nBody here.\n";
+        let fm = parse_command_front_matter(content);
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("Deploy rocket \u{1F680} now")
+        );
+        assert!(fm.body.contains("Body here."));
+    }
+
+    /// CJK content (3-byte UTF-8 codepoints) in the body section. The
+    /// closing `\n---` offset is computed in bytes — body slicing must use
+    /// char-boundary-safe access.
+    #[test]
+    fn test_front_matter_cjk_in_body() {
+        let content = "---\ndescription: cjk-test\n---\n\u{4F60}\u{597D}\u{4E16}\u{754C}\n";
+        let fm = parse_command_front_matter(content);
+        assert_eq!(fm.description.as_deref(), Some("cjk-test"));
+        assert!(
+            fm.body.contains('\u{4F60}'),
+            "CJK body must survive slicing: {:?}",
+            fm.body
+        );
+    }
+
+    /// Mixed multibyte: emoji in YAML AND CJK in body simultaneously.
+    /// Any naive byte-arithmetic regression hits both slice sites at once.
+    #[test]
+    fn test_front_matter_mixed_multibyte() {
+        let content = concat!(
+            "---\n",
+            "description: \"\u{1F4A1} idea\"\n",
+            "argument-hint: \"\u{2728} sparkle\"\n",
+            "---\n",
+            "\n",
+            "\u{65E5}\u{672C}\u{8A9E} content with \u{1F389}.\n",
+        );
+        let fm = parse_command_front_matter(content);
+        assert_eq!(fm.description.as_deref(), Some("\u{1F4A1} idea"));
+        assert_eq!(fm.argument_hint.as_deref(), Some("\u{2728} sparkle"));
+        assert!(fm.body.contains('\u{65E5}'));
+        assert!(fm.body.contains('\u{1F389}'));
+    }
+
+    /// Adversarial truncation: opening `---` followed by closing `\n---`
+    /// with nothing after it (`body_start` equals `after_first.len()`).
+    /// Pre-fix code claimed this would overflow; in practice `find`
+    /// guarantees it, but the test pins the no-panic contract.
+    #[test]
+    fn test_front_matter_truncated_at_closing_marker() {
+        let content = "---\ndescription: tiny\n---";
+        let fm = parse_command_front_matter(content);
+        // serde_yaml should parse the description; body is empty.
+        assert_eq!(fm.description.as_deref(), Some("tiny"));
+        assert_eq!(fm.body, "");
+    }
+
+    /// Malformed YAML (unclosed quote with multibyte content) must fall
+    /// back to the raw-body branch, not panic. This is the "Err not panic"
+    /// contract translated to this function's struct-return API.
+    #[test]
+    fn test_front_matter_malformed_yaml_with_multibyte_no_panic() {
+        let content = "---\ndescription: \"unterminated \u{1F525}\nallowed-tools: [Bash\n---\n\nbody \u{4E2D}\u{6587}\n";
+        // Must not panic; on YAML parse failure the whole content becomes the body.
+        let fm = parse_command_front_matter(content);
+        assert!(fm.description.is_none());
+        assert!(fm.allowed_tools.is_none());
+        assert_eq!(fm.body, content);
+    }
+
+    /// Pathological input: opening `---` then immediately EOF (no closing
+    /// marker, no body). Pre-fix `trimmed[3..]` would still work because
+    /// `---` is ASCII, but a future regression that lands the index mid-
+    /// codepoint must produce a graceful fallback, not a panic. We use
+    /// `trim_start` input prefixed with non-ASCII to also exercise the
+    /// outer `trim_start().starts_with("---")` short-circuit on multibyte.
+    #[test]
+    fn test_front_matter_unclosed_and_leading_multibyte_no_panic() {
+        // Leading multibyte prefix: function should not treat this as
+        // front matter at all (trim_start preserves the non-whitespace
+        // codepoint, so starts_with("---") is false).
+        let leading = "\u{1F600}---\ndescription: x\n";
+        let fm = parse_command_front_matter(leading);
+        assert!(fm.description.is_none());
+        assert_eq!(fm.body, leading);
+
+        // Opening marker but no closing marker — falls through to the
+        // "no closing ---" branch. Must not panic.
+        let unclosed = "---\ndescription: orphan with \u{1F4A5}\nand more \u{4E2D}\u{6587}\n";
+        let fm2 = parse_command_front_matter(unclosed);
+        assert!(fm2.description.is_none());
+        assert_eq!(fm2.body, unclosed);
     }
 
     #[test]
