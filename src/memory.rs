@@ -1291,14 +1291,65 @@ impl MemoryDb {
         })
     }
 
-    /// Reset everything including core memory, short-term memory, and auto-learning data.
+    /// Canonical seed SQL used by [`Self::reset_all`] to restore the default
+    /// core-memory rows after a wipe.
     ///
+    /// Extracted as a constant so the regression test for crosslink #400 can
+    /// substitute a deliberately failing seed and verify transactional
+    /// rollback without duplicating production seed text.
+    const DEFAULT_RESET_SEED_SQL: &'static str = r"
+        INSERT INTO core_memory (section, content) VALUES
+            ('persona', 'I am an AI assistant helping with this project. I will learn about the codebase and remember important details across sessions.'),
+            ('project_info', 'No project information recorded yet.'),
+            ('user_preferences', 'No user preferences recorded yet.');
+    ";
+
+    /// Reset everything including core memory, short-term memory, and
+    /// auto-learning data.
+    ///
+    /// The DELETEs across every table and the re-seed of `core_memory`
+    /// execute inside a single SQL transaction (crosslink #400). If the
+    /// reseed step fails — for example, because a constraint is violated —
+    /// the entire reset is rolled back so the database is never left
+    /// without `persona` / `project_info` / `user_preferences` rows.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database batch execution fails.
+    /// Returns an error if any DELETE or INSERT in the transaction fails.
+    /// On error the transaction is rolled back automatically when the
+    /// `rusqlite::Transaction` guard is dropped, leaving the previous state
+    /// intact.
     pub fn reset_all(&self) -> Result<()> {
-        self.lock_conn()?.execute_batch(
+        self.reset_all_with_seed_sql(Self::DEFAULT_RESET_SEED_SQL)
+    }
+
+    /// Transactional reset+reseed core, parameterised on the seed SQL.
+    ///
+    /// Always invoked via [`Self::reset_all`] in production with the
+    /// canonical [`Self::DEFAULT_RESET_SEED_SQL`]. The tests for
+    /// crosslink #400 use this helper with intentionally malformed seed
+    /// SQL to exercise the rollback path; it is `pub(crate)` so it is not
+    /// part of the public API.
+    pub(crate) fn reset_all_with_seed_sql(&self, seed_sql: &str) -> Result<()> {
+        // Delegate to a free function that takes the bare `&mut Connection`
+        // so the mutex guard is dropped on return — avoids
+        // clippy::significant_drop_tightening for a held `Transaction<'_>`
+        // that borrows from a named guard.
+        Self::reset_all_on_conn(&mut *self.lock_conn()?, seed_sql)
+    }
+
+    /// Inner helper: run the transactional reset on a `Connection`
+    /// reference. Extracted so the mutex guard in
+    /// [`Self::reset_all_with_seed_sql`] has no lifetime overlap with the
+    /// returned `Ok(())`.
+    fn reset_all_on_conn(conn: &mut Connection, seed_sql: &str) -> Result<()> {
+        // `transaction()` issues `BEGIN DEFERRED` and returns a Transaction
+        // whose Drop impl rolls back if `commit()` is never reached.
+        let tx = conn
+            .transaction()
+            .context("failed to begin reset_all transaction")?;
+
+        tx.execute_batch(
             r"
             DELETE FROM archival_memory;
             DELETE FROM core_memory;
@@ -1308,12 +1359,14 @@ impl MemoryDb {
             DELETE FROM file_relationships;
             DELETE FROM error_patterns;
             DELETE FROM learned_preferences;
-            INSERT INTO core_memory (section, content) VALUES
-                ('persona', 'I am an AI assistant helping with this project. I will learn about the codebase and remember important details across sessions.'),
-                ('project_info', 'No project information recorded yet.'),
-                ('user_preferences', 'No user preferences recorded yet.');
             ",
-        )?;
+        )
+        .context("reset_all: delete phase failed")?;
+
+        tx.execute_batch(seed_sql)
+            .context("reset_all: core_memory reseed failed")?;
+
+        tx.commit().context("reset_all: commit failed")?;
         Ok(())
     }
 }
@@ -1884,6 +1937,209 @@ mod tests {
         assert!(
             msg.contains("poison"),
             "error message must mention 'poison': {msg}"
+        );
+    }
+
+    // --- Regression tests for crosslink #400 -----------------------------
+    //
+    // Before the fix, `reset_all` issued one `execute_batch` containing
+    // DELETEs across every table followed by INSERTs into `core_memory`.
+    // Because `execute_batch` does NOT wrap its statements in a
+    // transaction, a crash or constraint failure between the DELETEs and
+    // the INSERTs left the database with zero rows in `core_memory` — no
+    // persona, no project_info, no user_preferences. The tests below
+    // exercise the transactional contract: success commits, mid-reseed
+    // failure rolls back, and a concurrent reader observes either the
+    // pre-reset state or the fully-reseeded state, never an in-flight
+    // empty snapshot.
+    // ---------------------------------------------------------------------
+
+    /// #400: success path — `reset_all` commits both the wipe and the
+    /// reseed as a single unit. Archival rows from before the reset are
+    /// gone, and the three canonical core-memory sections are present
+    /// afterwards.
+    #[test]
+    fn issue_400_reset_all_success_commits_wipe_and_reseed() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        // Pre-populate: archival rows plus a customised persona.
+        db.memory_save("entry one", &["a".into()]).unwrap();
+        db.memory_save("entry two", &["b".into()]).unwrap();
+        db.update_core_memory(SECTION_PERSONA, "custom persona")
+            .unwrap();
+
+        db.reset_all()
+            .expect("reset_all must succeed on healthy db");
+
+        let leftovers = db.memory_list(100).unwrap();
+        assert!(
+            leftovers.is_empty(),
+            "archival_memory must be empty after reset_all, found {} rows",
+            leftovers.len()
+        );
+
+        let core = db.get_core_memory().unwrap();
+        assert_eq!(
+            core.len(),
+            3,
+            "reset_all must reseed exactly 3 core_memory rows, found {}",
+            core.len()
+        );
+        let persona = db
+            .get_core_memory_section(SECTION_PERSONA)
+            .unwrap()
+            .expect("persona row must exist after reset_all commit");
+        assert!(
+            persona.content.starts_with("I am an AI assistant"),
+            "persona content must be the default seed, got: {}",
+            persona.content
+        );
+    }
+
+    /// #400: rollback path — if the reseed step fails (here, a duplicate
+    /// PRIMARY KEY on `core_memory.section`), the transaction's Drop impl
+    /// rolls back the preceding DELETEs. The pre-existing rows must
+    /// survive.
+    #[test]
+    fn issue_400_reset_all_mid_reseed_failure_rolls_back() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        let pre_id = db
+            .memory_save("must survive failed reset", &["preserve".into()])
+            .unwrap();
+        db.update_core_memory(SECTION_PERSONA, "pre-reset persona marker")
+            .unwrap();
+
+        // Bad seed: two rows with the same PRIMARY KEY (section='persona').
+        // The first INSERT succeeds, the second raises a UNIQUE constraint
+        // failure, which aborts the txn. Because `execute_batch` returns
+        // Err, `reset_all_with_seed_sql` never calls `tx.commit()`, so
+        // Drop on the Transaction issues ROLLBACK.
+        let bad_seed = r"
+            INSERT INTO core_memory (section, content) VALUES
+                ('persona', 'partial seed row 1'),
+                ('persona', 'duplicate primary key -> UNIQUE violation');
+        ";
+        let err = db
+            .reset_all_with_seed_sql(bad_seed)
+            .expect_err("duplicate PRIMARY KEY must propagate as Err");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("reseed") || msg.contains("unique"),
+            "error must reference the reseed phase or UNIQUE violation, got: {msg}"
+        );
+
+        // Forensic evidence: pre-reset rows are intact, NOT half-wiped.
+        let survivors = db.memory_list(100).unwrap();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "rollback must preserve archival rows; found {} (expected 1)",
+            survivors.len()
+        );
+        assert_eq!(
+            survivors[0].id, pre_id,
+            "the surviving row must be the one inserted before reset_all"
+        );
+
+        let core = db.get_core_memory().unwrap();
+        assert_eq!(
+            core.len(),
+            3,
+            "rollback must preserve the original 3 core_memory rows, found {}",
+            core.len()
+        );
+        let persona = db
+            .get_core_memory_section(SECTION_PERSONA)
+            .unwrap()
+            .expect("persona row must still exist after rollback");
+        assert_eq!(
+            persona.content, "pre-reset persona marker",
+            "rollback must restore the pre-reset persona content, got: {}",
+            persona.content
+        );
+    }
+
+    /// #400: concurrent reader sees a consistent snapshot.
+    ///
+    /// One thread loops on `reset_all` while another loops on
+    /// `get_core_memory`. The connection mutex plus rusqlite's
+    /// `Transaction` (BEGIN DEFERRED + explicit COMMIT) guarantee the
+    /// reader either sees the pre-reset state or the fully reseeded
+    /// state — never a half-wiped database with zero `core_memory` rows.
+    /// Before the fix this test would observe `core.len() == 0` between
+    /// the DELETE and the INSERT in the non-transactional
+    /// `execute_batch`.
+    #[test]
+    fn issue_400_reset_all_concurrent_reader_sees_consistent_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(MemoryDb::open(&dir.path().join("test.db")).unwrap());
+
+        // Seed some auto-learning state so reset_all has real work to do
+        // in its delete phase.
+        for i in 0..20 {
+            db.memory_save(&format!("row {i}"), &["seed".into()])
+                .unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_db = Arc::clone(&db);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let mut iterations = 0_u32;
+            while !writer_stop.load(Ordering::Relaxed) {
+                writer_db.reset_all().expect("reset_all must succeed");
+                iterations += 1;
+                if iterations >= 50 {
+                    break;
+                }
+            }
+            iterations
+        });
+
+        let reader_db = Arc::clone(&db);
+        let reader = std::thread::spawn(move || {
+            let mut observations = 0_u32;
+            let mut bad: Option<usize> = None;
+            for _ in 0..500 {
+                let core = reader_db
+                    .get_core_memory()
+                    .expect("get_core_memory must not error");
+                if core.len() != 3 {
+                    bad = Some(core.len());
+                    break;
+                }
+                observations += 1;
+            }
+            (observations, bad)
+        });
+
+        let writer_iters = writer.join().expect("writer thread panicked");
+        stop.store(true, Ordering::Relaxed);
+        let (reader_obs, bad) = reader.join().expect("reader thread panicked");
+
+        assert!(
+            bad.is_none(),
+            "reader observed inconsistent core_memory row count: got {} rows \
+             (must always be exactly 3) after {} clean observations and {} \
+             reset_all iterations — proves a non-transactional reset",
+            bad.unwrap_or_default(),
+            reader_obs,
+            writer_iters,
+        );
+        assert!(
+            writer_iters > 0,
+            "writer must have completed at least one reset_all"
+        );
+        assert!(
+            reader_obs > 0,
+            "reader must have observed core_memory at least once"
         );
     }
 }

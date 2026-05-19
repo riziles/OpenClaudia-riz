@@ -141,8 +141,40 @@ pub fn parse_page_range(pages: &str) -> Result<(u32, u32), String> {
     }
 }
 
+/// Reject file paths whose final component begins with `-`.
+///
+/// Even with `Command::arg()` (no shell), `pdftotext`/`pdfinfo` still parse
+/// their own argv: a file literally named `-help`, `--version`, `-opw`, or
+/// `-upw` is interpreted as a flag (some of which consume the *next* argv
+/// entry as a password). Rejecting flag-prefixed paths before invocation —
+/// combined with the `--` option terminator at the call site — closes that
+/// hole. See crosslink #381, #389.
+///
+/// Returns `Some(error_message)` when the path must be refused, `None` when
+/// it is safe to forward.
+fn reject_flag_prefix(path: &str) -> Option<String> {
+    // We check the path string the caller will hand to the subprocess. If
+    // the path itself starts with '-' (e.g. `-help`, `--bad.pdf`), the
+    // subprocess sees a flag at argv[1]. Absolute paths (start with `/`)
+    // and relative paths starting with `./` are immune.
+    if path.starts_with('-') {
+        return Some(format!(
+            "Refusing to invoke pdftotext/pdfinfo on path '{path}': leading '-' is interpreted \
+             as a flag by the subprocess. Pass an absolute path or prefix the relative path \
+             with './' (e.g. './{stripped}').",
+            stripped = path.trim_start_matches('-')
+        ));
+    }
+    None
+}
+
 /// Read a PDF file using pdftotext
 pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
+    // Reject any path the subprocess would parse as a flag BEFORE we spawn.
+    if let Some(err) = reject_flag_prefix(path) {
+        return (err, true);
+    }
+
     // Check if pdftotext is available
     let check = Command::new("which").arg("pdftotext").output();
     match check {
@@ -167,8 +199,10 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
 
     // If no pages specified, check total page count first
     if pages.is_none() {
-        // Use pdftotext on the whole file but first count pages with pdfinfo if available
-        let info_output = Command::new("pdfinfo").arg(path).output();
+        // Use pdftotext on the whole file but first count pages with pdfinfo if available.
+        // `--` terminates options so a hostile filename cannot be parsed as a flag
+        // (defence-in-depth alongside reject_flag_prefix above).
+        let info_output = Command::new("pdfinfo").arg("--").arg(path).output();
         if let Ok(info) = info_output {
             if info.status.success() {
                 let info_text = String::from_utf8_lossy(&info.stdout);
@@ -194,7 +228,10 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         }
     }
 
-    // Build pdftotext command
+    // Build pdftotext command.
+    // SAFETY: option terminator `--` is placed immediately before the path
+    // (and before the stdout `-` sentinel) so neither argv entry can be
+    // re-parsed as a flag. See crosslink #381, #389.
     let mut cmd = Command::new("pdftotext");
     if let Some(pages_str) = pages {
         match parse_page_range(pages_str) {
@@ -205,6 +242,7 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
             Err(e) => return (format!("Invalid pages parameter: {e}"), true),
         }
     }
+    cmd.arg("--"); // option terminator — must come before path and stdout sentinel
     cmd.arg(path);
     cmd.arg("-"); // Output to stdout
 
@@ -772,6 +810,120 @@ mod tests {
         assert!(
             output.contains("special device"),
             "error must mention 'special device': {output}"
+        );
+    }
+
+    // =========================================================================
+    // Behavior 10: pdftotext/pdfinfo flag-injection hardening (#381, #389)
+    // =========================================================================
+    //
+    // pdftotext and pdfinfo parse their OWN argv even when invoked via
+    // Command::arg() (no shell). A file named '-help', '--version', '-opw',
+    // or '-upw' is interpreted as a flag. Defence is two-layered:
+    //   1. reject_flag_prefix() refuses any path starting with '-' BEFORE spawn.
+    //   2. an explicit '--' option terminator is placed before the path arg.
+    // These tests pin both layers.
+
+    #[test]
+    fn reject_flag_prefix_rejects_single_dash_filename() {
+        // Layer 1: a bare file named '-help' must be refused.
+        let err = reject_flag_prefix("-help").expect("must reject -help");
+        assert!(
+            err.contains("leading '-'"),
+            "error must explain the cause: {err}"
+        );
+        assert!(
+            err.contains("./") || err.contains("absolute"),
+            "error must point at the remediation: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_flag_prefix_rejects_double_dash_filename() {
+        // Layer 1: '--version' would print version and skip extraction.
+        let err = reject_flag_prefix("--version").expect("must reject --version");
+        assert!(err.contains("--version"), "error mentions path: {err}");
+    }
+
+    #[test]
+    fn reject_flag_prefix_rejects_password_flag_filename() {
+        // Layer 1: '-opw' (owner password) and '-upw' (user password) consume
+        // the NEXT argv entry — the most dangerous shape. Must be refused.
+        assert!(
+            reject_flag_prefix("-opw").is_some(),
+            "owner-password flag name must be rejected"
+        );
+        assert!(
+            reject_flag_prefix("-upw").is_some(),
+            "user-password flag name must be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_flag_prefix_accepts_absolute_path() {
+        // Layer 1 positive: an absolute path is immune (starts with '/').
+        assert!(
+            reject_flag_prefix("/tmp/normal.pdf").is_none(),
+            "absolute path must pass"
+        );
+    }
+
+    #[test]
+    fn reject_flag_prefix_accepts_dot_slash_relative_path() {
+        // Layer 1 positive: explicitly-anchored relative path is safe.
+        assert!(
+            reject_flag_prefix("./doc.pdf").is_none(),
+            "./relative path must pass"
+        );
+        assert!(
+            reject_flag_prefix("subdir/doc.pdf").is_none(),
+            "plain relative path must pass"
+        );
+    }
+
+    #[test]
+    fn read_pdf_file_rejects_leading_hyphen_filename() {
+        // Layer 1 end-to-end: read_pdf_file must surface the rejection BEFORE
+        // any subprocess is spawned (so the test does not depend on poppler
+        // being installed). A leading-hyphen path is returned as is_error=true.
+        let (output, is_err) = read_pdf_file("-help", None);
+        assert!(is_err, "leading-hyphen path must be an error: {output}");
+        assert!(
+            output.contains("leading '-'") || output.contains("interpreted as a flag"),
+            "error must explain why: {output}"
+        );
+    }
+
+    #[test]
+    fn read_pdf_file_rejects_password_flag_filename_with_pages() {
+        // Layer 1 end-to-end: rejection must happen on the page-range path too,
+        // not only on the no-pages branch. '-opw' is the highest-risk shape.
+        let (output, is_err) = read_pdf_file("-opw", Some("1-3"));
+        assert!(is_err, "must reject '-opw' even with pages: {output}");
+        assert!(
+            output.contains("leading '-'") || output.contains("interpreted as a flag"),
+            "error must explain why: {output}"
+        );
+    }
+
+    #[test]
+    fn read_pdf_file_uses_double_dash_terminator_in_source() {
+        // Layer 2: the source file must place an explicit '--' option terminator
+        // immediately before the path arg in BOTH the pdfinfo and the pdftotext
+        // invocation. We assert this by inspecting the source rather than
+        // shelling out to poppler (which may not be installed in CI). This pins
+        // the defence-in-depth invariant against accidental regression.
+        let source = include_str!("read.rs");
+        // pdfinfo call site: "Command::new(\"pdfinfo\").arg(\"--\").arg(path)"
+        assert!(
+            source.contains("Command::new(\"pdfinfo\").arg(\"--\").arg(path)"),
+            "pdfinfo call must have '--' before path"
+        );
+        // pdftotext call site: separate cmd.arg("--") line, then cmd.arg(path).
+        // We look for the comment-flagged terminator line.
+        assert!(
+            source.contains("cmd.arg(\"--\"); // option terminator"),
+            "pdftotext must place '--' before the path arg"
         );
     }
 }

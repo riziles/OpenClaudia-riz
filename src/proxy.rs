@@ -1127,23 +1127,33 @@ async fn proxy_completions(
     convert_response(raw, max_bytes).await
 }
 
-/// Proxy Anthropic messages endpoint
-/// Handles OAuth Bearer token auth with Claude Code system prompt injection (like anthropic-proxy)
-async fn proxy_anthropic_messages(
-    State(state): State<ProxyState>,
-    headers: HeaderMap,
-    body: String,
-) -> Result<Response, ProxyError> {
-    let mut request: Value =
-        serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
+/// Resolved authentication for a `/v1/messages` request.
+///
+/// Modeled as an enum (rather than a pair of `Option`s) to make the
+/// "exactly one is present" invariant unrepresentable-as-broken at the
+/// type level — see crosslink #386.
+enum AnthropicAuth {
+    /// An OAuth Bearer session was matched from the request's
+    /// `anthropic_session=…` cookie.
+    Oauth(crate::oauth::OAuthSession),
+    /// No OAuth session matched; an API key was supplied either by the
+    /// caller (`Authorization` / `x-api-key`) or by provider config.
+    ApiKey(ApiKey),
+}
 
-    let provider = state
-        .config
-        .get_provider("anthropic")
-        .ok_or_else(|| ProxyError::ProviderNotConfigured("anthropic".to_string()))?;
-
-    // Check for OAuth session from cookie first
-    let session = headers
+/// Look up an OAuth session from the request's `anthropic_session`
+/// cookie, if any.
+///
+/// Returns `None` when the cookie header is absent, malformed, or
+/// names a session that is not in the store. Does NOT fall back to
+/// "any valid session" — see crosslink #375 (critical) for the
+/// reasoning. Extracted from the inline parse chain in
+/// `proxy_anthropic_messages` for crosslink #386.
+fn lookup_oauth_session_from_cookie(
+    headers: &HeaderMap,
+    oauth_store: &OAuthStore,
+) -> Option<crate::oauth::OAuthSession> {
+    headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
@@ -1159,81 +1169,132 @@ async fn proxy_anthropic_messages(
                 "[/v1/messages] Looking up session from cookie: {}",
                 session_id
             );
-            state.oauth_store.get_session(&session_id)
-        });
+            oauth_store.get_session(&session_id)
+        })
+}
 
-    // No "any valid session" fallback here. An absent cookie falls through
-    // to API-key auth below (extract_api_key / provider.api_key), rather
-    // than silently impersonating another client's OAuth session. See
-    // crosslink #375 (critical) — the prior fallback let any unauth
-    // caller (local malicious process, compromised plugin, network-adjacent
-    // attacker when bound to 0.0.0.0) charge requests to the first valid
-    // session in the store.
-
-    // If we have an OAuth session, use Bearer token auth with Claude Code prompt injection
-    if let Some(session) = session {
-        info!("[/v1/messages] Using OAuth session: {}", session.id);
-
-        // CRITICAL: Inject Claude Code system prompt (this is what makes OAuth work!)
-        // The API validates that requests contain this identifier
-        let claude_code_obj = serde_json::json!({
-            "type": "text",
-            "text": "You are Claude Code, Anthropic's official CLI for Claude."
-        });
-
-        match request.get_mut("system") {
-            Some(Value::Array(system_array)) => {
-                system_array.insert(0, claude_code_obj);
-            }
-            Some(Value::String(existing_str)) => {
-                let existing_obj = serde_json::json!({
-                    "type": "text",
-                    "text": existing_str.clone()
-                });
-                request["system"] = serde_json::json!([claude_code_obj, existing_obj]);
-            }
-            _ => {
-                request["system"] = serde_json::json!([claude_code_obj]);
-            }
-        }
-
-        // Strip TTL from cache_control objects (Anthropic API rejects TTL with OAuth)
-        strip_cache_control_ttl(&mut request);
-
-        let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
-
-        let mut builder = state.client.post(&url).json(&request);
-        // Centralized OAuth header construction — every Anthropic-specific
-        // header literal now lives on the adapter. See crosslink #338.
-        for (name, value) in
-            crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token)
-        {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        let response = builder.send().await?;
-
-        return convert_response(response, state.config.proxy.max_response_bytes).await;
+/// Resolve the authentication mode for an Anthropic `/v1/messages`
+/// request.
+///
+/// OAuth is preferred when a valid session cookie is present; otherwise
+/// an API key from `Authorization` / `x-api-key` / provider config is
+/// used. Returns `Err(ProxyError::NoApiKey)` only when neither path is
+/// available. Extracted for crosslink #386.
+fn resolve_anthropic_auth(
+    headers: &HeaderMap,
+    oauth_store: &OAuthStore,
+    provider: &ProviderConfig,
+) -> Result<AnthropicAuth, ProxyError> {
+    if let Some(session) = lookup_oauth_session_from_cookie(headers, oauth_store) {
+        return Ok(AnthropicAuth::Oauth(session));
     }
-
-    // Fallback to API key auth (no system prompt injection needed)
-    let api_key = extract_api_key(&headers)
+    let api_key = extract_api_key(headers)
         .or_else(|| provider.api_key.clone())
         .ok_or_else(|| ProxyError::NoApiKey("anthropic".to_string()))?;
+    Ok(AnthropicAuth::ApiKey(api_key))
+}
 
+/// Send an Anthropic `/v1/messages` request authenticated by an OAuth
+/// Bearer session.
+///
+/// Mutates the request body in place to (1) inject the Claude Code
+/// prefix block required for the API to accept the OAuth token and
+/// (2) strip `cache_control.ttl` (the OAuth path rejects TTL). Both
+/// transformations live in `claude_credentials` so the proxy and the
+/// CLI client share one source of truth.
+///
+/// Header construction is delegated to
+/// [`AnthropicAdapter::oauth_headers`] — there are no inline magic
+/// strings in this function. See crosslink #386 (and #272, #338).
+async fn send_oauth_anthropic_messages(
+    client: &Client,
+    provider: &ProviderConfig,
+    session: &crate::oauth::OAuthSession,
+    request: &mut Value,
+    max_bytes: usize,
+) -> Result<Response, ProxyError> {
+    info!("[/v1/messages] Using OAuth session: {}", session.id);
+
+    // CRITICAL co-requisites of every OAuth-authenticated request.
+    crate::claude_credentials::inject_oauth_prefix_only(request);
+    crate::claude_credentials::strip_cache_control_ttl(request);
+
+    let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
+    let mut builder = client.post(&url).json(request);
+    for (name, value) in
+        crate::providers::AnthropicAdapter::oauth_headers(&session.credentials.access_token)
+    {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let response = builder.send().await?;
+    convert_response(response, max_bytes).await
+}
+
+/// Send an Anthropic `/v1/messages` request authenticated by an API
+/// key.
+///
+/// Thin wrapper around [`forward_to_provider`] kept symmetric with
+/// [`send_oauth_anthropic_messages`] so the dispatch site reads
+/// uniformly. Crosslink #386.
+async fn send_api_key_anthropic_messages(
+    client: &Client,
+    provider: &ProviderConfig,
+    api_key: &ApiKey,
+    request: &Value,
+    max_bytes: usize,
+) -> Result<Response, ProxyError> {
     let is_stream = request["stream"].as_bool().unwrap_or(false);
-    let max_bytes = state.config.proxy.max_response_bytes;
     let raw = forward_to_provider(
-        &state.client,
+        client,
         provider,
         "anthropic",
-        &api_key,
+        api_key,
         "/v1/messages",
-        &request,
+        request,
         is_stream,
     )
     .await?;
-
     convert_response(raw, max_bytes).await
+}
+
+/// Proxy Anthropic messages endpoint.
+///
+/// Handles OAuth Bearer token auth (with Claude Code system-prompt
+/// injection) and falls back to API-key auth. The handler itself is
+/// kept slim — parse, resolve auth, dispatch — with the OAuth-specific
+/// transformations factored into [`crate::claude_credentials`] and the
+/// per-mode send paths into [`send_oauth_anthropic_messages`] /
+/// [`send_api_key_anthropic_messages`]. See crosslink #386.
+async fn proxy_anthropic_messages(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ProxyError> {
+    let mut request: Value =
+        serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
+
+    let provider = state
+        .config
+        .get_provider("anthropic")
+        .ok_or_else(|| ProxyError::ProviderNotConfigured("anthropic".to_string()))?;
+
+    let max_bytes = state.config.proxy.max_response_bytes;
+    match resolve_anthropic_auth(&headers, &state.oauth_store, provider)? {
+        AnthropicAuth::Oauth(session) => {
+            send_oauth_anthropic_messages(
+                &state.client,
+                provider,
+                &session,
+                &mut request,
+                max_bytes,
+            )
+            .await
+        }
+        AnthropicAuth::ApiKey(api_key) => {
+            send_api_key_anthropic_messages(&state.client, provider, &api_key, &request, max_bytes)
+                .await
+        }
+    }
 }
 
 /// Passthrough for unhandled routes
@@ -1302,27 +1363,6 @@ pub fn determine_provider(model: &str, config: &AppConfig) -> String {
         return config.proxy.target.clone();
     }
     kind.name().to_string()
-}
-
-/// Recursively strip `ttl` from any `cache_control` objects in a JSON value.
-/// Anthropic's API rejects TTL in `cache_control` when using OAuth credentials.
-fn strip_cache_control_ttl(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::Object(cc_map)) = map.get_mut("cache_control") {
-                cc_map.remove("ttl");
-            }
-            for v in map.values_mut() {
-                strip_cache_control_ttl(v);
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                strip_cache_control_ttl(v);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Extract API key from `Authorization` or `x-api-key` header.
@@ -2081,38 +2121,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Spec — `strip_cache_control_ttl` removes `ttl` from nested `cache_control`.
-    ///
-    /// Anthropic's API rejects `ttl` in `cache_control` when using OAuth credentials.
-    #[test]
-    fn strip_cache_control_ttl_removes_nested_ttl() {
-        let mut value = serde_json::json!({
-            "system": [
-                {
-                    "type": "text",
-                    "text": "hello",
-                    "cache_control": { "type": "ephemeral", "ttl": 3600 }
-                }
-            ]
-        });
-        strip_cache_control_ttl(&mut value);
-        let cc = &value["system"][0]["cache_control"];
-        assert_eq!(cc["type"], "ephemeral", "type must be preserved");
-        assert!(
-            cc.get("ttl").is_none(),
-            "ttl must be stripped from cache_control"
-        );
-    }
-
-    /// Spec — `strip_cache_control_ttl` is a no-op when there is no `ttl`.
-    #[test]
-    fn strip_cache_control_ttl_noop_when_no_ttl() {
-        let mut value = serde_json::json!({
-            "cache_control": { "type": "ephemeral" }
-        });
-        strip_cache_control_ttl(&mut value);
-        assert_eq!(value["cache_control"]["type"], "ephemeral");
-    }
+    // `strip_cache_control_ttl` lives in `claude_credentials` since
+    // crosslink #386 — its tests are colocated there. The proxy is
+    // covered indirectly by the dispatch-level tests below.
 
     // ── #304: bounded body read + swallowed-error fixes ──────────────────────
 

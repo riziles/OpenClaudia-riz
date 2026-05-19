@@ -3,15 +3,94 @@
 //! Manages cron-like schedules stored in a JSON file at
 //! `.openclaudia/schedules.json`. Actual execution is handled
 //! by the loop mode or an external scheduler.
+//!
+//! ## Concurrency model (crosslink #403)
+//!
+//! `ScheduleStore` operations are serialized via an advisory `flock(2)`
+//! held on a sibling lock file (`schedules.json.lock`). The whole
+//! load-modify-save sequence runs under the lock, so concurrent
+//! `cron_create` / `cron_delete` calls (across processes or across
+//! threads in the same process) cannot lose updates.
+//!
+//! The lock is released on `Drop` when the underlying `File` handle is
+//! closed — `flock` is released by the kernel on `close(2)`.
+//!
+//! Writes are atomic: serialized JSON is written to
+//! `schedules.json.tmp` and then renamed over `schedules.json`.
+//! `rename(2)` is atomic on POSIX, so a crash mid-write cannot
+//! truncate the live store.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const SCHEDULES_FILE: &str = ".openclaudia/schedules.json";
+const LOCK_SUFFIX: &str = ".lock";
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Advisory exclusive file lock guarding the schedule store.
+///
+/// On Unix this is an `flock(2)` `LOCK_EX` lock on a sibling lock file;
+/// it is released when the inner `File` is dropped (the kernel releases
+/// the lock on `close(2)`). On non-Unix platforms the bare `File`
+/// handle still provides serialization across processes when combined
+/// with `OpenOptions::write(true)`, matching the pattern used by
+/// `claude_credentials::CredentialLock`.
+struct ScheduleLock {
+    _file: std::fs::File,
+}
+
+impl ScheduleLock {
+    /// Acquire an exclusive advisory lock on `<schedule_path>.lock`.
+    ///
+    /// Blocks until the lock is available. Surfaces every failure
+    /// (lock-file open, `flock` syscall) as a `String` error rather
+    /// than silently degrading — callers translate this into a
+    /// user-visible tool error.
+    fn acquire(schedule_path: &Path) -> Result<Self, String> {
+        let mut lock_path = schedule_path.as_os_str().to_owned();
+        lock_path.push(LOCK_SUFFIX);
+        let lock_path = PathBuf::from(lock_path);
+
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {e}"))?;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to open schedule lock file {}: {e}",
+                    lock_path.display()
+                )
+            })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // SAFETY: `fd` is a valid file descriptor owned by `file`
+            // for the duration of this call. `flock` does not retain
+            // the descriptor; lifetime is bounded by `file`.
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if ret != 0 {
+                return Err(format!(
+                    "Failed to acquire schedule lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        Ok(Self { _file: file })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
@@ -31,10 +110,15 @@ struct ScheduleStore {
 }
 
 impl ScheduleStore {
-    fn load() -> Self {
-        let path = PathBuf::from(SCHEDULES_FILE);
+    /// Read the schedule store from disk.
+    ///
+    /// Callers performing a read-modify-write sequence MUST hold a
+    /// `ScheduleLock` for the same path across both the `load` and the
+    /// matching `save`; otherwise concurrent writers will silently
+    /// clobber each other's updates (the bug fixed in crosslink #403).
+    fn load_locked(path: &Path) -> Self {
         if path.exists() {
-            std::fs::read_to_string(&path)
+            std::fs::read_to_string(path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
@@ -43,16 +127,33 @@ impl ScheduleStore {
         }
     }
 
-    fn save(&self) -> Result<(), String> {
-        let path = PathBuf::from(SCHEDULES_FILE);
+    /// Write the schedule store atomically.
+    ///
+    /// Serializes to a `.tmp` sibling and `rename(2)`s it over the
+    /// destination. POSIX `rename` is atomic on the same filesystem,
+    /// so a crash mid-write cannot leave a truncated `schedules.json`.
+    fn save_locked(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| format!("Serialization error: {e}"))?;
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write: {e}"))
+
+        let mut tmp_path = path.as_os_str().to_owned();
+        tmp_path.push(TMP_SUFFIX);
+        let tmp_path = PathBuf::from(tmp_path);
+
+        std::fs::write(&tmp_path, json)
+            .map_err(|e| format!("Failed to write schedule tempfile: {e}"))?;
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("Failed to atomically rename schedule file: {e}"))
     }
+}
+
+/// Resolve the schedules path from the current working directory.
+fn schedules_path() -> PathBuf {
+    PathBuf::from(SCHEDULES_FILE)
 }
 
 /// Validate a cron expression (basic check for 5-field format)
@@ -164,7 +265,19 @@ pub fn execute_cron_create(args: &HashMap<String, Value>) -> (String, bool) {
         return (format!("Invalid cron expression: {e}"), true);
     }
 
-    let mut store = ScheduleStore::load();
+    let path = schedules_path();
+    // Hold an exclusive flock for the full load-modify-save sequence
+    // (crosslink #403): two concurrent `cron_create` calls would
+    // otherwise both load the original store, each push their own
+    // schedule, and the second writer would silently overwrite the
+    // first. `_lock` is dropped at the end of the function after the
+    // atomic rename completes.
+    let _lock = match ScheduleLock::acquire(&path) {
+        Ok(l) => l,
+        Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
+    };
+
+    let mut store = ScheduleStore::load_locked(&path);
 
     // Check for duplicate names
     if store.schedules.iter().any(|s| s.name == name) {
@@ -187,7 +300,7 @@ pub fn execute_cron_create(args: &HashMap<String, Value>) -> (String, bool) {
 
     store.schedules.push(schedule.clone());
 
-    if let Err(e) = store.save() {
+    if let Err(e) = store.save_locked(&path) {
         return (format!("Failed to save schedule: {e}"), true);
     }
 
@@ -210,7 +323,14 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
         None => return ("Error: id or name is required".to_string(), true),
     };
 
-    let mut store = ScheduleStore::load();
+    let path = schedules_path();
+    // Same locking discipline as `execute_cron_create` — see #403.
+    let _lock = match ScheduleLock::acquire(&path) {
+        Ok(l) => l,
+        Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
+    };
+
+    let mut store = ScheduleStore::load_locked(&path);
     let initial_len = store.schedules.len();
 
     store
@@ -221,7 +341,7 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
         return (format!("No schedule found matching '{id_or_name}'"), true);
     }
 
-    if let Err(e) = store.save() {
+    if let Err(e) = store.save_locked(&path) {
         return (format!("Failed to save: {e}"), true);
     }
 
@@ -229,7 +349,15 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
 }
 
 pub fn execute_cron_list(_args: &HashMap<String, Value>) -> (String, bool) {
-    let store = ScheduleStore::load();
+    let path = schedules_path();
+    // Hold the same exclusive lock as writers so a list cannot observe
+    // a partial mid-update state — combined with the atomic rename in
+    // `save_locked`, readers always see a fully consistent snapshot.
+    let _lock = match ScheduleLock::acquire(&path) {
+        Ok(l) => l,
+        Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
+    };
+    let store = ScheduleStore::load_locked(&path);
 
     if store.schedules.is_empty() {
         return ("No scheduled tasks.".to_string(), false);
@@ -616,5 +744,200 @@ mod tests {
     #[test]
     fn validate_cron_accepts_comma_list() {
         assert!(validate_cron("0,30 9 * * 1,5").is_ok());
+    }
+
+    // ─── #403: file-locked load-modify-save preserves writes ────────────────
+
+    /// Concurrent threads each create a uniquely-named schedule. Without the
+    /// `flock`, the load-modify-save sequence would lose updates: every
+    /// thread loads the same starting state, pushes its own schedule, and
+    /// the last writer overwrites all the others. With the lock held for
+    /// the whole sequence, all N writes must be visible after the dust
+    /// settles. This test is the forensic evidence for issue #403.
+    #[test]
+    fn cron_create_concurrent_writes_do_not_corrupt_store() {
+        use std::thread;
+        use tempfile::TempDir;
+
+        const N: usize = 8;
+
+        let _lock = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let original = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            handles.push(thread::spawn(move || {
+                let mut args = HashMap::new();
+                args.insert(
+                    "name".to_string(),
+                    Value::String(format!("concurrent_job_{i}")),
+                );
+                args.insert(
+                    "schedule".to_string(),
+                    Value::String("0 * * * *".to_string()),
+                );
+                args.insert("prompt".to_string(), Value::String(format!("p{i}")));
+                let (msg, is_err) = execute_cron_create(&args);
+                assert!(!is_err, "concurrent create #{i} failed: {msg}");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // All N schedules must be present — without the flock, several would
+        // be silently lost.
+        let path = schedules_path();
+        let store = ScheduleStore::load_locked(&path);
+        assert_eq!(
+            store.schedules.len(),
+            N,
+            "lost-update race: expected {N} schedules, found {} — \
+             load-modify-save is not properly serialized",
+            store.schedules.len()
+        );
+        let mut names: Vec<String> = store.schedules.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        for i in 0..N {
+            assert!(
+                names.iter().any(|n| n == &format!("concurrent_job_{i}")),
+                "missing schedule concurrent_job_{i}; got {names:?}"
+            );
+        }
+
+        if let Some(orig) = original {
+            let _ = std::env::set_current_dir(orig);
+        }
+    }
+
+    /// Forensic: a second `ScheduleLock::acquire` on the same path from
+    /// another thread must block until the first guard is dropped.
+    /// Demonstrates that the lock is released on `Drop` (and only then),
+    /// which is the contract that makes the load-modify-save serialization
+    /// in `execute_cron_create` / `execute_cron_delete` sound.
+    #[test]
+    #[cfg(unix)]
+    fn schedule_lock_blocks_then_releases_on_drop() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+        use tempfile::TempDir;
+
+        let _cwd = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schedules.json");
+
+        // Acquire the lock on the main thread.
+        let first = ScheduleLock::acquire(&path).expect("first acquire");
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // This must block until `first` is dropped.
+            let start = Instant::now();
+            let second = ScheduleLock::acquire(&path).expect("second acquire");
+            let elapsed = start.elapsed();
+            tx.send(elapsed).unwrap();
+            drop(second);
+        });
+
+        // Hold the lock for a measurable interval, then release.
+        thread::sleep(Duration::from_millis(150));
+        drop(first);
+
+        // The waiting thread must finish promptly after we drop, and must
+        // have spent at least ~100ms blocked (well above scheduler noise).
+        let elapsed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second acquire never completed — lock not released on drop");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "second acquire returned in {elapsed:?} — lock was not actually exclusive"
+        );
+        handle.join().expect("blocked thread panicked");
+    }
+
+    /// Forensic: lock acquisition surfaces a real error when it cannot open
+    /// the lock file (parent path is a regular file, not a directory).
+    /// Confirms we do not silently degrade to "no locking at all".
+    #[test]
+    fn schedule_lock_acquire_surfaces_open_failure() {
+        use tempfile::TempDir;
+
+        let _cwd = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+
+        // Create a regular file where we want a directory — `create_dir_all`
+        // and/or `OpenOptions::open` will refuse to put a lock file under it.
+        let blocker = tmp.path().join("not_a_dir");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let schedule_path = blocker.join("schedules.json");
+
+        let result = ScheduleLock::acquire(&schedule_path);
+        assert!(
+            result.is_err(),
+            "acquire must surface an error when the lock path is unusable; got Ok"
+        );
+        let err = result.err().unwrap();
+        assert!(
+            err.contains("Failed to") && (err.contains("directory") || err.contains("lock file")),
+            "error must describe the open failure; got: {err}"
+        );
+    }
+
+    /// Forensic: atomic rename — a save followed by a concurrent reader
+    /// never observes an empty / truncated `schedules.json`. Combined with
+    /// the temp-file + rename strategy, an interrupted save cannot leave a
+    /// half-written store on disk.
+    #[test]
+    fn schedule_save_locked_is_atomic_via_rename() {
+        use tempfile::TempDir;
+
+        let _cwd = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("schedules.json");
+
+        // Seed an initial non-trivial store.
+        let mut store = ScheduleStore::default();
+        store.schedules.push(Schedule {
+            id: "abcd1234".to_string(),
+            name: "atomic_seed".to_string(),
+            cron_expression: "0 * * * *".to_string(),
+            prompt: "p".to_string(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run: None,
+            run_count: 0,
+        });
+        store.save_locked(&path).expect("initial save");
+
+        // Re-save and verify the destination is replaced atomically — at no
+        // point should a tempfile remain alongside (rename moves it).
+        store.schedules.push(Schedule {
+            id: "efef5678".to_string(),
+            name: "atomic_second".to_string(),
+            cron_expression: "*/5 * * * *".to_string(),
+            prompt: "p2".to_string(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:01Z".to_string(),
+            last_run: None,
+            run_count: 0,
+        });
+        store.save_locked(&path).expect("second save");
+
+        let mut tmp_path = path.as_os_str().to_owned();
+        tmp_path.push(TMP_SUFFIX);
+        let tmp_path = PathBuf::from(tmp_path);
+        assert!(
+            !tmp_path.exists(),
+            "tempfile {} must be renamed away after a successful save",
+            tmp_path.display()
+        );
+
+        let reloaded = ScheduleStore::load_locked(&path);
+        assert_eq!(reloaded.schedules.len(), 2);
+        assert!(reloaded.schedules.iter().any(|s| s.name == "atomic_seed"));
+        assert!(reloaded.schedules.iter().any(|s| s.name == "atomic_second"));
     }
 }

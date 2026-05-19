@@ -37,6 +37,124 @@ use std::process::Command;
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
 
+/// Validate a user-supplied branch name before it reaches any other `git`
+/// invocation (crosslink #408).
+///
+/// `git worktree add -b <name>` historically refused option-looking arguments
+/// (those starting with `-`) only on git >= 2.17, and even modern git accepts
+/// shell-metacharacters like `;` or `&` inside ref names — which is fine for
+/// git itself, but inside the agent harness those characters then flow into
+/// log lines, prompt context, and `worktree_dir.join(&branch)` path joins.
+///
+/// This validator is intentionally stricter than git's own check:
+///
+/// 1. **Layered character rejection** runs *before* we shell out, so we never
+///    rely on the installed git version to catch dangerous inputs:
+///    * empty name → rejected
+///    * leading `-` → rejected (option-injection)
+///    * any of `;`, `&`, `|`, `` ` ``, `$`, `<`, `>`, `(`, `)`, `'`, `"`,
+///      `\n`, `\r`, `\t`, or any ASCII control character (< 0x20 or 0x7F) →
+///      rejected (shell-metacharacter / control-char hardening)
+///    * `..`, `:`, `\\`, `~`, `?`, `*`, `[` anywhere in the name → rejected
+///      (matches git's own ref rules; pinned here so we don't depend on
+///      `git check-ref-format`'s exact behavior across versions)
+///    * trailing `.` → rejected (git rule: ref must not end in `.`)
+/// 2. **`git check-ref-format --branch <name>`** then makes the final call on
+///    anything that survived the local checks. Its exit status decides
+///    accept/reject; its stderr is surfaced verbatim.
+///
+/// Both layers are required: the first guarantees we never spawn a git
+/// subprocess with an unsafe argument, the second guarantees we honor
+/// every git rule (e.g. `foo.lock`, `@`, `a@{b`) without re-implementing them.
+fn validate_branch_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("branch name is required".to_string());
+    }
+
+    if name.starts_with('-') {
+        return Err(format!(
+            "invalid branch name '{name}': must not start with '-' (option-injection guard)"
+        ));
+    }
+
+    if name.ends_with('.') {
+        return Err(format!(
+            "invalid branch name '{name}': must not end with '.'"
+        ));
+    }
+
+    for ch in name.chars() {
+        if ch.is_control() {
+            return Err(format!(
+                "invalid branch name: contains ASCII control character U+{:04X}",
+                ch as u32
+            ));
+        }
+        // Two categories of forbidden characters, merged into a single arm
+        // because the error rendering is identical:
+        //   * shell metacharacters:  ; & | ` $ < > ( ) ' " <space>
+        //   * git ref-syntax chars:  : \ ~ ? * [
+        // Both are surfaced with the same "forbidden character" message so the
+        // caller doesn't need to distinguish the category — the *fact* of
+        // rejection is what matters at the tool boundary.
+        if matches!(
+            ch,
+            ';' | '&'
+                | '|'
+                | '`'
+                | '$'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '\''
+                | '"'
+                | ' '
+                | ':'
+                | '\\'
+                | '~'
+                | '?'
+                | '*'
+                | '['
+        ) {
+            return Err(format!(
+                "invalid branch name '{name}': contains forbidden character '{ch}'"
+            ));
+        }
+    }
+
+    if name.contains("..") {
+        return Err(format!(
+            "invalid branch name '{name}': must not contain '..'"
+        ));
+    }
+
+    // Defer the remaining ref-format rules (foo.lock, @, a@{b, leading '/',
+    // empty path segments, etc.) to git itself. We pin the cwd to the system
+    // temp dir so this check never depends on being inside a git repo.
+    let tmp = std::env::temp_dir();
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", name])
+        .current_dir(&tmp)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn git check-ref-format: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(format!(
+                "invalid branch name '{name}': rejected by git check-ref-format"
+            ))
+        } else {
+            Err(format!("invalid branch name '{name}': {stderr}"))
+        }
+    }
+}
+
 /// Run a git command in a specified working directory with a timeout.
 ///
 /// `cwd` is mandatory: every call site must say *where* the git command runs.
@@ -106,6 +224,13 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
 
     if branch.is_empty() {
         return ("Error: branch name is required".to_string(), true);
+    }
+
+    // Crosslink #408: validate the branch name BEFORE any other git call.
+    // This rejects shell-metacharacters, control chars, option-injection
+    // prefixes, and forwards remaining rules to `git check-ref-format`.
+    if let Err(e) = validate_branch_name(&branch) {
+        return (format!("Error: {e}"), true);
     }
 
     let cwd = match std::env::current_dir() {
@@ -635,6 +760,150 @@ mod tests {
         assert!(
             !msg.contains("uncommitted changes") && !msg.contains("discard_changes"),
             "gap #623: OC must NOT emit a safety-guard message; got: {msg}"
+        );
+    }
+
+    // ─── #408 regression tests: branch-name validation ────────────────────────
+
+    /// Valid, ordinary branch names must pass validation.
+    #[test]
+    fn validate_branch_name_accepts_ordinary_names_408() {
+        for ok in &[
+            "feature/foo",
+            "main",
+            "release-1.2.3",
+            "topic_42",
+            "user/alice/work",
+        ] {
+            assert!(
+                validate_branch_name(ok).is_ok(),
+                "expected '{ok}' to validate; got: {:?}",
+                validate_branch_name(ok)
+            );
+        }
+    }
+
+    /// `..` is the classic path-traversal vector. The validator must reject
+    /// it before `worktree_dir = git_root.join('.worktrees').join(&branch)`
+    /// can escape the worktree root.
+    #[test]
+    fn validate_branch_name_rejects_double_dot_408() {
+        let cases = ["..", "a..b", "../escape", "foo/..", "./..", "..foo"];
+        for name in &cases {
+            let r = validate_branch_name(name);
+            assert!(r.is_err(), "expected '{name}' to be rejected; got Ok");
+        }
+    }
+
+    /// Leading `-` would let a malicious model smuggle a flag into
+    /// `git worktree add -b <name>`. Must be rejected at the validator,
+    /// not relied upon git >=2.17's own guard.
+    #[test]
+    fn validate_branch_name_rejects_leading_dash_408() {
+        for name in &["-foo", "-rf", "--upload-pack=evil", "-"] {
+            let r = validate_branch_name(name);
+            assert!(r.is_err(), "expected '{name}' to be rejected; got Ok");
+            let msg = r.unwrap_err();
+            assert!(
+                msg.contains('-') || msg.contains("option"),
+                "error must mention '-' or option-injection; got: {msg}"
+            );
+        }
+    }
+
+    /// Shell metacharacters like `;` and `&` are valid git refs but unsafe
+    /// to surface back into agent logs and prompts. The validator rejects
+    /// them even though `git check-ref-format --branch` accepts them.
+    #[test]
+    fn validate_branch_name_rejects_shell_metacharacters_408() {
+        for name in &[
+            "foo;rm -rf /",
+            "a&b",
+            "a|b",
+            "a`b`",
+            "a$b",
+            "a>b",
+            "a<b",
+            "a 'b",
+            "a\"b",
+        ] {
+            let r = validate_branch_name(name);
+            assert!(
+                r.is_err(),
+                "expected '{name}' to be rejected as shell metacharacter; got Ok"
+            );
+        }
+    }
+
+    /// Newlines, carriage returns, tabs, and other ASCII control characters
+    /// must be rejected — they corrupt log lines and can split arguments
+    /// inside the agent's prompt-rendering layer.
+    #[test]
+    fn validate_branch_name_rejects_control_chars_408() {
+        let cases = ["a\nb", "a\rb", "a\tb", "a\x01b", "a\x07b", "\x7fhello"];
+        for name in &cases {
+            let r = validate_branch_name(name);
+            assert!(
+                r.is_err(),
+                "expected control-char name {name:?} to be rejected; got Ok"
+            );
+            let msg = r.unwrap_err();
+            assert!(
+                msg.contains("control") || msg.contains("forbidden"),
+                "error must mention control / forbidden char; got: {msg}"
+            );
+        }
+    }
+
+    /// Characters explicitly forbidden by the issue's mandated refactor:
+    /// `:`, `\\`, `~`, `?`, `*`, `[`. Also pin trailing `.`.
+    #[test]
+    fn validate_branch_name_rejects_git_special_chars_408() {
+        let cases = ["a:b", "a\\b", "a~b", "a?b", "a*b", "a[b", "trailing."];
+        for name in &cases {
+            assert!(
+                validate_branch_name(name).is_err(),
+                "expected '{name}' to be rejected; got Ok"
+            );
+        }
+    }
+
+    /// End-to-end: `execute_enter_worktree` must reject a path-traversal
+    /// branch arg with `is_error=true` *without* invoking `git worktree add`.
+    /// We can't directly assert "no subprocess spawned", but if the function
+    /// short-circuits on validation we observe the validator error message,
+    /// not git's own "worktree" error.
+    #[test]
+    fn enter_worktree_rejects_path_traversal_branch_408() {
+        let _lock = cwd_lock();
+        let mut args = HashMap::new();
+        args.insert(
+            "branch".to_string(),
+            serde_json::Value::String("../escape".to_string()),
+        );
+        let (msg, is_err) = execute_enter_worktree(&args);
+        assert!(is_err, "path-traversal branch must produce is_error=true");
+        assert!(
+            msg.contains("invalid branch name") || msg.contains("'..'"),
+            "must surface validator rejection (not a git worktree-add error); got: {msg}"
+        );
+    }
+
+    /// End-to-end: `-rf` as a branch name must be rejected before reaching
+    /// `git worktree add -b -rf ...`.
+    #[test]
+    fn enter_worktree_rejects_leading_dash_branch_408() {
+        let _lock = cwd_lock();
+        let mut args = HashMap::new();
+        args.insert(
+            "branch".to_string(),
+            serde_json::Value::String("-rf".to_string()),
+        );
+        let (msg, is_err) = execute_enter_worktree(&args);
+        assert!(is_err, "leading-dash branch must produce is_error=true");
+        assert!(
+            msg.contains("invalid branch name"),
+            "must surface validator rejection; got: {msg}"
         );
     }
 

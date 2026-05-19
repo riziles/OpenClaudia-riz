@@ -407,6 +407,71 @@ pub const CLAUDE_CODE_SYSTEM_PROMPT: &str =
 /// This is where behavioral instructions and persona go.
 pub const CLAUDIA_SYSTEM_PROMPT: &str = include_str!("claude_code_prompt.txt");
 
+/// Inject only the Claude Code prefix block required for OAuth tokens.
+///
+/// Block 0: The exact one-liner prefix (API validates this string for OAuth)
+/// Block 1+: Whatever was already in the system field (preserved as-is)
+///
+/// Unlike [`inject_system_prompt`], this does NOT prepend the Claudia
+/// behavioral persona — it is the minimum mutation required for the
+/// Anthropic API to accept an OAuth Bearer request, and is used by the
+/// `/v1/messages` proxy endpoint where the caller (an arbitrary
+/// Anthropic SDK client) owns its own system prompt content.
+///
+/// Centralized here so that the magic-string prefix and the three-way
+/// match on the existing `system` shape live in one place. Previously
+/// inlined into `proxy::proxy_anthropic_messages` — see crosslink #386.
+pub fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
+    let prefix_block = serde_json::json!({
+        "type": "text",
+        "text": CLAUDE_CODE_SYSTEM_PROMPT,
+    });
+
+    match request.get_mut("system") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.insert(0, prefix_block);
+        }
+        Some(serde_json::Value::String(existing)) => {
+            let existing_obj = serde_json::json!({
+                "type": "text",
+                "text": existing.clone(),
+            });
+            request["system"] = serde_json::json!([prefix_block, existing_obj]);
+        }
+        _ => {
+            request["system"] = serde_json::json!([prefix_block]);
+        }
+    }
+}
+
+/// Recursively strip `ttl` from any `cache_control` objects in a JSON
+/// value.
+///
+/// The Anthropic Messages API rejects `cache_control.ttl` when the
+/// request is authenticated with an OAuth Bearer token (the field is
+/// only legal under `x-api-key` auth on accounts with the appropriate
+/// entitlement). Co-located with [`inject_oauth_prefix_only`] because
+/// the two are co-requisites of every OAuth-authenticated request —
+/// see crosslink #386.
+pub fn strip_cache_control_ttl(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(cc_map)) = map.get_mut("cache_control") {
+                cc_map.remove("ttl");
+            }
+            for v in map.values_mut() {
+                strip_cache_control_ttl(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_cache_control_ttl(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Inject the Claude Code system prompt into a request body.
 ///
 /// Block 0: The exact one-liner prefix (API validates this string for OAuth)
@@ -551,5 +616,91 @@ mod tests {
             "fine-grained-tool-streaming missing from anthropic-beta: {}",
             beta.1
         );
+    }
+
+    // --- Regression guards for crosslink #386: decomposition of
+    // proxy_anthropic_messages. These tests pin the wire-level behavior
+    // that was previously inlined into the proxy handler, so any future
+    // edit to the helpers preserves what subscriber clients observe.
+
+    /// Spec — `inject_oauth_prefix_only` prepends the exact prefix block
+    /// when `system` is already an array (preserves existing blocks).
+    #[test]
+    fn inject_oauth_prefix_only_prepends_to_array() {
+        let mut req = serde_json::json!({
+            "system": [{"type": "text", "text": "user-provided"}]
+        });
+        inject_oauth_prefix_only(&mut req);
+        let arr = req["system"].as_array().expect("system must be array");
+        assert_eq!(arr.len(), 2, "must prepend exactly one block");
+        assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(arr[1]["text"], "user-provided");
+    }
+
+    /// Spec — `inject_oauth_prefix_only` upgrades a string `system` to a
+    /// two-block array (prefix, then the original string).
+    #[test]
+    fn inject_oauth_prefix_only_upgrades_string() {
+        let mut req = serde_json::json!({"system": "you are helpful"});
+        inject_oauth_prefix_only(&mut req);
+        let arr = req["system"].as_array().expect("system must be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+        assert_eq!(arr[1]["text"], "you are helpful");
+    }
+
+    /// Spec — `inject_oauth_prefix_only` creates a one-block array when
+    /// `system` is missing entirely.
+    #[test]
+    fn inject_oauth_prefix_only_creates_when_absent() {
+        let mut req = serde_json::json!({});
+        inject_oauth_prefix_only(&mut req);
+        let arr = req["system"].as_array().expect("system must be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
+    }
+
+    /// Spec — `inject_oauth_prefix_only` does NOT inject the Claudia
+    /// behavioral persona block. That belongs to `inject_system_prompt`
+    /// for the CLI client, not to the proxy's pass-through behavior.
+    #[test]
+    fn inject_oauth_prefix_only_does_not_add_behavioral_block() {
+        let mut req = serde_json::json!({});
+        inject_oauth_prefix_only(&mut req);
+        let arr = req["system"].as_array().expect("system must be array");
+        assert_eq!(arr.len(), 1, "must be prefix-only, not prefix+behavioral");
+    }
+
+    /// Spec — `strip_cache_control_ttl` removes `ttl` from nested
+    /// `cache_control` objects (the OAuth API rejects TTL).
+    #[test]
+    fn strip_cache_control_ttl_removes_nested_ttl() {
+        let mut value = serde_json::json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": { "type": "ephemeral", "ttl": 3600 }
+                }
+            ]
+        });
+        strip_cache_control_ttl(&mut value);
+        let cc = &value["system"][0]["cache_control"];
+        assert_eq!(cc["type"], "ephemeral", "type must be preserved");
+        assert!(
+            cc.get("ttl").is_none(),
+            "ttl must be stripped from cache_control"
+        );
+    }
+
+    /// Spec — `strip_cache_control_ttl` is a no-op when no `ttl` is
+    /// present.
+    #[test]
+    fn strip_cache_control_ttl_noop_when_no_ttl() {
+        let mut value = serde_json::json!({
+            "cache_control": { "type": "ephemeral" }
+        });
+        strip_cache_control_ttl(&mut value);
+        assert_eq!(value["cache_control"]["type"], "ephemeral");
     }
 }
