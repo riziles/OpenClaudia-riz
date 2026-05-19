@@ -19,7 +19,7 @@ pub use guardrails::{
     BlastRadiusConfig, DiffMonitorConfig, GuardrailAction, GuardrailMode, GuardrailsConfig,
     QualityCheck, QualityGatesConfig, RunAfter,
 };
-pub use hooks::{Hook, HookEntry, HooksConfig};
+pub use hooks::{Hook, HookEntry, HookPolicy, HooksConfig, SandboxMode};
 pub use keybindings::{
     parse_chord, ChordResolveResult, KeyAction, KeyContext, KeybindingResolver, KeybindingsConfig,
     ParsedKeystroke,

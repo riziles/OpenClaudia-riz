@@ -38,7 +38,10 @@ pub use marketplace::{
     MarketplaceManifest, MarketplaceMetadata, MarketplacePlugin, MarketplaceSource, PluginSource,
     PluginSourceDef,
 };
-pub use validate::{derive_dir_name_from_url, validate_plugin_dir_name, validate_source_url};
+pub use validate::{
+    derive_dir_name_from_url, validate_plugin_dir_name, validate_source_url, PublicKey,
+    SignatureError,
+};
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -77,6 +80,23 @@ pub enum PluginError {
     /// administrator-applied denials from user preferences.
     #[error("Plugin policy rejected this source: {reason} ({scope})")]
     PolicyRejected { reason: String, scope: &'static str },
+
+    /// The plugin manifest carries no `signature` field but the active
+    /// [`policy::PluginPolicy`] includes a
+    /// [`policy::PolicyAction::RequireSignature`] action.
+    #[error("plugin '{0}' is not signed; policy requires a signature")]
+    UnsignedPlugin(String),
+
+    /// A signature was present but none of the trusted keys accepted it —
+    /// the plugin was signed by an unknown or untrusted signer.
+    #[error("plugin '{0}' signature does not match any trusted key (unknown signer)")]
+    UnknownSigner(String),
+
+    /// A signature was present and the correct key was identified, but the
+    /// cryptographic verification failed (manifest bytes may have been
+    /// tampered with after signing).
+    #[error("plugin '{0}' signature is cryptographically invalid (manifest may be tampered)")]
+    SignatureMismatch(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +396,7 @@ impl Plugin {
             agents: None,
             skills: None,
             mcp_servers,
+            signature: None,
         })
     }
 

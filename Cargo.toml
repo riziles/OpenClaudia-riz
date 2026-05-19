@@ -69,6 +69,7 @@ base64 = "0.22"
 sha2 = "0.10"
 rand = "0.10"
 url = "2"
+ed25519-dalek = "2"
 urlencoding = "2"
 
 # CLI enhancements
@@ -98,6 +99,7 @@ tempfile = "3"
 tokio-test = "0.4"
 wiremock = "0.6"
 predicates = "3"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints.clippy]
 # Group denies at priority -1 so specific overrides (priority 0) can selectively allow.

@@ -26,6 +26,27 @@
 use serde::{Deserialize, Serialize};
 
 use super::marketplace::MarketplaceSource;
+use super::validate::PublicKey;
+
+/// Actions that the policy can mandate on every plugin install.
+///
+/// Each variant represents an independent gate; the manager applies all
+/// non-`None` actions in sequence before allowing an install to proceed.
+#[derive(Debug, Clone)]
+pub enum PolicyAction {
+    /// Require a valid ed25519 signature over the manifest bytes. The install
+    /// is rejected unless the plugin's `signature` field is present **and**
+    /// verifies against at least one key in `trusted_keys`.
+    ///
+    /// Corresponds to crosslink #249 / #521 mandated-refactor point 2
+    /// (signed-manifest scheme).
+    RequireSignature {
+        /// The set of trusted signer public keys (32-byte ed25519 verifying
+        /// keys). An empty vec is treated as "no key is trusted" and will
+        /// always reject.
+        trusted_keys: Vec<PublicKey>,
+    },
+}
 
 /// Enterprise policy snapshot pulled from the settings.json layering chain.
 ///
@@ -50,6 +71,13 @@ pub struct PluginPolicy {
     /// layer (i.e. applied by an administrator, not the user).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub managed: bool,
+    /// Additional install-time actions enforced by this policy.
+    ///
+    /// Not serialized — `PolicyAction` variants carry non-serializable types
+    /// (raw key bytes). Callers populate this field programmatically from the
+    /// trust-key store after loading the base policy from JSON.
+    #[serde(skip)]
+    pub actions: Vec<PolicyAction>,
 }
 
 /// Why a marketplace was rejected. Kept as an enum rather than a

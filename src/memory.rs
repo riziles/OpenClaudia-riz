@@ -118,6 +118,22 @@ fn escape_fts5_phrase(raw: &str) -> String {
     format!("\"{inner}\"")
 }
 
+/// Tables that the auto-learning subsystem may prune.
+///
+/// Using an enum allowlist prevents callers from interpolating arbitrary
+/// table names into SQL (the `SQLi` pattern flagged in crosslink `#255`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoLearnTable {
+    /// Short-horizon code-style observations.
+    CodingPatterns,
+    /// Recorded tool-failure signatures.
+    ErrorPatterns,
+    /// Inferred user preferences.
+    LearnedPreferences,
+    /// Co-edit co-occurrence pairs.
+    FileRelationships,
+}
+
 /// Memory database handle
 pub struct MemoryDb {
     conn: Mutex<Connection>,
@@ -167,7 +183,10 @@ impl MemoryDb {
         &self.path
     }
 
-    /// Execute a raw SQL statement (for maintenance operations like pruning).
+    /// Execute a raw SQL statement (crate-internal: for test fixtures only).
+    ///
+    /// External callers must use typed methods such as [`prune_auto_learn_tables`]
+    /// to avoid SQL-injection at the call-site.
     ///
     /// # Errors
     ///
@@ -176,7 +195,7 @@ impl MemoryDb {
     /// # Panics
     ///
     /// Panics if the internal connection mutex is poisoned.
-    pub fn execute_raw(&self, sql: &str) -> Result<()> {
+    pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(sql).with_context(|| {
             format!(
@@ -184,6 +203,52 @@ impl MemoryDb {
                 crate::tools::safe_truncate(sql, 100)
             )
         })
+    }
+
+    /// Prune one auto-learning table, retaining the `keep` most-recent rows.
+    ///
+    /// Table names come from the [`AutoLearnTable`] enum allowlist so no
+    /// caller-controlled string can reach the SQL statement.  The row count
+    /// is bound as a query parameter — never interpolated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `DELETE` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal connection mutex is poisoned.
+    pub fn prune_auto_learn_table(&self, table: AutoLearnTable, keep: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // SQLite does not support binding table names as parameters, so we
+        // resolve the name through an exhaustive match — the compiler will
+        // catch any future enum variant that has no corresponding arm.
+        let stmt = match table {
+            AutoLearnTable::CodingPatterns => {
+                "DELETE FROM coding_patterns \
+                 WHERE rowid NOT IN \
+                 (SELECT rowid FROM coding_patterns ORDER BY rowid DESC LIMIT ?1)"
+            }
+            AutoLearnTable::ErrorPatterns => {
+                "DELETE FROM error_patterns \
+                 WHERE rowid NOT IN \
+                 (SELECT rowid FROM error_patterns ORDER BY rowid DESC LIMIT ?1)"
+            }
+            AutoLearnTable::LearnedPreferences => {
+                "DELETE FROM learned_preferences \
+                 WHERE rowid NOT IN \
+                 (SELECT rowid FROM learned_preferences ORDER BY rowid DESC LIMIT ?1)"
+            }
+            AutoLearnTable::FileRelationships => {
+                "DELETE FROM file_relationships \
+                 WHERE rowid NOT IN \
+                 (SELECT rowid FROM file_relationships ORDER BY rowid DESC LIMIT ?1)"
+            }
+        };
+        conn.execute(stmt, params![keep])
+            .with_context(|| format!("Failed to prune auto-learn table {table:?}"))?;
+        drop(conn);
+        Ok(())
     }
 
     /// Ensure database schema exists and run migrations (operates on bare `Connection`).
@@ -1763,5 +1828,66 @@ mod tests {
         // "AND", "OR", "NOT" are FTS5 operators — escaping wraps them in a phrase.
         let result = db.memory_search("AND OR NOT NEAR", 5);
         assert!(result.is_ok(), "FTS5 operator query must not error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Security regression tests — crosslink #255
+    // `prune_auto_learn_table` must use parameterized queries; callers cannot
+    // inject arbitrary SQL through either the table name or the row limit.
+    // -----------------------------------------------------------------------
+
+    /// #255: `prune_auto_learn_table` succeeds on an empty table without
+    /// errors — the DELETE is a no-op, not a crash.
+    #[test]
+    fn sqli_255_prune_empty_table_is_noop() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        // No rows in any table; prune should silently succeed.
+        let result = db.prune_auto_learn_table(AutoLearnTable::CodingPatterns, 500);
+        assert!(result.is_ok(), "prune on empty table must not error");
+    }
+
+    /// #255: `prune_auto_learn_table` prunes to the requested limit and
+    /// retains exactly that many rows (or fewer if the table is smaller).
+    /// Proves the `?1` parameter binding is honoured — not a literal 0 or ∞.
+    #[test]
+    fn sqli_255_prune_retains_keep_most_recent_rows() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        // Insert 5 coding patterns (each unique description → 5 distinct rows).
+        for i in 0..5u32 {
+            db.save_coding_pattern("src/*.rs", "convention", &format!("pattern-{i}"))
+                .unwrap();
+        }
+
+        // Prune to 3 — only 3 rows should remain.
+        db.prune_auto_learn_table(AutoLearnTable::CodingPatterns, 3)
+            .unwrap();
+
+        let remaining = db.get_patterns_for_file("src/anything.rs").unwrap();
+        assert_eq!(remaining.len(), 3, "prune keep=3 must leave exactly 3 rows");
+    }
+
+    /// #255: the new typed API covers all four auto-learn tables without
+    /// panicking.  Each prune on an empty table must return Ok(()).
+    /// This is a compile-time + runtime proof that the enum match is
+    /// exhaustive — a future variant that has no match arm won't compile.
+    #[test]
+    fn sqli_255_all_auto_learn_table_variants_are_handled() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        // If any variant were missing a match arm, compilation would fail.
+        for table in [
+            AutoLearnTable::CodingPatterns,
+            AutoLearnTable::ErrorPatterns,
+            AutoLearnTable::LearnedPreferences,
+            AutoLearnTable::FileRelationships,
+        ] {
+            let result = db.prune_auto_learn_table(table, 100);
+            assert!(result.is_ok(), "prune on empty {:?} must succeed", table);
+        }
     }
 }

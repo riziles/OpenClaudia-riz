@@ -21,12 +21,15 @@ pub use claude_compat::{
 };
 pub use merge::merge_hooks_config;
 
-use crate::config::{Hook, HookEntry, HooksConfig};
+use crate::config::{Hook, HookEntry, HookPolicy, HooksConfig};
+use crate::tools::is_sensitive_env;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -34,6 +37,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+
+/// Emitted once per process the first time a hook runs without an explicit
+/// `HookPolicy`. Prevents repeated log noise while still surfacing the gap.
+static ALLOW_ALL_DEPRECATION_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// All hook event types supported by `OpenClaudia`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -299,6 +306,10 @@ pub enum HookError {
 
     #[error("Invalid matcher regex: {0}")]
     InvalidMatcher(String),
+
+    /// Allowlist enforcement rejected the command's executable.
+    #[error("Hook command denied by allowlist: binary '{binary}' is not in allowed_commands")]
+    Denied { binary: String },
 }
 
 /// Callback for executing model hooks via a provider adapter.
@@ -617,9 +628,15 @@ impl HookEngine {
         timeout_secs: u64,
     ) -> Result<(HookOutput, i32), HookError> {
         match hook {
-            Hook::Command { command, .. } => {
-                self.run_command_hook(command, input_json, timeout_secs)
-                    .await
+            Hook::Command { command, shell, .. } => {
+                self.run_command_hook(
+                    command,
+                    *shell,
+                    self.config.policy.as_ref(),
+                    input_json,
+                    timeout_secs,
+                )
+                .await
             }
             Hook::Prompt { prompt, .. } => {
                 // Prompt hooks just return the prompt as system message
@@ -643,43 +660,130 @@ impl HookEngine {
         }
     }
 
-    /// Execute a command hook
+    /// Build a [`Command`] for direct-spawn mode (no shell).
+    ///
+    /// Tokenises `command` with `shlex`, enforces the allowlist, and returns
+    /// the ready-to-spawn `Command`. Returns `Err` on tokenisation failure or
+    /// allowlist denial.
+    fn build_direct_command(
+        command: &str,
+        policy: Option<&HookPolicy>,
+    ) -> Result<Command, HookError> {
+        let tokens = shlex::split(command).ok_or_else(|| {
+            HookError::CommandFailed(format!(
+                "Failed to tokenise hook command (unterminated quote?): {command}"
+            ))
+        })?;
+
+        if tokens.is_empty() {
+            return Err(HookError::CommandFailed(
+                "Hook command is empty after tokenisation".to_string(),
+            ));
+        }
+
+        let binary_path = &tokens[0];
+        // Strip to basename so "/usr/bin/python3" matches allowlist entry "python3".
+        let binary_name = Path::new(binary_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(binary_path.as_str());
+
+        match policy {
+            Some(p) => {
+                if let Some(allowed) = &p.allowed_commands {
+                    if !allowed.contains(binary_name) {
+                        return Err(HookError::Denied {
+                            binary: binary_name.to_string(),
+                        });
+                    }
+                }
+            }
+            None => {
+                if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "HooksConfig has no `policy` field — running in allow-all \
+                         backwards-compatible mode. Add `policy: {{}}` to silence \
+                         this warning, or `policy: {{allowed_commands: [...]}}` to \
+                         restrict which binaries hooks may execute."
+                    );
+                }
+            }
+        }
+
+        let mut cmd = Command::new(binary_path);
+        if tokens.len() > 1 {
+            cmd.args(&tokens[1..]);
+        }
+        Ok(cmd)
+    }
+
+    /// Scrub credential env vars and inject `CLAUDE_PROJECT_DIR` into `cmd`.
+    fn apply_hook_env(cmd: &mut Command, project_dir: &std::path::Path) {
+        let sensitive: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| is_sensitive_env(k))
+            .collect();
+        for key in &sensitive {
+            cmd.env_remove(key);
+        }
+        cmd.env("CLAUDE_PROJECT_DIR", project_dir);
+    }
+
+    /// Execute a command hook.
+    ///
+    /// Two execution paths:
+    /// - `use_shell = false` (default): tokenise with `shlex`, exec directly —
+    ///   shell metacharacters are inert literal arguments.
+    /// - `use_shell = true` (opt-in): pass to `sh -c`, warn loudly on every call.
+    ///
+    /// Credentials are scrubbed in both paths. See [`Self::build_direct_command`].
     async fn run_command_hook(
         &self,
         command: &str,
+        use_shell: bool,
+        policy: Option<&HookPolicy>,
         input_json: &str,
         timeout_secs: u64,
     ) -> Result<(HookOutput, i32), HookError> {
-        debug!(command = %command, "Running command hook");
+        debug!(command = %command, shell = use_shell, "Running command hook");
 
-        // Determine shell based on platform
-        let (shell, shell_arg) = if cfg!(windows) {
-            ("cmd", "/C")
+        // Resolve cwd eagerly — missing cwd is a hard error, not a silent "".
+        let project_dir = std::env::current_dir()
+            .map_err(|e| HookError::CommandFailed(format!("current_dir() failed: {e}")))?;
+
+        let mut child_cmd = if use_shell {
+            warn!(
+                command = %command,
+                "Hook is running with shell:true — shell injection risk. \
+                 Consider converting to a direct-spawn hook."
+            );
+            let (shell, shell_arg) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            let mut cmd = Command::new(shell);
+            cmd.arg(shell_arg).arg(command);
+            cmd
         } else {
-            ("sh", "-c")
+            Self::build_direct_command(command, policy)?
         };
 
-        let mut child = Command::new(shell)
-            .arg(shell_arg)
-            .arg(command)
+        Self::apply_hook_env(&mut child_cmd, &project_dir);
+
+        let mut child = child_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(
-                "CLAUDE_PROJECT_DIR",
-                std::env::current_dir().unwrap_or_default(),
-            )
             .spawn()
             .map_err(|e| HookError::CommandFailed(e.to_string()))?;
 
-        // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
             if let Err(e) = stdin.write_all(input_json.as_bytes()).await {
                 warn!("Failed to write hook input to stdin: {}", e);
             }
         }
 
-        // Wait for completion with timeout
         let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
@@ -687,15 +791,10 @@ impl HookEngine {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-
                 if !stderr.is_empty() {
                     debug!(stderr = %stderr, "Hook stderr");
                 }
-
-                // Parse JSON output if present
-                let hook_output = Self::parse_hook_output(&stdout);
-
-                Ok((hook_output, exit_code))
+                Ok((Self::parse_hook_output(&stdout), exit_code))
             }
             Ok(Err(e)) => Err(HookError::CommandFailed(e.to_string())),
             Err(_) => Err(HookError::Timeout(timeout_secs)),
@@ -746,7 +845,7 @@ impl HookEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HooksConfig;
+    use crate::config::{HooksConfig, SandboxMode};
     use merge::merge_claude_hooks;
 
     #[test]
@@ -920,7 +1019,9 @@ mod tests {
         assert_eq!(entry.hooks.len(), 1);
 
         match &entry.hooks[0] {
-            Hook::Command { command, timeout } => {
+            Hook::Command {
+                command, timeout, ..
+            } => {
                 assert_eq!(command, "echo test");
                 assert_eq!(*timeout, 60); // default timeout
             }
@@ -1433,6 +1534,7 @@ mod tests {
                 matcher: None,
                 hooks: vec![Hook::Command {
                     command: "true".to_string(),
+                    shell: false,
                     timeout: 5,
                 }],
             }],
@@ -1461,6 +1563,7 @@ mod tests {
                 matcher: None,
                 hooks: vec![Hook::Command {
                     command: "false".to_string(), // would fail
+                    shell: false,
                     timeout: 5,
                 }],
             }],
@@ -1468,6 +1571,7 @@ mod tests {
                 matcher: None,
                 hooks: vec![Hook::Command {
                     command: "true".to_string(),
+                    shell: false,
                     timeout: 5,
                 }],
             }],
@@ -1488,6 +1592,170 @@ mod tests {
         assert!(result.errors.is_empty());
     }
 
+    // ========================================================================
+    // HookPolicy / allowlist / secure-spawn tests  (crosslink #254 / #684)
+    // ========================================================================
+
+    /// Helper: build a minimal HooksConfig with a single post_tool_use
+    /// Command hook wired to the given command string + shell flag.
+    fn make_command_config(command: &str, shell: bool, policy: Option<HookPolicy>) -> HooksConfig {
+        HooksConfig {
+            policy,
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: command.to_string(),
+                    shell,
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Allowlist with a single entry permits a matching binary.
+    #[tokio::test]
+    async fn allowlist_permits_listed_binary() {
+        use std::collections::HashSet;
+        let policy = HookPolicy {
+            allowed_commands: Some(HashSet::from(["true".to_string()])),
+            sandbox: SandboxMode::EnvScrub,
+        };
+        let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        // `true` succeeds with exit code 0 → hook allowed.
+        assert!(result.allowed, "allowlisted binary must be permitted");
+        assert!(result.errors.is_empty(), "no errors for allowlisted binary");
+    }
+
+    /// Allowlist with no matching entry denies the command and surfaces a
+    /// `HookError::Denied` (not a generic CommandFailed).
+    #[tokio::test]
+    async fn allowlist_denies_unlisted_binary() {
+        use std::collections::HashSet;
+        let policy = HookPolicy {
+            allowed_commands: Some(HashSet::from(["python3".to_string()])),
+            sandbox: SandboxMode::EnvScrub,
+        };
+        // Attempt to run `true` which is NOT in the allowlist.
+        let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "exactly one error for denied binary"
+        );
+        assert!(
+            matches!(result.errors[0], HookError::Denied { .. }),
+            "error must be HookError::Denied, got: {:?}",
+            result.errors[0]
+        );
+    }
+
+    /// Direct spawn: a command containing `; rm -rf /tmp/x` is tokenised so
+    /// the semicolon and everything after it become a single extra argument,
+    /// NOT a second shell command.  The binary is just `echo`, and the rest
+    /// are passed as literal strings — no shell metacharacter interpretation.
+    #[tokio::test]
+    async fn direct_spawn_injection_is_tokenised_not_interpolated() {
+        use std::collections::HashSet;
+        // Allow only `echo` — if the semicolon were interpreted by a shell the
+        // binary would be `rm`, which is NOT in the allowlist, so the hook
+        // would return Denied.  Under direct spawn the whole string after
+        // splitting is ["echo", "; rm -rf /tmp/x"] → binary = "echo" → allowed.
+        // The string "; rm -rf /tmp/x" is passed as a *literal argument* to echo.
+        let policy = HookPolicy {
+            allowed_commands: Some(HashSet::from(["echo".to_string()])),
+            sandbox: SandboxMode::EnvScrub,
+        };
+        let engine = HookEngine::new(make_command_config(
+            "echo '; rm -rf /tmp/x'",
+            false,
+            Some(policy),
+        ));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        // Should succeed: echo exits 0, allowlist check passes.
+        assert!(
+            result.errors.is_empty(),
+            "injected semicolon must not split into a second command; errors: {:?}",
+            result.errors
+        );
+        assert!(result.allowed);
+    }
+
+    /// Shell mode (`shell: true`) succeeds but a warning is logged.
+    /// We verify it doesn't panic or return a spurious error for a simple pipe.
+    #[tokio::test]
+    async fn shell_mode_executes_pipeline() {
+        // No allowlist needed — shell mode skips the allowlist gate.
+        let engine = HookEngine::new(make_command_config(
+            "echo hello | cat",
+            true, // explicit shell: true
+            None, // no policy
+        ));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert!(result.errors.is_empty(), "shell pipeline must succeed");
+        assert!(result.allowed);
+    }
+
+    /// Env scrub: sensitive vars must not be present in the child's environment.
+    /// We run `printenv ANTHROPIC_API_KEY` and expect an empty/missing output.
+    #[tokio::test]
+    async fn env_scrub_removes_sensitive_vars() {
+        // Set a fake key in the current process env so there's something to scrub.
+        // Safety: single-threaded test context; no other thread reads this var.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-fake-key-for-test") };
+
+        let policy = HookPolicy {
+            allowed_commands: Some(std::collections::HashSet::from([
+                "printenv".to_string(),
+                "sh".to_string(),
+            ])),
+            sandbox: SandboxMode::EnvScrub,
+        };
+        let engine = HookEngine::new(make_command_config(
+            "printenv ANTHROPIC_API_KEY",
+            false,
+            Some(policy),
+        ));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+
+        // printenv exits 1 when the variable is unset — that's expected.
+        // Crucially, there should be no output containing the fake key.
+        // We inspect hook outputs (stdout) for the key string.
+        for out in &result.outputs {
+            if let Some(ctx) = &out.additional_context {
+                assert!(
+                    !ctx.contains("sk-fake-key-for-test"),
+                    "sensitive var must not appear in hook stdout"
+                );
+            }
+        }
+
+        // Restore env to not leak into other tests.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    /// Backwards-compatible mode (no policy): hook runs without error even
+    /// though no allowlist is configured.
+    #[tokio::test]
+    async fn no_policy_allow_all_backwards_compat() {
+        // No policy → allow-all mode.
+        let engine = HookEngine::new(make_command_config("true", false, None));
+        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert!(
+            result.errors.is_empty(),
+            "no-policy mode must allow any binary"
+        );
+        assert!(result.allowed);
+    }
+
     #[tokio::test]
     async fn fire_post_tool_dispatches_on_success_and_failure() {
         // A single post_tool_use entry sees both paths when no
@@ -1497,6 +1765,7 @@ mod tests {
                 matcher: None,
                 hooks: vec![Hook::Command {
                     command: "true".to_string(),
+                    shell: false,
                     timeout: 5,
                 }],
             }],

@@ -4,7 +4,7 @@ mod policy;
 
 pub use kill::{execute_kill_shell, terminate_process_tree};
 pub use output::execute_bash_output;
-pub use policy::{apply_env_scrub, validate_command};
+pub use policy::{apply_env_scrub, is_sensitive_env, validate_command};
 
 use crate::tools::safe_truncate;
 use serde_json::Value;

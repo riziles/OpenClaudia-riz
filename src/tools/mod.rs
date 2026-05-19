@@ -22,6 +22,7 @@ mod file;
 pub mod file_index;
 pub mod lsp;
 mod plan_mode;
+pub mod registry;
 mod task;
 mod todo;
 mod web;
@@ -31,6 +32,10 @@ pub mod worktree;
 pub use accumulator::{
     AnthropicContentBlock, AnthropicToolAccumulator, PartialToolCall, ToolCallAccumulator,
 };
+/// Credential-sensitivity classifier re-exported for use outside the tools
+/// module (e.g. `hooks::mod` env-scrub logic). Avoids making `bash` public.
+pub(crate) use bash::is_sensitive_env;
+pub use registry::{ToolContext, ToolHandler, ToolRegistry};
 pub use todo::{clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem};
 
 use crate::config::AppConfig;
@@ -871,7 +876,7 @@ fn gate_or_legacy_result(
 #[must_use]
 pub fn execute_tool_with_memory(
     tool_call: &ToolCall,
-    _memory_db: Option<&MemoryDb>,
+    memory_db: Option<&MemoryDb>,
     permission_mgr: Option<&PermissionManager>,
 ) -> ToolResult {
     if permission_mgr.is_none() {
@@ -884,56 +889,27 @@ pub fn execute_tool_with_memory(
     let args: HashMap<String, Value> =
         serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
 
-    let (content, is_error) = match tool_call.function.name.as_str() {
-        // Standard tools
-        "bash" => bash::execute_bash(&args),
-        "bash_output" => bash::execute_bash_output(&args),
-        "kill_shell" => bash::execute_kill_shell(&args),
-        "read_file" => file::execute_read_file(&args),
-        "write_file" => file::execute_write_file(&args),
-        "edit_file" => file::execute_edit_file(&args),
-        "notebook_edit" => file::execute_notebook_edit(&args),
-        "list_files" => file::execute_list_files(&args),
-        "chainlink" => chainlink::execute_chainlink(&args),
+    // Subagent tools require full config context; surface a clear error here
+    // so callers know to use execute_tool_full() instead.
+    if matches!(tool_call.function.name.as_str(), "task" | "agent_output") {
+        return ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content:
+                "Subagent tools require configuration context. Use execute_tool_full() instead."
+                    .to_string(),
+            is_error: true,
+        };
+    }
 
-        // Web tools
-        "web_fetch" => web::execute_web_fetch(&args),
-        "web_search" => web::execute_web_search(&args),
-        "web_browser" => web::execute_web_browser(&args),
-
-        // LSP tools
-        "lsp" => lsp::execute_lsp(&args),
-
-        // Todo tools (fallback for chainlink)
-        "todo_write" => todo::execute_todo_write(&args),
-        "todo_read" => todo::execute_todo_read(),
-
-        // User interaction tools
-        "ask_user_question" => ask_user::execute_ask_user_question(&args),
-
-        // Worktree tools
-        "enter_worktree" => worktree::execute_enter_worktree(&args),
-        "exit_worktree" => worktree::execute_exit_worktree(&args),
-        "list_worktrees" => worktree::execute_list_worktrees(),
-
-        // Cron scheduling tools
-        "cron_create" => cron::execute_cron_create(&args),
-        "cron_delete" => cron::execute_cron_delete(&args),
-        "cron_list" => cron::execute_cron_list(&args),
-
-        // Plan mode tools
-        "enter_plan_mode" => plan_mode::execute_enter_plan_mode(),
-        "exit_plan_mode" => plan_mode::execute_exit_plan_mode(&args),
-
-        // Subagent tools (require config - return error if called without it)
-        "task" | "agent_output" => (
-            "Subagent tools require configuration context. Use execute_tool_full() instead."
-                .to_string(),
-            true,
-        ),
-
-        _ => (format!("Unknown tool: {}", tool_call.function.name), true),
+    let mut ctx = ToolContext {
+        memory_db,
+        app_config: None,
+        task_mgr: None,
     };
+
+    let (content, is_error) = registry::registry()
+        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
+        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
 
     ToolResult {
         tool_call_id: tool_call.id.clone(),
@@ -1239,75 +1215,29 @@ pub fn execute_tool_with_tasks(
     let args: HashMap<String, Value> =
         serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
 
-    // Handle task management tools
-    match tool_call.function.name.as_str() {
-        "task_create" => {
-            if let Some(tm) = task_mgr {
-                let (content, is_error) = task::execute_task_create(&args, tm);
-                return ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content,
-                    is_error,
-                };
-            }
-            return ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: "Task management not available (no session)".to_string(),
-                is_error: true,
-            };
-        }
-        "task_update" => {
-            if let Some(tm) = task_mgr {
-                let (content, is_error) = task::execute_task_update(&args, tm);
-                return ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content,
-                    is_error,
-                };
-            }
-            return ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: "Task management not available (no session)".to_string(),
-                is_error: true,
-            };
-        }
-        "task_get" => {
-            if let Some(tm) = task_mgr {
-                let (content, is_error) = task::execute_task_get(&args, tm);
-                return ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content,
-                    is_error,
-                };
-            }
-            return ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: "Task management not available (no session)".to_string(),
-                is_error: true,
-            };
-        }
-        "task_list" => {
-            if let Some(tm) = task_mgr {
-                let (content, is_error) = task::execute_task_list(tm);
-                return ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content,
-                    is_error,
-                };
-            }
-            return ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: "Task management not available (no session)".to_string(),
-                is_error: true,
-            };
-        }
-        _ => {}
+    // Subagent tools (task / agent_output) need app_config and are handled
+    // inside execute_tool_full before the registry is consulted.
+    if matches!(tool_call.function.name.as_str(), "task" | "agent_output") {
+        return execute_tool_full(tool_call, memory_db, app_config, permission_mgr);
     }
 
-    // Fall through to existing execution path. Gate was already consulted at
-    // the top of this function; re-invoking it inside `execute_tool_full`
-    // with the same manager is idempotent (Allowed stays Allowed).
-    execute_tool_full(tool_call, memory_db, app_config, permission_mgr)
+    // All other tools — including task_create/task_update/task_get/task_list —
+    // go through the registry with the full context bundle.
+    let mut ctx = ToolContext {
+        memory_db,
+        app_config,
+        task_mgr,
+    };
+
+    let (content, is_error) = registry::registry()
+        .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
+        .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true));
+
+    ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content,
+        is_error,
+    }
 }
 
 /// New canonical dispatch: requires a [`PermissionManager`] and uses the strict fail-closed check.

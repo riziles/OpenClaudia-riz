@@ -1,8 +1,64 @@
 use serde::Deserialize;
+use std::collections::HashSet;
+
+// ── Hook security policy ──────────────────────────────────────────────────────
+
+/// Sandbox isolation level applied when spawning a hook command.
+///
+/// Defaults to [`SandboxMode::EnvScrub`] when a policy is present and the
+/// field is omitted. The weakest mode still scrubs all credentials from the
+/// child environment.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// No additional isolation beyond the defaults provided by the OS.
+    /// Credentials are still scrubbed (same as `EnvScrub`).
+    None,
+    /// Remove every credential-classified env var before spawning (default).
+    #[default]
+    EnvScrub,
+    /// Placeholder for future OS-level sandbox (e.g. bubblewrap/nsjail).
+    /// Currently behaves identically to `EnvScrub`; reserved for crosslink #254 Phase 2.
+    FullSandbox,
+}
+
+/// Per-`HooksConfig` security policy for command hook execution.
+///
+/// When `None` (the field is absent from the config), hooks run in
+/// **backwards-compatible allow-all mode** — every command is permitted and
+/// `EnvScrub` is applied automatically. A deprecation warning is emitted once
+/// per process so operators know to add an explicit policy.
+///
+/// Example config YAML:
+/// ```yaml
+/// hooks:
+///   policy:
+///     allowed_commands: ["python", "node", "jq"]
+///     sandbox: env_scrub
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HookPolicy {
+    /// Allowlist of executable base-names (not full paths) that hook
+    /// commands may use as their first token.
+    ///
+    /// `None` → allow every executable (backwards-compatible legacy mode).
+    /// `Some([])` → deny every command hook.
+    /// `Some(["python", "node"])` → only those two binaries are permitted.
+    #[serde(default)]
+    pub allowed_commands: Option<HashSet<String>>,
+
+    /// Isolation mode applied during spawn. Defaults to [`SandboxMode::EnvScrub`].
+    #[serde(default)]
+    pub sandbox: SandboxMode,
+}
 
 /// Hooks configuration
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HooksConfig {
+    /// Security policy applied to all command hooks in this config.
+    /// Absent → backwards-compatible allow-all mode (deprecation warning logged once).
+    #[serde(default)]
+    pub policy: Option<HookPolicy>,
     #[serde(default)]
     pub session_start: Vec<HookEntry>,
     #[serde(default)]
@@ -60,6 +116,11 @@ pub enum Hook {
     #[serde(rename = "command")]
     Command {
         command: String,
+        /// When `true` the command is passed to `sh -c` verbatim, enabling
+        /// pipes and redirects. A security warning is logged on every
+        /// invocation. Requires explicit opt-in; defaults to `false`.
+        #[serde(default)]
+        shell: bool,
         #[serde(default = "default_timeout")]
         timeout: u64,
     },
@@ -129,12 +190,61 @@ mod tests {
 
         let hook: Hook = serde_json::from_str(json).unwrap();
         match hook {
-            Hook::Command { command, timeout } => {
+            Hook::Command {
+                command,
+                shell,
+                timeout,
+            } => {
                 assert_eq!(command, "echo test");
+                assert!(!shell, "shell must default to false");
                 assert_eq!(timeout, 30);
             }
             _ => panic!("Expected Command hook"),
         }
+    }
+
+    #[test]
+    fn test_hook_command_shell_opt_in() {
+        let json = r#"{
+            "type": "command",
+            "command": "echo hello | cat",
+            "shell": true
+        }"#;
+
+        let hook: Hook = serde_json::from_str(json).unwrap();
+        match hook {
+            Hook::Command { shell, .. } => assert!(shell, "shell must be true when set"),
+            _ => panic!("Expected Command hook"),
+        }
+    }
+
+    #[test]
+    fn test_hook_policy_default() {
+        let policy = HookPolicy::default();
+        assert!(policy.allowed_commands.is_none());
+        assert_eq!(policy.sandbox, SandboxMode::EnvScrub);
+    }
+
+    #[test]
+    fn test_hook_policy_deserialize() {
+        let json = r#"{"allowed_commands": ["python3", "node"], "sandbox": "env_scrub"}"#;
+        let policy: HookPolicy = serde_json::from_str(json).unwrap();
+        let allowed = policy.allowed_commands.unwrap();
+        assert!(allowed.contains("python3"));
+        assert!(allowed.contains("node"));
+        assert_eq!(policy.sandbox, SandboxMode::EnvScrub);
+    }
+
+    #[test]
+    fn test_hooks_config_with_policy() {
+        let json = r#"{
+            "policy": {"allowed_commands": ["jq"]},
+            "pre_tool_use": []
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let policy = config.policy.unwrap();
+        let allowed = policy.allowed_commands.unwrap();
+        assert!(allowed.contains("jq"));
     }
 
     #[test]

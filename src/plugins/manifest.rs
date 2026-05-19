@@ -3,6 +3,7 @@
 //! Contains all types related to `.claude-plugin/plugin.json` parsing,
 //! including commands, hooks, MCP servers, agents, and skills specs.
 
+use crate::plugins::validate::PluginSignature;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -247,4 +248,16 @@ pub struct PluginManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub mcp_servers: Option<McpServersSpec>,
+    /// Optional detached ed25519 signature over the manifest bytes.
+    ///
+    /// When present, the signature is verified by
+    /// [`crate::plugins::validate::verify_signature`] during install if the
+    /// active [`crate::plugins::policy::PluginPolicy`] includes a
+    /// `RequireSignature` action. The field is skipped during serialization
+    /// when absent so existing manifests are unaffected.
+    ///
+    /// On-disk shape: serialized as a base64 string via the `Serialize` /
+    /// `Deserialize` impls on `PluginSignature` itself.
+    #[serde(default, rename = "signature", skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PluginSignature>,
 }

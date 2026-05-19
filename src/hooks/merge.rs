@@ -107,6 +107,9 @@ pub(crate) fn merge_claude_hooks(config: &mut HooksConfig, settings: &ClaudeCode
                     .map(|h| match h {
                         ClaudeCodeHook::Command { command, timeout } => Hook::Command {
                             command: command.clone(),
+                            // Claude Code settings files have no shell: field;
+                            // default to the safe direct-spawn mode.
+                            shell: false,
                             timeout: timeout.unwrap_or(60),
                         },
                     })

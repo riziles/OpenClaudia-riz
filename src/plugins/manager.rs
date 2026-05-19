@@ -10,7 +10,8 @@ use super::install::{InstallScope, InstalledPlugins, PluginInstallEntry};
 use super::marketplace::{
     MarketplaceManifest, MarketplacePlugin, MarketplaceSource, PluginSource, PluginSourceDef,
 };
-use super::policy::{self, PluginPolicy, PolicyRejection};
+use super::policy::{self, PluginPolicy, PolicyAction, PolicyRejection};
+use super::validate::{verify_signature, SignatureError};
 use super::{Plugin, PluginCommand, PluginError, PluginHook, PluginMcpServer};
 
 /// Manages plugin discovery, loading, and lifecycle
@@ -300,6 +301,146 @@ impl PluginManager {
             }
         }
         marketplaces
+    }
+
+    /// Enforce all [`PolicyAction`]s that bear on signature verification for
+    /// `plugin_name`. Reads raw manifest bytes from `manifest_json` (already
+    /// loaded from the marketplace source) and applies every
+    /// `RequireSignature` action in the policy.
+    ///
+    /// # Errors
+    ///
+    /// - [`PluginError::UnsignedPlugin`] — policy requires a signature but
+    ///   `manifest_sig` is `None`.
+    /// - [`PluginError::UnknownSigner`] — signature present but no trusted
+    ///   key accepted it.
+    /// - [`PluginError::SignatureMismatch`] — signature bytes are
+    ///   cryptographically invalid over the supplied bytes.
+    fn enforce_signature_policy(
+        plugin_name: &str,
+        manifest_bytes: &[u8],
+        manifest_sig: Option<&crate::plugins::validate::PluginSignature>,
+        policy: &PluginPolicy,
+    ) -> Result<(), PluginError> {
+        for action in &policy.actions {
+            let PolicyAction::RequireSignature { trusted_keys } = action;
+            let sig =
+                manifest_sig.ok_or_else(|| PluginError::UnsignedPlugin(plugin_name.to_string()))?;
+            match verify_signature(manifest_bytes, sig, trusted_keys) {
+                Ok(()) => {}
+                Err(SignatureError::UnknownSigner | SignatureError::MalformedKey(_)) => {
+                    return Err(PluginError::UnknownSigner(plugin_name.to_string()));
+                }
+                Err(
+                    SignatureError::SignatureMismatch
+                    | SignatureError::MissingSignature
+                    | SignatureError::InvalidLength(_)
+                    | SignatureError::InvalidEncoding(_),
+                ) => {
+                    return Err(PluginError::SignatureMismatch(plugin_name.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Install a plugin from a marketplace, enforcing all [`PolicyAction`]s
+    /// including signature verification.
+    ///
+    /// # Errors
+    ///
+    /// - [`PluginError::UnsignedPlugin`] when policy requires a signature and
+    ///   the manifest has none.
+    /// - [`PluginError::UnknownSigner`] when the signature does not match any
+    ///   trusted key.
+    /// - [`PluginError::SignatureMismatch`] when the signature is
+    ///   cryptographically invalid.
+    /// - All errors from [`Self::install_from_marketplace`].
+    pub fn install_from_marketplace_with_policy(
+        &mut self,
+        plugin_name: &str,
+        marketplace_name: &str,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        // Only do the manifest-load + signature check when there are
+        // RequireSignature actions to enforce — avoids double-loading otherwise.
+        let has_sig_requirement = policy
+            .actions
+            .iter()
+            .any(|a| matches!(a, PolicyAction::RequireSignature { .. }));
+
+        if has_sig_requirement {
+            // Locate the marketplace and plugin manifest to get the raw bytes
+            // and the inline signature field before any install side effects.
+            let marketplaces = self.list_marketplaces();
+            let (_name, mp_manifest) = marketplaces
+                .iter()
+                .find(|(n, _)| n == marketplace_name)
+                .ok_or_else(|| {
+                    PluginError::NotFound(format!("Marketplace '{marketplace_name}' not found"))
+                })?;
+
+            let mp_plugin = mp_manifest
+                .plugins
+                .iter()
+                .find(|p| p.name == plugin_name)
+                .ok_or_else(|| {
+                    PluginError::NotFound(format!(
+                        "Plugin '{plugin_name}' not found in marketplace '{marketplace_name}'"
+                    ))
+                })?;
+
+            // For path-based sources we can load the manifest from disk and
+            // check the inline `signature` field. For git sources the manifest
+            // is not yet cloned — we check the MarketplacePlugin-level
+            // signature field (if any) against the serialized plugin entry.
+            let marketplace_dir = Self::marketplaces_dir().join(marketplace_name);
+            let (manifest_bytes, manifest_sig) = match &mp_plugin.source {
+                super::marketplace::PluginSource::Path(rel_path) => {
+                    let plugin_dir = marketplace_dir.join(rel_path);
+                    // Try loading the plugin manifest to get its signature field.
+                    let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
+                    let root_path = plugin_dir.join("plugin.json");
+                    let manifest_path = if cc_path.exists() { cc_path } else { root_path };
+                    let raw = std::fs::read(&manifest_path).map_err(|e| {
+                        PluginError::IoError(format!(
+                            "Cannot read manifest for signature check: {e}"
+                        ))
+                    })?;
+                    let parsed: crate::plugins::manifest::PluginManifest =
+                        serde_json::from_slice(&raw).map_err(|e| {
+                            PluginError::InvalidManifest(format!(
+                                "Cannot parse manifest for signature check: {e}"
+                            ))
+                        })?;
+                    let sig = parsed.signature;
+                    (raw, sig)
+                }
+                super::marketplace::PluginSource::Structured(_) => {
+                    // For git/GitHub sources the content is not yet local.
+                    // Serialize the marketplace plugin entry as a stable byte
+                    // representation for the signature check. This covers the
+                    // case where the marketplace index itself is signed.
+                    let raw = serde_json::to_vec(mp_plugin).map_err(|e| {
+                        PluginError::InvalidManifest(format!(
+                            "Cannot serialize plugin entry for signature check: {e}"
+                        ))
+                    })?;
+                    // No inline manifest signature available pre-clone.
+                    (raw, None)
+                }
+            };
+
+            Self::enforce_signature_policy(
+                plugin_name,
+                &manifest_bytes,
+                manifest_sig.as_ref(),
+                policy,
+            )?;
+        }
+
+        // Policy actions satisfied — delegate to the base installer.
+        self.install_from_marketplace(plugin_name, marketplace_name)
     }
 
     /// Convert a [`PolicyRejection`] into a [`PluginError`]. Centralizes
