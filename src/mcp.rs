@@ -93,6 +93,29 @@ pub enum McpError {
         phase: &'static str,
     },
 
+    /// JSON-RPC response carried an `id` that did not match the
+    /// outstanding request's `id` (fix #701).
+    ///
+    /// JSON-RPC 2.0 §5 requires that the response `id` match the
+    /// request `id` it correlates to. A response with a different id
+    /// is either a protocol-desync bug in the server or an attempt
+    /// to splice another caller's reply into this transport. Either
+    /// way the client MUST reject it — silently accepting it would
+    /// return the wrong tool's result to the caller.
+    ///
+    /// `StdioTransport` enforced this since inception; `HttpTransport`
+    /// previously parsed the `id` field and discarded it. This
+    /// dedicated variant replaces the prior stringly-typed
+    /// `Protocol("Response ID mismatch: ...")` error so call sites
+    /// can match on the variant directly.
+    #[error("JSON-RPC response id mismatch: expected {expected}, got {got}")]
+    ResponseIdMismatch {
+        /// `id` the client sent with its outstanding request.
+        expected: u64,
+        /// `id` the server returned on the wire.
+        got: u64,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -405,10 +428,14 @@ impl McpTransport for StdioTransport {
         };
 
         if response.id != id {
-            return Err(McpError::Protocol(format!(
-                "Response ID mismatch: expected {}, got {}",
-                id, response.id
-            )));
+            // Fix #701 — dedicated variant replaces the previous
+            // stringly-typed Protocol(...) error so call sites and
+            // tests can match on the variant directly. Shared with
+            // HttpTransport for DRY across transports.
+            return Err(McpError::ResponseIdMismatch {
+                expected: id,
+                got: response.id,
+            });
         }
 
         if let Some(error) = response.error {
@@ -574,6 +601,20 @@ impl McpTransport for HttpTransport {
             .json()
             .await
             .map_err(|e| McpError::Protocol(format!("Failed to parse response: {e}")))?;
+
+        // Fix #701 — JSON-RPC §5 requires response.id == request.id.
+        // The pre-fix HTTP transport parsed `id` into the struct and
+        // discarded it, so a buggy or hostile MCP HTTP server could
+        // splice another caller's reply into this transport and the
+        // client would silently return the wrong tool's result.
+        // StdioTransport has always enforced this (same source file);
+        // we mirror that check here with the shared dedicated variant.
+        if response.id != id {
+            return Err(McpError::ResponseIdMismatch {
+                expected: id,
+                got: response.id,
+            });
+        }
 
         if let Some(error) = response.error {
             return Err(McpError::Protocol(format!(
@@ -2538,5 +2579,195 @@ mod tests {
         assert_eq!(BACKOFF[1], Duration::from_secs(5));
         assert_eq!(BACKOFF[2], Duration::from_secs(30));
         assert_eq!(MAX_RECONNECT_ATTEMPTS, 3);
+    }
+
+    // ─── Fix #701 — response-id mismatch detection across transports ──
+    //
+    // Forensic evidence: pre-fix `HttpTransport::request` (src/mcp.rs
+    // around line 573) parsed `JsonRpcResponse.id` into the struct and
+    // then discarded it — only `response.error` and `response.result`
+    // were consulted. A buggy or hostile MCP HTTP server that returned
+    // a reply carrying any other id (e.g. `9999` when the client just
+    // sent `1`) would be silently accepted and `response.result`
+    // returned to the caller. `StdioTransport` (around line 407)
+    // already enforced the §5 invariant but did so via a
+    // stringly-typed `McpError::Protocol("Response ID mismatch: ...")`,
+    // forcing call sites and tests to grep error messages instead of
+    // matching on a dedicated variant.
+    //
+    // These tests exercise three vectors and the migration:
+    //   1. HTTP matching id        — happy path, request succeeds.
+    //   2. HTTP mismatched id      — request returns
+    //                                `McpError::ResponseIdMismatch
+    //                                { expected, got }`.
+    //   3. HTTP non-numeric id     — `JsonRpcResponse.id: u64` causes
+    //                                serde to reject the response
+    //                                during JSON decode, surfacing
+    //                                `McpError::Protocol("Failed to
+    //                                parse response: ...")`. This
+    //                                pins the layering: the mismatch
+    //                                check fires only on a structurally
+    //                                valid response.
+    //   4. Stdio mismatched id     — the migrated variant is what
+    //                                bubbles up (no more
+    //                                `Protocol("Response ID mismatch
+    //                                ...")`).
+    //
+    // The HTTP tests use a one-shot raw-TCP mock server (no axum/hyper
+    // dependency required, matches the existing test style in this
+    // file). The transport is built via `__test_new_unchecked` so the
+    // SSRF guard does not reject the loopback URL.
+
+    /// One-shot raw-HTTP mock: accept a single TCP connection, read
+    /// the request bytes up to the configured ceiling, then write a
+    /// minimal `HTTP/1.1 200 OK` with the supplied body. The server
+    /// task exits after the single exchange so the test can be run
+    /// without external coordination. Returns the bound `127.0.0.1:N`
+    /// URL so the caller can point an `HttpTransport` at it.
+    async fn spawn_one_shot_http_mock(response_body: &'static str) -> String {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request enough to release the client.
+                // 8 KiB is plenty for the small JSON-RPC bodies the
+                // transport sends in these tests.
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Fix #701 — HTTP transport accepts a response whose `id` matches
+    /// the outstanding request. Anchors the happy path so the
+    /// mismatch-detection logic cannot regress into a false-positive
+    /// reject on correct traffic.
+    #[tokio::test]
+    async fn fix701_http_matching_id_succeeds() {
+        // First HTTP request issued by a fresh transport uses id=1
+        // (AtomicU64 starts at 1, fetch_add returns the pre-increment
+        // value). Mock returns id=1 with a recognisable payload.
+        let url = spawn_one_shot_http_mock(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true,"marker":"fix701_match"}}"#,
+        )
+        .await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), transport.request("ping", None))
+            .await
+            .expect("request did not deadlock")
+            .expect("matching id must succeed");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["marker"], "fix701_match");
+    }
+
+    /// Fix #701 — HTTP transport rejects a response whose numeric id
+    /// differs from the outstanding request. Forensic anchor: pre-fix
+    /// this call silently returned `result` instead.
+    #[tokio::test]
+    async fn fix701_http_mismatched_id_rejected_with_dedicated_variant() {
+        // Transport will send id=1; mock returns id=9999.
+        let url = spawn_one_shot_http_mock(
+            r#"{"jsonrpc":"2.0","id":9999,"result":{"should":"not be returned"}}"#,
+        )
+        .await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transport.request("ping", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("mismatched id MUST be rejected");
+
+        match err {
+            McpError::ResponseIdMismatch { expected, got } => {
+                assert_eq!(expected, 1, "client sent id=1");
+                assert_eq!(got, 9999, "mock returned id=9999");
+            }
+            other => panic!(
+                "expected McpError::ResponseIdMismatch, got: {other:?} \
+                 (pre-fix this returned Ok(result) — regression!)"
+            ),
+        }
+    }
+
+    /// Fix #701 — a response with a non-numeric `id` fails JSON
+    /// decoding because `JsonRpcResponse.id: u64`. The error surfaces
+    /// as `McpError::Protocol("Failed to parse response: ...")`, NOT
+    /// `ResponseIdMismatch` — the mismatch guard runs only on
+    /// structurally valid responses. Locking the layering down so a
+    /// future refactor doesn't accidentally widen `id` to `Value` and
+    /// silently accept string ids.
+    #[tokio::test]
+    async fn fix701_http_non_numeric_id_rejected_at_decode() {
+        let url =
+            spawn_one_shot_http_mock(r#"{"jsonrpc":"2.0","id":"not-a-number","result":{}}"#).await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transport.request("ping", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("non-numeric id MUST be rejected");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(
+                    msg.contains("Failed to parse response"),
+                    "expected JSON-decode protocol error, got: {msg}"
+                );
+            }
+            McpError::ResponseIdMismatch { .. } => panic!(
+                "non-numeric id must fail at JSON decode, NOT reach the \
+                 mismatch guard — layering broken"
+            ),
+            other => panic!("expected Protocol(...) error, got: {other:?}"),
+        }
+    }
+
+    /// Fix #701 — `StdioTransport` migration: a mismatched id now
+    /// surfaces `McpError::ResponseIdMismatch` (the shared variant),
+    /// not the prior stringly-typed `Protocol("Response ID mismatch
+    /// ...")`. Regression anchor for the DRY refactor.
+    #[tokio::test]
+    async fn fix701_stdio_mismatched_id_uses_dedicated_variant() {
+        // Transport sends id=1; script replies with id=42.
+        let transport = spawn_sh(
+            "read req; \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"x\":1}}\n'",
+        )
+        .expect("spawn");
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transport.request("ping", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("mismatched id MUST be rejected");
+
+        match err {
+            McpError::ResponseIdMismatch { expected, got } => {
+                assert_eq!(expected, 1, "client sent id=1");
+                assert_eq!(got, 42, "server returned id=42");
+            }
+            McpError::Protocol(msg) if msg.contains("Response ID mismatch") => {
+                panic!(
+                    "stdio path still using stringly-typed Protocol error \
+                     — DRY migration to ResponseIdMismatch did not land: {msg}"
+                );
+            }
+            other => panic!("expected McpError::ResponseIdMismatch, got: {other:?}"),
+        }
+        let _ = transport.close().await;
     }
 }

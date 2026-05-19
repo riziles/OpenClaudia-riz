@@ -1414,39 +1414,72 @@ pub fn execute_task_tool<S: BuildHasher>(
 
         (message, false)
     } else {
-        // Run synchronously
-        let result = match Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(run_subagent(&config, app_config, &client))
+        // Run synchronously via defensive runtime dispatch (#719).
+        dispatch_subagent_sync(&config, app_config, &client)
+    }
+}
+
+/// Synchronous-call-from-tool-dispatch path for `run_subagent`.
+///
+/// Defensive runtime dispatch (#719): `tokio::task::block_in_place` PANICS
+/// when called from a `current_thread` runtime (e.g. `#[tokio::test]`,
+/// `tokio_test::block_on`, many CLI harnesses). `Handle::block_on` from
+/// inside any runtime worker is also a documented deadlock risk because
+/// the inner future may yield back to the same executor that's blocked
+/// on its completion.
+///
+/// Resolution policy:
+///   * No runtime in scope    → create a dedicated runtime (CLI/tool
+///     dispatch boundary; acceptable, single allocation).
+///   * `MultiThread` runtime  → `block_in_place` + `block_on` is safe;
+///     `block_in_place` moves us off the worker thread.
+///   * `CurrentThread`        → fail fast with a typed error. We cannot
+///     `block_in_place` (panics) and cannot `block_on` (deadlocks the
+///     single worker). The caller must dispatch through the async path.
+fn dispatch_subagent_sync(
+    config: &SubagentConfig,
+    app_config: &AppConfig,
+    client: &Client,
+) -> (String, bool) {
+    let result = match Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                handle.block_on(run_subagent(config, app_config, client))
             }),
-            Err(_) => match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(run_subagent(&config, app_config, &client)),
-                Err(e) => {
-                    return (format!("Failed to create runtime: {e}"), true);
-                }
-            },
-        };
-
-        if result.success {
-            let mut message = format!(
-                "Agent completed in {} turns.\n\n{}",
-                result.turns_used, result.output
-            );
-
-            // If worktree was used and has changes, include path info
-            if let Some(ref wt) = result.worktree {
-                let _ = write!(
-                    message,
-                    "\n\nWorktree: {}\nBranch: {}",
-                    wt.worktree_path.display(),
-                    wt.branch_name
+            _ => {
+                return (
+                    "Task tool dispatched from a current_thread tokio runtime: \
+                     cannot block_on without deadlock. Invoke the task tool from \
+                     a multi_thread runtime or from the async tool dispatcher."
+                        .to_string(),
+                    true,
                 );
             }
+        },
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(run_subagent(config, app_config, client)),
+            Err(e) => {
+                return (format!("Failed to create runtime: {e}"), true);
+            }
+        },
+    };
 
-            (message, false)
-        } else {
-            (format!("Agent failed: {}", result.output), true)
+    if result.success {
+        let mut message = format!(
+            "Agent completed in {} turns.\n\n{}",
+            result.turns_used, result.output
+        );
+        if let Some(ref wt) = result.worktree {
+            let _ = write!(
+                message,
+                "\n\nWorktree: {}\nBranch: {}",
+                wt.worktree_path.display(),
+                wt.branch_name
+            );
         }
+        (message, false)
+    } else {
+        (format!("Agent failed: {}", result.output), true)
     }
 }
 
@@ -1986,6 +2019,175 @@ mod tests {
         assert!(
             mgr.get(&live).is_some(),
             "running agent must survive cleanup_finished"
+        );
+    }
+
+    // ── Crosslink #719: runtime-flavor-aware sync dispatch ────────────────
+    //
+    // The sync branch of `execute_task_tool` used to call
+    // `tokio::task::block_in_place(|| handle.block_on(...))` unconditionally
+    // whenever a tokio `Handle` was in scope. `block_in_place` PANICS under
+    // a `current_thread` runtime, so a Task tool call dispatched from a
+    // `#[tokio::test]` (default flavor: current_thread) or from any
+    // single-threaded CLI harness would crash the worker.
+    //
+    // The fix branches on `Handle::runtime_flavor()`:
+    //   * MultiThread     → `block_in_place` + `block_on` (safe).
+    //   * CurrentThread   → fail fast with a typed error message; no panic.
+    //   * No runtime      → spin up a dedicated `Runtime::new()`.
+    //
+    // The tests below pin all three branches. They use a fake `resume` id
+    // to make `run_subagent` return instantly with "No transcript found",
+    // so the test never touches the network and never depends on a real
+    // provider — we only care about which dispatch branch was taken.
+
+    /// Build a minimal `AppConfig` suitable for exercising
+    /// `execute_task_tool`. The Task tool only needs `proxy.target` and a
+    /// matching provider entry; the tests never reach the network because
+    /// they feed a bogus `resume` id that short-circuits `run_subagent`.
+    fn issue719_app_config() -> AppConfig {
+        use crate::config::ThinkingConfig;
+        use crate::config::{
+            GuardrailsConfig, HooksConfig, KeybindingsConfig, PermissionsConfig, ProviderConfig,
+            ProxyConfig, SessionConfig, VddConfig,
+        };
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                base_url: "http://127.0.0.1:1".to_string(),
+                api_key: Some(
+                    crate::providers::ApiKey::try_from_string("test-key".to_string()).unwrap(),
+                ),
+                model: None,
+                headers: HashMap::new(),
+                thinking: ThinkingConfig::default(),
+            },
+        );
+        AppConfig {
+            proxy: ProxyConfig::default(),
+            providers,
+            hooks: HooksConfig::default(),
+            session: SessionConfig::default(),
+            keybindings: KeybindingsConfig::default(),
+            vdd: VddConfig::default(),
+            guardrails: GuardrailsConfig::default(),
+            permissions: PermissionsConfig::default(),
+            managed_settings_path: None,
+        }
+    }
+
+    /// Build args that drive `execute_task_tool` through its sync branch
+    /// (`run_in_background=false`) and through `run_subagent`'s resume
+    /// fast-fail (`resume` set to an id guaranteed not to exist).
+    fn issue719_args() -> HashMap<String, Value> {
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert("description".to_string(), json!("issue719 test"));
+        args.insert("prompt".to_string(), json!("noop"));
+        args.insert("subagent_type".to_string(), json!("general-purpose"));
+        args.insert("run_in_background".to_string(), json!(false));
+        // Unknown id → `run_subagent` returns instantly with
+        // "No transcript found...". Keeps the test off the network.
+        args.insert(
+            "resume".to_string(),
+            json!(format!("issue719-missing-{}", Uuid::new_v4())),
+        );
+        args
+    }
+
+    /// #719 — From a `current_thread` runtime the function must NOT panic
+    /// (the old code's `block_in_place` would). It must return the typed
+    /// "cannot `block_on` without deadlock" error with `is_error=true`.
+    #[test]
+    fn issue719_current_thread_runtime_returns_error_without_panicking() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime must build");
+
+        let (msg, is_err) = rt.block_on(async {
+            // `execute_task_tool` is a sync fn; calling it inside an async
+            // block on a current_thread runtime is exactly the dispatch
+            // shape that used to panic via `block_in_place`.
+            let app_config = issue719_app_config();
+            let args = issue719_args();
+            execute_task_tool(&args, &app_config)
+        });
+
+        assert!(
+            is_err,
+            "current_thread dispatch must surface an error, not silently succeed: {msg}"
+        );
+        assert!(
+            msg.contains("current_thread") && msg.contains("deadlock"),
+            "current_thread branch must return the typed deadlock-guard message; got: {msg}"
+        );
+        assert!(
+            !msg.contains("No transcript found"),
+            "current_thread branch must short-circuit BEFORE run_subagent; got: {msg}"
+        );
+    }
+
+    /// #719 — From a `multi_thread` runtime the function must dispatch
+    /// through `block_in_place` + `block_on` and reach `run_subagent`.
+    /// We verify by checking the output came from `run_subagent`'s resume
+    /// fast-fail path, not from the deadlock-guard branch.
+    #[test]
+    fn issue719_multi_thread_runtime_dispatches_to_run_subagent() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi_thread runtime must build");
+
+        let (msg, is_err) = rt.block_on(async {
+            let app_config = issue719_app_config();
+            let args = issue719_args();
+            execute_task_tool(&args, &app_config)
+        });
+
+        assert!(
+            is_err,
+            "resume of unknown id must propagate as is_error=true: {msg}"
+        );
+        assert!(
+            msg.contains("No transcript found"),
+            "multi_thread branch must reach run_subagent (resume fast-fail); got: {msg}"
+        );
+        assert!(
+            !msg.contains("cannot block_on without deadlock"),
+            "multi_thread branch must NOT trigger the deadlock guard; got: {msg}"
+        );
+    }
+
+    /// #719 — With no tokio runtime in scope, the function must build its
+    /// own `Runtime::new()` and dispatch successfully. As with the
+    /// `multi_thread` case we verify the output came from `run_subagent`.
+    #[test]
+    fn issue719_no_runtime_creates_runtime_and_dispatches() {
+        // `execute_task_tool` is sync; calling it directly from the
+        // `#[test]` thread means `Handle::try_current()` returns `Err`,
+        // hitting the `Runtime::new()` fallback.
+        let app_config = issue719_app_config();
+        let args = issue719_args();
+        let (msg, is_err) = execute_task_tool(&args, &app_config);
+
+        assert!(
+            is_err,
+            "resume of unknown id must propagate as is_error=true: {msg}"
+        );
+        assert!(
+            msg.contains("No transcript found"),
+            "no-runtime branch must reach run_subagent (resume fast-fail); got: {msg}"
+        );
+        assert!(
+            !msg.contains("Failed to create runtime"),
+            "Runtime::new() must succeed inside a normal #[test] thread; got: {msg}"
+        );
+        assert!(
+            !msg.contains("cannot block_on without deadlock"),
+            "no-runtime branch must NOT trigger the deadlock guard; got: {msg}"
         );
     }
 }

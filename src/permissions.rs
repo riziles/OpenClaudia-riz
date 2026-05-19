@@ -9,7 +9,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -108,6 +108,14 @@ pub struct PermissionManager {
     /// Total denial counter — never resets within a session.
     /// Parity: CC `DenialTrackingState.totalDenials`.
     total_denials: u32,
+    /// Tool names the user has selected "Always allow" for in the interactive
+    /// TUI permission prompt. Lives for the entire `PermissionManager` lifetime
+    /// (one per session), so the decision survives across API turns and
+    /// agentic-loop iterations. See crosslink #724.
+    tui_always_allowed: Mutex<HashSet<String>>,
+    /// Tool names the user has selected "Always deny" for in the interactive
+    /// TUI permission prompt. Same scope as `tui_always_allowed`. See crosslink #724.
+    tui_always_denied: Mutex<HashSet<String>>,
 }
 
 impl PermissionManager {
@@ -135,6 +143,8 @@ impl PermissionManager {
             enabled,
             consecutive_denials: 0,
             total_denials: 0,
+            tui_always_allowed: Mutex::new(HashSet::new()),
+            tui_always_denied: Mutex::new(HashSet::new()),
         }
     }
 
@@ -147,7 +157,7 @@ impl PermissionManager {
     /// everything") at the call site rather than smuggling it in via a
     /// missing argument. See crosslink #460.
     #[must_use]
-    pub const fn unrestricted() -> Self {
+    pub fn unrestricted() -> Self {
         // `enabled = false` short-circuits `check()` to `CheckResult::Allowed`.
         Self {
             persisted_rules: Vec::new(),
@@ -157,6 +167,8 @@ impl PermissionManager {
             enabled: false,
             consecutive_denials: 0,
             total_denials: 0,
+            tui_always_allowed: Mutex::new(HashSet::new()),
+            tui_always_denied: Mutex::new(HashSet::new()),
         }
     }
 
