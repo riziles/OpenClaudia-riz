@@ -20,82 +20,239 @@ use crate::config::{
 };
 
 // ==========================================================================
-// Global guardrails instance
+// Global guardrails instance — crosslink #749 fail-closed refactor
 // ==========================================================================
 
-static GUARDRAILS: std::sync::LazyLock<Mutex<Option<GuardrailsEngine>>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));
+/// Tri-state holder for the global guardrails engine.
+///
+/// Per the QA mandate in crosslink #749, we distinguish three states
+/// explicitly so the security-boundary caller (`check_file_access`)
+/// can fail-closed correctly:
+///
+/// * `Disabled` — no policy is loaded. Either `configure()` was never
+///   called, or it ran with all guard families disabled (the project
+///   default — see `BlastRadiusConfig::default().enabled == false`).
+///   Either way the security boundary has nothing to enforce, so
+///   `check_file_access` returns `Ok(())`. This is NOT the same as
+///   "I tried to evaluate the policy and could not".
+/// * `Enabled(engine)` — `configure()` produced a real engine; the
+///   policy is delegated to it.
+/// * `Poisoned` — a previous panic left the mutex in an unrecoverable
+///   state. Returning success here would let the next write proceed
+///   against an unknown rule set; we refuse instead by returning
+///   `Err(POISON_ERR)`. This is the fail-closed contract that closes
+///   the original bug.
+enum GuardrailsState {
+    Disabled,
+    // Box keeps the variant size small (~16 B vs ~280 B inline). The
+    // engine is constructed once at startup and dereferenced on every
+    // tool dispatch, so the heap indirection is negligible compared to
+    // the regex match it gates.
+    Enabled(Box<GuardrailsEngine>),
+    Poisoned,
+}
 
-/// Initialize the guardrails engine from config. Called once at startup.
-pub fn configure(config: &GuardrailsConfig) {
-    if let Ok(mut guard) = GUARDRAILS.lock() {
-        *guard = Some(GuardrailsEngine::from_config(config));
-        info!("Guardrails engine configured");
+static GUARDRAILS: std::sync::LazyLock<Mutex<GuardrailsState>> =
+    std::sync::LazyLock::new(|| Mutex::new(GuardrailsState::Disabled));
+
+/// Sentinel error string returned at every security boundary when the
+/// guardrails mutex is found poisoned. The exact text is part of the
+/// public contract — callers (and tests in #749) match against this
+/// substring to distinguish poison-fail-closed from a rule-driven deny.
+const POISON_ERR: &str = "guardrails poisoned — refusing access";
+
+/// Lock the global guardrails mutex, transitioning the state to
+/// `Poisoned` on OS-level poison. After this point every
+/// security-boundary check returns `Err(POISON_ERR)` until the
+/// process restarts.
+fn lock_or_poison() -> std::sync::MutexGuard<'static, GuardrailsState> {
+    match GUARDRAILS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!(
+                "Guardrails mutex was poisoned by a previous panic;                  transitioning to fail-closed state"
+            );
+            let mut guard = poisoned.into_inner();
+            *guard = GuardrailsState::Poisoned;
+            guard
+        }
     }
 }
 
+/// True iff a `GuardrailsConfig` has at least one *enabled* guard
+/// family. We treat "configure called with everything disabled" the
+/// same as "configure never called" — both leave no policy to enforce.
+fn config_has_active_guards(config: &GuardrailsConfig) -> bool {
+    let br = config.blast_radius.as_ref().is_some_and(|c| c.enabled);
+    let dm = config.diff_monitor.as_ref().is_some_and(|c| c.enabled);
+    let qg = config.quality_gates.as_ref().is_some_and(|c| c.enabled);
+    br || dm || qg
+}
+
+/// Initialize the guardrails engine from config. Called once at startup.
+///
+/// If the state is poisoned, this function does NOT reconfigure — the
+/// poisoned state is sticky on purpose so a panic during a write-policy
+/// evaluation cannot be papered over by a subsequent `configure()`.
+pub fn configure(config: &GuardrailsConfig) {
+    // Build the new state OUTSIDE the lock. `GuardrailsEngine::from_config`
+    // walks regex / glob compilation and emits structured `info!` events;
+    // none of that needs the guardrails mutex held. Tightening the critical
+    // section to the swap also lets concurrent `check_file_access` calls
+    // make progress while a startup `configure` is mid-flight.
+    let (new_state, log_msg) = if config_has_active_guards(config) {
+        let engine = GuardrailsEngine::from_config(config);
+        (
+            GuardrailsState::Enabled(Box::new(engine)),
+            "Guardrails engine configured",
+        )
+    } else {
+        (
+            GuardrailsState::Disabled,
+            "Guardrails configured with no active guard families (Disabled)",
+        )
+    };
+
+    {
+        let mut guard = lock_or_poison();
+        if matches!(*guard, GuardrailsState::Poisoned) {
+            error!("Refusing to (re)configure guardrails: state is poisoned");
+            return;
+        }
+        *guard = new_state;
+        // Drop the guard at the end of this block (before the `info!`
+        // below) so concurrent readers do not block while we format the
+        // log line. Per `clippy::significant_drop_tightening`.
+    }
+    info!("{}", log_msg);
+}
+
 /// Check if a file path is allowed by blast radius rules.
-/// Returns `Ok(())` if allowed, `Err(message)` if blocked in strict mode.
 ///
 /// # Errors
 ///
-/// Returns an error string if the path is blocked by blast radius rules in strict mode.
+/// Returns an error string when the path is denied:
+/// * by an explicit blast-radius rule in strict mode (from the engine), or
+/// * because the guardrails mutex is poisoned (`POISON_ERR`).
+///
+/// `Disabled` returns `Ok(())` — no policy is loaded so there is
+/// nothing to enforce. This is the QA-mandated separation between
+/// "no policy" (allow) and "cannot evaluate policy" (deny).
+///
+/// This function is the security boundary for file-write dispatch and
+/// MUST fail closed on poison. See crosslink #749.
 pub fn check_file_access(path: &str) -> Result<(), String> {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
-            return engine.check_file_access(path);
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => engine.as_ref().check_file_access(path),
+        GuardrailsState::Poisoned => {
+            error!(
+                path = path,
+                "check_file_access: guardrails poisoned — denying"
+            );
+            Err(POISON_ERR.to_string())
         }
+        GuardrailsState::Disabled => Ok(()),
     }
-    Ok(())
 }
 
 /// Record a file modification for diff monitoring.
 /// Call after successful `write_file` or `edit_file`.
+///
+/// Non-security path: silently no-ops when disabled, logs an error
+/// when the mutex is poisoned.
 pub fn record_file_modification(path: &str, lines_added: u32, lines_removed: u32) {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => {
             engine.record_modification(path, lines_added, lines_removed);
         }
+        GuardrailsState::Poisoned => {
+            error!(
+                path = path,
+                "record_file_modification: guardrails poisoned — skipping"
+            );
+        }
+        GuardrailsState::Disabled => {}
     }
 }
 
 /// Check diff thresholds. Returns a warning if thresholds exceeded.
 pub fn check_diff_thresholds() -> Option<DiffWarning> {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
-            return engine.check_diff_thresholds();
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => engine.as_ref().check_diff_thresholds(),
+        GuardrailsState::Poisoned => {
+            error!("check_diff_thresholds: guardrails poisoned — returning None");
+            None
         }
+        GuardrailsState::Disabled => None,
     }
-    None
 }
 
 /// Run quality gate checks. Returns results for each configured check.
 pub fn run_quality_gates() -> Vec<QualityCheckResult> {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
-            return engine.run_quality_gates();
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => engine.as_ref().run_quality_gates(),
+        GuardrailsState::Poisoned => {
+            error!("run_quality_gates: guardrails poisoned — returning empty");
+            Vec::new()
         }
+        GuardrailsState::Disabled => Vec::new(),
     }
-    Vec::new()
 }
 
 /// Reset per-turn tracking (blast radius file count).
 pub fn reset_turn() {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
-            engine.reset_turn();
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => engine.as_ref().reset_turn(),
+        GuardrailsState::Poisoned => {
+            error!("reset_turn: guardrails poisoned — skipping");
         }
+        GuardrailsState::Disabled => {}
     }
 }
 
 /// Get current diff stats summary.
 pub fn get_diff_summary() -> Option<DiffStats> {
-    if let Ok(guard) = GUARDRAILS.lock() {
-        if let Some(engine) = guard.as_ref() {
-            return engine.get_diff_stats();
+    let guard = lock_or_poison();
+    match &*guard {
+        GuardrailsState::Enabled(engine) => engine.as_ref().get_diff_stats(),
+        GuardrailsState::Poisoned => {
+            error!("get_diff_summary: guardrails poisoned — returning None");
+            None
         }
+        GuardrailsState::Disabled => None,
     }
-    None
+}
+
+// ==========================================================================
+// Test-only helpers for the global guardrails state.
+// ==========================================================================
+
+/// Replace the global guardrails state. Test-only. Used to drive
+/// poisoned-state regression tests for crosslink #749.
+#[cfg(test)]
+fn set_state_for_test(new_state: GuardrailsState) {
+    let mut guard = GUARDRAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = new_state;
+}
+
+/// Snapshot the discriminant of the current state. Test-only.
+#[cfg(test)]
+fn current_state_kind() -> &'static str {
+    let guard = GUARDRAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *guard {
+        GuardrailsState::Disabled => "disabled",
+        GuardrailsState::Enabled(_) => "enabled",
+        GuardrailsState::Poisoned => "poisoned",
+    }
 }
 
 // ==========================================================================
@@ -1405,12 +1562,149 @@ mod tests {
     }
 
     // ====== Global API tests ======
+    //
+    // These tests mutate the process-global `GUARDRAILS` static, so
+    // they must serialize against one another. We use a dedicated
+    // mutex because each test wants to start from a known state.
+    //
+    // Every #749 test restores the state to `Disabled` on the way
+    // out so concurrent tools tests (write.rs / edit.rs / notebook.rs)
+    // that call `check_file_access` against the global keep observing
+    // the "no policy" allow path.
+
+    static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_global_for_test() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn make_strict_engine_with_deny(deny_glob: &str) -> GuardrailsEngine {
+        let cfg = GuardrailsConfig {
+            blast_radius: Some(BlastRadiusConfig {
+                enabled: true,
+                mode: GuardrailMode::Strict,
+                allowed_paths: vec![],
+                denied_paths: vec![deny_glob.to_string()],
+                max_files_per_turn: 0,
+            }),
+            diff_monitor: None,
+            quality_gates: None,
+        };
+        GuardrailsEngine::from_config(&cfg)
+    }
 
     #[test]
-    fn test_unconfigured_guardrails_allow_all() {
-        // Without configuration, all operations should pass
+    fn test_disabled_guardrails_allow_all() {
+        // "Disabled" == no policy loaded. The security boundary must
+        // return Ok so default-install installs behave the same as the
+        // pre-#749 codebase. Fail-closed only applies to Poisoned.
+        let _serialize = lock_global_for_test();
+        set_state_for_test(GuardrailsState::Disabled);
+
         assert!(check_file_access("any/file.rs").is_ok());
         assert!(check_diff_thresholds().is_none());
         assert!(run_quality_gates().is_empty());
+        assert!(get_diff_summary().is_none());
+    }
+
+    // ====== Crosslink #749 regression: fail-closed on bad state ======
+
+    #[test]
+    fn test_749_check_file_access_returns_err_when_poisoned() {
+        // BEFORE THE FIX: a poisoned mutex was swallowed by
+        // `if let Ok(guard) = ...lock()` and the function returned
+        // Ok(()). After the fix the security boundary must refuse.
+        let _serialize = lock_global_for_test();
+        set_state_for_test(GuardrailsState::Poisoned);
+        assert_eq!(current_state_kind(), "poisoned");
+
+        let result = check_file_access("/etc/shadow");
+        assert!(
+            result.is_err(),
+            "poisoned guardrails must fail-closed at the security              boundary, got: {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("poisoned"),
+            "error must identify the poisoned cause: got {msg:?}"
+        );
+
+        set_state_for_test(GuardrailsState::Disabled);
+    }
+
+    #[test]
+    fn test_749_check_file_access_happy_path_with_enabled_engine() {
+        // After the fix, a properly configured engine still routes
+        // through `Enabled(engine).check_file_access(...)`. The
+        // tri-state refactor must not regress the allow-decision path.
+        let _serialize = lock_global_for_test();
+        let engine = make_strict_engine_with_deny(".env*");
+        set_state_for_test(GuardrailsState::Enabled(Box::new(engine)));
+        assert_eq!(current_state_kind(), "enabled");
+
+        assert!(
+            check_file_access("src/main.rs").is_ok(),
+            "enabled engine should allow non-denied paths"
+        );
+
+        let blocked = check_file_access(".env.local");
+        assert!(blocked.is_err(), "deny rule must fire");
+        let msg = blocked.unwrap_err();
+        assert!(
+            msg.contains("Blast radius"),
+            "blocked-by-rule error should come from the engine, not              the poisoned-state sentinel: got {msg:?}"
+        );
+        assert!(!msg.contains("poisoned"));
+
+        set_state_for_test(GuardrailsState::Disabled);
+    }
+
+    #[test]
+    fn test_749_configure_refuses_when_poisoned() {
+        // Sticky-poison contract: once poisoned, configure() must NOT
+        // silently re-arm the engine.
+        let _serialize = lock_global_for_test();
+        set_state_for_test(GuardrailsState::Poisoned);
+
+        let cfg = GuardrailsConfig::default();
+        configure(&cfg);
+
+        assert_eq!(
+            current_state_kind(),
+            "poisoned",
+            "configure() must be a no-op once the state is poisoned"
+        );
+
+        set_state_for_test(GuardrailsState::Disabled);
+    }
+
+    #[test]
+    fn test_749_non_security_paths_safe_when_poisoned() {
+        // Non-security accessors must not panic or hang on poison.
+        let _serialize = lock_global_for_test();
+        set_state_for_test(GuardrailsState::Poisoned);
+
+        assert!(check_diff_thresholds().is_none());
+        assert!(run_quality_gates().is_empty());
+        assert!(get_diff_summary().is_none());
+        record_file_modification("any.rs", 1, 0);
+        reset_turn();
+
+        set_state_for_test(GuardrailsState::Disabled);
+    }
+
+    #[test]
+    fn test_749_configure_with_all_disabled_yields_disabled_state() {
+        // A `GuardrailsConfig::default()` has every guard disabled.
+        // configure() must therefore leave the state as Disabled and
+        // not allocate a real engine. This is what makes the global
+        // API safe for the existing tools tests.
+        let _serialize = lock_global_for_test();
+        set_state_for_test(GuardrailsState::Disabled);
+        configure(&GuardrailsConfig::default());
+        assert_eq!(current_state_kind(), "disabled");
+        assert!(check_file_access("any/file.rs").is_ok());
     }
 }

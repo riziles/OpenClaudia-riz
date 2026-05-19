@@ -230,6 +230,19 @@ pub struct StdioTransport {
     child: Arc<Mutex<Child>>,
     reader: Mutex<BufReader<tokio::process::ChildStdout>>,
     request_id: AtomicU64,
+    /// Serialises the (`write_request` → `read_response`) pair so
+    /// concurrent `request` calls cannot interleave on the stdio
+    /// pipes (fix #732). The pre-fix code took `child` for the
+    /// write, dropped it, then took `reader` for the read —
+    /// letting two callers' writes co-resident on the wire. With
+    /// a server free to reply in any order, caller A could read
+    /// B's reply, trigger `ResponseIdMismatch` (fix #701), and
+    /// the desync would cascade. Holding this dedicated guard
+    /// across the entire write+read pair makes the transaction
+    /// atomic; the inner `child` and `reader` mutexes remain
+    /// (the bounded-read borrow from fix #445 still compiles) as
+    /// strict child mutexes of `request_lock`, deadlock-free.
+    request_lock: Mutex<()>,
     /// Ring buffer holding the last `STDERR_BUFFER_CAP` bytes the server
     /// wrote to stderr (fix #445 point 1).
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -315,6 +328,7 @@ impl StdioTransport {
             child: Arc::new(Mutex::new(child)),
             reader: Mutex::new(reader),
             request_id: AtomicU64::new(1),
+            request_lock: Mutex::new(()), // Fix #732
             stderr_buf,
             _stderr_drain: Arc::new(drain),
         })
@@ -343,6 +357,15 @@ impl McpTransport for StdioTransport {
             .map_err(|e| McpError::Protocol(format!("Failed to serialize request: {e}")))?;
 
         debug!(method = %method, id = id, "Sending MCP request");
+
+        // Fix #732 — serialise the entire write+read transaction.
+        // Concurrent calls queue behind this guard so the server
+        // only ever has one outstanding request and cannot reorder
+        // replies. The leading underscore on `_request_guard`
+        // silences `unused_variables` without an `#[allow]`; the
+        // guard lives until the end of the scope, i.e. until the
+        // response has been parsed and the result is ready.
+        let _request_guard = self.request_lock.lock().await;
 
         let mut child = self.child.lock().await;
 
@@ -2768,6 +2791,242 @@ mod tests {
             }
             other => panic!("expected McpError::ResponseIdMismatch, got: {other:?}"),
         }
+        let _ = transport.close().await;
+    }
+
+    // ─── Fix #732 — StdioTransport concurrent-request serialisation ────
+    //
+    // Forensic evidence: pre-fix `StdioTransport::request` took the
+    // `child` mutex for the write, dropped it, and only then took
+    // the separate `reader` mutex for the read. With concurrent
+    // callers and a server free to reply out of arrival order, one
+    // caller could read the other's reply line, trigger
+    // `ResponseIdMismatch`, and the desync would cascade.
+    //
+    // Post-fix the `request_lock` guard is held across the entire
+    // write+read pair, so the server only ever has one outstanding
+    // request and has nothing to reorder.
+    //
+    // The deterministic forensic anchor is
+    // `fix732_concurrent_out_of_order_server_replies_correlate`: a
+    // bash mock with non-blocking reads gathers all available
+    // request lines then emits replies in REVERSE id order.
+    // Verified pre-fix (with the `request_lock` line commented
+    // out) that test failed with
+    // `ResponseIdMismatch{expected:1,got:4}`; post-fix it passes.
+
+    fn spawn_echo_id_mock() -> Result<StdioTransport, McpError> {
+        spawn_sh(
+            r#"while IFS= read -r line; do
+                  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+                  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+                  sleep 0.01
+                  printf '{"jsonrpc":"2.0","id":%s,"result":{"method_echo":"%s","id_echo":%s}}\n' "$id" "$method" "$id"
+               done"#,
+        )
+    }
+
+    /// Fix #732 — four concurrent calls each receive the reply
+    /// matching their own caller-distinct method.
+    #[tokio::test]
+    async fn fix732_four_concurrent_requests_all_correlate() {
+        let transport = Arc::new(spawn_echo_id_mock().expect("spawn"));
+
+        let t1 = Arc::clone(&transport);
+        let t2 = Arc::clone(&transport);
+        let t3 = Arc::clone(&transport);
+        let t4 = Arc::clone(&transport);
+
+        let fut_a = tokio::spawn(async move { t1.request("alpha", None).await });
+        let fut_b = tokio::spawn(async move { t2.request("bravo", None).await });
+        let fut_c = tokio::spawn(async move { t3.request("charlie", None).await });
+        let fut_d = tokio::spawn(async move { t4.request("delta", None).await });
+
+        let (ra, rb, rc, rd) = tokio::time::timeout(Duration::from_secs(15), async move {
+            tokio::join!(fut_a, fut_b, fut_c, fut_d)
+        })
+        .await
+        .expect("concurrent requests did not deadlock");
+
+        let ra = ra.expect("task a panicked").expect("request a failed");
+        let rb = rb.expect("task b panicked").expect("request b failed");
+        let rc = rc.expect("task c panicked").expect("request c failed");
+        let rd = rd.expect("task d panicked").expect("request d failed");
+
+        assert_eq!(ra["method_echo"], "alpha", "call a got wrong reply");
+        assert_eq!(rb["method_echo"], "bravo", "call b got wrong reply");
+        assert_eq!(rc["method_echo"], "charlie", "call c got wrong reply");
+        assert_eq!(rd["method_echo"], "delta", "call d got wrong reply");
+
+        let _ = transport.close().await;
+    }
+
+    /// Fix #732 — per-request id correlation preserved: the four
+    /// `AtomicU64` ids {1,2,3,4} round-trip back to their owning
+    /// callers.
+    #[tokio::test]
+    async fn fix732_concurrent_requests_preserve_id_correlation() {
+        let transport = Arc::new(spawn_echo_id_mock().expect("spawn"));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let t = Arc::clone(&transport);
+            handles.push(tokio::spawn(async move { t.request("ping", None).await }));
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(15), async move {
+            let mut out = Vec::with_capacity(4);
+            for h in handles {
+                out.push(h.await.expect("task panicked"));
+            }
+            out
+        })
+        .await
+        .expect("concurrent requests did not deadlock");
+
+        let mut ids = Vec::new();
+        for r in results {
+            let value = r.expect("request failed");
+            let id = value["id_echo"]
+                .as_u64()
+                .expect("server reply must echo numeric id");
+            ids.push(id);
+        }
+
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "four concurrent requests must consume ids 1..=4 with each \
+             id correlated back to its caller via the echoed reply"
+        );
+
+        let _ = transport.close().await;
+    }
+
+    /// Fix #732 — FORENSIC deterministic anchor. Mock server uses
+    /// non-blocking reads (`read -t 0.05`) to gather all available
+    /// request lines then emits replies in REVERSE id order.
+    ///
+    /// Pre-fix (verified by commenting out the `request_lock`
+    /// guard) this test fails with
+    /// `ResponseIdMismatch { expected: 1, got: 4 }`. Post-fix the
+    /// serialisation ensures the server never sees more than one
+    /// in-flight request — reverse-of-one-element is a no-op and
+    /// each reply matches.
+    #[tokio::test]
+    async fn fix732_concurrent_out_of_order_server_replies_correlate() {
+        let transport = Arc::new(
+            StdioTransport::spawn(
+                "bash",
+                &[
+                    "-c",
+                    r#"while IFS= read -r line; do
+                         lines=("$line")
+                         while IFS= read -r -t 0.05 more; do
+                             lines+=("$more")
+                         done
+                         rev=()
+                         for ((i=${#lines[@]}-1; i>=0; i--)); do
+                             rev+=("${lines[i]}")
+                         done
+                         for l in "${rev[@]}"; do
+                             id=$(printf '%s' "$l" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+                             printf '{"jsonrpc":"2.0","id":%s,"result":{"id_echo":%s}}\n' "$id" "$id"
+                         done
+                     done"#,
+                ],
+            )
+            .expect("spawn bash"),
+        );
+
+        let mut handles = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let t = Arc::clone(&transport);
+            handles.push(tokio::spawn(async move { t.request("ping", None).await }));
+        }
+
+        let mut ids = Vec::with_capacity(4);
+        for h in handles {
+            let value = tokio::time::timeout(Duration::from_secs(15), h)
+                .await
+                .expect("forensic test deadlocked — fix732 over-corrected")
+                .expect("task panicked")
+                .expect(
+                    "request failed — pre-fix #732 the script's reverse-batch \
+                     would cause ResponseIdMismatch when 2+ requests batched",
+                );
+            ids.push(
+                value["id_echo"]
+                    .as_u64()
+                    .expect("server reply must echo numeric id"),
+            );
+        }
+
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "four concurrent callers MUST consume ids 1..=4 with each \
+             id correlated back to its caller"
+        );
+
+        let _ = transport.close().await;
+    }
+
+    /// Fix #732 — forward-progress sanity: three concurrent
+    /// callers complete within a bounded deadline. Proves the
+    /// serialisation does not introduce starvation.
+    #[tokio::test]
+    async fn fix732_serialised_requests_make_forward_progress() {
+        let transport = Arc::new(
+            spawn_sh(
+                r#"i=0
+                   while IFS= read -r line; do
+                       i=$((i + 1))
+                       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+                       sleep 0.05
+                       printf '{"jsonrpc":"2.0","id":%s,"result":{"slot":%d}}\n' "$id" "$i"
+                   done"#,
+            )
+            .expect("spawn"),
+        );
+
+        let start = std::time::Instant::now();
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let t = Arc::clone(&transport);
+            handles.push(tokio::spawn(async move { t.request("ping", None).await }));
+        }
+
+        let mut slots = Vec::new();
+        for h in handles {
+            let value = tokio::time::timeout(Duration::from_secs(10), h)
+                .await
+                .expect("forward-progress deadline exceeded — request starved")
+                .expect("task panicked")
+                .expect("request failed");
+            slots.push(
+                value["slot"]
+                    .as_u64()
+                    .expect("script must echo numeric slot"),
+            );
+        }
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "three serialised requests took {elapsed:?} — likely starvation"
+        );
+
+        slots.sort_unstable();
+        assert_eq!(
+            slots,
+            vec![1, 2, 3],
+            "each caller must get a distinct reply"
+        );
+
         let _ = transport.close().await;
     }
 }

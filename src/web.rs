@@ -5,7 +5,8 @@
 //! - `web_search`: Search the web via Tavily, Brave API, or `DuckDuckGo` (headless browser)
 //! - `web_browser`: Full browser automation via headless Chrome (optional feature)
 
-use reqwest::Client;
+use futures::StreamExt;
+use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -13,6 +14,58 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
+
+/// Maximum bytes accepted from any remote HTTP response body (crosslink #745).
+///
+/// Without this cap, a malicious or compromised upstream — Jina Reader,
+/// Tavily, Brave, or a redirected target — can stream gigabytes into a
+/// `String` before the per-tool truncate (`src/tools/web.rs`) ever runs.
+/// 10 MiB is generous for markdown-converted articles and JSON search
+/// responses while keeping per-call memory bounded.
+pub(crate) const MAX_WEB_FETCH_BYTES: usize = 10 * 1024 * 1024;
+
+/// Stream a response body into a UTF-8 `String`, refusing to buffer more than
+/// `cap` bytes (crosslink #745).
+///
+/// Two layers of defense:
+/// 1. A pre-flight `Content-Length` check rejects bodies the server advertises
+///    as larger than `cap` without reading a single byte.
+/// 2. A streaming accumulator drains `bytes_stream()` chunk-by-chunk and
+///    aborts the moment the running total would exceed `cap`. This catches
+///    servers that lie about (or omit) `Content-Length`.
+///
+/// The error message names the configured cap and the offending URL so the
+/// failure is greppable in production logs.
+pub(crate) async fn read_bounded_text(
+    response: Response,
+    cap: usize,
+    url: &str,
+) -> Result<String, String> {
+    // Pre-flight: trust server-advertised Content-Length when present.
+    if let Some(advertised) = response.content_length() {
+        if advertised > cap as u64 {
+            return Err(format!(
+                "Response too large: {advertised} bytes exceeds cap {cap} at URL {url}"
+            ));
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read response chunk: {e}"))?;
+        total = total.saturating_add(chunk.len());
+        if total > cap {
+            return Err(format!(
+                "Response too large: {total} bytes exceeds cap {cap} at URL {url}"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(buf).map_err(|e| format!("Response is not valid UTF-8: {e}"))
+}
 
 /// Process-wide shared `reqwest::Client` (crosslink #368).
 ///
@@ -342,10 +395,9 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
         return Err(format!("HTTP error: {} - {}", response.status(), url));
     }
 
-    let content = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response: {e}"))?;
+    // Size-cap the body (crosslink #745): without this, a malicious target can
+    // stream gigabytes through Jina Reader before the tool-layer truncate runs.
+    let content = read_bounded_text(response, MAX_WEB_FETCH_BYTES, url).await?;
 
     // Extract title from markdown if present (first # heading)
     let title = content
@@ -458,14 +510,18 @@ async fn search_tavily(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, TAVILY_API_URL)
+            .await
+            .unwrap_or_default();
         return Err(format!("Tavily API error {status}: {body}"));
     }
 
-    let tavily_response: TavilyResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Tavily response: {e}"))?;
+    // Size-cap the JSON body before deserialization (crosslink #745). Without
+    // this, a compromised Tavily endpoint can stream a multi-GB payload that
+    // reqwest's `.json()` would happily buffer.
+    let raw = read_bounded_text(response, MAX_WEB_FETCH_BYTES, TAVILY_API_URL).await?;
+    let tavily_response: TavilyResponse =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse Tavily response: {e}"))?;
 
     Ok(tavily_response
         .results
@@ -497,14 +553,16 @@ async fn search_brave(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, BRAVE_SEARCH_URL)
+            .await
+            .unwrap_or_default();
         return Err(format!("Brave Search API error {status}: {body}"));
     }
 
-    let brave_response: BraveResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Brave response: {e}"))?;
+    // Size-cap the JSON body before deserialization (crosslink #745).
+    let raw = read_bounded_text(response, MAX_WEB_FETCH_BYTES, BRAVE_SEARCH_URL).await?;
+    let brave_response: BraveResponse =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse Brave response: {e}"))?;
 
     Ok(brave_response
         .web
@@ -561,6 +619,17 @@ pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>,
     let html = tab
         .get_content()
         .map_err(|e| format!("Failed to get page content: {e}"))?;
+
+    // Size-cap the rendered HTML (crosslink #745). Headless Chrome will happily
+    // materialize multi-GB DOMs from hostile pages; refuse to propagate that.
+    if html.len() > MAX_WEB_FETCH_BYTES {
+        return Err(format!(
+            "Response too large: {} bytes exceeds cap {} at URL {}",
+            html.len(),
+            MAX_WEB_FETCH_BYTES,
+            search_url
+        ));
+    }
 
     // Parse HTML and extract results
     let document = Html::parse_document(&html);
@@ -694,6 +763,18 @@ pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
     let content = tab
         .get_content()
         .map_err(|e| format!("Failed to get page content: {e}"))?;
+
+    // Size-cap the rendered HTML (crosslink #745). Same threat model as the
+    // DuckDuckGo path: a hostile site can materialize an arbitrarily large
+    // DOM through headless Chrome, so refuse anything past the configured cap.
+    if content.len() > MAX_WEB_FETCH_BYTES {
+        return Err(format!(
+            "Response too large: {} bytes exceeds cap {} at URL {}",
+            content.len(),
+            MAX_WEB_FETCH_BYTES,
+            url
+        ));
+    }
 
     // Get title
     let title = tab.get_title().ok();
@@ -1166,6 +1247,148 @@ mod tests {
         assert!(
             validate_resolved_ip(public).is_ok(),
             "8.8.8.8 (public) wrongly rejected by validate_resolved_ip"
+        );
+    }
+
+    // ── Body-size cap tests (crosslink #745) ─────────────────────────────────
+    //
+    // These pin the `read_bounded_text` contract and exercise it against a
+    // real `wiremock` HTTP server (not Jina Reader — those go through
+    // `fetch_url` which prepends the live proxy URL). The four scenarios cover:
+    //   1. small body under the cap → bytes returned verbatim
+    //   2. body that exceeds the cap mid-stream → error names the cap and URL
+    //   3. multi-chunk delivery summed across N chunks → total tracked correctly
+    //   4. server advertises Content-Length > cap → pre-flight rejects, no bytes
+    //      pulled from the socket
+    //
+    // The cap is overridden to a small value per test so we don't have to
+    // allocate the production 10 MiB just to trip the limit.
+
+    /// Small body under the cap is returned verbatim — no false rejection.
+    #[tokio::test]
+    async fn bounded_text_small_body_under_cap_passes() {
+        let server = wiremock::MockServer::start().await;
+        let body = "hello world";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let response = SHARED_HTTP_CLIENT.get(&url).send().await.unwrap();
+        let out = read_bounded_text(response, 8 * 1024, &url).await.unwrap();
+        assert_eq!(out, body, "small body must be returned verbatim");
+    }
+
+    /// 11 MiB body must trip the production cap (10 MiB) and error out with a
+    /// message naming the cap. Exercises the streaming overflow branch.
+    #[tokio::test]
+    async fn bounded_text_oversize_body_rejected_with_cap_named_error() {
+        let server = wiremock::MockServer::start().await;
+        // Build an 11 MiB body — guaranteed to exceed MAX_WEB_FETCH_BYTES (10 MiB).
+        let oversize = vec![b'A'; 11 * 1024 * 1024];
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(oversize))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let response = SHARED_HTTP_CLIENT.get(&url).send().await.unwrap();
+        let err = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+            .await
+            .expect_err("11 MiB body must trip the 10 MiB cap");
+        assert!(
+            err.contains("Response too large"),
+            "error must say 'Response too large': {err}"
+        );
+        assert!(
+            err.contains(&MAX_WEB_FETCH_BYTES.to_string()),
+            "error must name the cap ({MAX_WEB_FETCH_BYTES}): {err}"
+        );
+        assert!(
+            err.contains(&url),
+            "error must include the offending URL ({url}): {err}"
+        );
+    }
+
+    /// Multi-chunk delivery: when the body spans several `bytes_stream()`
+    /// chunks, the running total must be summed correctly across chunks. We
+    /// force this by serving a 256 KiB body — wiremock + hyper typically
+    /// deliver this in multiple frames. The total byte count must match.
+    #[tokio::test]
+    async fn bounded_text_multi_chunk_body_summed_correctly() {
+        let server = wiremock::MockServer::start().await;
+        // 256 KiB of ASCII bytes — large enough that hyper/reqwest will
+        // typically deliver it in multiple `bytes_stream()` chunks. ASCII so
+        // the resulting `String` is valid UTF-8 (the helper enforces that).
+        let payload: Vec<u8> = (0u32..(256 * 1024))
+            .map(|i| b'!' + u8::try_from(i % 90).expect("0..90 fits u8"))
+            .collect();
+        let expected_len = payload.len();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let response = SHARED_HTTP_CLIENT.get(&url).send().await.unwrap();
+        // Cap > body so the streaming accumulator drains every chunk; the test
+        // proves the running total stays accurate across multiple chunks.
+        let out = read_bounded_text(response, MAX_WEB_FETCH_BYTES, &url)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            expected_len,
+            "multi-chunk body must be summed to the full {expected_len} bytes, got {}",
+            out.len()
+        );
+        assert_eq!(
+            out.as_bytes(),
+            payload.as_slice(),
+            "multi-chunk body bytes must match exactly"
+        );
+    }
+
+    /// Pre-flight `Content-Length` check: when the server advertises a body
+    /// larger than the cap, we must reject BEFORE pulling more than the
+    /// advertised header from the socket. The error must echo the advertised
+    /// size, the cap, and the URL so logs are unambiguous.
+    #[tokio::test]
+    async fn bounded_text_content_length_preflight_rejects() {
+        let server = wiremock::MockServer::start().await;
+        // Advertise a body well over the test cap. The actual body just needs
+        // to exist; wiremock sets Content-Length from `set_body_bytes`.
+        let advertised: usize = 50 * 1024 * 1024;
+        let payload = vec![b'.'; advertised];
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(payload))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let response = SHARED_HTTP_CLIENT.get(&url).send().await.unwrap();
+        // Sanity: reqwest surfaced the advertised Content-Length.
+        assert_eq!(
+            response.content_length(),
+            Some(advertised as u64),
+            "wiremock did not honor the advertised Content-Length header"
+        );
+        let cap: usize = 1024 * 1024; // 1 MiB cap, well under the advertised size.
+        let err = read_bounded_text(response, cap, &url)
+            .await
+            .expect_err("pre-flight Content-Length check must reject");
+        assert!(
+            err.contains("Response too large"),
+            "pre-flight error must say 'Response too large': {err}"
+        );
+        assert!(
+            err.contains(&advertised.to_string()),
+            "pre-flight error must echo the advertised size ({advertised}): {err}"
+        );
+        assert!(
+            err.contains(&cap.to_string()),
+            "pre-flight error must echo the cap ({cap}): {err}"
+        );
+        assert!(
+            err.contains(&url),
+            "pre-flight error must echo the URL ({url}): {err}"
         );
     }
 }

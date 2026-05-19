@@ -498,10 +498,10 @@ fn b4a_env_scrub_removes_api_key_suffix_var() {
     );
 }
 
-/// B4b — non-sensitive var (PATH) is NOT scrubbed; child inherits it
+/// B4b — PATH is on the allowlist; child inherits it.
 ///
-/// OC: `apply_env_scrub` does NOT call `env_clear()` (policy.rs comment at line 143).
-/// PATH, HOME, `CARGO_HOME` pass through.
+/// OC: `apply_env_scrub` calls `env_clear()` then re-injects allowlisted
+/// vars (crosslink #730). PATH, HOME, `CARGO_HOME` are on the allowlist.
 #[test]
 #[cfg(unix)]
 fn b4b_env_scrub_preserves_path() {
@@ -522,12 +522,17 @@ fn b4b_env_scrub_preserves_path() {
     );
 }
 
-/// B4c — `_TOKEN` suffix var is scrubbed; `_HOME` suffix is not
+/// B4c — under the #730 allowlist, neither arbitrary `_TOKEN` nor arbitrary
+/// `_HOME`-suffix vars pass through to the child.
 ///
-/// OC: suffix rules in `is_sensitive_env` (policy.rs:74-79).
+/// Old contract (denylist): `_TOKEN` scrubbed, custom `_HOME` inherited.
+/// New contract (allowlist, crosslink #730): arbitrary names dropped
+/// regardless of suffix; only `ENV_ALLOWLIST_EXACT` / `ENV_ALLOWLIST_PREFIXES`
+/// pass through. This is the whole point of the fix — credentials with
+/// names like `DATABASE_URL` no longer leak.
 #[test]
 #[cfg(unix)]
-fn b4c_env_scrub_token_suffix_scrubbed_home_suffix_not() {
+fn b4c_env_scrub_allowlist_drops_arbitrary_names() {
     let token_key = "TEST_B4C_OC_MYSERVICE_TOKEN";
     let home_key = "TEST_B4C_OC_MYSERVICE_HOME";
     let token_val = "SENTINEL_TOKEN_B4C";
@@ -550,16 +555,16 @@ fn b4c_env_scrub_token_suffix_scrubbed_home_suffix_not() {
     std::env::remove_var(home_key);
 
     assert!(!result.is_error, "B4c: command must execute");
-    // _TOKEN key must be scrubbed
+    // _TOKEN key must be scrubbed (sensitive AND not on allowlist).
     assert!(
         !result.content.contains(token_val),
         "B4c: _TOKEN value must be scrubbed; got: {}",
         result.content
     );
-    // _HOME key must NOT be scrubbed
+    // Custom *_HOME var is NOT on the allowlist — under #730 it is dropped.
     assert!(
-        result.content.contains(home_val),
-        "B4c: _HOME value must pass through; got: {}",
+        !result.content.contains(home_val),
+        "B4c: arbitrary _HOME value must be dropped under allowlist; got: {}",
         result.content
     );
 }

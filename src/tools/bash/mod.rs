@@ -67,9 +67,10 @@ impl BackgroundShellManager {
 
     /// Spawn a new background shell and return its ID.
     ///
-    /// Enforces [`validate_command`] (length cap + denylist) and scrubs
-    /// credential-bearing env vars via [`apply_env_scrub`] before spawn.
-    /// See crosslink #257.
+    /// Enforces [`validate_command`] (length cap + denylist) and applies
+    /// the env allowlist via [`apply_env_scrub`] before spawn so that only
+    /// a curated set of variables (`PATH`, `HOME`, `USER`, `CARGO_HOME`, ...)
+    /// flows into the child. See crosslink #257 and #730.
     pub(crate) fn spawn(&self, command: &str) -> Result<String, String> {
         validate_command(command)?;
 
@@ -341,9 +342,11 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
 /// Execute a bash command.
 ///
 /// Applies the policy layer: length cap + denylist in [`validate_command`],
-/// and env scrubbing via [`apply_env_scrub`] so credential env vars
-/// (`ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`, etc.)
-/// never flow into the child. See crosslink #257.
+/// and env scrubbing via [`apply_env_scrub`] (allowlist — only `PATH`, `HOME`,
+/// `USER`, `CARGO_HOME`, `RUSTUP_HOME`, LC_*, etc. are inherited; arbitrary
+/// credential-bearing names such as `DATABASE_URL` are dropped along with
+/// `ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`).
+/// See crosslink #257 and #730.
 pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return ("Missing 'command' argument".to_string(), true);
