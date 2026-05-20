@@ -1620,13 +1620,43 @@ mod tests {
     }
 
     #[test]
-    fn test_task_get_not_found() {
+    fn fix588_task_get_not_found_returns_success_with_null() {
+        // crosslink #588: a not-found `task_get` matches CC's TaskGetTool,
+        // which resolves with `null` (success) rather than throwing. The
+        // earlier OC behaviour returned `is_error=true` with a "not found"
+        // string, which forced the model into a recovery path for what is
+        // a legitimate outcome (e.g. polling a deleted task).
         let task_mgr = TaskManager::new();
         let mut args = HashMap::new();
         args.insert("task_id".to_string(), json!("task-999"));
         let (output, is_error) = task::execute_task_get(&args, &task_mgr);
-        assert!(is_error);
-        assert!(output.contains("not found"));
+        assert!(
+            !is_error,
+            "task_get for missing id must be a successful lookup, not an error: {output}"
+        );
+        // Payload is the JSON literal `null` so structured consumers can
+        // distinguish "no task" from "tool failure" without parsing prose.
+        assert_eq!(output, "null", "not-found payload must be JSON null");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("payload must parse as JSON");
+        assert!(parsed.is_null(), "parsed payload must be JSON null");
+    }
+
+    #[test]
+    fn fix588_task_get_found_still_returns_full_detail() {
+        // crosslink #588 regression guard: the success path for an existing
+        // task must still emit the human-readable detail block, not null.
+        let mut task_mgr = TaskManager::new();
+        task_mgr.create_task("Real task".to_string(), "Desc".to_string(), None);
+        let mut args = HashMap::new();
+        args.insert("task_id".to_string(), json!("task-1"));
+        let (output, is_error) = task::execute_task_get(&args, &task_mgr);
+        assert!(!is_error, "found task must succeed: {output}");
+        assert_ne!(output, "null", "found task must not be the not-found sentinel");
+        assert!(
+            output.contains("Real task"),
+            "detail must include subject: {output}"
+        );
     }
 
     #[test]

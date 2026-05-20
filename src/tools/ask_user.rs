@@ -217,6 +217,93 @@ mod tests {
         assert!(!msg.contains("multi_select"));
     }
 
+    /// crosslink #585: emulate the read pattern in
+    /// `cli::repl::input::handle_user_questions` (post-fix): prefer
+    /// `multiSelect`, fall back to `multi_select`. Both keys must yield
+    /// `true` after the validator normalises the JSON.
+    fn read_multi_select(q: &Value) -> bool {
+        q.get("multiSelect")
+            .or_else(|| q.get("multi_select"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Pull the first question out of the validator's normalised JSON-string
+    /// output. Returns `None` when the call errored.
+    fn first_normalised_question(msg: &str, is_err: bool) -> Option<Value> {
+        if is_err {
+            return None;
+        }
+        let parsed: Value = serde_json::from_str(msg).ok()?;
+        parsed
+            .get("questions")
+            .and_then(|q| q.as_array())
+            .and_then(|arr| arr.first().cloned())
+    }
+
+    #[test]
+    fn fix585_canonical_multiselect_survives_validator() {
+        // crosslink #585: a caller passing the canonical `multiSelect: true`
+        // must see that flag preserved (not silently dropped) in the
+        // normalised output that the renderer subsequently consumes.
+        let args = make_args(json!([{
+            "question": "Pick",
+            "header": "Pick",
+            "multiSelect": true,
+            "options": [
+                {"label": "A", "description": "a"},
+                {"label": "B", "description": "b"},
+            ]
+        }]));
+        let (msg, is_err) = execute_ask_user_question(&args);
+        let q = first_normalised_question(&msg, is_err)
+            .expect("validator must succeed and emit a question");
+        assert_eq!(
+            q.get("multiSelect").and_then(Value::as_bool),
+            Some(true),
+            "canonical multiSelect must survive validator: {msg}"
+        );
+        assert!(
+            read_multi_select(&q),
+            "renderer's read pattern must observe multiSelect=true after validator"
+        );
+    }
+
+    #[test]
+    fn fix585_legacy_multi_select_normalised_then_read_by_renderer() {
+        // crosslink #585: the legacy `multi_select` key must be canonicalised
+        // to `multiSelect`, AND the renderer (which now reads `multiSelect`
+        // first) must still observe `true`. Without the input.rs fix, the
+        // renderer reads the legacy key and sees `None`, silently dropping
+        // multi-select mode.
+        let args = make_args(json!([{
+            "question": "Pick",
+            "header": "Pick",
+            "multi_select": true,
+            "options": [
+                {"label": "A", "description": "a"},
+                {"label": "B", "description": "b"},
+            ]
+        }]));
+        let (msg, is_err) = execute_ask_user_question(&args);
+        let q = first_normalised_question(&msg, is_err)
+            .expect("validator must succeed and emit a question");
+        // The validator's contract: canonical key only, no legacy leftover.
+        assert!(
+            q.get("multi_select").is_none(),
+            "legacy key must be removed after normalisation: {q}"
+        );
+        assert_eq!(
+            q.get("multiSelect").and_then(Value::as_bool),
+            Some(true),
+            "legacy multi_select must be rewritten to multiSelect=true: {q}"
+        );
+        assert!(
+            read_multi_select(&q),
+            "renderer's read pattern must observe true after legacy→canonical rewrite"
+        );
+    }
+
     #[test]
     fn rejects_non_string_preview() {
         let args = make_args(json!([{

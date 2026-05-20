@@ -459,6 +459,65 @@ mod tests {
         let _ = std::fs::remove_file(&fresh_path);
     }
 
+    // =========================================================================
+    // crosslink #569: explicit issue-tagged tests for replace_all support.
+    // The flag's runtime support landed under #687; these two tests pin the
+    // issue-#569 contract so the next reviewer doesn't lose the trail.
+    // =========================================================================
+
+    #[test]
+    fn fix569_replace_all_true_with_three_matches_replaces_all() {
+        // crosslink #569: `replace_all=true` must replace every occurrence,
+        // not silently drop the flag and bail with "be more specific".
+        // Scenario: three distinct hits, all of which must be rewritten.
+        let (_f, path) = tmp_readable("foo and foo and foo end\n");
+        let mut args = make_args(&path, "foo", "BAR");
+        args.insert("replace_all".to_string(), serde_json::json!(true));
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(
+            !is_err,
+            "replace_all=true with 3 matches must succeed: {msg}"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after, "BAR and BAR and BAR end\n",
+            "all three occurrences must be replaced"
+        );
+        // The success message reports the occurrence count so reviewers can
+        // tell at a glance that the multi-replace path actually ran.
+        assert!(
+            msg.contains("3 occurrences"),
+            "success message must report count=3: {msg}"
+        );
+    }
+
+    #[test]
+    fn fix569_replace_all_false_default_preserves_single_match_behavior() {
+        // crosslink #569: when `replace_all` is omitted (i.e. defaults to
+        // false), single-match edits must continue to work unchanged — the
+        // flag must not regress the existing happy path.
+        let (_f, path) = tmp_readable("unique_token here\nother line\n");
+        let args = make_args(&path, "unique_token", "REPLACED");
+        // Deliberately do NOT insert `replace_all`; rely on the default.
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(
+            !is_err,
+            "default (no replace_all) single-match edit must succeed: {msg}"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            after, "REPLACED here\nother line\n",
+            "single match must be replaced exactly once"
+        );
+        // The single-match path uses the non-counted success message —
+        // make sure we did NOT accidentally enter the multi-occurrence
+        // formatter (which would say "Replaced N occurrences").
+        assert!(
+            !msg.contains("occurrences"),
+            "single-match success must use the singular message, got: {msg}"
+        );
+    }
+
     // ===== crosslink #417: edit rejects symlink-swap on the leaf =====
 
     #[cfg(unix)]

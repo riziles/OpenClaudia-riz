@@ -16,8 +16,15 @@ pub fn handle_user_questions(questions: &[serde_json::Value]) -> String {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        // crosslink #585: the validator in `tools::ask_user` canonicalises
+        // the input key to `multiSelect` (CC's spelling). Read that first;
+        // fall back to the legacy `multi_select` only for callers that bypass
+        // the validator (back-compat). Without this fix the flag is silently
+        // dropped whenever `ask_user_question` normalises a `multiSelect`
+        // input, leaving the renderer stuck in single-select mode.
         let multi_select = q
-            .get("multi_select")
+            .get("multiSelect")
+            .or_else(|| q.get("multi_select"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 

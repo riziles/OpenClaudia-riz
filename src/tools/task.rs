@@ -100,14 +100,21 @@ pub fn execute_task_update(
     }
 }
 
-/// Execute the `task_get` tool
+/// Execute the `task_get` tool.
+///
+/// crosslink #588: a missing `task_id` is a successful lookup of "no such
+/// task", not an error — match CC's `TaskGetTool`, which resolves with
+/// `null` when the id is unknown. Returning an error here would force the
+/// model into a recovery path for what is a legitimate, expected outcome
+/// (e.g. polling a task that was deleted). The success payload is the
+/// literal JSON `null` so structured consumers can branch on it cheaply.
 pub fn execute_task_get(args: &HashMap<String, Value>, task_mgr: &TaskManager) -> (String, bool) {
     let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
         return ("Missing 'task_id' argument".to_string(), true);
     };
 
     task_mgr.get_task(task_id).map_or_else(
-        || (format!("Task '{task_id}' not found"), true),
+        || (Value::Null.to_string(), false),
         |task| (TaskManager::format_task_detail(task), false),
     )
 }

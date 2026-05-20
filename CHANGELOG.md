@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- task_get not-found should return null result (non-error) to match CC TaskGetTool behavior (#588)
+- ask_user_question multi-select key bug: input.rs reads legacy multi_select but validator normalizes to multiSelect (#585)
+- FileEditTool: replace_all parameter unsupported in OC (silent flag drop) (#569)
 - /files command: list all files currently tracked in context (#186)
 - /cost command: show total cost and duration of the current session (#181)
 - /rename command: rename the current conversation session (#188)
@@ -155,6 +158,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- PluginManager.install_from_marketplace: 160-line function violates SRP (#503)
 - modes/fragments.rs: accessor fns duplicate enum-match code across four variants — boilerplate registry (#500)
 - TUI /help text maintained manually in two places with drift (#499)
 - File I/O error messages swallowed to String via map_err(|e| e.to_string()) — stringly-typed errors (#492)
