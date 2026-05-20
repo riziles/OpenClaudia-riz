@@ -102,79 +102,30 @@ pub enum SlashCommandResult {
     SideQuestion(String),
 }
 
+/// Width to which the invocation column is padded so the dash-aligned
+/// descriptions line up. Wide enough for the longest invocation in the
+/// shared table (`/commit-push-pr` = 15 chars) plus a little slack.
+const SLASH_INVOCATION_WIDTH: usize = 19;
+
 pub fn slash_help() {
-    println!("\nSlash Commands:");
-    println!("  /help, /?        - Show this help message");
-    println!("  /new, /clear     - Start a new conversation");
-    println!("  /sessions        - List saved sessions");
-    println!("  /continue <n>    - Continue session number n");
-    println!("  /export          - Export conversation to markdown");
-    println!("  /compact         - Summarize old messages to save context");
-    println!("  /editor          - Open $EDITOR for composing message");
-    println!("  /undo            - Undo last message exchange");
-    println!("  /redo            - Redo last undone exchange");
-    println!("  /exit, /quit     - Exit the chat");
-    println!("  /history         - Show conversation history");
-    println!("  /model           - Show current model and provider");
-    println!("  /model list      - List available models for current provider");
-    println!("  /model <name>    - Switch to a different model");
-    println!("  /copy            - Copy last assistant response to clipboard");
-    println!("  /init            - Initialize project config with auto-detection");
-    println!("  /review          - Review uncommitted git changes");
-    println!("  /commit          - Stage changes and commit with auto-generated message");
-    println!("  /commit-push-pr  - Commit, push, and create a pull request");
-    println!("  /review <branch> - Compare current branch against <branch>");
-    println!("  /status          - Show session status (model, tokens, etc.)");
-    println!("  /connect         - Configure API keys for providers");
-    println!("  /theme           - List available color themes");
-    println!("  /theme <name>    - Switch to a color theme");
-    println!("  /mode            - Show current behavioral mode and list presets");
-    println!("  /mode <preset>   - Switch behavioral mode (create/extend/safe/refactor/...)");
-    println!("  /plan            - Toggle between Build and Plan modes");
-    println!("  /vim             - Toggle vim mode (show mode indicator in prompt)");
-    println!("  /effort [level]  - Set effort level (low/medium/high)");
-    println!("  /keybindings     - Show configured keyboard shortcuts");
-    println!("  /rename <title>  - Rename the current session");
-    println!("  /version         - Show version and system information");
-    println!("  /debug           - Show debug info (paths, env vars, config)");
-    println!("  /find <query>    - Fuzzy-find files in the project");
-    println!("  /doctor          - Run inline diagnostics");
-    println!("  /config          - Show current configuration");
-    println!("  /config path     - Show config file locations");
-    println!("  /cost            - Show session cost estimate");
-    println!("  /context         - Show context window usage breakdown");
-    println!("  /login           - Check authentication status");
-    println!("  /logout          - Show how to clear credentials");
-    println!();
-    println!("Memory Commands (auto-learning):");
-    println!("  /memory          - Show auto-learning stats");
-    println!("  /memory patterns - Show learned coding patterns");
-    println!("  /memory errors   - Show known error patterns");
-    println!("  /memory prefs    - Show learned preferences");
-    println!("  /memory files    - Show file co-edit relationships");
-    println!("  /memory reset    - Reset all learned data (with confirmation)");
-    println!();
-    println!("Activity Commands:");
-    println!("  /activity        - Show current session activities");
-    println!("  /activity sessions - Show recent session summaries");
-    println!("  /activity files  - Show files modified this session");
-    println!("  /activity issues - Show issues worked this session");
-    println!();
-    println!("Plugin Commands:");
-    println!("  /plugin          - List installed plugins");
-    println!("  /plugin install  - Install a plugin");
-    println!("  /plugin manage   - Manage installed plugins");
-    println!("  /plugin help     - Show all plugin commands");
-    println!("  /<plugin>:<cmd>  - Run a plugin command");
-    println!();
-    println!("Model Control:");
-    println!("  /model           - Show current model");
-    println!("  /model list      - List available models for current provider");
-    println!("  /effort <level>  - Set effort level (low/medium/high)");
-    println!();
-    println!("Skill Commands:");
-    println!("  /skill           - List available skills");
-    println!("  /skill <name>    - Invoke a skill (inject prompt as next message)");
+    // Sections (Slash / Memory / Activity / Plugin / Skill) come from the
+    // shared SLASH_SECTIONS table so the CLI printer and the TUI help
+    // overlay never drift (crosslink #499).
+    for section in openclaudia::slash_commands::SLASH_SECTIONS {
+        println!("\n{}:", section.title);
+        for c in section.commands {
+            println!(
+                "  {:<width$} - {}",
+                c.invocation,
+                c.description,
+                width = SLASH_INVOCATION_WIDTH
+            );
+        }
+    }
+
+    // CLI-only input affordances. These have no TUI analogue (the TUI
+    // shows keybindings instead), so they live here and not in the
+    // shared table.
     println!();
     println!("Shell Commands:");
     println!("  !<cmd>           - Execute shell command (e.g., !ls -la)");

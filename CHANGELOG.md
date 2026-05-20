@@ -155,6 +155,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- modes/fragments.rs: accessor fns duplicate enum-match code across four variants — boilerplate registry (#500)
+- TUI /help text maintained manually in two places with drift (#499)
+- File I/O error messages swallowed to String via map_err(|e| e.to_string()) — stringly-typed errors (#492)
+- /commit and /commit-push-pr inline the same git pipeline twice (DRY) (#476)
 - ToolInterceptor::to_tool_call mixes dispatch-layer name mapping with a second parameter-name mapping — two sources of truth for aliasing (#477)
 - Plugin manifest trust: no signature, origin, or integrity verification (#249)
 - proxy_chat_completions is a 308-line God function violating SRP (#247)

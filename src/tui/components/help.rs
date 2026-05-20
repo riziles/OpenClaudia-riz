@@ -22,6 +22,7 @@ use ratatui::{
 };
 
 use super::{Overlay, OverlayAction};
+use crate::slash_commands::SLASH_SECTIONS;
 
 /// One line in the cheatsheet — a shortcut and what it does.
 struct Shortcut {
@@ -29,9 +30,11 @@ struct Shortcut {
     description: &'static str,
 }
 
-/// Full cheatsheet text. Grouped by section; keep groups short so the
-/// overlay fits on typical 24-row terminals without scrolling.
-const SECTIONS: &[(&str, &[Shortcut])] = &[
+/// Keybinding-only sections (Input / Navigation / Thinking). Slash
+/// commands are sourced from [`crate::slash_commands::SLASH_SECTIONS`]
+/// per crosslink #499 so this overlay and the CLI's `slash_help()` stay
+/// in sync by construction.
+const KEYBIND_SECTIONS: &[(&str, &[Shortcut])] = &[
     (
         "Input",
         &[
@@ -67,63 +70,6 @@ const SECTIONS: &[(&str, &[Shortcut])] = &[
             Shortcut {
                 keys: "Esc",
                 description: "close overlays, dismiss prompts",
-            },
-        ],
-    ),
-    (
-        "Slash commands",
-        &[
-            Shortcut {
-                keys: "/help",
-                description: "show this overlay",
-            },
-            Shortcut {
-                keys: "/agents",
-                description: "list subagent types",
-            },
-            Shortcut {
-                keys: "/sessions",
-                description: "list saved sessions",
-            },
-            Shortcut {
-                keys: "/resume",
-                description: "resume a session by id or index",
-            },
-            Shortcut {
-                keys: "/compact",
-                description: "summarize old messages to free context",
-            },
-            Shortcut {
-                keys: "/export",
-                description: "export the conversation to markdown",
-            },
-            Shortcut {
-                keys: "/effort",
-                description: "switch effort level (low / medium / high / max)",
-            },
-            Shortcut {
-                keys: "/model",
-                description: "switch the model in use",
-            },
-            Shortcut {
-                keys: "/mode",
-                description: "switch behavioral mode",
-            },
-            Shortcut {
-                keys: "/plan",
-                description: "toggle plan mode (read-only)",
-            },
-            Shortcut {
-                keys: "/undo",
-                description: "drop the last user + assistant pair",
-            },
-            Shortcut {
-                keys: "/redo",
-                description: "restore the last undone pair",
-            },
-            Shortcut {
-                keys: "/quit",
-                description: "exit OpenClaudia",
             },
         ],
     ),
@@ -167,8 +113,14 @@ impl HelpOverlay {
     }
 
     /// Flatten the section tree into one `Vec<Line>` for the paragraph
-    /// widget. Allocation-per-render is fine — the cheatsheet is <50
+    /// widget. Allocation-per-render is fine — the cheatsheet is <100
     /// lines and this runs once per frame, at human-input cadence.
+    ///
+    /// Sources:
+    /// - Keybinding sections come from [`KEYBIND_SECTIONS`] (TUI-only).
+    /// - Slash-command sections come from
+    ///   [`crate::slash_commands::SLASH_SECTIONS`] (shared with the CLI
+    ///   `slash_help` printer; see crosslink #499).
     fn build_lines() -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -178,28 +130,41 @@ impl HelpOverlay {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        for (title, shortcuts) in SECTIONS {
-            lines.push(Line::from(Span::styled(
-                *title,
-                Style::default()
-                    .fg(Color::Rgb(218, 165, 32))
-                    .add_modifier(Modifier::BOLD),
-            )));
+        let section_title_style = Style::default()
+            .fg(Color::Rgb(218, 165, 32))
+            .add_modifier(Modifier::BOLD);
+        let key_style = Style::default()
+            .fg(Color::Rgb(100, 180, 255))
+            .add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(Color::White);
+
+        for (title, shortcuts) in KEYBIND_SECTIONS {
+            lines.push(Line::from(Span::styled(*title, section_title_style)));
             for sc in *shortcuts {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        sc.keys,
-                        Style::default()
-                            .fg(Color::Rgb(100, 180, 255))
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(sc.keys, key_style),
                     Span::raw("  "),
-                    Span::styled(sc.description, Style::default().fg(Color::White)),
+                    Span::styled(sc.description, desc_style),
                 ]));
             }
             lines.push(Line::from(""));
         }
+
+        // Slash commands — single source of truth shared with the CLI.
+        for section in SLASH_SECTIONS {
+            lines.push(Line::from(Span::styled(section.title, section_title_style)));
+            for c in section.commands {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(c.invocation, key_style),
+                    Span::raw("  "),
+                    Span::styled(c.description, desc_style),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+
         lines.push(Line::from(Span::styled(
             "Esc / q / ? to close",
             Style::default()
@@ -342,11 +307,45 @@ mod tests {
     #[test]
     fn sections_non_empty() {
         // Guard: if someone deletes the cheatsheet by accident, this
-        // test fails rather than shipping an empty overlay.
-        assert!(!SECTIONS.is_empty());
-        for (title, shortcuts) in SECTIONS {
+        // test fails rather than shipping an empty overlay. Covers both
+        // the keybinding-only sections (local) and the shared
+        // slash-command table.
+        assert!(!KEYBIND_SECTIONS.is_empty());
+        for (title, shortcuts) in KEYBIND_SECTIONS {
             assert!(!title.is_empty());
             assert!(!shortcuts.is_empty(), "section {title} has no shortcuts");
         }
+        assert!(!SLASH_SECTIONS.is_empty());
+        for section in SLASH_SECTIONS {
+            assert!(!section.title.is_empty());
+            assert!(
+                !section.commands.is_empty(),
+                "slash section {} has no entries",
+                section.title
+            );
+        }
+    }
+
+    /// The slash-command table is the bridge between TUI and CLI help
+    /// (crosslink #499). If the table somehow stops feeding into the
+    /// rendered overlay, this test catches it before users notice.
+    #[test]
+    fn rendered_lines_include_shared_slash_commands() {
+        let lines = HelpOverlay::build_lines();
+        let rendered: String = lines
+            .into_iter()
+            .flat_map(|l| l.spans.into_iter().map(|s| s.content.into_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Both a section title and a representative command from the
+        // shared table must show up.
+        assert!(
+            rendered.contains("Slash Commands"),
+            "rendered overlay missing 'Slash Commands' section title"
+        );
+        assert!(
+            rendered.contains("/compact"),
+            "rendered overlay missing a representative shared command"
+        );
     }
 }
