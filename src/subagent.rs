@@ -2598,7 +2598,7 @@ mod tests {
         use crate::config::ThinkingConfig;
         use crate::config::{
             GuardrailsConfig, HooksConfig, KeybindingsConfig, MemoryConfig, PermissionsConfig,
-            ProviderConfig, ProxyConfig, SessionConfig, VddConfig,
+            ProviderConfig, ProxyConfig, SessionConfig, VddConfig, WebFetchConfig,
         };
 
         let mut providers = HashMap::new();
@@ -2624,6 +2624,7 @@ mod tests {
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             managed_settings_path: None,
         }
     }

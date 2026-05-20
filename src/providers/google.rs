@@ -193,8 +193,12 @@ impl ProviderAdapter for GoogleAdapter {
         // Add Google Gemini 2.5 thinking config if enabled
         // See: https://ai.google.dev/gemini-api/docs/thinking
         if thinking.enabled {
-            // Budget range: 0-32768, default to 8192
-            let budget = thinking.budget_tokens.unwrap_or(8192).min(32768);
+            // Crosslink #599: route through effective_budget so the
+            // adaptive medium/high preset applies when only
+            // `reasoning_effort` is set. Gemini caps at 32768; the
+            // adaptive ceiling of 16000 is well under that, and an
+            // explicit budget over 32768 is clamped here.
+            let budget = thinking.effective_budget(8192).min(32768);
 
             // Ensure generationConfig exists
             if body.get("generationConfig").is_none() {
@@ -319,6 +323,16 @@ impl ProviderAdapter for GoogleAdapter {
     fn chat_endpoint(&self, model: &str) -> String {
         // Gemini uses model name in the URL path
         format!("/v1beta/models/{model}:generateContent")
+    }
+
+    /// Gemini exposes streaming on a distinct URL path
+    /// (`:streamGenerateContent?alt=sse`) rather than via a request-body
+    /// `stream` flag. The pipeline switches to this endpoint when
+    /// streaming is requested. See crosslink #602.
+    fn stream_endpoint(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        ))
     }
 
     fn get_headers(&self, api_key: &super::ApiKey) -> Vec<(String, String)> {
@@ -477,5 +491,71 @@ mod tests {
             !parts.iter().any(|p| p["text"] == ""),
             "#850: must not coerce unknown variant to empty text"
         );
+    }
+
+    // ── crosslink #602 — stream_endpoint / supports_streaming overrides ─────
+
+    /// `#602-a`: Google overrides `stream_endpoint` with the SSE-specific
+    /// path (`:streamGenerateContent?alt=sse`) and embeds the model name.
+    /// Pins the URL shape so the pipeline can switch endpoints when
+    /// streaming is requested.
+    #[test]
+    fn issue_602_google_stream_endpoint_uses_sse_path() {
+        let adapter = GoogleAdapter::new();
+        let endpoint = adapter
+            .stream_endpoint("gemini-2.5-pro")
+            .expect("Google must expose a streaming endpoint");
+        assert_eq!(
+            endpoint, "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "Google streaming URL must include model + :streamGenerateContent + alt=sse"
+        );
+    }
+
+    /// `#602-b`: the streaming URL is distinct from the non-streaming
+    /// `chat_endpoint`, and `supports_streaming` is true.
+    #[test]
+    fn issue_602_google_streaming_distinct_from_chat_endpoint() {
+        let adapter = GoogleAdapter::new();
+        let chat = adapter.chat_endpoint("gemini-2.5-flash");
+        let stream = adapter.stream_endpoint("gemini-2.5-flash").unwrap();
+        assert_ne!(chat, stream, "stream and non-stream endpoints must differ");
+        assert!(chat.ends_with(":generateContent"));
+        assert!(stream.contains(":streamGenerateContent"));
+        assert!(adapter.supports_streaming());
+    }
+
+    /// `#602-c`: other providers inherit the default — `stream_endpoint`
+    /// returns None, signalling "use the same URL with stream:true".
+    /// Pins that Google is the only override.
+    #[test]
+    fn issue_602_other_providers_default_to_none_stream_endpoint() {
+        use crate::providers::{
+            AnthropicAdapter, DeepSeekAdapter, OllamaAdapter, OpenAIAdapter, ProviderAdapter,
+            QwenAdapter, ZaiAdapter,
+        };
+        let anthropic = AnthropicAdapter::new();
+        let openai = OpenAIAdapter::new();
+        let deepseek = DeepSeekAdapter::new();
+        let qwen = QwenAdapter::new();
+        let zai = ZaiAdapter::new();
+        let ollama = OllamaAdapter::new();
+        let cases: Vec<(&str, &dyn ProviderAdapter)> = vec![
+            ("anthropic", &anthropic),
+            ("openai", &openai),
+            ("deepseek", &deepseek),
+            ("qwen", &qwen),
+            ("zai", &zai),
+            ("ollama", &ollama),
+        ];
+        for (name, adapter) in cases {
+            assert!(
+                adapter.stream_endpoint("any-model").is_none(),
+                "{name}: default stream_endpoint must be None — only Google overrides (#602)"
+            );
+            assert!(
+                adapter.supports_streaming(),
+                "{name}: every wired provider must report supports_streaming=true"
+            );
+        }
     }
 }

@@ -1,9 +1,14 @@
 mod kill;
 mod output;
+pub mod path_constraints;
 mod policy;
 
 pub use kill::{execute_kill_shell, terminate_process_tree};
 pub use output::execute_bash_output;
+pub use path_constraints::{
+    check_command_against_global, clear_global as clear_global_path_constraints,
+    install_global as install_global_path_constraints, PathConstraints,
+};
 pub use policy::{
     apply_env_scrub, dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env,
     validate_command,
@@ -473,6 +478,16 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
 
     if let Err(msg) = validate_command(command) {
         return Err(ToolError::InvalidInput(msg));
+    }
+
+    // Crosslink #594: enforce the optional path-allowlist gate. When no
+    // `PathConstraints` have been installed (the default), this is a no-op
+    // — preserving legacy behaviour for callers that have not opted in.
+    // When the proxy startup has populated the constraint set from
+    // `additionalWorkingDirectories`, commands touching paths outside the
+    // allowed roots are refused with a user-facing explanation.
+    if let Err(msg) = check_command_against_global(command) {
+        return (msg, true);
     }
 
     // Diagnostic: log whether the command would qualify for auto-allow under

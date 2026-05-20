@@ -667,6 +667,7 @@ mod tests {
             guardrails: crate::config::GuardrailsConfig::default(),
             permissions: crate::config::PermissionsConfig::default(),
             memory: crate::config::MemoryConfig::default(),
+            web_fetch: crate::config::WebFetchConfig::default(),
             managed_settings_path: None,
         }
     }

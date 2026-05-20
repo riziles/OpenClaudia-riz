@@ -39,6 +39,14 @@ pub use accumulator::{
 /// Credential-sensitivity classifier re-exported for use outside the tools
 /// module (e.g. `hooks::mod` env-scrub logic). Avoids making `bash` public.
 pub(crate) use bash::is_sensitive_env;
+/// Bash path-allowlist gate (crosslink #594). Re-exported so the permission
+/// layer and proxy startup can install a process-wide constraint set
+/// derived from `additionalWorkingDirectories` without making the entire
+/// `bash` module public.
+pub use bash::{
+    check_command_against_global as check_bash_path_against_global,
+    clear_global_path_constraints, install_global_path_constraints, PathConstraints,
+};
 /// RAII guard that marks the current thread as executing inside a subagent
 /// task, so `execute_enter_plan_mode` refuses with the CC-parity error
 /// (crosslink #620). Subagent runners construct one of these for the

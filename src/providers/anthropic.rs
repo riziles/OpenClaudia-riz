@@ -260,8 +260,13 @@ impl ProviderAdapter for AnthropicAdapter {
         // Add Anthropic extended thinking params if enabled
         // See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
         if thinking.enabled {
-            // Budget tokens must be at least 1024 for Anthropic
-            let budget = thinking.budget_tokens.unwrap_or(10000).max(1024);
+            // Crosslink #599: pull the effective budget through
+            // ThinkingConfig::effective_budget so a `reasoning_effort`
+            // setting of `medium`/`high` (with `adaptive=true`, the
+            // default) raises the budget without requiring the user to
+            // hand-set `budget_tokens`. Anthropic floors the budget at
+            // 1024 — preserved here.
+            let budget = thinking.effective_budget(10000).max(1024);
             body["thinking"] = json!({
                 "type": "enabled",
                 "budget_tokens": budget

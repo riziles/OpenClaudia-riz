@@ -84,6 +84,25 @@ pub enum AppEvent {
         stderr: String,
         exit_code: Option<i32>,
     },
+    /// The retry loop in `pipeline::send_with_retry` exhausted
+    /// [`crate::pipeline::MAX_API_RETRIES`] attempts on a 529-class
+    /// "service overloaded" status — the upstream API is sustainedly
+    /// over capacity rather than transiently rate-limiting.
+    ///
+    /// Carries an advisory `model_hint`: the model name the user should
+    /// consider falling back to. The UI / orchestrator may surface this
+    /// to the user, automatically retry with the hinted model, or do
+    /// nothing — this event is informational, not a control directive,
+    /// because the model-routing decision is owned by the higher layer
+    /// (session config, user prefs). See crosslink #598.
+    OverloadFallback {
+        /// Suggested replacement model name (e.g. `"claude-haiku-4-5"`).
+        ///
+        /// The hint is derived from `pipeline::overload_fallback_for(model)`,
+        /// which maps each known model family to its lighter sibling.
+        /// Empty when no sensible fallback is known.
+        model_hint: String,
+    },
 }
 
 /// Handles terminal events in a background thread, merges with async events.

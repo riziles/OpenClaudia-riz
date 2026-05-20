@@ -44,10 +44,84 @@ pub struct ThinkingConfig {
     /// Reasoning effort level for `OpenAI` o1/o3: "low", "medium", "high"
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// When `budget_tokens` is `None`, derive the budget from
+    /// `reasoning_effort` via [`adaptive_budget_for`].
+    ///
+    /// Default: `true` — CC's parity behavior. Setting an explicit
+    /// `budget_tokens` always wins over the adaptive derivation, and
+    /// setting `adaptive: false` makes a missing budget fall back to
+    /// each provider's hard-coded default (e.g. Anthropic 5000, Gemini
+    /// 8192) instead of effort-derived.
+    ///
+    /// See crosslink #599.
+    #[serde(default = "default_thinking_adaptive")]
+    pub adaptive: bool,
 }
 
 const fn default_thinking_enabled() -> bool {
     true
+}
+
+const fn default_thinking_adaptive() -> bool {
+    true
+}
+
+/// Derive a thinking-token budget from a reasoning-effort string.
+///
+/// Mirrors CC's `getAdaptiveThinkingBudget`:
+///   * `low`    → 1024 tokens (Anthropic minimum)
+///   * `medium` → 8000 tokens (sane default for tool-use turns)
+///   * `high`   → 16000 tokens (deep reasoning ceiling)
+///
+/// Any other value — including missing/empty — returns 0, which the
+/// provider adapters interpret as "fall back to the provider default".
+/// The mapping is intentionally a small step function rather than a
+/// continuous scale so the user-visible cost of switching effort
+/// levels is predictable.
+///
+/// See crosslink #599.
+#[must_use]
+pub fn adaptive_budget_for(effort: &str) -> u32 {
+    match effort.to_ascii_lowercase().as_str() {
+        "low" => 1024,
+        "medium" | "med" => 8000,
+        "high" => 16000,
+        _ => 0,
+    }
+}
+
+impl ThinkingConfig {
+    /// Resolve the effective thinking budget, applying the adaptive
+    /// derivation when [`Self::budget_tokens`] is `None` and
+    /// [`Self::adaptive`] is `true`.
+    ///
+    /// Precedence (highest first):
+    ///   1. Explicit `budget_tokens` set by the user.
+    ///   2. Adaptive derivation from `reasoning_effort` (when
+    ///      `adaptive == true`).
+    ///   3. The supplied `provider_default` (e.g. Anthropic 5000).
+    ///
+    /// `provider_default` is the value the adapter would have used
+    /// before #599 — callers pass their existing fallback so the
+    /// behaviour change is opt-in by setting `adaptive=true` (the new
+    /// default) with no explicit budget.
+    ///
+    /// See crosslink #599.
+    #[must_use]
+    pub fn effective_budget(&self, provider_default: u32) -> u32 {
+        if let Some(b) = self.budget_tokens {
+            return b;
+        }
+        if self.adaptive {
+            if let Some(effort) = self.reasoning_effort.as_deref() {
+                let derived = adaptive_budget_for(effort);
+                if derived > 0 {
+                    return derived;
+                }
+            }
+        }
+        provider_default
+    }
 }
 
 impl Default for ThinkingConfig {
@@ -57,6 +131,7 @@ impl Default for ThinkingConfig {
             budget_tokens: None,
             preserve_across_turns: false,
             reasoning_effort: None,
+            adaptive: default_thinking_adaptive(),
         }
     }
 }
@@ -93,6 +168,96 @@ mod tests {
         assert!(config.budget_tokens.is_none());
         assert!(!config.preserve_across_turns);
         assert!(config.reasoning_effort.is_none());
+        // Crosslink #599: adaptive defaults to true so a missing
+        // budget_tokens with reasoning_effort=medium/high derives a
+        // sensible budget without user intervention.
+        assert!(config.adaptive);
+    }
+
+    // ── crosslink #599 — adaptive thinking budget ───────────────────────────
+
+    /// `#599-a`: `adaptive_budget_for` maps effort strings to the
+    /// documented step function (low=1024, medium=8000, high=16000).
+    /// Anything else returns 0 (caller falls back to provider default).
+    #[test]
+    fn issue_599_adaptive_budget_step_function() {
+        assert_eq!(adaptive_budget_for("low"), 1024);
+        assert_eq!(adaptive_budget_for("medium"), 8000);
+        assert_eq!(adaptive_budget_for("med"), 8000);
+        assert_eq!(adaptive_budget_for("high"), 16000);
+        // Case-insensitive
+        assert_eq!(adaptive_budget_for("HIGH"), 16000);
+        assert_eq!(adaptive_budget_for("Medium"), 8000);
+        // Unknown values fall through to 0 — caller's provider_default wins.
+        assert_eq!(adaptive_budget_for(""), 0);
+        assert_eq!(adaptive_budget_for("ultra"), 0);
+    }
+
+    /// `#599-b`: `effective_budget` precedence — explicit `budget_tokens`
+    /// always wins, otherwise adaptive derivation from
+    /// `reasoning_effort`, otherwise the `provider_default`.
+    #[test]
+    fn issue_599_effective_budget_precedence() {
+        // Explicit budget wins even when reasoning_effort is set
+        let cfg = ThinkingConfig {
+            budget_tokens: Some(2048),
+            reasoning_effort: Some("high".to_string()),
+            adaptive: true,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_budget(99999), 2048);
+
+        // No explicit budget + adaptive + medium effort → 8000
+        let cfg = ThinkingConfig {
+            budget_tokens: None,
+            reasoning_effort: Some("medium".to_string()),
+            adaptive: true,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_budget(5000), 8000);
+
+        // No explicit budget + adaptive + high effort → 16000
+        let cfg = ThinkingConfig {
+            budget_tokens: None,
+            reasoning_effort: Some("high".to_string()),
+            adaptive: true,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_budget(5000), 16000);
+
+        // Adaptive disabled → provider_default
+        let cfg = ThinkingConfig {
+            budget_tokens: None,
+            reasoning_effort: Some("high".to_string()),
+            adaptive: false,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_budget(5000), 5000);
+
+        // No effort at all → provider_default
+        let cfg = ThinkingConfig {
+            budget_tokens: None,
+            reasoning_effort: None,
+            adaptive: true,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_budget(5000), 5000);
+    }
+
+    /// `#599-c`: serde deserialises the new `adaptive` field with default
+    /// true; explicit false is honoured.
+    #[test]
+    fn issue_599_adaptive_field_serde_round_trip() {
+        let cfg: ThinkingConfig = serde_json::from_str("{}").expect("default");
+        assert!(cfg.adaptive, "missing field → default true (CC parity)");
+
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"adaptive": false}"#).expect("explicit false");
+        assert!(!cfg.adaptive, "explicit false must be honoured");
+
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"adaptive": true}"#).expect("explicit true");
+        assert!(cfg.adaptive);
     }
 
     #[test]

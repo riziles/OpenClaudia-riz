@@ -123,6 +123,37 @@ pub trait ProviderAdapter: Send + Sync {
     /// The model parameter allows providers like Google to build model-specific URLs.
     fn chat_endpoint(&self, _model: &str) -> String;
 
+    /// Get the endpoint path for *streaming* chat completions, when the
+    /// provider exposes one that differs from [`Self::chat_endpoint`].
+    ///
+    /// Most providers (Anthropic, `OpenAI`, `DeepSeek`, Qwen, Z.AI) toggle
+    /// streaming via the `stream: true` request field on the same URL, so
+    /// the default implementation returns `None` — the caller continues to
+    /// use [`Self::chat_endpoint`].
+    ///
+    /// Google's Gemini API is the exception: streaming uses a different
+    /// path suffix (`:streamGenerateContent?alt=sse`) instead of a request
+    /// flag. The Google adapter overrides this method so the pipeline can
+    /// switch endpoints when streaming is requested.
+    ///
+    /// See crosslink #602.
+    fn stream_endpoint(&self, _model: &str) -> Option<String> {
+        None
+    }
+
+    /// True when this provider supports server-sent-event streaming.
+    ///
+    /// The default returns `true` — every provider currently wired into
+    /// `OpenClaudia` supports streaming, but the flag is exposed so that
+    /// future providers (or test doubles) can disable streaming via a
+    /// single override instead of plumbing the capability through
+    /// `pipeline.rs`.
+    ///
+    /// See crosslink #602.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
     /// Get required headers for this provider.
     ///
     /// The key is passed as an [`ApiKey`] rather than `&str` so that the

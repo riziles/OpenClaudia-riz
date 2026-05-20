@@ -924,6 +924,25 @@ impl App {
             }) => {
                 self.handle_shell_done(target, &stdout, &stderr, exit_code);
             }
+            Ok(AppEvent::OverloadFallback { model_hint }) => {
+                // Crosslink #598: the retry loop exhausted its budget on a
+                // 529 overload. Surface an advisory to the user so they
+                // know the upstream is sustainedly over capacity. Auto-
+                // switching is intentionally NOT done here — the model-
+                // routing decision belongs to the session/config layer,
+                // not the TUI render path.
+                let msg = if model_hint.is_empty() {
+                    "Upstream model is sustainedly overloaded (HTTP 529). \
+                     Consider waiting or switching to a lighter model."
+                        .to_string()
+                } else {
+                    format!(
+                        "Upstream model is sustainedly overloaded (HTTP 529). \
+                         Consider switching to '{model_hint}' for this session."
+                    )
+                };
+                self.messages.add(DisplayMessage::error(msg));
+            }
             Err(_) => return false,
         }
         true
@@ -2358,6 +2377,9 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::Tick => "Tick".to_string(),
         super::events::AppEvent::ShellDone { target, .. } => {
             format!("ShellDone({target:?})")
+        }
+        super::events::AppEvent::OverloadFallback { model_hint } => {
+            format!("OverloadFallback({model_hint})")
         }
     }
 }

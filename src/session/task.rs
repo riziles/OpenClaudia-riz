@@ -181,28 +181,6 @@ impl TaskManager {
             .collect()
     }
 
-    /// Check if adding an edge from `from_id` blocks `to_id` would create a cycle.
-    /// Uses DFS: starting from `to_id`, follow `blocks` edges. If we reach `from_id`,
-    /// there's a cycle.
-    fn would_create_cycle(&self, from_id: &str, to_id: &str) -> bool {
-        let mut visited = std::collections::HashSet::new();
-        let mut stack = vec![to_id.to_string()];
-        while let Some(current) = stack.pop() {
-            if current == from_id {
-                return true;
-            }
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            if let Some(task) = self.get_task(&current) {
-                for blocked in &task.blocks {
-                    stack.push(blocked.clone());
-                }
-            }
-        }
-        false
-    }
-
     /// Update a task's fields. Returns an error message if validation fails.
     ///
     /// Enforces that only one task can be `InProgress` at a time. When a task

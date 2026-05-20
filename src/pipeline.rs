@@ -404,6 +404,42 @@ fn backoff_with_jitter(attempt: u32) -> u64 {
     raw.max(1)
 }
 
+/// Map a model name to a lighter sibling that's suitable as a fallback when
+/// the requested model is sustainedly overloaded (HTTP 529).
+///
+/// The mapping is intentionally conservative — it only fires for model
+/// families where the lighter sibling is a known good degraded-mode target.
+/// Returns an empty string when no sensible fallback is known, in which
+/// case [`AppEvent::OverloadFallback`] is still emitted (so log consumers
+/// see the exhaustion signal) but the UI surface should not auto-switch.
+///
+/// See crosslink #598 — CC has an analogous mapping in
+/// `getFallbackModelForOverload` that downgrades opus→sonnet→haiku.
+#[must_use]
+pub fn overload_fallback_for(model: &str) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    // Claude family — opus → sonnet → haiku
+    if m.contains("opus") {
+        return "claude-sonnet-4-5";
+    }
+    if m.contains("sonnet") {
+        return "claude-haiku-4-5";
+    }
+    if m.contains("haiku") {
+        // Already the lightest tier — no further fallback.
+        return "";
+    }
+    // GPT family — gpt-4* → gpt-4o-mini; o-series → gpt-4o-mini
+    if m.starts_with("gpt-4") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        return "gpt-4o-mini";
+    }
+    // Gemini family — pro → flash
+    if m.contains("gemini") && m.contains("pro") {
+        return "gemini-2.5-flash";
+    }
+    ""
+}
+
 /// Drive the API request through up to `MAX_API_RETRIES` attempts,
 /// classifying transient transport errors and retryable HTTP statuses
 /// per crosslink #595/#596/#597. Each retry emits a structured
@@ -411,6 +447,12 @@ fn backoff_with_jitter(attempt: u32) -> u64 {
 /// so log consumers can bucket retry pressure programmatically. The
 /// user-facing `AppEvent::StreamText` retry marker is preserved for
 /// REPL/TUI compatibility.
+///
+/// When the loop exhausts [`MAX_API_RETRIES`] on a 529 ("service
+/// overloaded") status, the function additionally emits
+/// [`AppEvent::OverloadFallback`] with an advisory model hint so the
+/// orchestrator can suggest or automatically switch to a lighter
+/// sibling. See crosslink #598.
 async fn send_with_retry(
     client: &reqwest::Client,
     endpoint: &str,
@@ -474,6 +516,30 @@ async fn send_with_retry(
         }
 
         if !resp.status().is_success() {
+            // Crosslink #598: the retry loop has reached its budget on a
+            // retryable status. If that status is 529 (Anthropic "service
+            // overloaded"), emit an OverloadFallback advisory so the UI
+            // can suggest / auto-switch to a lighter model. We compute
+            // the hint from the request body's `model` field — the
+            // request was built upstream by the proxy and always carries
+            // it.
+            if status == 529 {
+                let model = request_body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let hint = overload_fallback_for(model);
+                tracing::warn!(
+                    target: "openclaudia::retry",
+                    event = "overload_fallback",
+                    model,
+                    model_hint = hint,
+                    "529 overload persisted past retry budget; emitting OverloadFallback"
+                );
+                let _ = tx.send(AppEvent::OverloadFallback {
+                    model_hint: hint.to_string(),
+                });
+            }
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("API error {status}: {body}"));
         }
@@ -2241,5 +2307,59 @@ mod tests {
         // and reusable across seams.
         assert!(is_retryable_status(429));
         let _ = backoff_with_jitter(0);
+    }
+
+    // ── crosslink #598 — overload fallback hint ──────────────────────────────
+
+    /// `#598-a`: opus models fall back to sonnet, sonnet to haiku.
+    /// Pins the descent through the Claude tiers.
+    #[test]
+    fn issue_598_claude_family_downgrade_path() {
+        assert_eq!(overload_fallback_for("claude-opus-4-5"), "claude-sonnet-4-5");
+        assert_eq!(overload_fallback_for("claude-sonnet-4-5"), "claude-haiku-4-5");
+        // Haiku has no further downgrade — empty hint, but the event
+        // is still emitted by send_with_retry so log consumers see it.
+        assert_eq!(overload_fallback_for("claude-haiku-4-5"), "");
+    }
+
+    /// `#598-b`: GPT-4 / o-series degrade to gpt-4o-mini; Gemini Pro to
+    /// Gemini Flash; unknown model families return the empty hint.
+    #[test]
+    fn issue_598_cross_provider_fallback_map() {
+        assert_eq!(overload_fallback_for("gpt-4-turbo"), "gpt-4o-mini");
+        assert_eq!(overload_fallback_for("gpt-4o"), "gpt-4o-mini");
+        assert_eq!(overload_fallback_for("o1-preview"), "gpt-4o-mini");
+        assert_eq!(overload_fallback_for("o3-mini"), "gpt-4o-mini");
+        assert_eq!(overload_fallback_for("gemini-2.5-pro"), "gemini-2.5-flash");
+        // Unknown family — empty hint, distinct from a known mapping.
+        assert_eq!(overload_fallback_for("llama-3-70b"), "");
+        assert_eq!(overload_fallback_for(""), "");
+    }
+
+    /// `#598-c`: the `OverloadFallback` `AppEvent` variant carries a
+    /// `String` `model_hint` and can round-trip through a channel. Acts
+    /// as the type-level pin so a future enum change that drops the
+    /// variant (or its field shape) breaks one test instead of cascading
+    /// through every match site silently.
+    #[test]
+    fn issue_598_overload_fallback_event_round_trips() {
+        let (tx, rx) = std::sync::mpsc::channel::<AppEvent>();
+        tx.send(AppEvent::OverloadFallback {
+            model_hint: "claude-haiku-4-5".to_string(),
+        })
+        .expect("send must succeed on a live channel");
+        match rx.recv().expect("event must arrive") {
+            AppEvent::OverloadFallback { model_hint } => {
+                assert_eq!(model_hint, "claude-haiku-4-5");
+            }
+            other => panic!("expected OverloadFallback, got {}", describe_app_event(&other)),
+        }
+    }
+
+    fn describe_app_event(ev: &AppEvent) -> &'static str {
+        match ev {
+            AppEvent::OverloadFallback { .. } => "OverloadFallback",
+            _ => "other",
+        }
     }
 }

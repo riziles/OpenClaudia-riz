@@ -256,6 +256,7 @@ mod tests {
             budget_tokens: None,
             preserve_across_turns: false,
             reasoning_effort: None,
+            adaptive: true,
         }
     }
 

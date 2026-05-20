@@ -17,6 +17,7 @@ mod provider;
 mod proxy;
 mod session;
 mod vdd;
+mod web;
 
 pub use acp::AcpConfig;
 pub use guardrails::{
@@ -34,12 +35,13 @@ pub use crate::keybindings::{
 pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
 pub use permissions::PermissionsConfig;
-pub use provider::{ProviderConfig, ThinkingConfig};
+pub use provider::{adaptive_budget_for, ProviderConfig, ThinkingConfig};
 pub use proxy::ProxyConfig;
 pub use session::{SessionConfig, TokenTrackingConfig};
 pub use vdd::{
     VddAdversaryConfig, VddConfig, VddMode, VddStaticAnalysis, VddThresholds, VddTracking,
 };
+pub use web::{default_preapproved_domains, is_preapproved, WebFetchConfig};
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
@@ -72,6 +74,10 @@ pub struct AppConfig {
     /// See crosslink #604 for the team-memory parity work.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Web-fetch tool configuration, including the preapproved-domain
+    /// allowlist consulted by the permission layer. See crosslink #603.
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
     /// Path to enterprise managed settings file, if one was loaded.
     /// Managed settings override all user and project settings.
     #[serde(skip)]
@@ -320,6 +326,7 @@ mod tests {
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             managed_settings_path: None,
         };
 
@@ -365,6 +372,7 @@ mod tests {
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             managed_settings_path: None,
         };
 
@@ -388,6 +396,7 @@ mod tests {
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             managed_settings_path: None,
         };
 
@@ -412,6 +421,7 @@ mod tests {
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             managed_settings_path: managed,
         }
     }
