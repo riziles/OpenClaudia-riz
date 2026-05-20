@@ -80,11 +80,7 @@ pub const MAX_FETCH_OUTPUT_BYTES: usize = 50_000;
 /// previously open-coded identical assembly + the `50000` magic constant
 /// (crosslink #807). Both call sites now route through this single function
 /// so a tweak to the format or the cap applies uniformly.
-pub fn format_fetch_output(
-    title: Option<&str>,
-    url: &str,
-    content: &str,
-) -> String {
+pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> String {
     let mut output = String::new();
     if let Some(title) = title {
         let _ = write!(output, "# {title}\n\n");
@@ -293,10 +289,7 @@ mod tests {
             host_of("http://user:pass@example.com/x"),
             Some("example.com".into())
         );
-        assert_eq!(
-            host_of("https://[::1]:8080/path"),
-            Some("[::1]".into())
-        );
+        assert_eq!(host_of("https://[::1]:8080/path"), Some("[::1]".into()));
     }
 
     #[test]
@@ -393,12 +386,11 @@ mod tests {
     fn format_fetch_output_pins_shape_807() {
         // Title present + body short of the cap → leading "# title", URL
         // header, body verbatim, no truncation marker.
-        let out = format_fetch_output(
-            Some("Hello"),
-            "https://example.com/",
-            "the body content",
+        let out = format_fetch_output(Some("Hello"), "https://example.com/", "the body content");
+        assert_eq!(
+            out,
+            "# Hello\n\nURL: https://example.com/\n\nthe body content"
         );
-        assert_eq!(out, "# Hello\n\nURL: https://example.com/\n\nthe body content");
 
         // Title absent → no leading heading at all.
         let out = format_fetch_output(None, "https://example.com/", "body");
@@ -411,7 +403,9 @@ mod tests {
         let out = format_fetch_output(None, "https://example.com/", &body);
         let expected_total = "URL: https://example.com/\n\n".len() + body.len();
         assert!(
-            out.contains(&format!("(content truncated, {expected_total} total chars)")),
+            out.contains(&format!(
+                "(content truncated, {expected_total} total chars)"
+            )),
             "truncation marker must echo the pre-truncation total length"
         );
         assert!(

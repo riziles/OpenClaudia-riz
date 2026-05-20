@@ -16,7 +16,7 @@
 //! - `terminal/create`, `terminal/output`, `terminal/wait_for_exit`,
 //!   `terminal/kill`, `terminal/release` — shell execution
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -124,8 +124,17 @@ pub struct AcpServer {
     /// `.openclaudia/rules` content lands in the ACP model context
     /// (crosslink #694).
     rules_engine: RulesEngine,
-    /// Active ACP session ID → `OpenClaudia` session ID mapping
+    /// Active ACP session ID → `OpenClaudia` session ID mapping.
+    /// Bounded to [`MAX_ACP_SESSIONS`] entries; oldest insertion is
+    /// evicted when a new session would push the count over the cap
+    /// (crosslink #759).
     session_map: HashMap<String, String>,
+    /// Insertion-order tracker that pairs with [`Self::session_map`].
+    /// We deliberately do NOT use a third-party LRU crate: the cap is
+    /// small (≤64) and the operations are O(N) but only run on
+    /// session/new + session/load — paths that are already at the
+    /// upper bound of "few times per second" usage (crosslink #759).
+    session_order: VecDeque<String>,
     /// Conversation messages for the active session
     messages: Vec<Value>,
     /// Model name
@@ -363,7 +372,59 @@ async fn pre_tool_use_gate(
     None
 }
 
+/// Upper bound on the number of ACP-session-id → openclaudia-id
+/// entries the server keeps in memory. Long-lived stdio sessions can
+/// otherwise leak unbounded memory (crosslink #759). 64 is the bound
+/// the issue's mandated refactor calls out; we mirror it here.
+const MAX_ACP_SESSIONS: usize = 64;
+
+/// Insert an ACP→openclaudia session-id mapping into `map`, evicting
+/// the oldest entry first if `order` is already at `cap`. Idempotent
+/// on re-insert: a session that is already present is bumped to the
+/// most-recent position rather than duplicated, so a client that
+/// re-loads the same session repeatedly does not get evicted by
+/// itself (crosslink #759).
+///
+/// Free function so tests can drive the LRU semantics without
+/// standing up a full `AcpServer` (which needs an mpsc sender,
+/// session-persist directory, hook engine, etc.).
+fn upsert_session_mapping_into(
+    map: &mut HashMap<String, String>,
+    order: &mut VecDeque<String>,
+    cap: usize,
+    acp_session_id: String,
+    oc_session_id: String,
+) {
+    if let Some(existing_pos) = order.iter().position(|s| s == &acp_session_id) {
+        // Move the existing key to the back (most-recent).
+        order.remove(existing_pos);
+    } else if order.len() >= cap {
+        // Evict the oldest mapping before insert. We do NOT
+        // remove the openclaudia session from disk — it remains
+        // resumable via `session/load` even if the in-memory
+        // mapping was evicted.
+        if let Some(evict) = order.pop_front() {
+            map.remove(&evict);
+            debug!(evicted_acp_session = %evict, "Evicted oldest ACP session mapping (LRU cap)");
+        }
+    }
+    map.insert(acp_session_id.clone(), oc_session_id);
+    order.push_back(acp_session_id);
+}
+
 impl AcpServer {
+    /// See [`upsert_session_mapping_into`]. Thin instance wrapper so
+    /// existing call sites read naturally.
+    fn upsert_session_mapping(&mut self, acp_session_id: String, oc_session_id: String) {
+        upsert_session_mapping_into(
+            &mut self.session_map,
+            &mut self.session_order,
+            MAX_ACP_SESSIONS,
+            acp_session_id,
+            oc_session_id,
+        );
+    }
+
     /// Create a new ACP server from the loaded config.
     #[must_use]
     pub fn new(
@@ -393,6 +454,7 @@ impl AcpServer {
             hook_engine,
             rules_engine,
             session_map: HashMap::new(),
+            session_order: VecDeque::new(),
             messages: Vec::new(),
             model,
             api_key,
@@ -617,8 +679,7 @@ impl AcpServer {
 
         // Generate an ACP-facing session ID
         let acp_session_id = uuid::Uuid::new_v4().to_string();
-        self.session_map
-            .insert(acp_session_id.clone(), oc_session_id);
+        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id);
         self.messages.clear();
 
         self.send_response(
@@ -664,8 +725,7 @@ impl AcpServer {
         // Unknown or unloadable — create a new session and map it
         let session = self.session_manager.get_or_create_session();
         let oc_session_id = session.id.clone();
-        self.session_map
-            .insert(acp_session_id.clone(), oc_session_id);
+        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id);
         self.messages.clear();
 
         self.send_response(
@@ -2260,6 +2320,102 @@ mod ide_tests {
         assert!(state.active_file.is_none());
         assert!(state.selection.is_none());
         assert!(state.diagnostics.is_empty());
+    }
+}
+
+// ============================================================================
+// LRU-bound tests for #759 — session_map must not grow unbounded
+// ============================================================================
+
+#[cfg(test)]
+mod session_lru_tests {
+    use super::{upsert_session_mapping_into, MAX_ACP_SESSIONS};
+    use std::collections::{HashMap, VecDeque};
+
+    /// Inserting up to the cap MUST NOT evict — only inserting one
+    /// past it triggers eviction of the oldest entry.
+    #[test]
+    fn cap_evicts_oldest_only_when_full() {
+        let mut map = HashMap::new();
+        let mut order = VecDeque::new();
+        let cap = 4usize;
+
+        for i in 0..cap {
+            upsert_session_mapping_into(
+                &mut map,
+                &mut order,
+                cap,
+                format!("acp-{i}"),
+                format!("oc-{i}"),
+            );
+        }
+        assert_eq!(map.len(), cap, "cap reached without eviction");
+
+        // One past — oldest (acp-0) goes.
+        upsert_session_mapping_into(
+            &mut map,
+            &mut order,
+            cap,
+            "acp-new".to_string(),
+            "oc-new".to_string(),
+        );
+        assert_eq!(map.len(), cap, "post-eviction count is still at cap");
+        assert!(!map.contains_key("acp-0"), "oldest entry must be evicted");
+        assert_eq!(map.get("acp-new").map(String::as_str), Some("oc-new"));
+    }
+
+    /// Re-inserting the same key MUST bump it to the most-recent
+    /// position, not duplicate it or move a different victim. A
+    /// long-lived client re-loading the same session repeatedly
+    /// would otherwise evict itself.
+    #[test]
+    fn reinsert_bumps_recency_no_duplicate() {
+        let mut map = HashMap::new();
+        let mut order = VecDeque::new();
+        let cap = 3usize;
+
+        for i in 0..cap {
+            upsert_session_mapping_into(
+                &mut map,
+                &mut order,
+                cap,
+                format!("acp-{i}"),
+                format!("oc-{i}"),
+            );
+        }
+        // Touch acp-0 — should now be the youngest.
+        upsert_session_mapping_into(
+            &mut map,
+            &mut order,
+            cap,
+            "acp-0".to_string(),
+            "oc-0".to_string(),
+        );
+        assert_eq!(order.len(), cap, "no duplicate inserted");
+        assert_eq!(order.back().map(String::as_str), Some("acp-0"));
+        assert_eq!(order.front().map(String::as_str), Some("acp-1"));
+
+        // Now overflow — acp-1 (oldest) is evicted, not acp-0.
+        upsert_session_mapping_into(
+            &mut map,
+            &mut order,
+            cap,
+            "acp-new".to_string(),
+            "oc-new".to_string(),
+        );
+        assert!(
+            map.contains_key("acp-0"),
+            "recently-touched key must survive"
+        );
+        assert!(!map.contains_key("acp-1"), "oldest must be the evictee");
+    }
+
+    /// The hard-coded production cap is 64 — pin it so a future
+    /// tuning change is visible in the diff (crosslink #759 mandated
+    /// refactor cites this exact number).
+    #[test]
+    fn production_cap_pins_at_64() {
+        assert_eq!(MAX_ACP_SESSIONS, 64);
     }
 }
 

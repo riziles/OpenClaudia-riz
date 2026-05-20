@@ -70,9 +70,15 @@ const CORE: &[SlashCommand] = &[
     cmd("/copy", "Copy last assistant response to clipboard"),
     cmd("/init", "Initialize project config with auto-detection"),
     cmd("/review", "Review uncommitted git changes"),
-    cmd("/commit", "Stage changes and commit with auto-generated message"),
+    cmd(
+        "/commit",
+        "Stage changes and commit with auto-generated message",
+    ),
     cmd("/commit-push-pr", "Commit, push, and create a pull request"),
-    cmd("/review <branch>", "Compare current branch against <branch>"),
+    cmd(
+        "/review <branch>",
+        "Compare current branch against <branch>",
+    ),
     cmd("/status", "Show session status (model, tokens, etc.)"),
     cmd("/connect", "Configure API keys for providers"),
     cmd("/theme", "List available color themes"),
@@ -105,7 +111,10 @@ const MEMORY: &[SlashCommand] = &[
     cmd("/memory errors", "Show known error patterns"),
     cmd("/memory prefs", "Show learned preferences"),
     cmd("/memory files", "Show file co-edit relationships"),
-    cmd("/memory reset", "Reset all learned data (with confirmation)"),
+    cmd(
+        "/memory reset",
+        "Reset all learned data (with confirmation)",
+    ),
 ];
 
 const ACTIVITY: &[SlashCommand] = &[
@@ -125,7 +134,10 @@ const PLUGIN: &[SlashCommand] = &[
 
 const SKILLS: &[SlashCommand] = &[
     cmd("/skill", "List available skills"),
-    cmd("/skill <name>", "Invoke a skill (inject prompt as next message)"),
+    cmd(
+        "/skill <name>",
+        "Invoke a skill (inject prompt as next message)",
+    ),
 ];
 
 /// All sections in the order they should render.

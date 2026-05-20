@@ -788,11 +788,9 @@ mod plan_mode_tests {
         let dir = TempDir::new().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# plan\n").unwrap();
-        let state = PlanModeState::enter_with_previous_mode(
-            plan.clone(),
-            Some("refactor".to_string()),
-        )
-        .expect("enter must succeed");
+        let state =
+            PlanModeState::enter_with_previous_mode(plan.clone(), Some("refactor".to_string()))
+                .expect("enter must succeed");
         assert_eq!(state.previous_mode.as_deref(), Some("refactor"));
         // Sanity: the other fields still satisfy their #334 invariants.
         assert!(state.active);
@@ -807,18 +805,14 @@ mod plan_mode_tests {
         let dir = TempDir::new().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# plan\n").unwrap();
-        let state = PlanModeState::enter_with_previous_mode(
-            plan,
-            Some("extend".to_string()),
-        )
-        .expect("enter must succeed");
+        let state = PlanModeState::enter_with_previous_mode(plan, Some("extend".to_string()))
+            .expect("enter must succeed");
         let json = serde_json::to_string(&state).expect("serialise");
         assert!(
             json.contains("\"previous_mode\":\"extend\""),
             "JSON must carry the snapshot; got: {json}"
         );
-        let round: PlanModeState =
-            serde_json::from_str(&json).expect("deserialise");
+        let round: PlanModeState = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(round.previous_mode.as_deref(), Some("extend"));
     }
 

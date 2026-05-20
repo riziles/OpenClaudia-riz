@@ -104,8 +104,8 @@ impl TeamMemoryStore {
                         format!("creating team memory directory {}", dir.display())
                     })?;
                 }
-                let team_db = MemoryDb::open(&dir.join("memory.db"))
-                    .context("opening team memory db")?;
+                let team_db =
+                    MemoryDb::open(&dir.join("memory.db")).context("opening team memory db")?;
                 Some(Arc::new(team_db))
             }
             None => None,
@@ -114,9 +114,8 @@ impl TeamMemoryStore {
         let tombstones = match (&team, user_db_path.parent()) {
             (Some(_), Some(parent)) => {
                 let tomb_path = parent.join("team_tombstones.db");
-                let conn = Connection::open(&tomb_path).with_context(|| {
-                    format!("opening tombstone db at {}", tomb_path.display())
-                })?;
+                let conn = Connection::open(&tomb_path)
+                    .with_context(|| format!("opening tombstone db at {}", tomb_path.display()))?;
                 conn.execute_batch(
                     "CREATE TABLE IF NOT EXISTS archival_tombstones (team_id INTEGER PRIMARY KEY);
                      CREATE TABLE IF NOT EXISTS core_tombstones (section TEXT PRIMARY KEY);",
@@ -230,26 +229,15 @@ impl TeamMemoryStore {
     ///
     /// Returns an error if the underlying database write fails or if
     /// `Team` / `Both` is requested without a configured team store.
-    pub fn save_archival(
-        &self,
-        scope: MemoryScope,
-        content: &str,
-        tags: &[String],
-    ) -> Result<i64> {
+    pub fn save_archival(&self, scope: MemoryScope, content: &str, tags: &[String]) -> Result<i64> {
         match scope {
             MemoryScope::User => self.user.memory_save(content, tags),
             MemoryScope::Team => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 team.memory_save(content, tags)
             }
             MemoryScope::Both => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 let id = self.user.memory_save(content, tags)?;
                 // Last-write-wins: the team copy is independent. We
                 // intentionally ignore its rowid — the merged read
@@ -270,21 +258,14 @@ impl TeamMemoryStore {
     /// # Errors
     ///
     /// Returns an error if any underlying read fails.
-    pub fn list_archival(
-        &self,
-        scope: MemoryScope,
-        limit: usize,
-    ) -> Result<Vec<ScopedArchival>> {
+    pub fn list_archival(&self, scope: MemoryScope, limit: usize) -> Result<Vec<ScopedArchival>> {
         match scope {
             MemoryScope::User => {
                 let rows = self.user.memory_list(limit)?;
                 Ok(rows.into_iter().map(ScopedArchival::user).collect())
             }
             MemoryScope::Team => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 let rows = team.memory_list(limit)?;
                 let tombstoned = self.archival_tombstones()?;
                 Ok(rows
@@ -326,10 +307,7 @@ impl TeamMemoryStore {
         match scope {
             MemoryScope::User => self.user.memory_delete(id),
             MemoryScope::Team => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 team.memory_delete(id)
             }
             MemoryScope::Both => {
@@ -362,17 +340,11 @@ impl TeamMemoryStore {
         match scope {
             MemoryScope::User => self.user.update_core_memory(section, content),
             MemoryScope::Team => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 team.update_core_memory(section, content)
             }
             MemoryScope::Both => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 self.user.update_core_memory(section, content)?;
                 team.update_core_memory(section, content)
             }
@@ -394,10 +366,7 @@ impl TeamMemoryStore {
         match scope {
             MemoryScope::User => self.user.get_core_memory_section(section),
             MemoryScope::Team => {
-                let team = self
-                    .team
-                    .as_ref()
-                    .ok_or(TeamMemoryError::TeamUnavailable)?;
+                let team = self.team.as_ref().ok_or(TeamMemoryError::TeamUnavailable)?;
                 let tombstoned = self.core_tombstones()?;
                 if tombstoned.contains(section) {
                     return Ok(None);
@@ -585,9 +554,7 @@ mod tests {
         assert_eq!(pre.len(), 1);
 
         // User tombstones the team id.
-        store
-            .tombstone_team_archival(team_id)
-            .expect("tombstone");
+        store.tombstone_team_archival(team_id).expect("tombstone");
 
         let post = store
             .list_archival(MemoryScope::Both, 10)
@@ -602,7 +569,10 @@ mod tests {
         let team_view = store
             .list_archival(MemoryScope::Team, 10)
             .expect("list team");
-        assert!(team_view.is_empty(), "tombstone filters Team-scoped read too");
+        assert!(
+            team_view.is_empty(),
+            "tombstone filters Team-scoped read too"
+        );
     }
 
     /// Core memory: User-scope update is invisible to the team and

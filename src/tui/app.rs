@@ -2568,8 +2568,7 @@ mod tests {
         app.persist_transcript_tail();
 
         assert_eq!(
-            app.transcript_watermark,
-            3,
+            app.transcript_watermark, 3,
             "watermark advances to len when every append succeeds"
         );
     }

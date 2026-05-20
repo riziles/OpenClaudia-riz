@@ -226,10 +226,14 @@ impl<'a> SessionView<'a> {
         self.inner.request_count
     }
 
-    /// Legacy total-tokens counter.
+    /// Total tokens used in this session, derived from
+    /// [`Self::cumulative_usage`]. Previously this was a separate
+    /// field that drifted from `cumulative_usage` whenever a caller
+    /// hit one writer but not the other — see crosslink #854. Kept
+    /// as a method on the view so existing callers compile unchanged.
     #[must_use]
     pub const fn total_tokens(&self) -> u64 {
-        self.inner.total_tokens
+        self.inner.total_tokens()
     }
 
     /// Cumulative token usage across all turns.
@@ -283,11 +287,21 @@ pub struct Session {
     pub parent_session_id: Option<String>,
     /// Number of API requests in this session
     pub request_count: u64,
-    /// Total tokens used (approximate) - kept for backward compat
-    pub total_tokens: u64,
-    /// Cumulative token usage across all turns
+    /// Cumulative token usage across all turns. This is the single
+    /// source of truth for "how many tokens have been spent" —
+    /// [`Self::total_tokens`] is derived from it (crosslink #854).
     #[serde(default)]
     pub cumulative_usage: TokenUsage,
+    /// Deserialize-only escape hatch for sessions persisted before
+    /// crosslink #854 removed the parallel `total_tokens` field. Old
+    /// JSONL still carries a `total_tokens` integer; serde would
+    /// otherwise refuse the unknown field on strict configs. We
+    /// accept it and surface the value (best-effort) via
+    /// [`Session::legacy_persisted_total_tokens`] so a diagnostic UI
+    /// can report it — the source of truth for live updates remains
+    /// `cumulative_usage`. Never serialized back out.
+    #[serde(default, skip_serializing, rename = "total_tokens")]
+    legacy_total_tokens: Option<u64>,
     /// Per-turn metrics history (capped at [`MAX_TURN_METRICS`] entries)
     #[serde(default)]
     pub turn_metrics: Vec<TurnMetrics>,
@@ -310,8 +324,8 @@ impl Session {
             progress: SessionProgress::default(),
             parent_session_id: None,
             request_count: 0,
-            total_tokens: 0,
             cumulative_usage: TokenUsage::default(),
+            legacy_total_tokens: None,
             turn_metrics: Vec::new(),
             total_turns: 0,
         }
@@ -329,8 +343,8 @@ impl Session {
             progress: SessionProgress::default(),
             parent_session_id: Some(parent_id.to_string()),
             request_count: 0,
-            total_tokens: 0,
             cumulative_usage: TokenUsage::default(),
+            legacy_total_tokens: None,
             turn_metrics: Vec::new(),
             total_turns: 0,
         }
@@ -357,9 +371,40 @@ impl Session {
         self.touch();
     }
 
-    /// Add tokens to the total (legacy simple counter)
+    /// Total tokens spent in this session — input + output, derived
+    /// from [`Self::cumulative_usage`]. Crosslink #854: previously a
+    /// parallel field that drifted whenever a caller hit `add_tokens`
+    /// (which bypassed `cumulative_usage`) but not `record_actual_usage`.
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.cumulative_usage.total()
+    }
+
+    /// Read the legacy `total_tokens` value from a session that was
+    /// persisted before crosslink #854 split the counter out of
+    /// `Session`. Returns `None` for sessions written after the
+    /// migration. Provided so diagnostic UIs can still surface the
+    /// historical approximation when `cumulative_usage` was never
+    /// populated.
+    #[must_use]
+    pub const fn legacy_persisted_total_tokens(&self) -> Option<u64> {
+        self.legacy_total_tokens
+    }
+
+    /// Add tokens to the cumulative usage as a coarse input-side
+    /// estimate. Crosslink #854: this used to write a separate
+    /// `total_tokens` field that diverged from `cumulative_usage`;
+    /// it now routes through the single source of truth. Use
+    /// [`Self::record_actual_usage`] when a typed [`TokenUsage`] is
+    /// available from a provider response.
     pub fn add_tokens(&mut self, tokens: u64) {
-        self.total_tokens += tokens;
+        // Treat untyped tokens as input — that's how the old
+        // counter accrued for tooling that didn't distinguish.
+        let usage = TokenUsage {
+            input_tokens: tokens,
+            ..TokenUsage::default()
+        };
+        self.cumulative_usage.accumulate(&usage);
         self.touch();
     }
 
@@ -403,9 +448,11 @@ impl Session {
         turn_number
     }
 
-    /// Record actual usage from provider response for the most recent turn
+    /// Record actual usage from provider response for the most recent turn.
+    /// Crosslink #854: the redundant `total_tokens += usage.total()`
+    /// write has been removed — `total_tokens` is now derived from
+    /// `cumulative_usage` so the two cannot drift.
     pub fn record_actual_usage(&mut self, usage: TokenUsage) {
-        self.total_tokens += usage.total();
         self.cumulative_usage.accumulate(&usage);
         if let Some(last_turn) = self.turn_metrics.last_mut() {
             last_turn.actual_usage = Some(usage);
@@ -706,10 +753,7 @@ impl SessionManager {
     /// * [`EndSessionError::PersistFailed`] — persistence of one of the
     ///   session files failed.  The in-memory session has already been
     ///   removed from the manager when this is returned.
-    pub fn end_session(
-        &mut self,
-        handoff_notes: Option<&str>,
-    ) -> Result<Session, EndSessionError> {
+    pub fn end_session(&mut self, handoff_notes: Option<&str>) -> Result<Session, EndSessionError> {
         let mut session = self
             .current_session
             .take()
@@ -1098,10 +1142,12 @@ mod tests {
 
         assert_eq!(session.cumulative_usage.input_tokens, 500);
         assert_eq!(session.cumulative_usage.output_tokens, 250);
-        // total_tokens legacy field also updated
+        // total_tokens() derives from cumulative_usage (crosslink #854):
+        // input + output, no parallel state.
         assert_eq!(
-            session.total_tokens, 750,
-            "legacy total_tokens must equal input+output"
+            session.total_tokens(),
+            750,
+            "total_tokens() must derive input+output from cumulative_usage"
         );
 
         // Second turn
@@ -1115,7 +1161,36 @@ mod tests {
         assert_eq!(session.cumulative_usage.input_tokens, 800);
         assert_eq!(session.cumulative_usage.output_tokens, 350);
         assert_eq!(session.cumulative_usage.cache_read_tokens, 50);
-        assert_eq!(session.total_tokens, 1150);
+        assert_eq!(session.total_tokens(), 1150);
+    }
+
+    /// Crosslink #854: a session persisted before the parallel
+    /// `total_tokens` field was removed still carries the integer in
+    /// its JSON. The deserialize-only escape hatch silently absorbs
+    /// it; the derived `total_tokens()` then reflects the migrated
+    /// `cumulative_usage` (which is zero for an unknown field — that's
+    /// the documented trade-off: old persisted state loses the legacy
+    /// approximate counter, but no future code can write to a field
+    /// that drifts).
+    ///
+    /// To stay robust against unrelated `SessionProgress` shape
+    /// changes, we round-trip a default session, then inject the
+    /// legacy `total_tokens` into the serialized form and reload.
+    #[test]
+    fn legacy_total_tokens_in_persisted_json_is_absorbed() {
+        let baseline = Session::new_initializer();
+        let mut raw: serde_json::Value =
+            serde_json::to_value(&baseline).expect("baseline must serialize");
+        raw.as_object_mut()
+            .unwrap()
+            .insert("total_tokens".into(), serde_json::json!(9999));
+        let session: Session = serde_json::from_value(raw).expect("legacy session JSON must parse");
+        // Legacy field carried no information we can recover into
+        // typed input/output, so total_tokens() is zero — but the
+        // session loads, and the legacy figure is still inspectable
+        // for diagnostic UIs.
+        assert_eq!(session.total_tokens(), 0);
+        assert_eq!(session.legacy_persisted_total_tokens(), Some(9999));
     }
 
     /// Spec — `record_turn_estimate` assigns monotonically increasing turn numbers.

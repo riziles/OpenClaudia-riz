@@ -126,8 +126,7 @@ impl ReadFileTracker {
             return;
         }
         // Collect (stamp, path) pairs and partial-sort by stamp ascending.
-        let mut stamped: Vec<(u64, PathBuf)> =
-            files.iter().map(|(p, &s)| (s, p.clone())).collect();
+        let mut stamped: Vec<(u64, PathBuf)> = files.iter().map(|(p, &s)| (s, p.clone())).collect();
         stamped.sort_by_key(|(stamp, _)| *stamp);
         for (_, p) in stamped.into_iter().take(excess) {
             files.remove(&p);
@@ -148,10 +147,11 @@ impl ReadFileTracker {
             return false;
         };
         let key = super::todo::current_session_key();
-        self.buckets
-            .lock()
-            .ok()
-            .is_some_and(|buckets| buckets.get(&key).is_some_and(|f| f.contains_key(&check_path)))
+        self.buckets.lock().ok().is_some_and(|buckets| {
+            buckets
+                .get(&key)
+                .is_some_and(|f| f.contains_key(&check_path))
+        })
     }
 
     /// Clear every session's bucket. Used by tests and at
@@ -624,7 +624,10 @@ mod tests {
         // on disk: canonicalize on the leaf will fail.
         let dir = tempfile::tempdir().expect("tempdir");
         let ghost = dir.path().join("does_not_exist_12345.txt");
-        assert!(!ghost.exists(), "test precondition: ghost path must not exist");
+        assert!(
+            !ghost.exists(),
+            "test precondition: ghost path must not exist"
+        );
 
         assert!(
             !READ_TRACKER.has_been_read(&ghost),

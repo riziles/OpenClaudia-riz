@@ -71,11 +71,30 @@ impl AnthropicAdapter {
     /// semantics, causing every agentic tool-loop request to fail with
     /// Anthropic 400 "each `tool_use` must have a matching `tool_result`"
     /// (crosslink #475).
+    ///
+    /// Crosslink #837: `serde_json::to_value(&ChatMessage)` can only
+    /// fail on a panicking `Serialize` impl, which `ChatMessage`
+    /// derives — so the conversion is effectively infallible. The
+    /// previous `filter_map(.ok())` would silently drop a message on
+    /// a serialization bug, masking it; we now log + drop with full
+    /// context so the failure is at least diagnosable.
     fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
-        let as_values: Vec<Value> = messages
-            .iter()
-            .filter_map(|m| serde_json::to_value(m).ok())
-            .collect();
+        let mut as_values: Vec<Value> = Vec::with_capacity(messages.len());
+        for (idx, m) in messages.iter().enumerate() {
+            match serde_json::to_value(m) {
+                Ok(v) => as_values.push(v),
+                Err(e) => {
+                    tracing::warn!(
+                        index = idx,
+                        role = %m.role,
+                        error = %e,
+                        "anthropic::convert_messages: ChatMessage failed to serialize \
+                         (should be impossible — please file a bug). \
+                         Dropping the message rather than fail the request."
+                    );
+                }
+            }
+        }
         convert_messages_to_anthropic(&as_values)
     }
 

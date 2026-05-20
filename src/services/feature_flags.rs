@@ -27,15 +27,42 @@ pub trait FeatureFlagSource: Send + Sync {
 /// `set` writes are intentionally build-time / startup-time — no lock overhead
 /// on the `is_enabled` hot path at the cost of needing `&mut self` for
 /// mutation. Wrap in `Arc<RwLock<>>` if you need concurrent updates.
+///
+/// Crosslink #843: the env-var snapshot is captured ONCE in
+/// [`StaticFlags::new`] / [`Self::reload_env`] rather than re-read on
+/// every `is_enabled` call. The hot path that previously did
+/// `format!()` + `std::env::var()` + uppercase per call now does one
+/// `HashMap` lookup. Operators that need to toggle a flag without a
+/// restart can call `reload_env` (or rebuild the source).
 #[derive(Debug, Default, Clone)]
 pub struct StaticFlags {
     entries: HashMap<String, bool>,
+    /// Pre-resolved env overrides keyed by the **uppercased** flag
+    /// name (i.e. the suffix of `OPENCLAUDIA_FEATURE_<UPPER>`). Each
+    /// value is `Some(true)`/`Some(false)` per the truthiness table;
+    /// flags without an env var simply have no entry here.
+    env_cache: HashMap<String, bool>,
 }
 
 impl StaticFlags {
+    /// Construct a new flag source. Snapshots the current
+    /// `OPENCLAUDIA_FEATURE_*` env vars; later changes to the
+    /// environment do NOT affect this instance until
+    /// [`Self::reload_env`] is called (crosslink #843).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: HashMap::new(),
+            env_cache: snapshot_env_overrides(),
+        }
+    }
+
+    /// Re-read the current process env into the cache. Use when the
+    /// surrounding code legitimately changes
+    /// `OPENCLAUDIA_FEATURE_*` at runtime (e.g. a test toggling a
+    /// gate, or a future config-reload signal).
+    pub fn reload_env(&mut self) {
+        self.env_cache = snapshot_env_overrides();
     }
 
     /// Pre-seed a flag. Called at startup / test setup.
@@ -49,29 +76,37 @@ impl StaticFlags {
         self.set(name, value);
         self
     }
+}
 
-    /// Resolve via env var: `OPENCLAUDIA_FEATURE_<UPPER>` where
-    /// truthy = `1` / `true` / `on` / `yes` (case-insensitive).
-    /// Any other value → `false`. Missing env var → `None`, letting
-    /// the caller fall through to the map.
-    fn env_override(name: &str) -> Option<bool> {
-        let upper = name.to_ascii_uppercase();
-        let key = format!("OPENCLAUDIA_FEATURE_{upper}");
-        let raw = std::env::var(&key).ok()?;
-        Some(matches!(
-            raw.to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        ))
+/// Snapshot every `OPENCLAUDIA_FEATURE_*` variable into a
+/// flag-name → boolean map. The truthy set is `{1, true, on, yes}`
+/// (case-insensitive); everything else evaluates to `false`. Pulled
+/// out as a free function so [`StaticFlags::new`] and
+/// [`StaticFlags::reload_env`] share one implementation
+/// (crosslink #843).
+fn snapshot_env_overrides() -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    for (k, v) in std::env::vars() {
+        if let Some(suffix) = k.strip_prefix("OPENCLAUDIA_FEATURE_") {
+            let truthy = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+            out.insert(suffix.to_string(), truthy);
+        }
     }
+    out
 }
 
 impl FeatureFlagSource for StaticFlags {
     fn is_enabled(&self, name: &str) -> bool {
-        // Env var wins — operators / CI can override the compiled
+        // Env override wins — operators / CI can pre-set the compiled
         // defaults without a rebuild. Matches the precedence used
         // elsewhere (MAX_THINKING_TOKENS, CLAUDE_CODE_EFFORT_LEVEL).
-        if let Some(env) = Self::env_override(name) {
-            return env;
+        // The cache is keyed on the UPPERCASED flag name to match the
+        // env-var convention, so a one-shot uppercase here is the
+        // only per-call allocation (and the caller's `name` is
+        // typically a &'static str).
+        let upper = name.to_ascii_uppercase();
+        if let Some(env) = self.env_cache.get(&upper) {
+            return *env;
         }
         self.entries.get(name).copied().unwrap_or(false)
     }
@@ -137,20 +172,26 @@ mod tests {
     #[test]
     fn env_var_overrides_map_entry() {
         let _lock = env_lock();
-        let flags = StaticFlags::new().with("beta_feature", false);
-        // With map=false, no env override yet: should be false.
-        assert!(!flags.is_enabled("beta_feature"));
+        // Crosslink #843: the env snapshot is captured at construct
+        // time, so the EnvGuard must precede `StaticFlags::new()`.
+        unsafe {
+            std::env::remove_var("OPENCLAUDIA_FEATURE_BETA_FEATURE");
+        }
+        let flags_no_env = StaticFlags::new().with("beta_feature", false);
+        assert!(!flags_no_env.is_enabled("beta_feature"));
 
         let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_BETA_FEATURE", "1");
+        let flags = StaticFlags::new().with("beta_feature", false);
         assert!(flags.is_enabled("beta_feature"));
     }
 
     #[test]
     fn env_var_accepts_truthy_variants() {
         let _lock = env_lock();
-        let flags = StaticFlags::new();
         for truthy in ["1", "true", "on", "yes", "TRUE", "Yes", "ON"] {
             let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_GATE", truthy);
+            // Snapshot captured AFTER the env is set (crosslink #843).
+            let flags = StaticFlags::new();
             assert!(
                 flags.is_enabled("gate"),
                 "expected '{truthy}' to count as truthy"
@@ -161,9 +202,9 @@ mod tests {
     #[test]
     fn env_var_rejects_non_truthy_variants() {
         let _lock = env_lock();
-        let flags = StaticFlags::new();
         for falsy in ["0", "false", "off", "no", "random"] {
             let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_GATE", falsy);
+            let flags = StaticFlags::new();
             assert!(
                 !flags.is_enabled("gate"),
                 "expected '{falsy}' to count as falsy"
@@ -236,8 +277,10 @@ mod tests {
     #[test]
     fn b2_env_false_overrides_map_true() {
         let _lock = env_lock();
-        let flags = StaticFlags::new().with("env_wins_flag", true);
+        // Crosslink #843: env snapshot is taken at construction, so
+        // the EnvGuard must precede `StaticFlags::new()`.
         let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_ENV_WINS_FLAG", "0");
+        let flags = StaticFlags::new().with("env_wins_flag", true);
         assert!(
             !flags.is_enabled("env_wins_flag"),
             "falsy env var must override map=true"
@@ -254,5 +297,33 @@ mod tests {
         }
         let flags = StaticFlags::new();
         assert!(!flags.is_enabled("totally_unknown_xyz"));
+    }
+
+    /// Crosslink #843: `is_enabled` must NOT consult the live env on
+    /// the hot path. Once `StaticFlags::new()` returns, mutating the
+    /// env should be invisible to it until `reload_env` is called.
+    #[test]
+    fn env_cache_is_snapshot_not_live() {
+        let _lock = env_lock();
+        unsafe {
+            std::env::remove_var("OPENCLAUDIA_FEATURE_LATE_SET");
+        }
+        let mut flags = StaticFlags::new();
+        // Sanity: no env override yet.
+        assert!(!flags.is_enabled("late_set"));
+
+        // Now mutate the env. The cache is stale; the snapshot must win.
+        let _g = EnvGuard::set("OPENCLAUDIA_FEATURE_LATE_SET", "1");
+        assert!(
+            !flags.is_enabled("late_set"),
+            "is_enabled must NOT re-read std::env on the hot path"
+        );
+
+        // Reload makes the change visible.
+        flags.reload_env();
+        assert!(
+            flags.is_enabled("late_set"),
+            "reload_env must pick up live env changes"
+        );
     }
 }

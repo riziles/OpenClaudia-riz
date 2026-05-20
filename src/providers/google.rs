@@ -129,9 +129,7 @@ impl GoogleAdapter {
             }
         }
         if non_text_seen {
-            tracing::warn!(
-                "google::extract_system dropped non-text parts from a system message"
-            );
+            tracing::warn!("google::extract_system dropped non-text parts from a system message");
         }
         if pieces.is_empty() {
             None

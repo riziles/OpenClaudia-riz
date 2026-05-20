@@ -127,6 +127,32 @@ pub struct Teammate {
     pub transcript_path: PathBuf,
 }
 
+/// Two `Teammate`s compare equal iff their [`TeammateId`]s match —
+/// the same key used by every per-teammate cache
+/// (`Coordinator::teammates`, `LeaderPermissionBridge::always_allowed`,
+/// etc., crosslink #846). This makes the existing `Clone` semantically
+/// honest: a clone is a snapshot of the same agent, not a sibling.
+/// Lifecycle state may legitimately diverge between two clones (one
+/// transitioning to `Dead` while the other is still `Running`); the
+/// id-based equality reflects which canonical row the coordinator
+/// should consult.
+impl PartialEq for Teammate {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Teammate {}
+
+/// Hashing mirrors [`PartialEq`] — uses only the `TeammateId` so
+/// `HashMap<Teammate, _>` and `HashSet<Teammate>` round-trip cleanly
+/// against any clone of the same agent.
+impl std::hash::Hash for Teammate {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
 impl Teammate {
     /// Build a fresh teammate in `Spawning` state. Colors rotate
     /// through the fixed palette; caller supplies the ordinal.
@@ -151,6 +177,35 @@ impl Teammate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crosslink #846: a clone of a teammate must compare equal to
+    /// its source — the `TeammateId` is the identity key used by the
+    /// coordinator's `HashMap<TeammateId, Teammate>` and every
+    /// per-teammate cache. Without `PartialEq via TeammateId`, two
+    /// clones with diverging state could be treated as different
+    /// agents by code that does not realize it should look up by id.
+    #[test]
+    fn clone_compares_equal_via_teammate_id() {
+        let tm = Teammate::new(
+            AgentType::GeneralPurpose,
+            0,
+            "sess-1".to_string(),
+            std::path::PathBuf::from("/tmp/t.jsonl"),
+        );
+        let mut clone = tm.clone();
+        // Lifecycle states diverge — equality still holds because the id matches.
+        clone.state = TeammateState::Dead("unit-test diverge".to_string());
+        assert_eq!(tm, clone, "clones must compare equal via TeammateId");
+
+        // A fresh teammate with a different id must NOT compare equal.
+        let other = Teammate::new(
+            AgentType::GeneralPurpose,
+            1,
+            "sess-2".to_string(),
+            std::path::PathBuf::from("/tmp/u.jsonl"),
+        );
+        assert_ne!(tm, other);
+    }
 
     #[test]
     fn palette_exhausts_before_repeating() {

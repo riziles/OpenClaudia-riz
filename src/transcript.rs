@@ -514,7 +514,9 @@ mod tests {
         let (_, suffix) = out.rsplit_once('-').expect("suffix present");
         assert_eq!(suffix.len(), 16);
         assert!(
-            suffix.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "suffix must be lowercase hex: {suffix}"
         );
 
@@ -532,14 +534,26 @@ mod tests {
         let dashed = sanitize_path("/home/doll/Open-Claudia");
         let spaced = sanitize_path("/home/doll/Open Claudia");
         let nested = sanitize_path("/home/doll/Open/Claudia");
-        assert_ne!(dashed, spaced, "Open-Claudia vs Open Claudia must differ ({dashed} == {spaced})");
-        assert_ne!(dashed, nested, "Open-Claudia vs Open/Claudia must differ ({dashed} == {nested})");
-        assert_ne!(spaced, nested, "Open Claudia vs Open/Claudia must differ ({spaced} == {nested})");
+        assert_ne!(
+            dashed, spaced,
+            "Open-Claudia vs Open Claudia must differ ({dashed} == {spaced})"
+        );
+        assert_ne!(
+            dashed, nested,
+            "Open-Claudia vs Open/Claudia must differ ({dashed} == {nested})"
+        );
+        assert_ne!(
+            spaced, nested,
+            "Open Claudia vs Open/Claudia must differ ({spaced} == {nested})"
+        );
 
         // /foo/bar vs /foo-bar — the example from the issue body.
         let slash = sanitize_path("/foo/bar");
         let hyphen = sanitize_path("/foo-bar");
-        assert_ne!(slash, hyphen, "/foo/bar vs /foo-bar must differ ({slash} == {hyphen})");
+        assert_ne!(
+            slash, hyphen,
+            "/foo/bar vs /foo-bar must differ ({slash} == {hyphen})"
+        );
     }
 
     #[test]
@@ -551,7 +565,11 @@ mod tests {
         let out = sanitize_path(&long);
         // 200 (prefix cap) + 1 (dash) + 16 (digest) = 217 ≤ 255.
         assert!(out.len() <= 255, "out is {} bytes", out.len());
-        assert!(out.len() >= 200, "prefix should fill the cap, got {}", out.len());
+        assert!(
+            out.len() >= 200,
+            "prefix should fill the cap, got {}",
+            out.len()
+        );
     }
 
     #[test]

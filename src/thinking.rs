@@ -48,9 +48,7 @@ pub fn has_ultrathink_keyword(text: &str) -> bool {
     if find_whole_word_ci(bytes, ULTRATHINK_NEEDLE) {
         return true;
     }
-    ULTRATHINK_PHRASES
-        .iter()
-        .any(|p| contains_ci(bytes, p))
+    ULTRATHINK_PHRASES.iter().any(|p| contains_ci(bytes, p))
 }
 
 /// Return `true` if `haystack` (raw bytes) contains `needle` (lower-case

@@ -147,8 +147,20 @@ pub(crate) fn truncate_content(raw: &str) -> (String, EntrypointTruncation) {
     let mut bytes_triggered = false;
     let mut truncated = if line_count > MAX_ENTRYPOINT_LINES {
         lines_triggered = true;
-        let kept: Vec<&str> = raw.lines().take(MAX_ENTRYPOINT_LINES).collect();
-        kept.join("\n")
+        // Preserve original line endings (CRLF on Windows-authored
+        // files, trailing LF on POSIX-typical files). `str::lines()`
+        // strips terminators and `Vec::join("\n")` would silently
+        // rewrite CRLF→LF and drop the trailing newline (crosslink
+        // #744). Walk byte offsets via `split_inclusive('\n')` instead
+        // — each kept slice already carries its own terminator.
+        let mut out = String::with_capacity(raw.len());
+        for (i, segment) in raw.split_inclusive('\n').enumerate() {
+            if i >= MAX_ENTRYPOINT_LINES {
+                break;
+            }
+            out.push_str(segment);
+        }
+        out
     } else {
         raw.to_string()
     };
@@ -237,6 +249,46 @@ mod tests {
         assert!(out.contains("- e0\n"));
         assert!(!out.contains("- e399"));
         assert!(out.contains("truncated"));
+    }
+
+    /// Truncating a CRLF-terminated file must NOT silently rewrite
+    /// the line endings to LF (crosslink #744). Windows-authored
+    /// MEMORY.md files are common in mixed-OS teams.
+    #[test]
+    fn line_truncation_preserves_crlf() {
+        let raw: String = (0..400)
+            .map(|i| format!("- e{i}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let (out, kind) = truncate_content(&raw);
+        assert_eq!(kind, EntrypointTruncation::Lines);
+        // Original CRLF terminators retained in the kept prefix.
+        assert!(
+            out.contains("- e0\r\n"),
+            "CRLF line endings must survive truncation, got: {out:?}"
+        );
+    }
+
+    /// Truncating must NOT drop a trailing newline that the original
+    /// file carried (crosslink #744). `str::lines()` swallows it; we
+    /// route through `split_inclusive('\n')` to preserve it.
+    #[test]
+    fn line_truncation_preserves_trailing_newline() {
+        let mut raw: String = (0..400)
+            .map(|i| format!("- e{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        raw.push('\n');
+        let (out, _) = truncate_content(&raw);
+        // The kept-prefix segment ends with a newline before the
+        // truncated-suffix marker is appended.
+        let body_end = out.find("\n\n[truncated").unwrap_or(out.len());
+        let body = &out[..body_end];
+        assert!(
+            body.ends_with('\n'),
+            "trailing newline in the source must survive into the kept prefix; got tail: {:?}",
+            &body[body.len().saturating_sub(8)..]
+        );
     }
 
     #[test]

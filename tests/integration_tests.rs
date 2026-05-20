@@ -2380,7 +2380,7 @@ mod token_tracking {
         // Check cumulative
         assert_eq!(session.cumulative_usage.input_tokens, 4800);
         assert_eq!(session.cumulative_usage.output_tokens, 1200);
-        assert_eq!(session.total_tokens, 6000); // backward compat field
+        assert_eq!(session.total_tokens(), 6000); // derived from cumulative_usage (#854)
 
         // Check last turn has actual usage
         let last = session.turn_metrics.last().unwrap();
@@ -2565,7 +2565,12 @@ mod token_tracking {
 
         assert_eq!(session.id, "test-old-session");
         assert_eq!(session.request_count, 5);
-        assert_eq!(session.total_tokens, 10000);
+        // Crosslink #854: total_tokens() is derived from cumulative_usage now.
+        // Legacy persisted values are preserved on the side via
+        // legacy_persisted_total_tokens() so diagnostic UIs can still surface
+        // them, but the derived counter starts fresh.
+        assert_eq!(session.total_tokens(), 0);
+        assert_eq!(session.legacy_persisted_total_tokens(), Some(10000));
         // New fields should have defaults
         assert_eq!(session.cumulative_usage.input_tokens, 0);
         assert_eq!(session.cumulative_usage.output_tokens, 0);
@@ -2960,7 +2965,7 @@ mod token_tracking {
 
         assert_eq!(session.turn_metrics.len(), 2);
         assert_eq!(session.cumulative_usage.total(), 0); // No actual usage recorded
-        assert_eq!(session.total_tokens, 0);
+        assert_eq!(session.total_tokens(), 0);
 
         // Both turns should have None for actual_usage
         for turn in &session.turn_metrics {

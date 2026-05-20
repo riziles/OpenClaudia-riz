@@ -277,38 +277,130 @@ pub fn extract_compact_boundary_metadata(msg: &ChatMessage) -> Option<CompactBou
     serde_json::from_str::<CompactBoundaryMetadata>(after_marker.trim()).ok()
 }
 
-/// Get context window size for a model
+/// Substring → context-window-tokens lookup row. Order matters: the
+/// first row whose `needle` is contained in the lowercase model name
+/// wins. More-specific names MUST precede their less-specific
+/// supersets (e.g. `gpt-4o` before `gpt-4`, `opus`/`sonnet`/`haiku`
+/// before the bare `claude` fallback). Adding a provider is now a
+/// table edit, not an if/else cascade (crosslink #754).
+struct ContextWindowRow {
+    needle: &'static str,
+    tokens: usize,
+}
+
+/// Ordered table walked by [`get_context_window`]. Sorted from
+/// most-specific to least-specific within each provider family so
+/// substring matching cannot accidentally promote `gpt-4o` →
+/// `gpt-4` or `claude-3-5-sonnet-gpt-bridge` → `gpt-4`.
+const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
+    // Claude family — specific names before the generic fallback.
+    ContextWindowRow {
+        needle: "opus",
+        tokens: CLAUDE_OPUS_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "sonnet",
+        tokens: CLAUDE_SONNET_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "haiku",
+        tokens: CLAUDE_HAIKU_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude",
+        tokens: CLAUDE_SONNET_CONTEXT,
+    },
+    // OpenAI GPT family — gpt-4.1 / gpt-4o must precede bare gpt-4
+    // because `"gpt-4o".contains("gpt-4")` would otherwise win
+    // accidentally. The 4.1 / 4o / 4 ordering is the contract.
+    ContextWindowRow {
+        needle: "gpt-5",
+        tokens: GPT5_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-4.1",
+        tokens: GPT41_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-4o",
+        tokens: GPT4O_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-4",
+        tokens: GPT4_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-3.5",
+        tokens: GPT35_CONTEXT,
+    },
+    // Google Gemini.
+    ContextWindowRow {
+        needle: "gemini",
+        tokens: GEMINI_PRO_CONTEXT,
+    },
+    // OpenAI reasoning family share the gpt-4o window; one row each
+    // so a future divergence can be applied without ratchet-untangling.
+    ContextWindowRow {
+        needle: "o1",
+        tokens: GPT4O_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "o3",
+        tokens: GPT4O_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "o4",
+        tokens: GPT4O_CONTEXT,
+    },
+];
+
+/// Get context window size for a model.
+///
+/// Walks [`CONTEXT_WINDOW_TABLE`] in declaration order; the first
+/// row whose `needle` appears in `model.to_lowercase()` wins. Falls
+/// back to [`DEFAULT_CONTEXT`] for unknown models so the compactor
+/// still has a safe upper bound even on a brand-new provider name.
 #[must_use]
 pub fn get_context_window(model: &str) -> usize {
     let model_lower = model.to_lowercase();
-
-    if model_lower.contains("opus") {
-        CLAUDE_OPUS_CONTEXT
-    } else if model_lower.contains("sonnet") {
-        CLAUDE_SONNET_CONTEXT
-    } else if model_lower.contains("haiku") {
-        CLAUDE_HAIKU_CONTEXT
-    } else if model_lower.contains("claude") {
-        CLAUDE_SONNET_CONTEXT // Default Claude
-    } else if model_lower.contains("gpt-5") {
-        GPT5_CONTEXT
-    } else if model_lower.contains("gpt-4.1") {
-        GPT41_CONTEXT
-    } else if model_lower.contains("gpt-4o") {
-        GPT4O_CONTEXT
-    } else if model_lower.contains("gpt-4") {
-        GPT4_CONTEXT
-    } else if model_lower.contains("gpt-3.5") {
-        GPT35_CONTEXT
-    } else if model_lower.contains("gemini") {
-        GEMINI_PRO_CONTEXT
-    } else if model_lower.contains("o1") || model_lower.contains("o3") || model_lower.contains("o4")
-    {
-        GPT4O_CONTEXT
-    } else {
-        DEFAULT_CONTEXT
-    }
+    CONTEXT_WINDOW_TABLE
+        .iter()
+        .find(|row| model_lower.contains(row.needle))
+        .map_or(DEFAULT_CONTEXT, |row| row.tokens)
 }
+
+/// ASCII characters per emitted token. Subword tokenizers (BPE,
+/// SentencePiece-byte-fallback) emit roughly one token per four
+/// characters of natural-English text — the GPT-3/4 corpus average
+/// reported by `tiktoken-rs` is 4.05. Whitespace is absorbed by the
+/// surrounding token so we count non-whitespace ASCII chars only
+/// (crosslink #762).
+const ASCII_CHARS_PER_TOKEN: usize = 4;
+
+/// Weighted contribution for a non-ASCII alphanumeric codepoint
+/// (CJK, accented Latin, Hangul, Hiragana, Katakana, Arabic). After
+/// the final `weighted_non_ascii / NON_ASCII_WEIGHT_DIVISOR` step
+/// (see [`NON_ASCII_WEIGHT_DIVISOR`]), this represents ≈1.0 tokens
+/// per char, matching empirical per-character token cost reported in
+/// the Anthropic `count_tokens` docs for CJK passages (crosslink
+/// #762, derived from #321 table).
+const NON_ASCII_ALPHANUMERIC_WEIGHT: usize = 4;
+
+/// Weighted contribution for a non-ASCII symbol codepoint (emoji,
+/// arrows, box-drawing, math symbols). After the divisor below this
+/// represents ≈3.0 tokens / char — emoji are split into 2-4 tokens
+/// each by both `tiktoken-rs` and `claude-3` tokenizers; we use the
+/// upper bound so the estimate trips compaction early rather than
+/// late (crosslink #762).
+const NON_ASCII_SYMBOL_WEIGHT: usize = 6;
+
+/// Divisor applied to the accumulated non-ASCII weight to convert it
+/// to tokens. Chosen so that `NON_ASCII_ALPHANUMERIC_WEIGHT /
+/// NON_ASCII_WEIGHT_DIVISOR == 2` and
+/// `NON_ASCII_SYMBOL_WEIGHT / NON_ASCII_WEIGHT_DIVISOR == 3` — the
+/// 2× / 3× tokens-per-char multipliers documented above. Kept as a
+/// named constant so future re-weighting touches one place.
+const NON_ASCII_WEIGHT_DIVISOR: usize = 2;
 
 /// Estimate token count for a string using a per-character weight heuristic.
 ///
@@ -329,10 +421,14 @@ pub fn get_context_window(model: &str) -> usize {
 ///
 /// ## Weights chosen
 /// - ASCII whitespace: 0 (absorbed by the surrounding subword token)
-/// - ASCII non-whitespace: 1 token per 4 chars  (≈ GPT/Claude average for English)
-/// - Non-ASCII alphanumeric (CJK, accented Latin, Hangul, etc.): 2 tokens per char
-/// - Everything else (emoji, misc. symbols): 3 tokens per char
-/// - Each `<image_data>` block: +1 600 tokens (flat)
+/// - ASCII non-whitespace: 1 token per [`ASCII_CHARS_PER_TOKEN`] chars
+///   (≈ GPT/Claude average for English; tiktoken-rs reports 4.05).
+/// - Non-ASCII alphanumeric: weighted via [`NON_ASCII_ALPHANUMERIC_WEIGHT`]
+///   then divided by [`NON_ASCII_WEIGHT_DIVISOR`] → ≈2 tokens/char.
+/// - Non-ASCII symbols: weighted via [`NON_ASCII_SYMBOL_WEIGHT`] then
+///   divided by [`NON_ASCII_WEIGHT_DIVISOR`] → ≈3 tokens/char.
+/// - Each `<image_data>` block: +[`IMAGE_TOKEN_COST`] (flat, derived
+///   from Anthropic medium-resolution billing).
 ///
 /// NOTE: This is still an approximation. For production accuracy integrate
 /// `tiktoken-rs` (`OpenAI`) or the Anthropic `count_tokens` endpoint (cached per
@@ -350,18 +446,13 @@ pub fn estimate_tokens(text: &str) -> usize {
                 ascii_chars = ascii_chars.saturating_add(1);
             }
         } else if c.is_alphanumeric() {
-            // CJK, accented Latin, Hangul, Hiragana, Katakana, Arabic, etc.
-            // Real tokenizers assign roughly 1 token per character for these scripts.
-            // Weight = 2 so that dividing ascii_chars by 4 and adding
-            // weighted_non_ascii / 2 gives the right ratio.
-            weighted_non_ascii = weighted_non_ascii.saturating_add(4); // ×2 after ÷2 below
+            weighted_non_ascii = weighted_non_ascii.saturating_add(NON_ASCII_ALPHANUMERIC_WEIGHT);
         } else {
-            // Emoji, arrows, box-drawing, math symbols — up to 3 tokens each.
-            weighted_non_ascii = weighted_non_ascii.saturating_add(6); // ×3 after ÷2 below
+            weighted_non_ascii = weighted_non_ascii.saturating_add(NON_ASCII_SYMBOL_WEIGHT);
         }
     }
 
-    let base = ascii_chars / 4 + weighted_non_ascii / 2;
+    let base = ascii_chars / ASCII_CHARS_PER_TOKEN + weighted_non_ascii / NON_ASCII_WEIGHT_DIVISOR;
 
     // Each <image_data>…</image_data> placeholder represents a real image payload
     // billed at ~1 600 tokens by Anthropic (claude-3-sonnet medium resolution).

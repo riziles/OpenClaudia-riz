@@ -14,9 +14,7 @@ use std::fs;
 ///
 /// The fallback matches the pre-#618 behaviour so the worst case is a
 /// graceful degradation, never a panic or a wrong mode flip.
-fn restore_previous_mode(
-    plan_state: Option<&openclaudia::session::PlanModeState>,
-) -> AgentMode {
+fn restore_previous_mode(plan_state: Option<&openclaudia::session::PlanModeState>) -> AgentMode {
     plan_state
         .and_then(|s| s.previous_mode.as_deref())
         .map_or(AgentMode::Build, AgentMode::from_token)

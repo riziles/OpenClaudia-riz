@@ -247,13 +247,22 @@ pub fn build_system_prompt_blocks(
     }
 
     // 10. Custom instructions
+    //
+    // Crosslink #844: `custom_instructions` comes from session config
+    // / CLI args / hook outputs — any of which can be loaded from
+    // user-controlled files at the project root. Injecting verbatim
+    // lets `</custom_instructions>` plus a "Now ignore the above"
+    // tail escape the section boundary and steer the model.
+    // `xml_escape_for_prompt` neutralises the three bytes that can
+    // close the surrounding tag (markdown content is untouched).
     if let Some(custom) = custom_instructions {
-        if !custom.trim().is_empty() {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
             if !suffix.is_empty() {
                 suffix.push_str("\n\n");
             }
             suffix.push_str("## Custom Instructions\n");
-            suffix.push_str(custom);
+            suffix.push_str(&crate::memory::xml_escape_for_prompt(trimmed));
         }
     }
 

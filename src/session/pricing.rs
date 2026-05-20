@@ -1010,8 +1010,8 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         };
-        let cost_no_search = calculate_cost("claude-sonnet-4-5", &usage_with_tokens)
-            .expect("sonnet must resolve");
+        let cost_no_search =
+            calculate_cost("claude-sonnet-4-5", &usage_with_tokens).expect("sonnet must resolve");
         let cost_with_search =
             calculate_cost_with_extras("claude-sonnet-4-5", &usage_with_tokens, &extras)
                 .expect("sonnet must resolve");
@@ -1068,8 +1068,7 @@ mod tests {
             cache_write_tokens: 0,
         };
         // claude-opus-4-5 has no fast-mode override — must equal standard.
-        let standard =
-            calculate_cost("claude-opus-4-5", &usage).expect("opus-4-5 must resolve");
+        let standard = calculate_cost("claude-opus-4-5", &usage).expect("opus-4-5 must resolve");
         let fast =
             calculate_cost_fast_mode("claude-opus-4-5", &usage).expect("opus-4-5 must resolve");
         assert!(
@@ -1143,8 +1142,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         };
-        let _ = calculate_cost("claude-3-haiku-20240307", &usage)
-            .expect("haiku must resolve");
+        let _ = calculate_cost("claude-3-haiku-20240307", &usage).expect("haiku must resolve");
         assert!(
             !has_unknown_model_cost(),
             "successful pricing lookup must not set the unknown-model flag"

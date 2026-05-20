@@ -18,6 +18,7 @@ pub(crate) mod args;
 mod ask_user;
 mod bash;
 mod chainlink;
+pub(crate) mod command;
 mod cron;
 mod file;
 pub mod file_index;
@@ -1708,7 +1709,10 @@ mod tests {
         args.insert("task_id".to_string(), json!("task-1"));
         let (output, is_error) = task::execute_task_get(&args, &task_mgr);
         assert!(!is_error, "found task must succeed: {output}");
-        assert_ne!(output, "null", "found task must not be the not-found sentinel");
+        assert_ne!(
+            output, "null",
+            "found task must not be the not-found sentinel"
+        );
         assert!(
             output.contains("Real task"),
             "detail must include subject: {output}"

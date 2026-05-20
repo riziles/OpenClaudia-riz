@@ -39,14 +39,6 @@ use std::sync::{Mutex, OnceLock};
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
 
-/// Exponential-backoff polling schedule for `git_in`'s wait loop
-/// (crosslink #956). Each entry is the sleep duration in milliseconds
-/// between successive `try_wait` checks; the loop pins on the last
-/// entry once the schedule is exhausted. Tuned so trivial git plumbing
-/// commands (sub-millisecond exit) see <10 ms wall-clock overhead
-/// instead of the previous flat 100 ms.
-const GIT_WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
-
 /// Process-wide set of worktree paths currently held by the agent harness.
 ///
 /// Populated by [`execute_enter_worktree`] on success and consulted on every
@@ -249,50 +241,36 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
 /// This is the contract that lets us remove `set_current_dir` from this
 /// module entirely (crosslink #345).
 ///
-/// The wait loop uses **exponential backoff** (1 → 2 → 5 → 10 → 25 →
-/// 50 → 100 ms, then sustained 100 ms) rather than a flat 100 ms
-/// sleep (crosslink #956). The prior fixed-100ms loop added up to a
-/// full 100 ms of latency to EVERY git command — even ones that
-/// returned in <1 ms (the common case for `rev-parse`, `check-ref-format`
-/// etc.). Backoff polling gives sub-millisecond exit detection for
-/// fast commands while still capping the loop at the same 100 ms
-/// upper bound for long-running ones, so the timeout-resolution
-/// behaviour is preserved.
+/// Crosslink #836: subprocess spawning, timeout/backoff, and reaping
+/// are delegated to [`crate::tools::command::run_with_timeout`] so the
+/// pdf reader, the git worktree path, and any future tool share one
+/// implementation. The exponential-backoff schedule (1→2→5→10→25→50→100 ms,
+/// then sustained 100 ms) lives in that helper; the crosslink #956 latency
+/// fix is preserved unchanged.
 fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn git: {e}"))?;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
-    let mut step = 0usize;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| format!("Git wait failed: {e}"))
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "Git command timed out after {GIT_TIMEOUT_SECS}s: git {}",
-                        args.join(" ")
-                    ));
-                }
-                let idx = step.min(GIT_WAIT_BACKOFF_MS.len() - 1);
-                let sleep_ms = GIT_WAIT_BACKOFF_MS[idx];
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                step = step.saturating_add(1);
-            }
-            Err(e) => return Err(format!("Git wait error: {e}")),
+    // Crosslink #836: route through the shared [`run_with_timeout`]
+    // helper so git, pdftotext, and any future tool subprocess share
+    // one timeout/backoff implementation. The git-specific timeout
+    // and argv-tail formatting are kept here so the caller-visible
+    // error string is unchanged.
+    crate::tools::command::run_with_timeout(
+        "git",
+        args,
+        Some(cwd),
+        std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
+    )
+    .map_err(|err| match err {
+        crate::tools::command::CommandError::SpawnFailed { source, .. } => {
+            format!("Failed to spawn git: {source}")
         }
-    }
+        crate::tools::command::CommandError::TimedOut { .. } => format!(
+            "Git command timed out after {GIT_TIMEOUT_SECS}s: git {}",
+            args.join(" ")
+        ),
+        crate::tools::command::CommandError::WaitFailed { source, .. } => {
+            format!("Git wait failed: {source}")
+        }
+    })
 }
 
 /// Create a new git worktree for isolated agent work.
@@ -420,7 +398,10 @@ fn retry_worktree_add_for_existing_branch(
 ) -> (String, bool) {
     let stderr = String::from_utf8_lossy(&failed_output.stderr);
     if !stderr.contains("already exists") {
-        return (format!("Failed to create worktree: {}", stderr.trim()), true);
+        return (
+            format!("Failed to create worktree: {}", stderr.trim()),
+            true,
+        );
     }
     let retry = git_in(
         cwd,
@@ -444,7 +425,10 @@ fn retry_worktree_add_for_existing_branch(
                 false,
             )
         }
-        _ => (format!("Failed to create worktree: {}", stderr.trim()), true),
+        _ => (
+            format!("Failed to create worktree: {}", stderr.trim()),
+            true,
+        ),
     }
 }
 

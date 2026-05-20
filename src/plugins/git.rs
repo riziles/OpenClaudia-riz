@@ -690,8 +690,7 @@ mod tests {
         // (simulates the operator having originally added the marketplace
         // by its public https endpoint).
         let clone_dest = tmp.path().join("marketplace-clone");
-        clone_and_record(&bare.to_string_lossy(), &clone_dest, original_url)
-            .expect("clone+record");
+        clone_and_record(&bare.to_string_lossy(), &clone_dest, original_url).expect("clone+record");
 
         // Repoint origin to a different host.
         let git = git_bin().expect("git on PATH").to_path_buf();

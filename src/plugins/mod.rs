@@ -963,16 +963,19 @@ impl Plugin {
         }
     }
 
-    /// Resolve skill paths from manifest + convention
+    /// Resolve skill paths from manifest + convention.
+    ///
+    /// Convention-based discovery walks `<plugin>/skills/` for the same
+    /// layouts `skills::load_skills` understands — subdirectories
+    /// containing a `SKILL.md` AND bare top-level `.md` files
+    /// (crosslink #832). Both call sites route through
+    /// [`crate::skills::walk_skill_entries`] so the rule for "what
+    /// counts as a skill" is defined once.
     fn resolve_skills(&mut self) {
         let skills_dir = self.path.join("skills");
         if skills_dir.exists() && self.manifest.skills.is_none() {
-            if let Ok(entries) = fs::read_dir(&skills_dir) {
-                for entry in entries.flatten() {
-                    if entry.path().is_dir() {
-                        self.skill_paths.push(entry.path());
-                    }
-                }
+            for entry in crate::skills::walk_skill_entries(&skills_dir) {
+                self.skill_paths.push(entry.root_path().to_path_buf());
             }
         }
         if let Some(ref skills_spec) = self.manifest.skills {

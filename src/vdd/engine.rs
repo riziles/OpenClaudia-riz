@@ -30,6 +30,32 @@ pub struct VddEngine {
     pub(crate) client: Client,
 }
 
+/// Typed pair of `(provider_name, api_key)` for the builder agent.
+///
+/// The routing handle every VDD method needs in order to send a
+/// follow-up request through the same provider that produced the
+/// text under review (crosslink #950).
+///
+/// Previously these two were passed as `&str + Option<&ApiKey>` at
+/// every call site; a typo in the provider name silently routed to
+/// the wrong adapter with no diagnostic. Bundling them into a single
+/// newtype eliminates the "did I pass the right pair?" failure mode
+/// AND collapses the function-signature footprint from two
+/// parameters to one.
+#[derive(Debug, Clone, Copy)]
+pub struct BuilderProvider<'a> {
+    pub name: &'a str,
+    pub api_key: Option<&'a ApiKey>,
+}
+
+impl<'a> BuilderProvider<'a> {
+    /// Construct a builder-provider handle.
+    #[must_use]
+    pub const fn new(name: &'a str, api_key: Option<&'a ApiKey>) -> Self {
+        Self { name, api_key }
+    }
+}
+
 /// Per-iteration inputs for the blocking loop. Bundled into a struct so
 /// `run_iteration` can take a single argument without tripping the
 /// `too_many_arguments` lint.
@@ -39,8 +65,7 @@ struct IterationContext<'a> {
     static_results: &'a [StaticAnalysisResult],
     iteration: u32,
     previous_fps: &'a [FindingIdentity],
-    builder_provider: &'a str,
-    builder_api_key: Option<&'a ApiKey>,
+    builder: BuilderProvider<'a>,
 }
 
 impl VddEngine {
@@ -64,8 +89,7 @@ impl VddEngine {
         &self,
         builder_text: &str,
         user_task: &str,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         if !self.config.enabled || builder_text.len() < 100 {
             // Disabled, or response too short to be code worth reviewing —
@@ -84,7 +108,7 @@ impl VddEngine {
             "VDD: Starting adversarial review"
         );
 
-        self.single_pass_review(builder_text, user_task, builder_provider, builder_api_key)
+        self.single_pass_review(builder_text, user_task, builder)
             .await
     }
 
@@ -102,8 +126,7 @@ impl VddEngine {
         &self,
         builder_text: &str,
         user_task: &str,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         // Run static analysis
         let static_results = self.run_static_analysis().await;
@@ -134,8 +157,8 @@ impl VddEngine {
             app_config: &self.app_config,
             previous_fps: &[],
             builder_code: builder_text,
-            builder_provider,
-            builder_api_key,
+            builder_provider: builder.name,
+            builder_api_key: builder.api_key,
         };
         triage_findings(&mut findings, &triage_ctx).await;
 
@@ -170,8 +193,7 @@ impl VddEngine {
         &self,
         builder_response: &Value,
         original_request: &ChatCompletionRequest,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
     ) -> Result<VddResult, VddError> {
         if !self.config.enabled {
             return Ok(VddResult::Skipped("VDD disabled".to_string()));
@@ -188,11 +210,12 @@ impl VddEngine {
         // Crosslink #433: a typo'd builder provider name short-circuits
         // VDD as "Skipped" with a useful diagnostic rather than silently
         // routing through OpenAIAdapter and returning empty text.
-        let builder_adapter = match get_adapter(builder_provider) {
+        let builder_adapter = match get_adapter(builder.name) {
             Ok(a) => a,
             Err(e) => {
+                let name = builder.name;
                 return Ok(VddResult::Skipped(format!(
-                    "Builder provider '{builder_provider}' unknown: {e}"
+                    "Builder provider '{name}' unknown: {e}"
                 )));
             }
         };
@@ -221,24 +244,13 @@ impl VddEngine {
         match self.config.mode {
             VddMode::Advisory => {
                 let result = self
-                    .advisory_review(
-                        &builder_text,
-                        original_request,
-                        builder_provider,
-                        builder_api_key,
-                    )
+                    .advisory_review(&builder_text, original_request, builder)
                     .await?;
                 Ok(VddResult::Advisory(result))
             }
             VddMode::Blocking => {
                 let result = self
-                    .blocking_loop(
-                        builder_response,
-                        &builder_text,
-                        original_request,
-                        builder_provider,
-                        builder_api_key,
-                    )
+                    .blocking_loop(builder_response, &builder_text, original_request, builder)
                     .await?;
                 Ok(VddResult::Blocking(result))
             }
@@ -255,17 +267,11 @@ impl VddEngine {
         &self,
         builder_text: &str,
         original_request: &ChatCompletionRequest,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         let original_task = extract_user_task(original_request);
-        self.single_pass_review(
-            builder_text,
-            &original_task,
-            builder_provider,
-            builder_api_key,
-        )
-        .await
+        self.single_pass_review(builder_text, &original_task, builder)
+            .await
     }
 
     /// Blocking mode: full adversarial loop until convergence.
@@ -274,8 +280,7 @@ impl VddEngine {
         initial_builder_response: &Value,
         initial_builder_text: &str,
         original_request: &ChatCompletionRequest,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
     ) -> Result<VddBlockingResult, VddError> {
         let mut session = VddSession::new(VddMode::Blocking);
         let mut tracker = ConfabulationTracker::new(
@@ -299,7 +304,7 @@ impl VddEngine {
         // already past `advisory_review`'s skip gate), so we bubble it up
         // as `ConfigError`.
         let builder_adapter =
-            get_adapter(builder_provider).map_err(|e| VddError::ConfigError(e.to_string()))?;
+            get_adapter(builder.name).map_err(|e| VddError::ConfigError(e.to_string()))?;
         let initial_builder_tokens = builder_adapter
             .extract_token_usage(initial_builder_response)
             .unwrap_or_default();
@@ -320,8 +325,7 @@ impl VddEngine {
                 static_results: &static_results,
                 iteration,
                 previous_fps: &previous_fps,
-                builder_provider,
-                builder_api_key,
+                builder,
             };
             let (genuine_count, fp_count, findings) =
                 self.run_iteration(&iteration_ctx, &mut session).await?;
@@ -358,8 +362,7 @@ impl VddEngine {
                     original_request,
                     &findings,
                     iteration,
-                    builder_provider,
-                    builder_api_key,
+                    builder,
                     &mut session,
                 )
                 .await
@@ -438,8 +441,7 @@ impl VddEngine {
         original_request: &ChatCompletionRequest,
         findings: &[Finding],
         iteration: u32,
-        builder_provider: &str,
-        builder_api_key: Option<&ApiKey>,
+        builder: BuilderProvider<'_>,
         session: &mut VddSession,
     ) -> Result<Option<(String, Value)>, VddError> {
         let genuine_findings: Vec<&Finding> = findings
@@ -455,8 +457,8 @@ impl VddEngine {
             &self.config,
             &self.app_config,
             &revision_request,
-            builder_provider,
-            builder_api_key,
+            builder.name,
+            builder.api_key,
         )
         .await
         {
@@ -528,8 +530,8 @@ impl VddEngine {
             app_config: &self.app_config,
             previous_fps: ctx.previous_fps,
             builder_code: ctx.builder_text,
-            builder_provider: ctx.builder_provider,
-            builder_api_key: ctx.builder_api_key,
+            builder_provider: ctx.builder.name,
+            builder_api_key: ctx.builder.api_key,
         };
         triage_findings(&mut findings, &triage_ctx).await;
 

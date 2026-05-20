@@ -260,9 +260,8 @@ pub fn validate_source_url(raw: &str) -> Result<(), PluginError> {
         raw.to_string()
     };
 
-    let url = Url::parse(&normalised).map_err(|e| {
-        PluginError::InvalidManifest(format!("Invalid source URL '{raw}': {e}"))
-    })?;
+    let url = Url::parse(&normalised)
+        .map_err(|e| PluginError::InvalidManifest(format!("Invalid source URL '{raw}': {e}")))?;
 
     if !ALLOWED_URL_SCHEMES.contains(&url.scheme()) {
         return Err(PluginError::InvalidManifest(format!(
@@ -361,9 +360,8 @@ fn scp_to_ssh_url(s: &str) -> Option<String> {
 /// lint is happy and the list can be shared with future call-sites
 /// that need the same check.
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate a directory name that was derived from a URL (the trailing

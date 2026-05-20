@@ -786,23 +786,21 @@ impl MemoryDb {
         // we don't have to wrestle with GROUP_CONCAT.  N+1 here is
         // bounded by `limit`, which the caller already chose; for
         // the typical limit of <= 100 this is fine.
-        let rows: Vec<(i64, String, String, String)> = match stmt.query_map(
-            params![phrase_query, limit_i64],
-            |row| {
+        let rows: Vec<(i64, String, String, String)> =
+            match stmt.query_map(params![phrase_query, limit_i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                 ))
-            },
-        ) {
-            Ok(iter) => match iter.collect::<rusqlite::Result<Vec<_>>>() {
-                Ok(rs) => rs,
+            }) {
+                Ok(iter) => match iter.collect::<rusqlite::Result<Vec<_>>>() {
+                    Ok(rs) => rs,
+                    Err(_e) => return Ok(Vec::new()),
+                },
                 Err(_e) => return Ok(Vec::new()),
-            },
-            Err(_e) => return Ok(Vec::new()),
-        };
+            };
 
         let mut memories = Vec::with_capacity(rows.len());
         for (id, content, created_at, updated_at) in rows {

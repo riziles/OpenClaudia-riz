@@ -37,7 +37,7 @@ mod transport;
 mod triage;
 
 // Re-exports for public API
-pub use engine::VddEngine;
+pub use engine::{BuilderProvider, VddEngine};
 pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 pub use finding::{Finding, FindingStatus, Severity};
 pub use review::{AdversaryReview, VddIteration, VddSession};

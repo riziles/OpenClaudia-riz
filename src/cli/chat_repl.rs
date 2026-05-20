@@ -1209,10 +1209,7 @@ impl ChatRepl {
         // `max_turns` ceiling was reached. Emit a structured
         // `error_max_turns` result event so SDK/MCP consumers see a
         // typed signal, matching CC's QueryEngine.ts:851-873 behaviour.
-        if max_iterations > 0
-            && iteration >= max_iterations
-            && !state.tool_calls.is_empty()
-        {
+        if max_iterations > 0 && iteration >= max_iterations && !state.tool_calls.is_empty() {
             let _ = emit_max_turns_event(
                 &self.chat_session.id,
                 "google_gemini",
@@ -2553,12 +2550,8 @@ impl ChatRepl {
 
         if max_iterations > 0 && iteration >= max_iterations && tool_accumulator.has_tool_calls() {
             // #601 — structured `error_max_turns` for the OpenAI path.
-            let _ = emit_max_turns_event(
-                &self.chat_session.id,
-                "openai",
-                max_iterations,
-                iteration,
-            );
+            let _ =
+                emit_max_turns_event(&self.chat_session.id, "openai", max_iterations, iteration);
             eprintln!(
                 "\n\x1b[33m⚠ Reached max_turns limit ({max_iterations} turns). Configure session.max_turns in config.yaml (0 = unlimited).\x1b[0m"
             );

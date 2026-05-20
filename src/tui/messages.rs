@@ -470,25 +470,14 @@ impl MessageList {
                 Line::from(vec![
                     Span::styled(
                         "OpenClaudia",
-                        Style::default()
-                            .fg(PURPLE)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        &line["OpenClaudia".len()..],
-                        Style::default().fg(GOLD),
-                    ),
+                    Span::styled(&line["OpenClaudia".len()..], Style::default().fg(GOLD)),
                 ])
             } else if line.starts_with("Provider:") {
-                Line::from(Span::styled(
-                    line,
-                    Style::default().fg(PURPLE),
-                ))
+                Line::from(Span::styled(line, Style::default().fg(PURPLE)))
             } else if line.starts_with("Model:") {
-                Line::from(Span::styled(
-                    line,
-                    Style::default().fg(GOLD),
-                ))
+                Line::from(Span::styled(line, Style::default().fg(GOLD)))
             } else if line.starts_with("Welcome") {
                 Line::from(Span::styled(
                     line,
@@ -557,9 +546,7 @@ impl MessageList {
             MessageKind::User => {
                 out.push(Line::from(Span::styled(
                     "\u{203A} user",
-                    Style::default()
-                        .fg(USER_BLUE)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(USER_BLUE).add_modifier(Modifier::BOLD),
                 )));
                 for line in msg.content.lines() {
                     out.push(Line::from(format!("  {line}")));
@@ -569,9 +556,7 @@ impl MessageList {
             MessageKind::Assistant => {
                 out.push(Line::from(Span::styled(
                     "\u{23BF} Claudia",
-                    Style::default()
-                        .fg(PURPLE)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
                 )));
                 for line in msg.content.lines() {
                     out.push(Line::from(format!("  {line}")));
@@ -621,9 +606,7 @@ impl MessageList {
         if self.is_streaming && !self.streaming_text.is_empty() {
             lines.push(Line::from(Span::styled(
                 "\u{23BF} Claudia",
-                Style::default()
-                    .fg(PURPLE)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
             )));
             for line in self.streaming_text.lines() {
                 lines.push(Line::from(format!("  {line}")));
@@ -934,7 +917,10 @@ mod tests {
         // top-anchored row index, because we are looking at older rows.
         let mut ml = MessageList::new();
         ml.scroll_up(7);
-        assert_eq!(ml.scroll_offset, 7, "scroll_up moves the offset away from 0");
+        assert_eq!(
+            ml.scroll_offset, 7,
+            "scroll_up moves the offset away from 0"
+        );
         assert_eq!(
             ml.rows_from_top(50),
             43,

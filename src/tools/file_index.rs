@@ -126,8 +126,7 @@ impl FileIndex {
                     // `/a` itself. If canonicalize fails (broken symlink,
                     // permission error) we fall back to the literal path —
                     // the depth cap still ensures termination.
-                    let canonical =
-                        std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if !visited.insert(canonical) {
                         continue;
                     }

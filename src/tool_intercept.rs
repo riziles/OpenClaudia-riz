@@ -614,15 +614,13 @@ impl ToolInterceptor {
             // an unconditional panic the compiler cannot warn about.
             // `map_or(true, ...)` removes the `.unwrap()` entirely.
             if let Some(idx) = self.buffer.find(&open_tag) {
-                let should_replace =
-                    earliest_match.is_none_or(|(prev, _)| idx < prev);
+                let should_replace = earliest_match.is_none_or(|(prev, _)| idx < prev);
                 if should_replace {
                     earliest_match = Some((idx, *tool));
                 }
             }
             if let Some(idx) = self.buffer.find(&open_tag_attr) {
-                let should_replace =
-                    earliest_match.is_none_or(|(prev, _)| idx < prev);
+                let should_replace = earliest_match.is_none_or(|(prev, _)| idx < prev);
                 if should_replace {
                     earliest_match = Some((idx, *tool));
                 }
@@ -847,9 +845,7 @@ impl ToolInterceptor {
             // count distinct entries — an already-present key being
             // overwritten does not consume budget. Note we still advance
             // `search_pos` past the matched element so the loop terminates.
-            if !parameters.contains_key(param_name)
-                && parameters.len() >= Self::MAX_NESTED_PARAMS
-            {
+            if !parameters.contains_key(param_name) && parameters.len() >= Self::MAX_NESTED_PARAMS {
                 parameters.insert(
                     "__parse_error".to_string(),
                     format!(
@@ -1755,12 +1751,7 @@ this never closes"#;
         // mirror of the success test — plain ASCII that does NOT mention
         // "error" anywhere — to prove the routing is exit-code-driven, not
         // content-driven.
-        let xml = format_tool_results_xml_with_names(&[(
-            "id-2",
-            Some("Bash"),
-            "foo",
-            true,
-        )]);
+        let xml = format_tool_results_xml_with_names(&[("id-2", Some("Bash"), "foo", true)]);
         assert!(
             xml.contains("<status>error</status>"),
             "exit-code failure must surface as error status"
@@ -1775,15 +1766,10 @@ this never closes"#;
     fn completion_note_bash_success_with_benign_content_still_emitted() {
         // Plain success with neutral stdout — sanity check that the happy
         // path keeps emitting the hint after the heuristic was removed.
-        let xml = format_tool_results_xml_with_names(&[(
-            "id-3",
-            Some("Bash"),
-            "hello world",
-            false,
-        )]);
+        let xml =
+            format_tool_results_xml_with_names(&[("id-3", Some("Bash"), "hello world", false)]);
         assert!(xml.contains("<status>success</status>"));
-        assert!(xml
-            .contains("<completion_note>Command executed successfully.</completion_note>"));
+        assert!(xml.contains("<completion_note>Command executed successfully.</completion_note>"));
     }
 
     #[test]
@@ -1791,20 +1777,10 @@ this never closes"#;
         // The write_file / edit_file branches were not part of #486 — verify
         // they still emit their own hints on success and stay quiet on
         // error, so the refactor didn't collapse them by accident.
-        let write_ok = format_tool_results_xml_with_names(&[(
-            "id-w",
-            Some("Write"),
-            "ok",
-            false,
-        )]);
+        let write_ok = format_tool_results_xml_with_names(&[("id-w", Some("Write"), "ok", false)]);
         assert!(write_ok.contains("File created successfully"));
 
-        let edit_err = format_tool_results_xml_with_names(&[(
-            "id-e",
-            Some("Edit"),
-            "boom",
-            true,
-        )]);
+        let edit_err = format_tool_results_xml_with_names(&[("id-e", Some("Edit"), "boom", true)]);
         assert!(!edit_err.contains("<completion_note>"));
     }
 
@@ -1867,21 +1843,14 @@ this never closes"#;
         let mut interceptor = ToolInterceptor::new();
 
         // Two complete blocks back-to-back.
-        interceptor.push(
-            r#"<invoke name="Bash"><parameter name="command">a</parameter></invoke>"#,
-        );
-        interceptor.push(
-            r#"<invoke name="Bash"><parameter name="command">b</parameter></invoke>"#,
-        );
+        interceptor.push(r#"<invoke name="Bash"><parameter name="command">a</parameter></invoke>"#);
+        interceptor.push(r#"<invoke name="Bash"><parameter name="command">b</parameter></invoke>"#);
         assert!(interceptor.has_complete_block());
 
         // Extract first block — buffer shrinks to the second block.
         let (tools_a, _, _) = interceptor.extract_tool_calls();
         assert_eq!(tools_a.len(), 1);
-        assert_eq!(
-            tools_a[0].parameters.get("command"),
-            Some(&"a".to_string())
-        );
+        assert_eq!(tools_a[0].parameters.get("command"), Some(&"a".to_string()));
 
         // Cache MUST be invalidated; otherwise has_complete_block could read
         // a stale offset past the new buffer end.
@@ -1891,10 +1860,7 @@ this never closes"#;
         assert!(interceptor.has_complete_block());
         let (tools_b, _, _) = interceptor.extract_tool_calls();
         assert_eq!(tools_b.len(), 1);
-        assert_eq!(
-            tools_b[0].parameters.get("command"),
-            Some(&"b".to_string())
-        );
+        assert_eq!(tools_b[0].parameters.get("command"), Some(&"b".to_string()));
 
         // Buffer is now empty; cache must agree.
         assert!(!interceptor.has_pending_tool_calls());

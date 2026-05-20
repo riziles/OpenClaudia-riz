@@ -36,11 +36,21 @@ pub fn load_output_style() -> Option<String> {
 fn read_style(path: &Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(content) => {
-            let trimmed = content.trim().to_string();
+            let trimmed = content.trim();
             if trimmed.is_empty() {
                 None
             } else {
-                Some(trimmed)
+                // Crosslink #828: the output-style file content is
+                // user-provided (and may be repo-committed, so a hostile
+                // contributor in a multi-author project can plant it).
+                // It is interpolated VERBATIM into the system prompt, so
+                // a `</output_style>` injection plus sibling
+                // instructions would escape the style block and steer
+                // the model. `xml_escape_for_prompt` neutralises the
+                // three bytes (`<`, `>`, `&`) that can close the
+                // surrounding tag — markdown formatting and ASCII
+                // English remain untouched.
+                Some(crate::memory::xml_escape_for_prompt(trimmed).into_owned())
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -189,8 +199,7 @@ mod tests {
         let path = dir.path().join("output-style.md");
         std::fs::write(&path, "some style content").expect("write fixture");
         // Strip all permission bits so read_to_string fails with PermissionDenied.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod 000");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
 
         // If the test runs as root, permission bits are bypassed and the
         // PermissionDenied branch is unreachable — skip rather than assert
@@ -276,7 +285,9 @@ mod tests {
 
         let err = result.expect_err("removing a directory via remove_file must fail");
         // The typed variant — not a String — must come through.
-        let kind = err.io_kind().expect("must be the Io variant, not Json/Yaml");
+        let kind = err
+            .io_kind()
+            .expect("must be the Io variant, not Json/Yaml");
         assert!(
             matches!(
                 kind,

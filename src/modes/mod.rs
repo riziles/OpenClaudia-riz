@@ -277,11 +277,17 @@ impl FromStr for Preset {
 // =========================================================================
 
 /// Complete behavioral configuration: three axis values plus optional modifiers.
+///
+/// `modifiers` carries `#[serde(default)]` so sessions persisted
+/// before the field existed deserialize cleanly into an empty Vec
+/// (crosslink #839). The companion test
+/// `serde_missing_modifiers_defaults_to_empty` pins the round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorMode {
     pub agency: Agency,
     pub quality: Quality,
     pub scope: Scope,
+    #[serde(default)]
     pub modifiers: Vec<Modifier>,
 }
 
@@ -849,19 +855,22 @@ mod tests {
         assert_eq!(mode, BehaviorMode::default());
     }
 
-    /// Missing `modifiers` field should default to empty vec.
-    /// Tests backwards compat for sessions saved before modifiers existed.
+    /// Missing `modifiers` field MUST default to an empty Vec so
+    /// sessions persisted before the field was added (crosslink #839
+    /// regression) still load. The struct carries `#[serde(default)]`
+    /// on the field — this is the round-trip pin.
     #[test]
     fn serde_missing_modifiers_defaults_to_empty() {
         let json = r#"{"agency":"autonomous","quality":"pragmatic","scope":"adjacent"}"#;
-        let result: Result<BehaviorMode, _> = serde_json::from_str(json);
-        // This will error since modifiers is not optional — that's the
-        // current design.  If we want backwards compat, we'd need
-        // #[serde(default)] on the field.  This test documents the behavior.
+        let mode: BehaviorMode =
+            serde_json::from_str(json).expect("BehaviorMode must accept missing `modifiers`");
+        assert_eq!(mode.agency, Agency::Autonomous);
+        assert_eq!(mode.quality, Quality::Pragmatic);
+        assert_eq!(mode.scope, Scope::Adjacent);
         assert!(
-            result.is_err(),
-            "BehaviorMode currently requires modifiers field; \
-             add #[serde(default)] to make it optional"
+            mode.modifiers.is_empty(),
+            "missing `modifiers` must default to empty, got {:?}",
+            mode.modifiers
         );
     }
 

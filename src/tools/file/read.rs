@@ -233,7 +233,32 @@ fn reject_flag_prefix(path: &str) -> Option<String> {
     None
 }
 
-/// Read a PDF file using pdftotext
+/// Maximum wall-clock time we allow pdftotext / pdfinfo to run before
+/// killing the child. A malformed PDF can pin the parser indefinitely
+/// (loops in the `XRef` table, encrypted streams the wrong way around);
+/// 30 s is more than any well-formed extraction needs while still
+/// bounding the worker thread (crosslink #827).
+const PDF_TIMEOUT_SECS: u64 = 30;
+
+/// Read a PDF file using pdftotext.
+///
+/// # Subprocess hardening
+///
+/// `pdftotext` and `pdfinfo` are spawned via
+/// [`crate::tools::command::run_with_timeout`] with a 30 s deadline so
+/// a malformed PDF cannot pin the worker (crosslink #827, #836). Both
+/// stdout and stderr are captured (`Stdio::piped`); on a non-zero
+/// exit, the stderr tail is included in the error message so the
+/// model can react.
+///
+/// # Locale dependency
+///
+/// `pdftotext` honours the inherited `LANG` / `LC_*` environment when
+/// guessing the default text encoding. A user-facing surprise is that
+/// running `OpenClaudia` under `LC_ALL=C` yields ASCII-only output even
+/// for UTF-8 PDFs; setting `LC_ALL=en_US.UTF-8` (or any UTF-8 locale)
+/// restores fidelity. This is documented here so callers can mention
+/// it in PDF-related troubleshooting.
 pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
     // Reject any path the subprocess would parse as a flag BEFORE we spawn.
     if let Some(err) = reject_flag_prefix(path) {
@@ -262,13 +287,16 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         _ => {}
     }
 
-    // If no pages specified, check total page count first
+    let timeout = std::time::Duration::from_secs(PDF_TIMEOUT_SECS);
+
+    // If no pages specified, check total page count first.
     if pages.is_none() {
-        // Use pdftotext on the whole file but first count pages with pdfinfo if available.
         // `--` terminates options so a hostile filename cannot be parsed as a flag
         // (defence-in-depth alongside reject_flag_prefix above).
-        let info_output = Command::new("pdfinfo").arg("--").arg(path).output();
-        if let Ok(info) = info_output {
+        let info_args = ["--", path];
+        if let Ok(info) =
+            crate::tools::command::run_with_timeout("pdfinfo", &info_args, None, timeout)
+        {
             if info.status.success() {
                 let info_text = String::from_utf8_lossy(&info.stdout);
                 for line in info_text.lines() {
@@ -293,25 +321,28 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
         }
     }
 
-    // Build pdftotext command.
+    // Build pdftotext argv.
     // SAFETY: option terminator `--` is placed immediately before the path
     // (and before the stdout `-` sentinel) so neither argv entry can be
     // re-parsed as a flag. See crosslink #381, #389.
-    let mut cmd = Command::new("pdftotext");
+    let mut argv: Vec<String> = Vec::new();
     if let Some(pages_str) = pages {
         match parse_page_range(pages_str) {
             Ok((first, last)) => {
-                cmd.arg("-f").arg(first.to_string());
-                cmd.arg("-l").arg(last.to_string());
+                argv.push("-f".to_string());
+                argv.push(first.to_string());
+                argv.push("-l".to_string());
+                argv.push(last.to_string());
             }
             Err(e) => return (format!("Invalid pages parameter: {e}"), true),
         }
     }
-    cmd.arg("--"); // option terminator — must come before path and stdout sentinel
-    cmd.arg(path);
-    cmd.arg("-"); // Output to stdout
+    argv.push("--".to_string());
+    argv.push(path.to_string());
+    argv.push("-".to_string()); // stdout sentinel
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
 
-    match cmd.output() {
+    match crate::tools::command::run_with_timeout("pdftotext", &argv_refs, None, timeout) {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1068,17 +1099,23 @@ mod tests {
         // invocation. We assert this by inspecting the source rather than
         // shelling out to poppler (which may not be installed in CI). This pins
         // the defence-in-depth invariant against accidental regression.
+        //
+        // Crosslink #827 / #836: pdf-reader subprocess invocations now route
+        // through `crate::tools::command::run_with_timeout` with an explicit
+        // argv. The terminator still leads the path; the source-level shape
+        // changed from `cmd.arg("--").arg(path)` to a `[..., "--", path, ...]`
+        // slice literal pushed into the argv vector.
         let source = include_str!("read.rs");
-        // pdfinfo call site: "Command::new(\"pdfinfo\").arg(\"--\").arg(path)"
+        // pdfinfo invocation builds `let info_args = ["--", path];` then calls
+        // run_with_timeout("pdfinfo", &info_args, …).
         assert!(
-            source.contains("Command::new(\"pdfinfo\").arg(\"--\").arg(path)"),
-            "pdfinfo call must have '--' before path"
+            source.contains("let info_args = [\"--\", path];"),
+            "pdfinfo invocation must build argv with '--' immediately before path"
         );
-        // pdftotext call site: separate cmd.arg("--") line, then cmd.arg(path).
-        // We look for the comment-flagged terminator line.
+        // pdftotext invocation pushes a literal "--" String to argv before path.
         assert!(
-            source.contains("cmd.arg(\"--\"); // option terminator"),
-            "pdftotext must place '--' before the path arg"
+            source.contains("argv.push(\"--\".to_string());"),
+            "pdftotext argv must place '--' option terminator before the path"
         );
     }
 }

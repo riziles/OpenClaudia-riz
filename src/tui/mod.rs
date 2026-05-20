@@ -56,8 +56,7 @@ pub(crate) const USER_BLUE: Color = Color::Rgb(100, 180, 255);
 ///
 /// Lives in `mod.rs` (not `app.rs`) so the brand chrome is colocated with the
 /// brand palette (crosslink #442).
-pub(crate) const SPINNER_FRAMES: &[&str] =
-    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ─── Theme support ──────────────────────────────────────────────────────────
 

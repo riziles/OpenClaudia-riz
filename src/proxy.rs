@@ -796,8 +796,9 @@ async fn apply_vdd_review(
 
     let vdd_result = {
         let engine = vdd_engine.lock().await;
+        let builder = crate::vdd::BuilderProvider::new(provider_name, Some(api_key));
         engine
-            .process_response(&response_json, request, provider_name, Some(api_key))
+            .process_response(&response_json, request, builder)
             .await
     };
 
@@ -928,7 +929,7 @@ fn resolve_provider<'a>(
         .config
         .get_provider(&provider_name)
         .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
-    let api_key = extract_api_key(headers)
+    let api_key = extract_api_key(headers)?
         .or_else(|| provider.api_key.clone())
         .ok_or_else(|| ProxyError::NoApiKey(provider_name.clone()))?;
     Ok((provider_name, provider, api_key))
@@ -1171,7 +1172,7 @@ async fn proxy_completions(
         .get_provider(&provider_name)
         .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
 
-    let api_key = extract_api_key(&headers)
+    let api_key = extract_api_key(&headers)?
         .or_else(|| provider.api_key.clone())
         .ok_or_else(|| ProxyError::NoApiKey(provider_name.clone()))?;
 
@@ -1252,7 +1253,7 @@ fn resolve_anthropic_auth(
     if let Some(session) = lookup_oauth_session_from_cookie(headers, oauth_store) {
         return Ok(AnthropicAuth::Oauth(session));
     }
-    let api_key = extract_api_key(headers)
+    let api_key = extract_api_key(headers)?
         .or_else(|| provider.api_key.clone())
         .ok_or_else(|| ProxyError::NoApiKey("anthropic".to_string()))?;
     Ok(AnthropicAuth::ApiKey(api_key))
@@ -1382,7 +1383,7 @@ async fn proxy_passthrough(
         .active_provider()
         .ok_or_else(|| ProxyError::ProviderNotConfigured(state.config.proxy.target.clone()))?;
 
-    let api_key = extract_api_key(&headers)
+    let api_key = extract_api_key(&headers)?
         .or_else(|| provider.api_key.clone())
         .ok_or_else(|| ProxyError::NoApiKey(state.config.proxy.target.clone()))?;
 
@@ -1442,43 +1443,54 @@ pub fn determine_provider(model: &str, config: &AppConfig) -> String {
 /// rather than returning an error — the header may be someone else's
 /// garbage (malformed client, stale cookie) and the caller's fallback to
 /// `provider.api_key` is the correct recovery. See crosslink #256.
-fn extract_api_key(headers: &HeaderMap) -> Option<ApiKey> {
-    // Authorization header — must use `Bearer <key>` form. A raw key
-    // without the prefix is rejected with a structured warn! so the
-    // operator can diagnose mis-configured clients (previously this
-    // silently returned None — crosslink #452 mandated point 3).
+fn extract_api_key(headers: &HeaderMap) -> Result<Option<ApiKey>, ProxyError> {
+    // Authorization header — must use `Bearer <key>` form.
+    //
+    // Crosslink #831: a client that sends a bare API key in
+    // `Authorization` (no `Bearer ` prefix) plus a second key in
+    // `x-api-key` would previously succeed using the second one, with
+    // the first silently dropped. Combined with the proxy-level
+    // fallback to `provider.api_key`, an operator could be billing an
+    // unintended key with no audit trail. We now fail-closed: ANY
+    // presence of `Authorization` that does not parse as
+    // `Bearer <key>` is a 400 InvalidBody, not a silent fall-through
+    // to alternate auth schemes.
     let authz = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let from_authz = authz.and_then(|v| {
-        v.strip_prefix("Bearer ")
-            .map(std::string::ToString::to_string)
-            .or_else(|| {
-                warn!(
-                    "Authorization header present but lacks 'Bearer ' prefix; \
-                     refusing to use it as an API key"
-                );
-                None
-            })
-    });
+    let from_authz: Option<String> = if let Some(v) = authz {
+        if let Some(key) = v.strip_prefix("Bearer ") {
+            Some(key.to_string())
+        } else {
+            warn!(
+                "Authorization header present but lacks 'Bearer ' prefix; \
+                 rejecting request rather than falling through to x-api-key (crosslink #831)"
+            );
+            return Err(ProxyError::InvalidBody(
+                "Authorization header must use 'Bearer <key>' format".to_string(),
+            ));
+        }
+    } else {
+        None
+    };
 
-    let raw = from_authz.or_else(|| {
-        // Also check x-api-key header (Anthropic style)
-        headers
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .map(std::string::ToString::to_string)
-    })?;
+    let raw = if let Some(k) = from_authz {
+        k
+    } else if let Some(s) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        s.to_string()
+    } else {
+        return Ok(None);
+    };
 
     match ApiKey::try_from_string(raw) {
-        Ok(key) => Some(key),
+        Ok(key) => Ok(Some(key)),
         Err(e) => {
             // Structured log — never the raw value.
             warn!(
                 error = %e,
                 "Rejected malformed api_key supplied via request header"
             );
-            None
+            Ok(None)
         }
     }
 }

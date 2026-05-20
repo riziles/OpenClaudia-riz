@@ -962,8 +962,7 @@ mod tests {
             severity: Severity::Low,
             cwe: None,
             line_range: None,
-            description: "Possible panic in helper if input is malformed (re-reported)"
-                .to_string(),
+            description: "Possible panic in helper if input is malformed (re-reported)".to_string(),
         }];
         let ctx = TriageContext {
             client: &client,

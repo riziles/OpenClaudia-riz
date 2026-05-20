@@ -238,21 +238,77 @@ fn parse_skill_file_logged(path: &Path) -> Option<SkillDefinition> {
     }
 }
 
-/// Scan a single directory for skill definitions, appending into `out`.
-fn scan_one_dir(dir: &Path, out: &mut Vec<SkillDefinition>) {
+/// Either a subdirectory containing a `SKILL.md` (the canonical packaged-skill
+/// layout) or a single `.md` file at the top of a skills directory.
+///
+/// Returned by [`walk_skill_entries`] — the SINGLE shared walker that
+/// both `skills::load_skills` and `plugins::Plugin::resolve_skills`
+/// route through (crosslink #832). The two previously walked the same
+/// kind of directory with subtly different rules; this enum is the
+/// chokepoint that prevents future drift.
+#[derive(Debug, Clone)]
+pub enum SkillEntry {
+    /// `<dir>/SKILL.md` exists. `dir` is the subdirectory path, `file`
+    /// the resolved `SKILL.md` inside it.
+    DirWithSkillMd { dir: PathBuf, file: PathBuf },
+    /// A `.md` file directly inside the skills directory.
+    BareMdFile(PathBuf),
+}
+
+impl SkillEntry {
+    /// Return the directory or file that callers should treat as the
+    /// skill's "root" for permission-checking / path-recording.
+    #[must_use]
+    pub fn root_path(&self) -> &Path {
+        match self {
+            Self::DirWithSkillMd { dir, .. } => dir.as_path(),
+            Self::BareMdFile(p) => p.as_path(),
+        }
+    }
+}
+
+/// Walk a single skills directory and emit one [`SkillEntry`] per
+/// candidate.
+///
+/// Silently returns an empty `Vec` if `dir` is not readable (the
+/// walker is best-effort; callers that need the failure must stat
+/// `dir` themselves first).
+///
+/// Crosslink #832: extracted from `skills::scan_one_dir` and
+/// `plugins::Plugin::resolve_skills` so the two stay in sync. Adding a
+/// new packaging convention (e.g. `<dir>/skill.yaml`) is now one edit
+/// here, not two.
+#[must_use]
+pub fn walk_skill_entries(dir: &Path) -> Vec<SkillEntry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-
         if path.is_dir() {
-            // Look for SKILL.md inside subdirectory
             let skill_file = path.join("SKILL.md");
             if skill_file.exists() {
-                if let Some(mut skill) = parse_skill_file_logged(&skill_file) {
+                out.push(SkillEntry::DirWithSkillMd {
+                    dir: path,
+                    file: skill_file,
+                });
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(SkillEntry::BareMdFile(path));
+        }
+    }
+    out
+}
+
+/// Scan a single directory for skill definitions, appending into `out`.
+fn scan_one_dir(dir: &Path, out: &mut Vec<SkillDefinition>) {
+    for entry in walk_skill_entries(dir) {
+        match entry {
+            SkillEntry::DirWithSkillMd { dir, file } => {
+                if let Some(mut skill) = parse_skill_file_logged(&file) {
                     if skill.name.is_empty() {
-                        skill.name = path
+                        skill.name = dir
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown")
@@ -261,17 +317,17 @@ fn scan_one_dir(dir: &Path, out: &mut Vec<SkillDefinition>) {
                     out.push(skill);
                 }
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            // Direct .md file in skills dir
-            if let Some(mut skill) = parse_skill_file_logged(&path) {
-                if skill.name.is_empty() {
-                    skill.name = path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+            SkillEntry::BareMdFile(path) => {
+                if let Some(mut skill) = parse_skill_file_logged(&path) {
+                    if skill.name.is_empty() {
+                        skill.name = path
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                    }
+                    out.push(skill);
                 }
-                out.push(skill);
             }
         }
     }

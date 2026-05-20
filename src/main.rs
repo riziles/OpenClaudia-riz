@@ -970,10 +970,8 @@ async fn run_vdd_review(
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .unwrap_or("");
 
-    match engine
-        .review_text(content, user_task, target, api_key)
-        .await
-    {
+    let builder = vdd::BuilderProvider::new(target, api_key);
+    match engine.review_text(content, user_task, builder).await {
         Ok(result) => {
             if result.findings.is_empty() {
                 println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
@@ -1027,8 +1025,7 @@ fn build_chat_body_anthropic(
     use openclaudia::providers::{convert_messages_to_anthropic, convert_tools_to_anthropic};
     let anthropic_messages = convert_messages_to_anthropic(messages);
     let openai_tools = tools::get_all_tool_definitions(true);
-    let anthropic_tools =
-        convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
+    let anthropic_tools = convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
 
     let mut req = serde_json::json!({
         "model": model,
@@ -1106,10 +1103,7 @@ fn build_chat_body_google(messages: &[serde_json::Value]) -> serde_json::Value {
 }
 
 /// Build the generic OpenAI-compatible request body.
-fn build_chat_body_openai_like(
-    messages: &[serde_json::Value],
-    model: &str,
-) -> serde_json::Value {
+fn build_chat_body_openai_like(messages: &[serde_json::Value], model: &str) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "messages": messages,

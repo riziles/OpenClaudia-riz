@@ -242,7 +242,7 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
         session.add_modified_file("src/main.rs");
         info!(
             "Session updated: {} tokens, {} completed tasks",
-            session.total_tokens,
+            session.total_tokens(),
             session.progress.completed_tasks.len()
         );
     }

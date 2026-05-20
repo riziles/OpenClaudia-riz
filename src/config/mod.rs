@@ -225,6 +225,13 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
+    // Validate the permissions default-allow globs (crosslink #938).
+    // Rejects empty / unbounded / control-char patterns at load time
+    // so a typo cannot silently widen the allow-list.
+    if let Err(e) = config.permissions.validate() {
+        return Err(ConfigError::Message(e));
+    }
+
     // Validate each provider's base_url for SSRF / scheme safety (crosslink #329).
     let mut names: Vec<&String> = config.providers.keys().collect();
     names.sort();

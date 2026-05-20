@@ -856,15 +856,14 @@ impl PluginManager {
             // sidecar means the clone pre-dates this fix and we refuse
             // to pull because we cannot prove the remote is the same
             // one the operator originally vetted.
-            let expected_url = read_origin_url_sidecar(&dir)?.ok_or_else(|| {
-                PluginError::PolicyRejected {
+            let expected_url =
+                read_origin_url_sidecar(&dir)?.ok_or_else(|| PluginError::PolicyRejected {
                     reason: format!(
                         "marketplace '{name}' has no recorded origin URL. \
                          Remove and re-add it to enable safe updates."
                     ),
                     scope: "marketplace",
-                }
-            })?;
+                })?;
             git_pull(&dir, Some(&expected_url))?;
         } else {
             return Err(PluginError::InvalidManifest(
@@ -1189,6 +1188,12 @@ impl PluginManager {
     ///
     /// # Errors
     /// Returns an error if the git clone fails or the plugin manifest is invalid.
+    ///
+    /// `git_ref` MUST be `Some(_)`. Passing `None` returns
+    /// [`PluginError::InvalidManifest`] — the no-silent-HEAD rule
+    /// (crosslink #249 mandated point 5 and #742): tracking upstream
+    /// HEAD turns any future push to the repo into active code in the
+    /// agent's privilege domain without review.
     pub fn install_from_git(
         &mut self,
         url: &str,
@@ -1198,6 +1203,19 @@ impl PluginManager {
         // credentials) before any filesystem work. git_clone will validate
         // again — deliberately redundant, cheap defense-in-depth.
         super::validate::validate_source_url(url)?;
+
+        // No-silent-HEAD rule: parity with
+        // `install_from_marketplace` / `fetch_plugin_archive`
+        // (crosslink #249, #742). Reject before any filesystem work so
+        // the caller's audit log records the rejection cleanly rather
+        // than a partially-materialized clone.
+        if git_ref.is_none() {
+            return Err(PluginError::InvalidManifest(format!(
+                "Plugin source URL '{url}' has no `ref`; \
+                 refusing to track upstream HEAD. Specify a tag, branch, \
+                 or commit SHA (e.g. `<url>#v1.2.3`)."
+            )));
+        }
 
         // Derive the plugins/ subdir name from the URL's last segment with
         // full traversal protection — closes crosslink #248. Previously the
@@ -1758,6 +1776,27 @@ mod install_decomp_tests {
                 // direct code path); skip rather than fail here.
             }
             other => panic!("expected InvalidManifest (no `ref`) or IoError, got {other:?}"),
+        }
+    }
+
+    /// `install_from_git` rejects `git_ref: None` with `InvalidManifest`
+    /// before any filesystem work — parity with the marketplace path
+    /// (crosslink #742). Without this guard, `/plugin install <url>`
+    /// silently tracks upstream HEAD.
+    #[test]
+    fn install_from_git_rejects_none_git_ref() {
+        let mut pm = PluginManager::new();
+        let err = pm
+            .install_from_git("https://example.com/repo.git", None)
+            .expect_err("None git_ref must be rejected at the install gate");
+        match err {
+            PluginError::InvalidManifest(msg) => {
+                assert!(
+                    msg.contains("no `ref`"),
+                    "error must call out the missing ref, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidManifest (no `ref`), got {other:?}"),
         }
     }
 
