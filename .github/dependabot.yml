@@ -5,16 +5,22 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # GHSA-cq8v-f236-94qc covers `rand::rng()` unsoundness. The API was
-      # introduced in rand 0.9.0 and does not exist in the 0.8.x branch, so
-      # 0.8.x is not actually vulnerable despite matching the advisory range.
-      # In this repo, rand 0.8 is only a transitive optional dep of
-      # ratatui-termwiz (never activated — we use ratatui with default
-      # features, which selects the crossterm backend). `cargo build
-      # --message-format=json` confirms only rand 0.9.4 and 0.10.1 are
-      # actually compiled.
+      # GHSA-cq8v-f236-94qc / RUSTSEC-2026-0097 covers `rand::rng()`
+      # unsoundness when a custom logger reseeds ThreadRng. The RustSec
+      # advisory lists three separately-patched ranges:
+      #
+      #   patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]
+      #
+      # i.e. the fix landed in 0.8.6, 0.9.3, and 0.10.1. This repo's
+      # `Cargo.lock` contains rand 0.8.6 (transitive via the unused
+      # ratatui-termwiz backend), 0.9.4, and 0.10.1 — ALL of which fall
+      # within a patched range, so we are not actually vulnerable.
+      # GitHub's Advisory Database does not honour the split-range
+      # patching and reports any 0.9.x as vulnerable; suppress here to
+      # silence the false positive. `cargo audit` honours the split
+      # ranges and reports zero vulnerabilities for rand.
       - dependency-name: rand
-        versions: ["< 0.9"]
+        versions: ["< 0.11"]
 
   - package-ecosystem: cargo
     directory: /fuzz
@@ -22,4 +28,4 @@ updates:
       interval: weekly
     ignore:
       - dependency-name: rand
-        versions: ["< 0.9"]
+        versions: ["< 0.11"]
