@@ -200,24 +200,30 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// Session stats endpoint - returns token usage and turn metrics
+/// Session stats endpoint - returns token usage and turn metrics.
+///
+/// Uses [`SessionManager::current_view`] (crosslink #458) — a zero-copy
+/// [`SessionView`](crate::session::SessionView) over the active session,
+/// so building the JSON payload never deep-copies `turn_metrics` or
+/// `cumulative_usage`.
 async fn session_stats(State(state): State<ProxyState>) -> impl IntoResponse {
     let sm = state.session_manager.read().await;
-    Json(sm.get_session().map_or_else(
+    Json(sm.current_view().map_or_else(
         || serde_json::json!({ "error": "No active session" }),
         |session| {
-            let last_turn = session.turn_metrics.last();
+            let last_turn = session.turn_metrics().last();
+            let cumulative = session.cumulative_usage();
             serde_json::json!({
-                "session_id": session.id,
-                "mode": session.mode,
-                "request_count": session.request_count,
-                "turns": session.turn_metrics.len(),
+                "session_id": session.id(),
+                "mode": session.mode(),
+                "request_count": session.request_count(),
+                "turns": session.turn_metrics().len(),
                 "cumulative_usage": {
-                    "input_tokens": session.cumulative_usage.input_tokens,
-                    "output_tokens": session.cumulative_usage.output_tokens,
-                    "cache_read_tokens": session.cumulative_usage.cache_read_tokens,
-                    "cache_write_tokens": session.cumulative_usage.cache_write_tokens,
-                    "total_tokens": session.cumulative_usage.total(),
+                    "input_tokens": cumulative.input_tokens,
+                    "output_tokens": cumulative.output_tokens,
+                    "cache_read_tokens": cumulative.cache_read_tokens,
+                    "cache_write_tokens": cumulative.cache_write_tokens,
+                    "total_tokens": cumulative.total(),
                 },
                 "last_turn": last_turn.map(|t| serde_json::json!({
                     "turn_number": t.turn_number,

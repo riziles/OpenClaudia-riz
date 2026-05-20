@@ -14,8 +14,7 @@ mod task;
 // Re-export all public types
 pub use audit::AuditLogger;
 pub use pricing::{
-    calculate_cost, calculate_cost_with_ttl, get_pricing, CacheWriteTtl, ModelPricing,
-    PricingError,
+    calculate_cost, calculate_cost_with_ttl, get_pricing, CacheWriteTtl, ModelPricing, PricingError,
 };
 pub use state::{
     get_session_context, is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy,
@@ -153,7 +152,118 @@ pub struct SessionProgress {
     pub vdd_sessions: Vec<String>,
 }
 
-/// A single agent session
+/// Zero-copy read-only view over a [`Session`].
+///
+/// `SessionView<'a>` borrows the underlying [`Session`] and exposes its
+/// fields by reference, allowing callers to read session state without
+/// triggering a full struct clone.  Use this in place of `session.clone()`
+/// whenever the caller only needs to *read* the session — the major heap
+/// fields (`turn_metrics`, `progress.completed_tasks`, …) all become
+/// `&[T]` / `&str` slices, so a single 24-hour session with thousands of
+/// turn-metrics entries is no longer deep-copied on every read.
+///
+/// Construction: prefer [`Session::view`] over building this directly so
+/// the lifetime tracking against the owning [`Session`] is enforced.
+///
+/// Issue: crosslink #458 — `Session` is `#[derive(Clone)]` and was cloned
+/// on every read in older call sites.  The `Clone` derive is retained for
+/// snapshot persistence + tests, but new read-paths should take a
+/// `SessionView<'_>` instead.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionView<'a> {
+    inner: &'a Session,
+}
+
+impl<'a> SessionView<'a> {
+    /// Wrap an existing [`Session`] reference as a read-only view.
+    #[must_use]
+    pub const fn new(session: &'a Session) -> Self {
+        Self { inner: session }
+    }
+
+    /// Session ID (borrowed).
+    #[must_use]
+    pub fn id(&self) -> &'a str {
+        &self.inner.id
+    }
+
+    /// Session mode (cheap `Copy`).
+    #[must_use]
+    pub const fn mode(&self) -> SessionMode {
+        self.inner.mode
+    }
+
+    /// When the session was created.
+    #[must_use]
+    pub const fn created_at(&self) -> &'a DateTime<Utc> {
+        &self.inner.created_at
+    }
+
+    /// When the session was last updated.
+    #[must_use]
+    pub const fn updated_at(&self) -> &'a DateTime<Utc> {
+        &self.inner.updated_at
+    }
+
+    /// Borrowed reference to session progress.
+    #[must_use]
+    pub const fn progress(&self) -> &'a SessionProgress {
+        &self.inner.progress
+    }
+
+    /// Parent session ID, if any (borrowed).
+    #[must_use]
+    pub fn parent_session_id(&self) -> Option<&'a str> {
+        self.inner.parent_session_id.as_deref()
+    }
+
+    /// Number of API requests in this session.
+    #[must_use]
+    pub const fn request_count(&self) -> u64 {
+        self.inner.request_count
+    }
+
+    /// Legacy total-tokens counter.
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.inner.total_tokens
+    }
+
+    /// Cumulative token usage across all turns.
+    #[must_use]
+    pub const fn cumulative_usage(&self) -> &'a TokenUsage {
+        &self.inner.cumulative_usage
+    }
+
+    /// Per-turn metrics slice (borrowed; capped at [`MAX_TURN_METRICS`]).
+    #[must_use]
+    pub fn turn_metrics(&self) -> &'a [TurnMetrics] {
+        &self.inner.turn_metrics
+    }
+
+    /// Monotonically increasing total turn count.
+    #[must_use]
+    pub const fn total_turns(&self) -> u64 {
+        self.inner.total_turns
+    }
+
+    /// Borrow the underlying [`Session`] (escape hatch for code that
+    /// genuinely needs the full struct — e.g. serde serialisation).
+    #[must_use]
+    pub const fn as_session(&self) -> &'a Session {
+        self.inner
+    }
+}
+
+/// A single agent session.
+///
+/// `Session` derives [`Clone`] so it can be snapshot-serialised for
+/// persistence and so tests can capture a frozen copy for assertions.
+/// **Production read-paths should not clone the whole struct** — use
+/// [`Session::view`] (returns a [`SessionView<'_>`]) when you only need
+/// to inspect fields.  See crosslink #458 for the historical context:
+/// cloning was previously the default and deep-copied multi-kilobyte
+/// `turn_metrics`/`progress` vectors on every read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// Unique session identifier
@@ -221,6 +331,16 @@ impl Session {
             turn_metrics: Vec::new(),
             total_turns: 0,
         }
+    }
+
+    /// Borrow this session as a zero-copy read-only [`SessionView`].
+    ///
+    /// Prefer this over [`Clone::clone`] anywhere you only need to read
+    /// session fields — the view holds a single shared reference and
+    /// avoids deep-copying `turn_metrics`/`progress`/`cumulative_usage`.
+    #[must_use]
+    pub const fn view(&self) -> SessionView<'_> {
+        SessionView::new(self)
     }
 
     /// Update the session timestamp
@@ -501,6 +621,17 @@ impl SessionManager {
     #[must_use]
     pub const fn get_session(&self) -> Option<&Session> {
         self.current_session.as_ref()
+    }
+
+    /// Get a zero-copy [`SessionView`] of the current session.
+    ///
+    /// Returns `None` when there is no active session.  This is the
+    /// preferred read-only accessor: it avoids the historical pattern of
+    /// `get_or_create_session().clone()` that deep-copied the entire
+    /// [`Session`] struct on every read (crosslink #458).
+    #[must_use]
+    pub fn current_view(&self) -> Option<SessionView<'_>> {
+        self.current_session.as_ref().map(Session::view)
     }
 
     /// Store VDD advisory context to inject into the next turn
@@ -1373,5 +1504,239 @@ mod tests {
             log.contains("failed to persist session on drop"),
             "Drop's error message must mention persist failure, got: {log}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #458 — Session is `#[derive(Clone)]` and was deep-copied on every read.
+    //
+    // Fix landed: `SessionView<'a>` zero-copy wrapper + `Session::view()` +
+    // `SessionManager::current_view()`.  The `Clone` derive is retained for
+    // snapshot persistence and tests, but production read-paths now borrow
+    // through a `SessionView<'_>`.
+    //
+    // The tests below assert:
+    //   1. Multi-reader concurrency over the existing `Arc<RwLock<…>>`
+    //      wrapping (see `ProxyState::session_manager`) — many readers can
+    //      hold `SessionView`s simultaneously without cloning the session.
+    //   2. A writer serialises correctly: while a write guard is held no
+    //      reader makes progress; once released, readers see the mutation.
+    //   3. `turn_metrics` tracking (#285) still works end-to-end when the
+    //      session is accessed exclusively via `SessionView` — i.e. the
+    //      view path observes the same monotonic turn numbers and bounded
+    //      ring as the direct-field path.
+    // -----------------------------------------------------------------------
+
+    /// #458: a `SessionView` is a zero-copy borrow — multiple views can
+    /// coexist over the same session without any clones, and all expose
+    /// identical field values.
+    #[test]
+    fn issue_458_session_view_is_zero_copy_multi_borrow() {
+        let mut session = Session::new_initializer();
+        session.record_turn_estimate(123, 45, 6, 7);
+        session.record_actual_usage(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 10,
+            cache_write_tokens: 5,
+        });
+        session.complete_task("alpha");
+        session.complete_task("beta");
+
+        let v1 = session.view();
+        let v2 = session.view();
+        let v3 = SessionView::new(&session);
+
+        // All three views point at the same underlying session pointer.
+        // (Comparing the raw pointer is the strongest possible assertion
+        // that no clone happened — different addresses would mean a copy.)
+        assert!(std::ptr::eq(v1.as_session(), v2.as_session()));
+        assert!(std::ptr::eq(v1.as_session(), v3.as_session()));
+
+        // Field accessors return borrows, never owned strings/vecs.
+        assert_eq!(v1.id(), session.id);
+        assert_eq!(v2.turn_metrics().len(), 1);
+        assert_eq!(v3.progress().completed_tasks.len(), 2);
+        assert_eq!(v1.cumulative_usage().input_tokens, 100);
+        assert_eq!(v2.total_turns(), 1);
+    }
+
+    /// #458 (test 1 of mandated 3): Multi-reader concurrent access to a
+    /// shared `Session` works under `Arc<RwLock<SessionManager>>` — the
+    /// production wrapping used by `ProxyState`.  Many concurrent readers
+    /// each take a `SessionView` without cloning the session, and all
+    /// observe the same field values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_458_arc_rwlock_supports_concurrent_readers() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+        // Seed the session with non-trivial state so a clone would be
+        // genuinely expensive — that's exactly what `view()` lets us avoid.
+        manager.get_or_create_session();
+        {
+            let s = manager.get_session_mut().unwrap();
+            for _ in 0..256 {
+                s.record_turn_estimate(1_000, 100, 80, 20);
+            }
+            s.complete_task("seeded");
+        }
+        let expected_id = manager.get_session().unwrap().id.clone();
+        let expected_turns = manager.get_session().unwrap().turn_metrics.len();
+
+        let manager = Arc::new(RwLock::new(manager));
+
+        // Spawn 16 concurrent readers; each opens a read guard, takes a
+        // SessionView, asserts identity + turn count, then drops the
+        // guard explicitly so the lock is released as early as possible.
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let mgr = Arc::clone(&manager);
+            let expected_id = expected_id.clone();
+            handles.push(tokio::spawn(async move {
+                let guard = mgr.read().await;
+                let (id_matches, turns, first_task) = {
+                    let view = guard
+                        .current_view()
+                        .expect("active session must exist for readers");
+                    (
+                        view.id() == expected_id,
+                        view.turn_metrics().len(),
+                        view.progress().completed_tasks[0].clone(),
+                    )
+                };
+                drop(guard);
+                assert!(id_matches, "view.id() must match the seeded session id");
+                assert_eq!(turns, expected_turns);
+                assert_eq!(first_task, "seeded");
+            }));
+        }
+        for h in handles {
+            h.await.expect("reader task panicked");
+        }
+    }
+
+    /// #458 (test 2 of mandated 3): Write access serialises correctly.
+    /// A long-held write guard blocks new readers until released; once
+    /// released, every subsequent reader observes the mutation via a
+    /// `SessionView`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_458_arc_rwlock_serialises_writes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+        manager.get_or_create_session();
+        let manager = Arc::new(RwLock::new(manager));
+
+        // Writer task: takes the write guard, sleeps briefly (simulating
+        // a non-trivial mutation), records a turn estimate, and releases.
+        let writer = {
+            let mgr = Arc::clone(&manager);
+            tokio::spawn(async move {
+                let mut guard = mgr.write().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                {
+                    let s = guard
+                        .get_session_mut()
+                        .expect("active session must exist for writer");
+                    s.record_turn_estimate(42, 4, 3, 2);
+                    s.complete_task("written-under-write-lock");
+                }
+                drop(guard);
+            })
+        };
+
+        // Reader task: tries to read after the writer has had a head start.
+        // The read guard must wait for the writer to finish; when it
+        // succeeds, the mutation must be visible via `SessionView`.
+        let reader = {
+            let mgr = Arc::clone(&manager);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let guard = mgr.read().await;
+                let (turns_len, total_turns, tasks_len, first_task) = {
+                    let view = guard
+                        .current_view()
+                        .expect("active session must exist for reader");
+                    (
+                        view.turn_metrics().len(),
+                        view.total_turns(),
+                        view.progress().completed_tasks.len(),
+                        view.progress().completed_tasks[0].clone(),
+                    )
+                };
+                drop(guard);
+                // If serialisation worked, the reader saw the writer's
+                // mutation — exactly one turn was recorded.
+                assert_eq!(turns_len, 1);
+                assert_eq!(total_turns, 1);
+                assert_eq!(tasks_len, 1);
+                assert_eq!(first_task, "written-under-write-lock");
+            })
+        };
+
+        writer.await.expect("writer task panicked");
+        reader.await.expect("reader task panicked");
+    }
+
+    /// #458 (test 3 of mandated 3): Functional regression — `turn_metrics`
+    /// tracking (the #285 invariant) still works end-to-end when callers
+    /// read exclusively through `SessionView`.  The view path must
+    /// observe the same monotonic turn numbers and the same
+    /// `MAX_TURN_METRICS` ring as the direct-field path.
+    #[test]
+    fn issue_458_turn_metrics_tracking_visible_through_view() {
+        let mut session = Session::new_initializer();
+
+        // Push enough turns to (a) populate the ring and (b) trigger one
+        // eviction, so the test exercises both the bounded-ring and the
+        // monotonic-total-turns invariants.
+        let pushes = MAX_TURN_METRICS + 7;
+        for _ in 0..pushes {
+            session.record_turn_estimate(1_000, 100, 80, 20);
+            session.record_actual_usage(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        }
+
+        // Read everything we care about *only* via SessionView — no direct
+        // field access from this point on.
+        let view = session.view();
+
+        // 1. Ring is bounded.
+        assert_eq!(
+            view.turn_metrics().len(),
+            MAX_TURN_METRICS,
+            "view must observe the same bounded ring as the direct-field path"
+        );
+
+        // 2. total_turns is monotonic and unaffected by eviction.
+        assert_eq!(view.total_turns(), pushes as u64);
+
+        // 3. Cumulative usage accumulated across *all* turns (including
+        //    evicted ones).
+        assert_eq!(view.cumulative_usage().input_tokens, pushes as u64);
+        assert_eq!(view.cumulative_usage().output_tokens, pushes as u64);
+
+        // 4. The retained ring is strictly monotonic in turn_number, and
+        //    the first retained entry's turn_number is strictly greater
+        //    than the evicted count — same #285 invariant, but witnessed
+        //    through the view.
+        let nums: Vec<u64> = view.turn_metrics().iter().map(|t| t.turn_number).collect();
+        for window in nums.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "turn_numbers must be strictly increasing through SessionView"
+            );
+        }
+        let evicted = (pushes - MAX_TURN_METRICS) as u64;
+        assert!(nums[0] > evicted);
     }
 }
