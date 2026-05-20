@@ -96,7 +96,12 @@ fn b1_non_plugin_directory_absorbed_silently() {
 /// empty installed map (no panic, no error propagation).
 #[test]
 fn b1_missing_installed_plugins_json_starts_empty() {
-    let ip = InstalledPlugins::load();
+    // crosslink #380: `load` now takes a project_root so it can merge the
+    // global file (~/.openclaudia/...) with the project file
+    // (<project_root>/.openclaudia/...). A tempdir with no project file
+    // exercises the missing-file branch.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ip = InstalledPlugins::load(tmp.path());
     // Whether or not the real file exists, `load()` must not panic.
     // All we can assert portably: the struct is valid.
     assert!(ip.version >= 2 || ip.plugins.is_empty() || !ip.plugins.is_empty());

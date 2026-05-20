@@ -15,6 +15,18 @@ use super::policy::{self, PluginPolicy, PolicyAction, PolicyRejection};
 use super::validate::{verify_signature, SignatureError};
 use super::{Plugin, PluginCommand, PluginError, PluginHook, PluginMcpServer};
 
+/// Resolve the project root that owns per-project tracking state
+/// (`<project_root>/.openclaudia/plugins/installed_plugins.json`).
+///
+/// Falls back to the current process cwd as a best-effort root; if even
+/// `current_dir()` fails (deleted cwd, etc.) we use `"."`, which the
+/// caller's atomic-save path will canonicalize via `create_dir_all`.
+/// This matches the value the install entries themselves already record
+/// in `project_path` (see [`PluginInstallEntry::project_path`]).
+fn project_root_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 /// Manages plugin discovery, loading, and lifecycle
 pub struct PluginManager {
     /// Loaded plugins by name
@@ -44,7 +56,7 @@ impl PluginManager {
         Self {
             plugins: HashMap::new(),
             search_paths,
-            installed: InstalledPlugins::load(),
+            installed: InstalledPlugins::load(&project_root_cwd()),
         }
     }
 
@@ -257,7 +269,7 @@ impl PluginManager {
     /// Reload all plugins
     pub fn reload(&mut self) -> Vec<PluginError> {
         self.plugins.clear();
-        self.installed = InstalledPlugins::load();
+        self.installed = InstalledPlugins::load(&project_root_cwd());
         self.discover()
     }
 
@@ -899,7 +911,8 @@ impl PluginManager {
                 };
                 // Track and return (dest already populated by git clone)
                 let plugin_id = format!("{plugin_name}@{marketplace_name}");
-                let mut installed = InstalledPlugins::load();
+                let project_root = project_root_cwd();
+                let mut installed = InstalledPlugins::load(&project_root);
                 installed.upsert(
                     &plugin_id,
                     PluginInstallEntry {
@@ -917,7 +930,7 @@ impl PluginManager {
                         git_commit_sha: Some(commit_sha),
                     },
                 );
-                if let Err(e) = installed.save() {
+                if let Err(e) = installed.save(&project_root) {
                     warn!("Failed to save install tracking: {}", e);
                 }
                 let _ = self.reload();
@@ -937,7 +950,8 @@ impl PluginManager {
 
         // Track installation
         let plugin_id = format!("{plugin_name}@{marketplace_name}");
-        let mut installed = InstalledPlugins::load();
+        let project_root = project_root_cwd();
+        let mut installed = InstalledPlugins::load(&project_root);
         installed.upsert(
             &plugin_id,
             PluginInstallEntry {
@@ -955,7 +969,7 @@ impl PluginManager {
                 git_commit_sha: None,
             },
         );
-        if let Err(e) = installed.save() {
+        if let Err(e) = installed.save(&project_root) {
             warn!("Failed to save install tracking: {}", e);
         }
 
@@ -1008,7 +1022,8 @@ impl PluginManager {
             Ok(plugin) => {
                 let actual_name = plugin.name().to_string();
                 // Track installation
-                let mut installed = InstalledPlugins::load();
+                let project_root = project_root_cwd();
+                let mut installed = InstalledPlugins::load(&project_root);
                 installed.upsert(
                     &actual_name,
                     PluginInstallEntry {
@@ -1026,7 +1041,7 @@ impl PluginManager {
                         git_commit_sha: Some(commit_sha),
                     },
                 );
-                if let Err(e) = installed.save() {
+                if let Err(e) = installed.save(&project_root) {
                     warn!("Failed to save install tracking: {}", e);
                 }
                 let _ = self.reload();

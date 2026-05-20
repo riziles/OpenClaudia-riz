@@ -1605,9 +1605,10 @@ pub fn handle_plugin_action(action: PluginAction, plugin_manager: &mut plugins::
             }
         }
         PluginAction::Uninstall { plugin } => {
-            let mut installed = plugins::InstalledPlugins::load();
+            let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let mut installed = plugins::InstalledPlugins::load(&project_root);
             if installed.remove(&plugin) {
-                if let Err(e) = installed.save() {
+                if let Err(e) = installed.save(&project_root) {
                     tracing::warn!("Failed to save install tracking: {}", e);
                 }
                 let plugins_dir = std::path::PathBuf::from(".openclaudia/plugins");
@@ -1678,7 +1679,9 @@ fn plugin_install(
                             eprintln!("Failed to install plugin: {e}\n");
                             return;
                         }
-                        let mut installed = plugins::InstalledPlugins::load();
+                        let project_root = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        let mut installed = plugins::InstalledPlugins::load(&project_root);
                         installed.upsert(
                             &name,
                             plugins::PluginInstallEntry {
@@ -1696,7 +1699,7 @@ fn plugin_install(
                                 git_commit_sha: None,
                             },
                         );
-                        if let Err(e) = installed.save() {
+                        if let Err(e) = installed.save(&project_root) {
                             tracing::warn!("Failed to save install tracking: {}", e);
                         }
                         let _ = plugin_manager.reload();
