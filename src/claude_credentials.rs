@@ -459,6 +459,15 @@ pub fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
     }
 }
 
+/// Maximum recursion depth for [`strip_cache_control_ttl`].
+///
+/// Matches the cap used by `hooks::merge::deep_merge` (crosslink #333).
+/// Realistic Anthropic Messages API request bodies bottom out at <10
+/// levels of nesting (system / messages / content blocks / tool inputs);
+/// 32 leaves ample headroom while preventing a hostile request body
+/// from blowing the stack via unbounded JSON nesting (crosslink #805).
+pub(crate) const MAX_STRIP_DEPTH: usize = 32;
+
 /// Recursively strip `ttl` from any `cache_control` objects in a JSON
 /// value.
 ///
@@ -468,19 +477,42 @@ pub fn inject_oauth_prefix_only(request: &mut serde_json::Value) {
 /// entitlement). Co-located with [`inject_oauth_prefix_only`] because
 /// the two are co-requisites of every OAuth-authenticated request —
 /// see crosslink #386.
+///
+/// Recursion is capped at [`MAX_STRIP_DEPTH`] levels. A hostile request
+/// body containing thousands of nested arrays or objects would
+/// otherwise overflow the stack before `serde_json` itself bailed
+/// (crosslink #805). On reaching the cap we emit a `warn!` with the
+/// JSON path that triggered the cutoff and stop recursing into that
+/// subtree; any `cache_control.ttl` deeper than the cap is left in
+/// place, which the upstream API will reject with a 400 — strictly
+/// safer than crashing the proxy.
 pub fn strip_cache_control_ttl(value: &mut serde_json::Value) {
+    strip_cache_control_ttl_inner(value, 0, "$");
+}
+
+fn strip_cache_control_ttl_inner(value: &mut serde_json::Value, depth: usize, path: &str) {
+    if depth >= MAX_STRIP_DEPTH {
+        tracing::warn!(
+            path = %path,
+            limit = MAX_STRIP_DEPTH,
+            "strip_cache_control_ttl depth cap reached; refusing to recurse further (crosslink #805)",
+        );
+        return;
+    }
     match value {
         serde_json::Value::Object(map) => {
             if let Some(serde_json::Value::Object(cc_map)) = map.get_mut("cache_control") {
                 cc_map.remove("ttl");
             }
-            for v in map.values_mut() {
-                strip_cache_control_ttl(v);
+            for (k, v) in map.iter_mut() {
+                let child_path = format!("{path}.{k}");
+                strip_cache_control_ttl_inner(v, depth + 1, &child_path);
             }
         }
         serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                strip_cache_control_ttl(v);
+            for (i, v) in arr.iter_mut().enumerate() {
+                let child_path = format!("{path}[{i}]");
+                strip_cache_control_ttl_inner(v, depth + 1, &child_path);
             }
         }
         _ => {}
@@ -717,5 +749,122 @@ mod tests {
         });
         strip_cache_control_ttl(&mut value);
         assert_eq!(value["cache_control"]["type"], "ephemeral");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Regression tests for crosslink #805: unbounded recursion in
+    // `strip_cache_control_ttl` would let a hostile request body
+    // (deeply nested objects or arrays) blow the stack. The fix caps
+    // recursion at MAX_STRIP_DEPTH levels.
+    // ────────────────────────────────────────────────────────────────
+
+    /// A 1000-level nested array would previously recurse 1000 frames
+    /// deep and could overflow the stack on smaller-stack platforms.
+    /// With the cap, the call returns cleanly without panicking.
+    #[test]
+    fn strip_cache_control_ttl_rejects_1000_level_nesting_without_stack_overflow() {
+        // Build [[[…[]…]]] 1000 levels deep.
+        let mut value = serde_json::Value::Array(Vec::new());
+        for _ in 0..1000u16 {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        // Must not panic / stack-overflow.
+        strip_cache_control_ttl(&mut value);
+    }
+
+    /// At the depth cap, anything beyond is intentionally not visited
+    /// — so a `cache_control.ttl` planted at depth > cap survives
+    /// (and the API will 400, which is strictly safer than crashing).
+    #[test]
+    fn strip_cache_control_ttl_does_not_visit_past_depth_cap() {
+        // Wrap a cache_control object inside MAX_STRIP_DEPTH + 5 arrays.
+        let payload = serde_json::json!({
+            "cache_control": { "type": "ephemeral", "ttl": 3600 }
+        });
+        let mut value = payload;
+        for _ in 0..(MAX_STRIP_DEPTH + 5) {
+            value = serde_json::Value::Array(vec![value]);
+        }
+
+        strip_cache_control_ttl(&mut value);
+
+        // Unwrap back down to find the inner cache_control.
+        let mut cursor = &value;
+        while let Some(arr) = cursor.as_array() {
+            if arr.is_empty() {
+                break;
+            }
+            cursor = &arr[0];
+        }
+        // The ttl beyond the cap MUST still be present — proving the
+        // cap actually stopped recursion (and that the function did
+        // not silently rewrite arbitrary depth without bound). The
+        // ttl lives inside `cache_control`, not at the top-level
+        // cursor — we are testing that the cap prevented the
+        // descent into the object that contains it.
+        let cc = cursor
+            .get("cache_control")
+            .expect("cache_control object survives wrapping");
+        let ttl = cc.get("ttl");
+        assert!(
+            ttl.is_some(),
+            "ttl beyond depth cap should be left intact (cap stopped recursion), got cc={cc:?}",
+        );
+    }
+
+    /// Just *under* the cap, the strip still happens — proving the
+    /// cap is permissive enough for realistic request shapes. A real
+    /// Anthropic Messages API request bottoms out at ~10 levels
+    /// (system / messages / content blocks / tool inputs), so a 16-
+    /// level test is comfortably realistic and well under the 32 cap.
+    #[test]
+    fn strip_cache_control_ttl_strips_within_depth_cap() {
+        let mut inner = serde_json::json!({
+            "cache_control": { "type": "ephemeral", "ttl": 3600 }
+        });
+        // Wrap in 16 layers of arrays — well under MAX_STRIP_DEPTH = 32.
+        for _ in 0..16 {
+            inner = serde_json::Value::Array(vec![inner]);
+        }
+
+        strip_cache_control_ttl(&mut inner);
+
+        // Unwrap down to the cache_control object.
+        let mut cursor = &inner;
+        while let Some(arr) = cursor.as_array() {
+            cursor = &arr[0];
+        }
+        let cc = cursor.get("cache_control").expect("cache_control survives");
+        assert_eq!(cc["type"], "ephemeral");
+        assert!(
+            cc.get("ttl").is_none(),
+            "ttl within depth cap MUST be stripped, got cc={cc:?}",
+        );
+    }
+
+    /// Depth cap is exactly `MAX_STRIP_DEPTH` (boundary pin). At depth
+    /// `MAX_STRIP_DEPTH - 1` we still descend; at `MAX_STRIP_DEPTH`
+    /// we don't. A `cache_control` at *exactly* the cap depth survives
+    /// (because depth incremented before the descend).
+    #[test]
+    fn strip_cache_control_ttl_depth_cap_boundary() {
+        // 31 wraps means the inner `cache_control` object is visited
+        // at depth = 31 (the loop increments once per array
+        // descent), which is < MAX_STRIP_DEPTH (32) — so it strips.
+        let mut value = serde_json::json!({
+            "cache_control": { "type": "ephemeral", "ttl": 1 }
+        });
+        for _ in 0..(MAX_STRIP_DEPTH - 1) {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        strip_cache_control_ttl(&mut value);
+        let mut cursor = &value;
+        while let Some(arr) = cursor.as_array() {
+            cursor = &arr[0];
+        }
+        assert!(
+            cursor["cache_control"].get("ttl").is_none(),
+            "ttl just under the cap must be stripped"
+        );
     }
 }
