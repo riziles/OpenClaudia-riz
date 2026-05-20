@@ -656,13 +656,18 @@ pub fn slash_model(
             };
             println!("  \x1b[36m{m}\x1b[0m{marker}");
         }
-        if let Ok(config) = openclaudia::config::load_config() {
+        // Crosslink #433: get_adapter now returns Result. If the provider
+        // name from `/models <provider>` is unknown, skip the dynamic-model
+        // lookup quietly — the static list above has already been printed.
+        if let (Ok(config), Ok(adapter)) = (
+            openclaudia::config::load_config(),
+            openclaudia::providers::get_adapter(provider),
+        ) {
             if let Some(provider_config) = config.get_provider(provider) {
-                let adapter = openclaudia::providers::get_adapter(provider);
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     if let Some(dynamic) = handle.block_on(super::models::fetch_dynamic_models(
                         provider_config,
-                        adapter.as_ref(),
+                        adapter,
                     )) {
                         println!("\n  Dynamic models (from API):");
                         for m in &dynamic {

@@ -928,7 +928,11 @@ async fn transform_and_forward(
     request: &ChatCompletionRequest,
     is_stream: bool,
 ) -> Result<reqwest::Response, ProxyError> {
-    let adapter = get_adapter(provider_name);
+    // Crosslink #433: get_adapter now returns Result<&'static dyn …>; an
+    // unknown provider name surfaces as a 400 instead of a silent OpenAI
+    // fallback. The error string already lists the supported set so the
+    // client sees a useful diagnostic.
+    let adapter = get_adapter(provider_name).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
     debug!(provider = adapter.name(), "Using provider adapter");
 
     let mut transformed_request = adapter
@@ -1346,7 +1350,12 @@ async fn proxy_passthrough(
     // Previously this called a local `set_auth_header` helper that branched
     // on provider-name equality — the adapter trait is the correct
     // abstraction (crosslink #338).
-    let adapter = crate::providers::get_adapter(&state.config.proxy.target);
+    //
+    // Crosslink #433: get_adapter now propagates an explicit error if
+    // `state.config.proxy.target` is a typo'd name. This used to silently
+    // fall back to OpenAIAdapter; the failure was invisible.
+    let adapter = crate::providers::get_adapter(&state.config.proxy.target)
+        .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
     for (k, v) in adapter.get_headers(&api_key) {
         req_builder = req_builder.header(k.as_str(), v.as_str());
     }
@@ -1647,7 +1656,14 @@ async fn forward_to_provider<T: Serialize + Sync>(
     let mut req = client.post(&url).json(body);
 
     // Provider-owned auth and protocol headers.
-    let adapter = crate::providers::get_adapter(provider_name);
+    //
+    // Crosslink #433: unknown provider names now surface as
+    // `InvalidBody(UnknownProvider…)` rather than a silent OpenAIAdapter
+    // fallback. This is the auth-header construction site, so the failure
+    // mode here was particularly silent (the request would have shipped
+    // with Bearer auth pointed at the wrong endpoint).
+    let adapter = crate::providers::get_adapter(provider_name)
+        .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
     for (key, value) in adapter.get_headers(api_key) {
         req = req.header(key.as_str(), value.as_str());
     }

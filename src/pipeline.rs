@@ -248,22 +248,31 @@ pub fn build_request(
 }
 
 /// Resolve the API endpoint for the given provider configuration.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`crate::providers::ProviderError::UnknownProvider`] when
+/// `provider` is not a registered adapter name AND the caller is not
+/// using a Claude Code OAuth token (OAuth bypasses adapter dispatch
+/// because the endpoint is fixed by `get_oauth_endpoint`). Previously
+/// (crosslink #433) this function silently fell back to
+/// `/v1/chat/completions` against `OpenAIAdapter`, hiding typos in
+/// `proxy.target` from the user.
 pub fn resolve_endpoint(
     provider: &str,
     model: &str,
     base_url: &str,
     claude_code_token: Option<&str>,
-) -> String {
+) -> Result<String, crate::providers::ProviderError> {
     if claude_code_token.is_some() {
-        crate::claude_credentials::get_oauth_endpoint(model)
+        Ok(crate::claude_credentials::get_oauth_endpoint(model))
     } else {
-        let adapter = get_adapter(provider);
-        format!(
+        let adapter = get_adapter(provider)?;
+        Ok(format!(
             "{}{}",
             normalize_base_url(base_url),
             adapter.chat_endpoint(model)
-        )
+        ))
     }
 }
 
@@ -273,24 +282,29 @@ pub fn resolve_endpoint(
 /// `claude_code_token` is `Some(_)` (OAuth path doesn't need an API key).
 /// If both are `None` the function returns an empty auth set — the caller
 /// is expected to have validated the combination. See crosslink #256.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`crate::providers::ProviderError::UnknownProvider`] when
+/// `provider` is unknown AND an API key is being used (the OAuth path
+/// uses `get_oauth_headers` which doesn't go through adapter dispatch).
+/// See crosslink #433.
 pub fn resolve_headers(
     provider: &str,
     api_key: Option<&crate::providers::ApiKey>,
     claude_code_token: Option<&str>,
     extra_headers: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut headers = claude_code_token.map_or_else(
-        || {
-            api_key.map_or_else(Vec::new, |key| {
-                let adapter = get_adapter(provider);
-                adapter.get_headers(key)
-            })
-        },
-        crate::claude_credentials::get_oauth_headers,
-    );
+) -> Result<Vec<(String, String)>, crate::providers::ProviderError> {
+    let mut headers = if let Some(token) = claude_code_token {
+        crate::claude_credentials::get_oauth_headers(token)
+    } else if let Some(key) = api_key {
+        let adapter = get_adapter(provider)?;
+        adapter.get_headers(key)
+    } else {
+        Vec::new()
+    };
     headers.extend(extra_headers.iter().cloned());
-    headers
+    Ok(headers)
 }
 
 // ─── Streaming + tool execution ─────────────────────────────────────────────

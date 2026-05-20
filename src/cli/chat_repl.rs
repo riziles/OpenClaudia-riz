@@ -72,7 +72,10 @@ pub struct ChatRepl {
     coordinator: bool,
     dangerously_skip_permissions: bool,
     ext_regex: regex::Regex,
-    adapter: Box<dyn openclaudia::providers::ProviderAdapter>,
+    // Crosslink #433: was `Box<dyn ProviderAdapter>`. Now `&'static dyn …`
+    // — `get_adapter` returns a shared static singleton, so the REPL just
+    // borrows it for the lifetime of the process. No allocation, no Drop.
+    adapter: &'static dyn openclaudia::providers::ProviderAdapter,
     client: reqwest::Client,
     hook_engine: openclaudia::hooks::HookEngine,
     rules_engine: openclaudia::rules::RulesEngine,
@@ -150,7 +153,6 @@ impl ChatRepl {
     /// error and the caller should exit cleanly (matches the original
     /// `return Ok(())` branches of `cmd_chat`).
     pub async fn new(args: ChatReplArgs) -> anyhow::Result<Option<Self>> {
-        use openclaudia::providers::get_adapter;
         use openclaudia::rules::RulesEngine;
 
         chdir_to_git_root();
@@ -212,7 +214,11 @@ impl ChatRepl {
             provider.model.clone(),
             &config.proxy.target,
         );
-        let adapter = get_adapter(&config.proxy.target);
+        // Crosslink #433: typo in `proxy.target` fails fast at REPL setup
+        // instead of silently falling back to OpenAIAdapter.
+        let Some(adapter) = resolve_repl_adapter(&config.proxy.target) else {
+            return Ok(None);
+        };
         let client = reqwest::Client::new();
         let hook_engine = build_hook_engine(&config);
         let rules_engine = RulesEngine::new(".openclaudia/rules");
@@ -406,7 +412,7 @@ impl ChatRepl {
             &self.config.proxy.target,
             &self.model,
             provider,
-            self.adapter.as_ref(),
+            self.adapter,
             self.api_key.as_ref(),
             self.claude_code_token.as_deref(),
         );
@@ -2890,6 +2896,24 @@ struct InitialStreamResult {
 }
 
 // ── Free helpers (no `self`) used by ChatRepl methods ──
+
+/// Resolve the REPL's provider adapter from `proxy.target`. Returns
+/// `None` (with an error printed to stderr) when the configured target
+/// is not a registered adapter name — the caller treats `None` as the
+/// "setup printed a message, exit cleanly" signal already used elsewhere
+/// in [`ChatRepl::new`]. Extracted to keep the body of `new` under the
+/// clippy `too_many_lines` ceiling. See crosslink #433.
+fn resolve_repl_adapter(
+    target: &str,
+) -> Option<&'static dyn openclaudia::providers::ProviderAdapter> {
+    match openclaudia::providers::get_adapter(target) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    }
+}
 
 fn parse_tool_args(func: &tools::FunctionCall) -> serde_json::Value {
     serde_json::from_str(&func.arguments).unwrap_or_else(|e| {

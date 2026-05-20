@@ -54,6 +54,24 @@ pub enum ProviderError {
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+
+    /// The provider name supplied to [`get_adapter`] does not match any
+    /// registered adapter. Carries the unrecognised name AND the list of
+    /// supported names so the caller can surface a helpful error to the
+    /// user (e.g. a 400 Bad Request body that lists what is valid).
+    ///
+    /// See crosslink #433 — the previous behaviour was a `tracing::warn!`
+    /// followed by a silent fallback to `OpenAIAdapter`, meaning a typo
+    /// in `proxy.target` (`"anthrpic"`) resulted in API calls being sent
+    /// to a configured `OpenAI` endpoint with no user-visible error.
+    #[error(
+        "Unknown provider: '{name}'. Supported providers: {}",
+        supported.join(", ")
+    )]
+    UnknownProvider {
+        name: String,
+        supported: Vec<&'static str>,
+    },
 }
 
 /// Model information returned from provider
@@ -259,29 +277,94 @@ impl ProviderKind {
     }
 }
 
-/// Get the appropriate adapter for a provider name
-#[must_use]
-pub fn get_adapter(provider: &str) -> Box<dyn ProviderAdapter> {
-    match provider.to_lowercase().as_str() {
-        "anthropic" => Box::new(AnthropicAdapter::new()),
-        "google" | "gemini" => Box::new(GoogleAdapter::new()),
-        "zai" | "glm" | "zhipu" => Box::new(ZaiAdapter::new()),
-        "deepseek" => Box::new(DeepSeekAdapter::new()),
-        "qwen" | "alibaba" => Box::new(QwenAdapter::new()),
-        "ollama" => Box::new(OllamaAdapter::new()),
-        // OpenAI-compatible providers: explicitly named
-        "openai" | "local" | "lmstudio" | "localai" | "text-generation-webui" => {
-            Box::new(OpenAIAdapter::new())
+// ── Crosslink #433: static adapter singletons ───────────────────────────────
+//
+// Each `*Adapter` struct exposes a `pub const fn new()`, so every adapter
+// can be constructed at compile time and stored as a `static` value with
+// `'static` lifetime. Previously [`get_adapter`] returned
+// `Box<dyn ProviderAdapter>`, allocating one boxed instance per *request*
+// in the proxy hot path (`proxy_chat_completions`). The trait objects below
+// replace that with a single shared instance per provider, looked up by name
+// and returned as `&'static dyn ProviderAdapter` — zero allocation, zero
+// per-request work.
+//
+// The slice [`SUPPORTED_PROVIDERS`] is the authoritative list of names
+// `get_adapter` recognises. It's used both for dispatch and to populate the
+// "supported providers" hint inside [`ProviderError::UnknownProvider`], so
+// the error message can never drift from the dispatch table.
+
+static ANTHROPIC: AnthropicAdapter = AnthropicAdapter::new();
+static OPENAI: OpenAIAdapter = OpenAIAdapter::new();
+static GOOGLE: GoogleAdapter = GoogleAdapter::new();
+static DEEPSEEK: DeepSeekAdapter = DeepSeekAdapter::new();
+static QWEN: QwenAdapter = QwenAdapter::new();
+static ZAI: ZaiAdapter = ZaiAdapter::new();
+static OLLAMA: OllamaAdapter = OllamaAdapter::new();
+
+/// Canonical names accepted by [`get_adapter`]. Aliases are listed in the
+/// same order they appear in the dispatch `match` so the error message hint
+/// matches what the function actually resolves.
+const SUPPORTED_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "gemini",
+    "deepseek",
+    "qwen",
+    "alibaba",
+    "zai",
+    "glm",
+    "zhipu",
+    "ollama",
+    "local",
+    "lmstudio",
+    "localai",
+    "text-generation-webui",
+];
+
+/// Resolve a provider name to its singleton adapter.
+///
+/// Returns `&'static dyn ProviderAdapter` — no allocation, no per-call
+/// construction. The dispatch is case-insensitive (the input is lowercased
+/// for matching) to preserve the prior contract: `proxy.target: OpenAI` in
+/// `config.yaml` resolves to the same adapter as `proxy.target: openai`.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::UnknownProvider`] when `provider` does not
+/// match any registered adapter name (no silent fallback — see #433). The
+/// error includes the unrecognised name and the list of supported names so
+/// callers can surface a helpful diagnostic (e.g. a 400 response body).
+///
+/// # Examples
+///
+/// ```
+/// use openclaudia::providers::get_adapter;
+/// let adapter = get_adapter("anthropic").expect("known provider");
+/// assert_eq!(adapter.name(), "anthropic");
+///
+/// // Typos surface as errors, not silent OpenAI fallbacks.
+/// assert!(get_adapter("anthrpic").is_err());
+/// ```
+pub fn get_adapter(provider: &str) -> Result<&'static dyn ProviderAdapter, ProviderError> {
+    let adapter: &'static dyn ProviderAdapter = match provider.to_ascii_lowercase().as_str() {
+        "anthropic" => &ANTHROPIC,
+        "google" | "gemini" => &GOOGLE,
+        "zai" | "glm" | "zhipu" => &ZAI,
+        "deepseek" => &DEEPSEEK,
+        "qwen" | "alibaba" => &QWEN,
+        "ollama" => &OLLAMA,
+        // OpenAI-compatible providers: explicitly named (no silent fallback
+        // for unrecognised names — see the `_ =>` arm below).
+        "openai" | "local" | "lmstudio" | "localai" | "text-generation-webui" => &OPENAI,
+        _ => {
+            return Err(ProviderError::UnknownProvider {
+                name: provider.to_string(),
+                supported: SUPPORTED_PROVIDERS.to_vec(),
+            });
         }
-        // Unknown provider: warn and fall back to OpenAI-compatible
-        other => {
-            tracing::warn!(
-                provider = other,
-                "Unknown provider — falling back to OpenAI-compatible adapter. Check config if this is a typo."
-            );
-            Box::new(OpenAIAdapter::new())
-        }
-    }
+    };
+    Ok(adapter)
 }
 
 /// Fetch available models from a provider's `/v1/models` endpoint.
@@ -495,23 +578,26 @@ mod tests {
 
     #[test]
     fn test_get_adapter() {
-        assert_eq!(get_adapter("anthropic").name(), "anthropic");
-        assert_eq!(get_adapter("google").name(), "google");
-        assert_eq!(get_adapter("openai").name(), "openai");
-        assert_eq!(get_adapter("zai").name(), "zai");
-        assert_eq!(get_adapter("glm").name(), "zai");
-        assert_eq!(get_adapter("zhipu").name(), "zai");
+        assert_eq!(get_adapter("anthropic").unwrap().name(), "anthropic");
+        assert_eq!(get_adapter("google").unwrap().name(), "google");
+        assert_eq!(get_adapter("openai").unwrap().name(), "openai");
+        assert_eq!(get_adapter("zai").unwrap().name(), "zai");
+        assert_eq!(get_adapter("glm").unwrap().name(), "zai");
+        assert_eq!(get_adapter("zhipu").unwrap().name(), "zai");
         // DeepSeek and Qwen have dedicated adapters for thinking support
-        assert_eq!(get_adapter("deepseek").name(), "deepseek");
-        assert_eq!(get_adapter("qwen").name(), "qwen");
-        assert_eq!(get_adapter("alibaba").name(), "qwen");
+        assert_eq!(get_adapter("deepseek").unwrap().name(), "deepseek");
+        assert_eq!(get_adapter("qwen").unwrap().name(), "qwen");
+        assert_eq!(get_adapter("alibaba").unwrap().name(), "qwen");
         // Ollama for local LLM inference
-        assert_eq!(get_adapter("ollama").name(), "ollama");
+        assert_eq!(get_adapter("ollama").unwrap().name(), "ollama");
         // OpenAI-compatible local providers
-        assert_eq!(get_adapter("local").name(), "openai");
-        assert_eq!(get_adapter("lmstudio").name(), "openai");
-        assert_eq!(get_adapter("localai").name(), "openai");
-        assert_eq!(get_adapter("unknown").name(), "openai"); // Default
+        assert_eq!(get_adapter("local").unwrap().name(), "openai");
+        assert_eq!(get_adapter("lmstudio").unwrap().name(), "openai");
+        assert_eq!(get_adapter("localai").unwrap().name(), "openai");
+        // Crosslink #433: unknown names are now an explicit error, NOT a
+        // silent OpenAI fallback. See `get_adapter_unknown_provider_*`
+        // tests below for the full forensic pin.
+        assert!(get_adapter("unknown").is_err());
     }
 
     #[test]
@@ -688,7 +774,7 @@ mod tests {
             ProviderKind::Qwen,
             ProviderKind::Zai,
         ] {
-            let adapter = get_adapter(kind.name());
+            let adapter = get_adapter(kind.name()).expect("known provider");
             assert_eq!(
                 adapter.name(),
                 kind.name(),
@@ -946,5 +1032,139 @@ mod tests {
         let adapter = OllamaAdapter::new();
         let response = json!({"model": "llama3"});
         assert!(adapter.extract_response_text(&response).is_none());
+    }
+
+    // ── Crosslink #433: static dispatch + explicit UnknownProvider ──────────
+    //
+    // These tests pin the contract enforced by the refactor:
+    //
+    //   1. `get_adapter` returns a `&'static dyn ProviderAdapter`, so two
+    //      calls for the same name return the **same** pointer. The previous
+    //      `Box<dyn ProviderAdapter>` allocation produced a distinct heap
+    //      address per call (one allocation per request on the proxy hot
+    //      path, see `proxy_chat_completions`).
+    //   2. Lookup is case-insensitive — `get_adapter("OpenAI")` must
+    //      resolve, matching the pre-refactor behaviour where
+    //      `provider.to_lowercase()` was applied before matching.
+    //   3. Unknown names return `Err(UnknownProvider)`. They do NOT silently
+    //      fall back to `OpenAIAdapter`. The error carries the typo'd name
+    //      AND the supported list so the proxy can render a useful 400.
+    //   4. Every known name registered in the dispatch table round-trips
+    //      via `.name()` to its expected canonical adapter name. This
+    //      catches drift between aliases (`"glm"` → `"zai"`) and the
+    //      adapter's own self-reported name.
+
+    /// Same pointer across calls — proves the static-singleton refactor.
+    /// Under the old `Box::new(...)` implementation this would have been
+    /// two distinct heap addresses; under the new `&'static` return type
+    /// the address is constant for the lifetime of the process.
+    #[test]
+    fn get_adapter_returns_same_pointer_across_calls() {
+        let a = get_adapter("anthropic").expect("known");
+        let b = get_adapter("anthropic").expect("known");
+        assert!(
+            std::ptr::eq(
+                std::ptr::from_ref::<dyn ProviderAdapter>(a).cast::<()>(),
+                std::ptr::from_ref::<dyn ProviderAdapter>(b).cast::<()>(),
+            ),
+            "expected the same static instance on repeated calls"
+        );
+    }
+
+    /// Case-insensitive lookup — preserves the pre-refactor behaviour
+    /// (`provider.to_lowercase()` before matching).
+    #[test]
+    fn get_adapter_is_case_insensitive() {
+        assert_eq!(get_adapter("OpenAI").unwrap().name(), "openai");
+        assert_eq!(get_adapter("ANTHROPIC").unwrap().name(), "anthropic");
+        assert_eq!(get_adapter("Gemini").unwrap().name(), "google");
+        assert_eq!(get_adapter("DeepSeek").unwrap().name(), "deepseek");
+    }
+
+    /// Typo'd names surface as an explicit `UnknownProvider` error — NOT a
+    /// silent `OpenAIAdapter` fallback. Forensic pin: the previous
+    /// implementation emitted `tracing::warn!` and returned `OpenAIAdapter`,
+    /// so a config typo like `proxy.target: "anthrpic"` would silently
+    /// route Anthropic-formatted requests to an `OpenAI` endpoint, billing
+    /// the wrong account and producing 4xx responses with confusing causes.
+    #[test]
+    fn get_adapter_unknown_provider_returns_explicit_error() {
+        let result = get_adapter("anthrpic"); // common typo
+        match result {
+            Err(ProviderError::UnknownProvider { name, supported }) => {
+                assert_eq!(name, "anthrpic");
+                // The hint must list at least the known canonical names so
+                // the caller can surface a helpful diagnostic.
+                assert!(supported.contains(&"anthropic"));
+                assert!(supported.contains(&"openai"));
+                assert!(supported.contains(&"google"));
+            }
+            Err(other) => panic!("expected UnknownProvider, got {other:?}"),
+            Ok(adapter) => panic!(
+                "expected UnknownProvider error, got silent fallback to '{}'",
+                adapter.name()
+            ),
+        }
+
+        // Same assertion via a separate typo and the error's `Display`
+        // impl — the rendered message must mention the bad name and at
+        // least one supported provider. We can't use `.unwrap_err()`
+        // because the `Ok` branch holds `&dyn ProviderAdapter` which is
+        // not `Debug`, so destructure explicitly.
+        let rendered = match get_adapter("typo-provider") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected UnknownProvider error for 'typo-provider'"),
+        };
+        assert!(rendered.contains("typo-provider"));
+        assert!(rendered.contains("anthropic"));
+    }
+
+    /// Round-trip: every name registered in the dispatch table resolves to
+    /// an adapter whose `.name()` matches the canonical name for that
+    /// family. Aliases (`"glm"` → `"zai"`, `"gemini"` → `"google"`) are
+    /// included because the previous bug would not have caught alias
+    /// drift either.
+    #[test]
+    fn get_adapter_known_names_round_trip_via_name() {
+        let cases: &[(&str, &str)] = &[
+            ("anthropic", "anthropic"),
+            ("openai", "openai"),
+            ("google", "google"),
+            ("gemini", "google"),
+            ("deepseek", "deepseek"),
+            ("qwen", "qwen"),
+            ("alibaba", "qwen"),
+            ("zai", "zai"),
+            ("glm", "zai"),
+            ("zhipu", "zai"),
+            ("ollama", "ollama"),
+            ("local", "openai"),
+            ("lmstudio", "openai"),
+            ("localai", "openai"),
+            ("text-generation-webui", "openai"),
+        ];
+        for (input, expected) in cases {
+            let adapter = get_adapter(input)
+                .unwrap_or_else(|e| panic!("'{input}' should be a known provider but got: {e}"));
+            assert_eq!(
+                adapter.name(),
+                *expected,
+                "alias '{input}' resolved to wrong adapter"
+            );
+        }
+    }
+
+    /// Every name listed in [`SUPPORTED_PROVIDERS`] must itself be a
+    /// resolvable name. Guards against drift between the dispatch table
+    /// and the hint list inside the error.
+    #[test]
+    fn supported_providers_list_matches_dispatch_table() {
+        for name in SUPPORTED_PROVIDERS {
+            assert!(
+                get_adapter(name).is_ok(),
+                "name '{name}' appears in SUPPORTED_PROVIDERS but \
+                 get_adapter rejects it"
+            );
+        }
     }
 }

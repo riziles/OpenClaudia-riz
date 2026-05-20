@@ -172,7 +172,17 @@ impl VddEngine {
         // routed through the builder's `ProviderAdapter`, the same one
         // the proxy hot path uses — so a new provider sees identical
         // extraction semantics in both places.
-        let builder_adapter = get_adapter(builder_provider);
+        // Crosslink #433: a typo'd builder provider name short-circuits
+        // VDD as "Skipped" with a useful diagnostic rather than silently
+        // routing through OpenAIAdapter and returning empty text.
+        let builder_adapter = match get_adapter(builder_provider) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(VddResult::Skipped(format!(
+                    "Builder provider '{builder_provider}' unknown: {e}"
+                )));
+            }
+        };
         let builder_text = builder_adapter
             .extract_response_text(builder_response)
             .unwrap_or_default();
@@ -315,7 +325,12 @@ impl VddEngine {
         // bottom of the loop body), so a clean pass that converged on
         // iteration 1 (no revisions needed) reported zero builder
         // tokens — misleading cost accounting shown to the user.
-        let builder_adapter = get_adapter(builder_provider);
+        // Crosslink #433: explicit error for an unknown builder provider —
+        // the blocking loop has no graceful "skip" semantics here (we're
+        // already past `advisory_review`'s skip gate), so we bubble it up
+        // as `ConfigError`.
+        let builder_adapter =
+            get_adapter(builder_provider).map_err(|e| VddError::ConfigError(e.to_string()))?;
         let initial_builder_tokens = builder_adapter
             .extract_token_usage(initial_builder_response)
             .unwrap_or_default();
@@ -700,7 +715,9 @@ mod tests {
         // The blocking loop calls `get_adapter(builder_provider)` and then
         // `.extract_token_usage(initial_builder_response)` before the
         // first iteration. Replicate that exactly.
-        let adapter = get_adapter("openai");
+        // Crosslink #433: `get_adapter` returns Result; `"openai"` is a
+        // known canonical name so `.unwrap()` is infallible here.
+        let adapter = get_adapter("openai").unwrap();
         let initial_tokens = adapter
             .extract_token_usage(&initial)
             .expect("OpenAI usage envelope present");
@@ -724,7 +741,7 @@ mod tests {
             "choices": [{"message": {"content": "revised"}}],
             "usage": {"prompt_tokens": 250, "completion_tokens": 70}
         });
-        let adapter = get_adapter("openai");
+        let adapter = get_adapter("openai").unwrap();
         session
             .builder_tokens
             .accumulate(&adapter.extract_token_usage(&initial).unwrap());
@@ -748,7 +765,7 @@ mod tests {
         let initial = json!({
             "choices": [{"message": {"content": "no usage envelope"}}]
         });
-        let adapter = get_adapter("openai");
+        let adapter = get_adapter("openai").unwrap();
         let initial_tokens = adapter.extract_token_usage(&initial).unwrap_or_default();
         session.builder_tokens.accumulate(&initial_tokens);
 
@@ -770,7 +787,7 @@ mod tests {
             "content": [{"type": "text", "text": "code goes here"}],
             "usage": {"input_tokens": 800, "output_tokens": 150}
         });
-        let adapter = get_adapter("anthropic");
+        let adapter = get_adapter("anthropic").unwrap();
         let initial_tokens = adapter
             .extract_token_usage(&initial)
             .expect("anthropic usage present");

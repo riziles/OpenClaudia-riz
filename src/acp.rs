@@ -822,7 +822,17 @@ impl AcpServer {
     // Complex protocol handler, splitting would reduce readability
     #[allow(clippy::too_many_lines)]
     async fn run_prompt_loop(&mut self, acp_session_id: &str) -> String {
-        let adapter = get_adapter(&self.config.proxy.target);
+        // Crosslink #433: a typo in `proxy.target` now surfaces here as
+        // an explicit error instead of being silently mapped to
+        // `OpenAIAdapter`. This matches the other early-exit patterns in
+        // this loop ("cancelled", "error", "end_turn").
+        let adapter = match get_adapter(&self.config.proxy.target) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "ACP: unknown provider in config.proxy.target");
+                return "error".to_string();
+            }
+        };
         let client = reqwest::Client::new();
         let max_iterations = 50; // Safety limit
 

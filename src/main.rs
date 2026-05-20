@@ -279,12 +279,16 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
     };
 
     let model = resolve_model_name(model_override, provider.model.clone(), &config.proxy.target);
+    // Crosslink #433: a typo'd `proxy.target` now surfaces as an explicit
+    // error here, instead of being silently mapped to `OpenAIAdapter` and
+    // producing 4xx responses from the upstream that the user can't
+    // attribute to a config typo.
     let endpoint = openclaudia::pipeline::resolve_endpoint(
         &config.proxy.target,
         &model,
         &provider.base_url,
         claude_code_token.as_deref(),
-    );
+    )?;
     let headers = openclaudia::pipeline::resolve_headers(
         &config.proxy.target,
         api_key.as_ref(),
@@ -294,7 +298,7 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>(),
-    );
+    )?;
 
     guardrails::configure(&config.guardrails);
     tui_launch(&config, &model, endpoint, headers, claude_code_token)

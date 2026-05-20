@@ -256,7 +256,11 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     // Test provider adapters and error variants
     print!("\nProvider adapters... ");
-    let adapter = get_adapter("anthropic");
+    // Crosslink #433: `get_adapter` now returns Result. `"anthropic"` is
+    // a known canonical name, so this unwrap is infallible — but using
+    // `expect` documents the invariant at the call site rather than
+    // hiding it behind `.unwrap()`.
+    let adapter = get_adapter("anthropic").expect("anthropic is a built-in adapter name");
     println!("{} adapter OK", adapter.name());
 
     let test_response = serde_json::json!({

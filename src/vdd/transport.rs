@@ -87,7 +87,10 @@ pub async fn send_to_adversary(
             ))
         })?;
 
-    let adapter = get_adapter(&config.adversary.provider);
+    // Crosslink #433: a typo in `config.adversary.provider` now surfaces
+    // as `ConfigError` instead of being silently mapped to OpenAIAdapter.
+    let adapter = get_adapter(&config.adversary.provider)
+        .map_err(|e| VddError::ConfigError(e.to_string()))?;
     let transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
@@ -174,7 +177,9 @@ pub async fn send_to_builder(
         ))
     })?;
 
-    let adapter = get_adapter(provider_name);
+    // Crosslink #433: explicit error for an unknown builder provider
+    // name, no silent OpenAIAdapter fallback.
+    let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
     let transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
@@ -234,7 +239,8 @@ pub async fn send_to_builder_for_verification(
         ))
     })?;
 
-    let adapter = get_adapter(provider_name);
+    // Crosslink #433: explicit error for an unknown verifier provider name.
+    let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
     let transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier transform: {e}")))?;
