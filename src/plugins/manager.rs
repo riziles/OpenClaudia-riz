@@ -1279,6 +1279,114 @@ impl PluginManager {
         }
     }
 
+    /// Install a plugin directly from a git URL, enforcing all
+    /// [`PolicyAction`]s including [`PolicyAction::RequireSignature`]
+    /// (crosslink #249).
+    ///
+    /// `install_from_git` itself does NOT consult the policy — the unsigned
+    /// install path is only used by callers that have already proven the
+    /// upstream is trusted (tests, internal automation). Production CLI /
+    /// TUI entry points MUST call this method so the signature requirement
+    /// configured in `PluginPolicy::actions` is actually enforced on every
+    /// install, not just marketplace installs.
+    ///
+    /// The signature check runs AFTER `git_clone` (so the manifest exists
+    /// on disk) but BEFORE the install record is persisted. On rejection,
+    /// the cloned tree is removed so a failed verification leaves no
+    /// trace in `.openclaudia/plugins/`.
+    ///
+    /// # Errors
+    ///
+    /// - [`PluginError::UnsignedPlugin`] when policy requires a signature
+    ///   and the manifest has none.
+    /// - [`PluginError::UnknownSigner`] when the signature does not match
+    ///   any trusted key.
+    /// - [`PluginError::SignatureMismatch`] when the signature is
+    ///   cryptographically invalid for the manifest bytes.
+    /// - All errors from [`Self::install_from_git`].
+    pub fn install_from_git_with_policy(
+        &mut self,
+        url: &str,
+        git_ref: Option<&str>,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        // Short-circuit when the policy has no signature requirement: the
+        // base installer is sufficient and we save one manifest re-read.
+        let has_sig_requirement = policy
+            .actions
+            .iter()
+            .any(|a| matches!(a, PolicyAction::RequireSignature { .. }));
+        if !has_sig_requirement {
+            return self.install_from_git(url, git_ref);
+        }
+
+        // Run the base installer first — it performs the URL-scheme check,
+        // the no-silent-HEAD rule, the dir-name traversal protection, the
+        // clone, and the manifest validation. Whatever this returns is
+        // the *materialised* plugin name on disk; we then re-load the
+        // manifest from there to drive the signature check.
+        let plugin_name = self.install_from_git(url, git_ref)?;
+
+        // Locate the manifest on disk so we can hand the verifier the
+        // canonical bytes the signature was generated over. The lookup
+        // convention `Plugin::load` uses is mirrored here
+        // (.claude-plugin/plugin.json first, plugin.json at the root as
+        // fallback). The derived dir name from the URL is the only stable
+        // way to find the clone — `install_from_git` returns the *plugin*
+        // name from the manifest, which may differ from the dir name.
+        let dir_name = super::validate::derive_dir_name_from_url(url)?;
+        let plugin_dir = PathBuf::from(".openclaudia/plugins").join(&dir_name);
+        let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
+        let root_path = plugin_dir.join("plugin.json");
+        let manifest_path = if cc_path.exists() { cc_path } else { root_path };
+
+        let result = (|| -> Result<(), PluginError> {
+            let manifest_bytes = fs::read(&manifest_path).map_err(|e| {
+                PluginError::IoError(format!("Cannot read manifest for signature check: {e}"))
+            })?;
+            let parsed: crate::plugins::manifest::PluginManifest =
+                serde_json::from_slice(&manifest_bytes).map_err(|e| {
+                    PluginError::InvalidManifest(format!(
+                        "Cannot parse manifest for signature check: {e}"
+                    ))
+                })?;
+            Self::enforce_signature_policy(
+                &plugin_name,
+                &manifest_bytes,
+                parsed.signature.as_ref(),
+                policy,
+            )
+        })();
+
+        if let Err(e) = result {
+            // Verification failed — remove the freshly-cloned tree and the
+            // install record so a rejected plugin leaves no trace. Cleanup
+            // errors are deliberately logged-and-swallowed: the plugin
+            // error is what the caller needs to see, and an undeleted
+            // clone is a non-fatal leak the next `plugin doctor` pass will
+            // catch.
+            if plugin_dir.exists() {
+                if let Err(rm_err) = fs::remove_dir_all(&plugin_dir) {
+                    warn!(
+                        "Failed to remove rejected plugin clone at {}: {}",
+                        plugin_dir.display(),
+                        rm_err
+                    );
+                }
+            }
+            let project_root = project_root_cwd();
+            let mut installed = InstalledPlugins::load(&project_root);
+            installed.remove(&plugin_name);
+            if let Err(save_err) = installed.save(&project_root) {
+                warn!("Failed to update install tracking after rejection: {save_err}");
+            }
+            let _ = self.reload();
+            return Err(e);
+        }
+
+        Ok(plugin_name)
+    }
+
     /// List plugins available from all installed marketplaces
     #[must_use]
     pub fn list_available_plugins(&self) -> Vec<(String, MarketplacePlugin)> {
@@ -1797,6 +1905,58 @@ mod install_decomp_tests {
                 );
             }
             other => panic!("expected InvalidManifest (no `ref`), got {other:?}"),
+        }
+    }
+
+    /// `install_from_git_with_policy` enforces the no-silent-HEAD rule too —
+    /// closes the crosslink #249 install-time-gate hole. Without this guard
+    /// the policy-aware path would silently bypass the rule that the base
+    /// installer enforces.
+    #[test]
+    fn install_from_git_with_policy_rejects_none_git_ref() {
+        let mut pm = PluginManager::new();
+        // Empty policy: still expects the base installer to reject.
+        let policy = PluginPolicy::default();
+        let err = pm
+            .install_from_git_with_policy("https://example.com/repo.git", None, &policy)
+            .expect_err("policy path must inherit the no-silent-HEAD guard");
+        match err {
+            PluginError::InvalidManifest(msg) => {
+                assert!(
+                    msg.contains("no `ref`"),
+                    "policy path must surface the same missing-ref error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidManifest (no `ref`), got {other:?}"),
+        }
+    }
+
+    /// `install_from_git_with_policy` rejects a disallowed URL scheme the same
+    /// way the base installer does — proves the policy wrapper does not
+    /// accidentally bypass `validate_source_url` by inverting the call order.
+    #[test]
+    fn install_from_git_with_policy_rejects_unsafe_scheme() {
+        let mut pm = PluginManager::new();
+        // A RequireSignature action so we exercise the long path (the wrapper
+        // takes the base installer's error before signature checking runs).
+        let policy = PluginPolicy {
+            actions: vec![PolicyAction::RequireSignature {
+                trusted_keys: vec![],
+            }],
+            ..PluginPolicy::default()
+        };
+        let err = pm
+            .install_from_git_with_policy("file:///etc/passwd", Some("main"), &policy)
+            .expect_err("file:// schemes must be rejected before any clone work");
+        // The exact error variant comes from `validate_source_url`; the
+        // contract here is just that the wrapper does not crash through
+        // to the clone phase. Any error variant is acceptable as long as
+        // it predates the clone.
+        match err {
+            PluginError::InvalidManifest(_) | PluginError::IoError(_) => {}
+            other => {
+                panic!("expected an early validation error, got {other:?} (clone phase reached)")
+            }
         }
     }
 

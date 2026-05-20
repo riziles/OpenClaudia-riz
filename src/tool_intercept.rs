@@ -267,9 +267,63 @@ impl ToolInterceptor {
         }
     }
 
-    /// Add content to the buffer
+    /// Maximum size, in bytes, the intercept buffer is allowed to grow
+    /// to before [`Self::push`] starts dropping content (crosslink #343).
+    ///
+    /// 4 MiB covers every legitimate model output by an order of magnitude
+    /// — Anthropic's typical max-completion budget tops out at 200 KB of
+    /// text — while bounding the worst-case memory footprint of a single
+    /// stream that keeps emitting `<bash>…` shorthand without ever closing
+    /// the tag. The push-side cap means a single stream cannot grow the
+    /// buffer without bound; the parser-side caps
+    /// ([`Self::MAX_NESTED_DEPTH`], [`Self::MAX_NESTED_PARAMS`],
+    /// [`Self::MAX_ATTRIBUTES`]) cover the parse step itself.
+    pub(crate) const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Maximum number of `attr="value"` pairs `parse_shorthand_tag` will
+    /// process per tag (crosslink #343).
+    ///
+    /// 32 covers every legitimate shorthand schema by an order of
+    /// magnitude (the widest is `edit_file` with `path`, `old_string`,
+    /// `new_string` — 3 attributes). The cap stops a hostile stream from
+    /// allocating an unbounded `HashMap` by emitting
+    /// `<bash a1="" a2="" … aN="">…</bash>`.
+    pub(crate) const MAX_ATTRIBUTES: usize = 32;
+
+    /// Add content to the intercept buffer.
+    ///
+    /// crosslink #343: if the buffer would exceed [`Self::MAX_BUFFER_BYTES`]
+    /// the trailing content is dropped. This is a hard cap on the
+    /// interceptor's worst-case memory footprint when a stream keeps
+    /// emitting unclosed shorthand tags. The dropped content is logged at
+    /// `warn!` so an audit log captures the rejection — the alternative
+    /// (panicking, or letting the buffer grow to OOM) is worse.
     pub fn push(&mut self, content: &str) {
-        self.buffer.push_str(content);
+        if self.buffer.len() >= Self::MAX_BUFFER_BYTES {
+            // Already over the cap: drop the new chunk entirely.
+            tracing::warn!(
+                buffer_bytes = self.buffer.len(),
+                cap = Self::MAX_BUFFER_BYTES,
+                drop_bytes = content.len(),
+                "ToolInterceptor: buffer cap reached, dropping incoming content (crosslink #343)"
+            );
+            return;
+        }
+        let room = Self::MAX_BUFFER_BYTES.saturating_sub(self.buffer.len());
+        if content.len() <= room {
+            self.buffer.push_str(content);
+            return;
+        }
+        // Partial fit: take only what we have room for and emit a warning.
+        // Truncate at a char boundary so we never split a UTF-8 codepoint.
+        let truncated = crate::tools::safe_truncate(content, room);
+        tracing::warn!(
+            buffer_bytes = self.buffer.len(),
+            cap = Self::MAX_BUFFER_BYTES,
+            drop_bytes = content.len() - truncated.len(),
+            "ToolInterceptor: buffer cap nearly reached, truncating incoming content (crosslink #343)"
+        );
+        self.buffer.push_str(truncated);
     }
 
     /// Get the current buffer contents
@@ -673,9 +727,19 @@ impl ToolInterceptor {
             let close_bracket = tag_content.find('>')?;
             let attr_str = &tag_content[open_attr.len()..close_bracket];
 
-            // Simple attribute parsing: attr="value"
+            // Simple attribute parsing: attr="value".
+            // crosslink #343: bounded by Self::MAX_ATTRIBUTES so a tag
+            // like `<bash a1="" … aN="">…</bash>` cannot allocate an
+            // unbounded HashMap or run quadratic-time in attr count.
             let mut attr_search = 0;
             while let Some(eq_pos) = attr_str[attr_search..].find('=') {
+                if parameters.len() >= Self::MAX_ATTRIBUTES {
+                    tracing::warn!(
+                        cap = Self::MAX_ATTRIBUTES,
+                        "parse_shorthand_tag: attribute cap reached, dropping remaining attrs (crosslink #343)"
+                    );
+                    break;
+                }
                 let abs_eq = attr_search + eq_pos;
                 let attr_name = attr_str[attr_search..abs_eq].trim();
 
@@ -1975,6 +2039,96 @@ this never closes"#;
         assert!(
             !params.contains_key("__parse_error"),
             "#899: under-cap payload must not raise a parse-error marker"
+        );
+    }
+
+    // ── crosslink #343: buffer / attribute caps ─────────────────────────
+
+    /// #343 — push beyond `MAX_BUFFER_BYTES` drops the trailing content
+    /// instead of growing without bound. The cap is enforced on each
+    /// push call so a single multi-megabyte chunk also gets clamped.
+    #[test]
+    fn fix343_buffer_cap_drops_excess_push() {
+        let mut interceptor = ToolInterceptor::new();
+        // Fill the buffer right up to the cap.
+        let fill = "a".repeat(ToolInterceptor::MAX_BUFFER_BYTES);
+        interceptor.push(&fill);
+        assert_eq!(
+            interceptor.get_buffer().len(),
+            ToolInterceptor::MAX_BUFFER_BYTES,
+            "buffer must be exactly at the cap after initial fill"
+        );
+        // Subsequent push must be dropped entirely.
+        interceptor.push("overflow");
+        assert_eq!(
+            interceptor.get_buffer().len(),
+            ToolInterceptor::MAX_BUFFER_BYTES,
+            "#343: pushes beyond MAX_BUFFER_BYTES must be dropped"
+        );
+    }
+
+    /// #343 — push with partial room takes only what fits and drops the
+    /// remainder. Critical for streaming: a chunk that straddles the cap
+    /// boundary must not grow the buffer past the cap.
+    #[test]
+    fn fix343_partial_fit_truncates_at_boundary() {
+        let mut interceptor = ToolInterceptor::new();
+        let fill = "x".repeat(ToolInterceptor::MAX_BUFFER_BYTES - 10);
+        interceptor.push(&fill);
+        // Try to push 100 more bytes — only 10 should land.
+        interceptor.push(&"y".repeat(100));
+        assert_eq!(
+            interceptor.get_buffer().len(),
+            ToolInterceptor::MAX_BUFFER_BYTES,
+            "#343: partial-fit push must clamp to the cap"
+        );
+    }
+
+    /// #343 — A tag with too many attributes only emits up to
+    /// `MAX_ATTRIBUTES` parameters; the remainder are silently dropped
+    /// and logged. Prevents a hostile `<bash a1="" … aN="">` from
+    /// allocating an unbounded `HashMap`.
+    #[test]
+    fn fix343_shorthand_attribute_cap_bounds_map_size() {
+        use std::fmt::Write as _;
+        let interceptor = ToolInterceptor::new();
+        // Construct a tag with twice the cap's worth of attributes.
+        let cap = ToolInterceptor::MAX_ATTRIBUTES;
+        let mut attrs = String::with_capacity(cap * 16);
+        for i in 0..cap * 2 {
+            let _ = write!(attrs, " a{i}=\"v\"");
+        }
+        let tag = format!("<bash{attrs}></bash>");
+        let parsed = interceptor.parse_shorthand_tag("bash", &tag);
+        let parsed = parsed.expect("shorthand parse should succeed even when capped");
+        // The map must be bounded at the cap (no overshoot).
+        assert!(
+            parsed.parameters.len() <= cap,
+            "#343: attribute count {} exceeded MAX_ATTRIBUTES={}",
+            parsed.parameters.len(),
+            cap
+        );
+    }
+
+    /// #343 — a normal small tag with a few attributes still parses all
+    /// of them. Pins that the cap does not regress legitimate inputs.
+    #[test]
+    fn fix343_under_cap_attributes_parse_all() {
+        let interceptor = ToolInterceptor::new();
+        let parsed = interceptor
+            .parse_shorthand_tag(
+                "edit_file",
+                r#"<edit_file path="a.rs" old_string="foo" new_string="bar"></edit_file>"#,
+            )
+            .expect("under-cap tag must parse");
+        assert_eq!(parsed.parameters.get("path"), Some(&"a.rs".to_string()));
+        assert_eq!(
+            parsed.parameters.get("old_string"),
+            Some(&"foo".to_string())
+        );
+        assert_eq!(
+            parsed.parameters.get("new_string"),
+            Some(&"bar".to_string())
         );
     }
 }

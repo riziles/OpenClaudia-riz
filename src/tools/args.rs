@@ -85,6 +85,156 @@ impl std::fmt::Display for ToolArgError {
 
 impl std::error::Error for ToolArgError {}
 
+// ─── Typed tool result surface (crosslink #222, #376) ────────────────────────
+//
+// The legacy executor return shape is `(String, bool)` — content + is_error.
+// `(String, bool)` cannot encode:
+//   * structured data (e.g. a directory listing the renderer could format),
+//   * the *kind* of error (argument vs. permission vs. I/O vs. backend),
+//   * an inner `Error` chain a `?`-propagating caller can match on.
+// Three call surfaces have grown around this gap: tool executors return
+// `(String, bool)`, the proxy layer wraps them in `(String, String, bool)`,
+// and slash commands sometimes use `anyhow::Result`. Tracked as #222
+// (standardise error handling) and #376 (drop `(String, bool)` for the
+// tool return surface specifically).
+//
+// `ToolOutput` and `ToolError` below are the standard target shape. Migration
+// is gradual: new tools return `Result<ToolOutput, ToolError>` natively;
+// legacy executors that still return `(String, bool)` keep working through
+// the bridging `From` impls so the registry's `(String, bool)` glue compiles
+// untouched. The first migrated executor is `bash::execute_bash` (#376).
+
+/// Structured result of a successful tool invocation.
+///
+/// `content` is the human-/model-facing rendered text — what the previous
+/// `(String, bool)` shape called the first element. `structured` is the
+/// optional JSON form the renderer can pretty-print without re-parsing
+/// `content`. Tools that have no structured data leave it `None`; tools
+/// that do (file index entries, task lists, git diffs, and similar)
+/// populate it so downstream consumers don't string-parse a rendered table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// Rendered text content (legacy first tuple element).
+    pub content: String,
+    /// Optional JSON representation alongside the rendered text.
+    pub structured: Option<Value>,
+}
+
+impl ToolOutput {
+    /// Construct a [`ToolOutput`] with text content only.
+    #[must_use]
+    pub const fn text(content: String) -> Self {
+        Self {
+            content,
+            structured: None,
+        }
+    }
+
+    /// Construct a [`ToolOutput`] with both rendered text and a structured
+    /// JSON payload the renderer / downstream consumer can introspect
+    /// without re-parsing the text.
+    #[must_use]
+    pub const fn with_structured(content: String, structured: Value) -> Self {
+        Self {
+            content,
+            structured: Some(structured),
+        }
+    }
+}
+
+/// Structured tool execution error.
+///
+/// Variants name the failure category so callers can match on the failure
+/// mode rather than `is_error: bool`. The `Display` form is the message
+/// the legacy `(String, bool)` shape carried as its first tuple element —
+/// every variant produces a stable, user-visible string and the
+/// `From<ToolError> for (String, bool)` bridge below lets a typed
+/// executor continue to satisfy the legacy `ToolHandler::execute` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolError {
+    /// A required argument was absent or the wrong JSON type. Wraps
+    /// [`ToolArgError`] to avoid a parallel error hierarchy.
+    InvalidArgument(ToolArgError),
+    /// The arguments parsed but failed a domain validation rule (e.g.
+    /// command on the bash denylist, length cap exceeded, malformed path).
+    InvalidInput(String),
+    /// An external operation failed (subprocess, filesystem, HTTP, …).
+    /// The message is the upstream error rendered for human consumption.
+    External(String),
+    /// The permissions layer rejected the call. Distinct from
+    /// `InvalidInput` so policy-enforcement code can surface the rejection
+    /// distinctly from a user typo.
+    PermissionDenied(String),
+    /// Catch-all for messages that don't fit a sharper category yet. Use
+    /// of `Other` is a migration shim — new code should pick a sharper
+    /// variant or add one.
+    Other(String),
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(e) => write!(f, "{e}"),
+            Self::InvalidInput(msg)
+            | Self::External(msg)
+            | Self::PermissionDenied(msg)
+            | Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidArgument(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<ToolArgError> for ToolError {
+    fn from(e: ToolArgError) -> Self {
+        Self::InvalidArgument(e)
+    }
+}
+
+/// Convert a typed [`ToolError`] into the legacy `(message, is_error=true)`
+/// shape every `ToolHandler::execute` still produces. The bridge is the
+/// load-bearing migration shim: an executor can be rewritten to return
+/// `Result<ToolOutput, ToolError>` natively while its registry wrapper
+/// keeps emitting the legacy tuple via `.unwrap_or_else(Into::into)` and
+/// `(out.content, false)` on the happy path.
+impl From<ToolError> for (String, bool) {
+    fn from(e: ToolError) -> Self {
+        (e.to_string(), true)
+    }
+}
+
+/// Convert a typed [`ToolOutput`] into the legacy `(content, is_error=false)`
+/// shape. Symmetric with the [`ToolError`] bridge so a `Result<ToolOutput,
+/// ToolError>` collapses to `(String, bool)` via `match { Ok(o) => o.into(),
+/// Err(e) => e.into() }` — exactly the wrapping every registry adapter
+/// performs today.
+impl From<ToolOutput> for (String, bool) {
+    fn from(o: ToolOutput) -> Self {
+        (o.content, false)
+    }
+}
+
+/// Collapse a `Result<ToolOutput, ToolError>` into the legacy
+/// `(message, is_error)` tuple. The migration shim every registry adapter
+/// uses to keep the `ToolHandler::execute` signature stable while the
+/// executor itself is rewritten to be `Result`-typed. Spelled out as a
+/// free function so call sites read as `into_legacy(result)` instead of
+/// fan-out `match` arms.
+#[must_use]
+pub fn into_legacy(result: Result<ToolOutput, ToolError>) -> (String, bool) {
+    match result {
+        Ok(out) => out.into(),
+        Err(e) => e.into(),
+    }
+}
+
 /// Typed accessors over a tool handler's argument map.
 ///
 /// Blanket-implemented for `HashMap<String, Value, S>` so every executor
@@ -338,5 +488,85 @@ mod tests {
         // Call through the trait — proves blanket impl applies.
         let v: &str = m.arg_str("k").expect("typed accessor over custom S");
         assert_eq!(v, "v");
+    }
+
+    // ── ToolOutput / ToolError typed surface (crosslink #222, #376) ─────
+
+    #[test]
+    fn tool_output_text_leaves_structured_none() {
+        let o = ToolOutput::text("hello".into());
+        assert_eq!(o.content, "hello");
+        assert!(o.structured.is_none());
+    }
+
+    #[test]
+    fn tool_output_with_structured_populates_both() {
+        let o = ToolOutput::with_structured("ls".into(), json!(["a", "b"]));
+        assert_eq!(o.content, "ls");
+        assert_eq!(o.structured, Some(json!(["a", "b"])));
+    }
+
+    #[test]
+    fn tool_output_collapses_to_legacy_ok_tuple() {
+        let (s, is_err): (String, bool) = ToolOutput::text("ok".into()).into();
+        assert_eq!(s, "ok");
+        assert!(!is_err, "ToolOutput always collapses to is_error=false");
+    }
+
+    #[test]
+    fn tool_error_invalid_argument_round_trips_message() {
+        let err = ToolError::from(ToolArgError::MissingOrWrongType { key: "path" });
+        assert_eq!(err.to_string(), "Missing 'path' argument");
+        let (s, is_err): (String, bool) = err.into();
+        assert_eq!(s, "Missing 'path' argument");
+        assert!(is_err, "ToolError always collapses to is_error=true");
+    }
+
+    #[test]
+    fn tool_error_invalid_input_displays_payload() {
+        let err = ToolError::InvalidInput("denylist hit: rm -rf /".into());
+        assert_eq!(err.to_string(), "denylist hit: rm -rf /");
+    }
+
+    #[test]
+    fn tool_error_external_displays_payload() {
+        let err = ToolError::External("Failed to execute command: no such file".into());
+        assert_eq!(err.to_string(), "Failed to execute command: no such file");
+    }
+
+    #[test]
+    fn tool_error_permission_denied_displays_payload() {
+        let err = ToolError::PermissionDenied("write blocked by Edit rule".into());
+        assert_eq!(err.to_string(), "write blocked by Edit rule");
+    }
+
+    #[test]
+    fn into_legacy_collapses_ok_to_content_false() {
+        let r: Result<ToolOutput, ToolError> = Ok(ToolOutput::text("done".into()));
+        assert_eq!(into_legacy(r), ("done".to_string(), false));
+    }
+
+    #[test]
+    fn into_legacy_collapses_err_to_message_true() {
+        let r: Result<ToolOutput, ToolError> = Err(ToolError::External("boom".into()));
+        assert_eq!(into_legacy(r), ("boom".to_string(), true));
+    }
+
+    #[test]
+    fn tool_error_source_chain_exposes_arg_error() {
+        use std::error::Error as _;
+        let err = ToolError::from(ToolArgError::MissingOrWrongType { key: "x" });
+        let src = err
+            .source()
+            .expect("InvalidArgument exposes inner ToolArgError as source");
+        // The source must be the ToolArgError, not a re-stringification.
+        assert_eq!(src.to_string(), "Missing 'x' argument");
+    }
+
+    #[test]
+    fn tool_error_source_chain_none_for_message_variants() {
+        use std::error::Error as _;
+        let err = ToolError::Other("unstructured".into());
+        assert!(err.source().is_none(), "Other has no inner error");
     }
 }

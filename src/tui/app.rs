@@ -355,6 +355,135 @@ struct PendingPermission {
     reply: std::sync::mpsc::Sender<super::events::PermissionResponse>,
 }
 
+/// Dispatch table for the TUI's no-argument slash commands (crosslink #259).
+///
+/// Each entry maps a canonical command spelling (`/quit`, `/help`, …) to
+/// the [`App`] method that handles it. The TUI keeps its own table — the
+/// CLI's [`command_registry`] cannot be reused directly because CLI
+/// handlers print to stdout, which corrupts the TUI's alternate-screen
+/// rendering. Mirroring the registry *pattern* here (table-driven
+/// dispatch over an if-chain) is the OCP win #232 brought to the CLI;
+/// this commit extends it to the TUI for the seven branches below.
+///
+/// Adding a new no-arg TUI command:
+///   1. Add a `slash_<name>` method on [`App`] that takes `&mut self`.
+///   2. Append `("/canonical_name", App::slash_<name>)` to this table.
+///   3. (Optional) Add aliases by appending more `(alias, App::slash_<name>)`
+///      rows pointing at the same handler.
+///
+/// Commands that take arguments (`/load <id>`, `/rewind N`, `/effort low`,
+/// `/rename <title>`, …) bypass the table because their key shape is a
+/// prefix, not an exact match — they continue through `handle_session_slash`,
+/// `handle_export_effort_slash`, and `handle_info_slash` until a future pass
+/// generalises the table to prefix dispatch (documented in
+/// [`App::handle_slash_command`]'s rustdoc).
+type TuiSlashHandler = fn(&mut App);
+
+const TUI_SLASH_TABLE: &[(&str, TuiSlashHandler)] = &[
+    ("/quit", App::slash_quit),
+    ("/exit", App::slash_quit),
+    ("/help", App::slash_help),
+    ("?", App::slash_help),
+    ("/resume", App::slash_resume),
+    ("/continue", App::slash_resume),
+    ("/clear", App::slash_clear),
+    ("/status", App::slash_status),
+    ("/mode", App::slash_mode),
+    ("/skill", App::slash_skill_list),
+    ("/skills", App::slash_skill_list),
+];
+
+/// O(n) lookup for the TUI slash table. The table is small (≤16 entries
+/// in practice) so linear scan beats a `HashMap` on cache locality and
+/// avoids the `OnceLock` build the CLI registry needs.
+fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
+    TUI_SLASH_TABLE
+        .iter()
+        .find_map(|(name, handler)| (*name == text).then_some(*handler))
+}
+
+/// Which input mode the TUI is in when a keystroke arrives (crosslink #364).
+///
+/// The three values map 1:1 to the three explicit `handle_key_*` methods
+/// on [`App`]. Computed fresh on every keystroke from `App`'s observable
+/// state (overlay open? streaming in flight?) rather than stored as a
+/// field, so the mode is always consistent with the data driving it —
+/// pinning the mode in a field would create a second source of truth that
+/// could drift out of sync with `overlay` / `is_waiting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMode {
+    /// A modal overlay (help, log selector, …) is open and owns the
+    /// keyboard until it returns `OverlayAction::Close`.
+    Modal,
+    /// A model response is in flight; only `Escape` (cancel) is
+    /// meaningful, every other key is dropped.
+    Streaming,
+    /// Interactive editing — text input, scrolling, slash commands,
+    /// permission-prompt acknowledgement.
+    Normal,
+}
+
+/// HTTP-pipeline transport state used by every API turn (crosslink #253).
+///
+/// Extracted from the [`App`] god object so the transport bundle is a
+/// single, cohesive value the async spawn site can clone in one line. Five
+/// of `App`'s original 22 fields collapse into this struct:
+///
+/// * `client`          — the `reqwest::Client` shared across turns
+/// * `endpoint`        — the API URL the proxy/provider exposes
+/// * `headers`         — wire-level headers (auth, anthropic-version, …)
+/// * `claude_code_token` — OAuth bearer when running in claude-code-token mode
+/// * `prompt_blocks`   — pre-split system prompt blocks for Anthropic caching
+///
+/// `model` and `provider` are NOT included: they're also shown in the UI
+/// status bar and used by display code (`handle_slash_doctor`, status
+/// pane, `/cost`). Pulling them through `ApiClient` would force every UI
+/// reference to go through a level of indirection without a corresponding
+/// cohesion win. The cut here is the actual *transport* bundle.
+///
+/// Fields are `pub` so the existing `self.api_client.endpoint.clone()`
+/// idiom at the spawn site stays one-line. A future iteration can hide
+/// these behind a builder once the construction order is firm.
+#[derive(Debug, Clone)]
+pub struct ApiClient {
+    /// HTTP client reused across turns (connection pool, TLS state, …).
+    pub client: reqwest::Client,
+    /// The provider endpoint URL the proxy will POST to.
+    pub endpoint: String,
+    /// Wire-level headers carried on every request (auth, anthropic-version, …).
+    pub headers: Vec<(String, String)>,
+    /// OAuth bearer used by the claude-code-token flow. `None` when the
+    /// raw `ANTHROPIC_API_KEY` path is taken.
+    pub claude_code_token: Option<String>,
+    /// Pre-split system-prompt blocks the Anthropic adapter uses to get
+    /// cache hits on the long static tail. `None` when no split has been
+    /// computed (non-Anthropic providers).
+    pub prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+}
+
+impl ApiClient {
+    /// Construct an [`ApiClient`] with a fresh `reqwest::Client` and the
+    /// remaining fields defaulted (empty endpoint / headers, no token, no
+    /// prompt-block split). The pipeline-bootstrap path fills these in via
+    /// [`App::set_api_config`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            endpoint: String::new(),
+            headers: Vec::new(),
+            claude_code_token: None,
+            prompt_blocks: None,
+        }
+    }
+}
+
+impl Default for ApiClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Main TUI application state.
 pub struct App {
     pub messages: MessageList,
@@ -369,15 +498,13 @@ pub struct App {
     /// Sender for pushing API events into the event loop's channel.
     api_event_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
 
-    // ── API pipeline fields ──
-    pub client: reqwest::Client,
-    pub endpoint: String,
-    pub headers: Vec<(String, String)>,
+    // ── API pipeline ──
+    /// HTTP transport bundle (crosslink #253). Replaces the five
+    /// fields `client`, `endpoint`, `headers`, `claude_code_token`,
+    /// `prompt_blocks` that used to live directly on `App`.
+    pub api_client: ApiClient,
     pub effort_level: EffortLevel,
     pub system_prompt: String,
-    /// Split system prompt blocks for Anthropic cache efficiency.
-    pub prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
-    pub claude_code_token: Option<String>,
     /// Memory database for auto-learning from tool execution.
     pub memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     /// Library-layer permission manager. When `Some`, every tool call routed
@@ -436,13 +563,9 @@ impl App {
             is_waiting: false,
             spinner_frame: 0,
             api_event_tx: None,
-            client: reqwest::Client::new(),
-            endpoint: String::new(),
-            headers: Vec::new(),
+            api_client: ApiClient::new(),
             effort_level: EffortLevel::Medium,
             system_prompt: String::new(),
-            prompt_blocks: None,
-            claude_code_token: None,
             memory_db: None,
             permission_mgr: None,
             session_messages: Vec::new(),
@@ -624,11 +747,11 @@ impl App {
         prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
         claude_code_token: Option<String>,
     ) {
-        self.endpoint = endpoint;
-        self.headers = headers;
+        self.api_client.endpoint = endpoint;
+        self.api_client.headers = headers;
         self.system_prompt = system_prompt;
-        self.prompt_blocks = prompt_blocks;
-        self.claude_code_token = claude_code_token;
+        self.api_client.prompt_blocks = prompt_blocks;
+        self.api_client.claude_code_token = claude_code_token;
     }
 
     /// Get an event sender for pushing async API events into the TUI loop.
@@ -900,47 +1023,120 @@ impl App {
         }
     }
 
+    /// Three explicit modes share the keyboard (crosslink #364):
+    ///
+    /// * [`KeyMode::Modal`] — an overlay (help, log selector) is open; it
+    ///   owns every keystroke until it returns `OverlayAction::Close`.
+    /// * [`KeyMode::Streaming`] — a model response is in flight. Only
+    ///   `Escape` (cancel) and `Ctrl+C` are meaningful; every other key is
+    ///   dropped.
+    /// * [`KeyMode::Normal`] — interactive editing. Text input, scrolling,
+    ///   slash-command dispatch live here.
+    ///
+    /// The permission prompt is a sub-state of Normal mode (it overlays
+    /// the input line but does not block scrolling), so it stays inside
+    /// the Normal-mode dispatcher.
+    const fn current_key_mode(&self) -> KeyMode {
+        if self.overlay.is_some() {
+            KeyMode::Modal
+        } else if self.is_waiting {
+            KeyMode::Streaming
+        } else {
+            KeyMode::Normal
+        }
+    }
+
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
-        // Modal overlays consume every keystroke while open. Ordering
-        // matters: overlay handling comes BEFORE the global Ctrl+C
-        // quit so dismissing the overlay with Ctrl+C doesn't tear
-        // down the whole app.
-        if let Some(overlay) = self.overlay.as_mut() {
-            use super::components::{Overlay as _, OverlayAction};
-            let action = match overlay {
-                ActiveOverlay::Help(o) => o.handle_key(key),
-                ActiveOverlay::LogSelector(o) => o.handle_key(key),
-            };
-            match action {
-                OverlayAction::Consumed => {}
-                OverlayAction::Close => {
-                    self.overlay = None;
-                }
-                OverlayAction::ResumeSession(id) => {
-                    self.overlay = None;
-                    self.resume_session_by_id(&id);
-                }
-            }
-            return;
-        }
-
-        // Ctrl+C always quits
+        // The global Ctrl+C interrupt is the single keystroke that
+        // crosses every mode boundary: it dismisses overlays, cancels
+        // streaming, denies a pending permission prompt, and quits the
+        // app. Order-of-precedence is checked first to keep the
+        // mode-specific dispatchers focused on their own responsibilities.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            // If permission prompt is active, deny and dismiss
-            if let Some(perm) = self.pending_permission.take() {
-                let _ = perm.reply.send(super::events::PermissionResponse::Deny);
-                return;
-            }
-            self.should_quit = true;
+            self.handle_global_ctrl_c();
             return;
         }
 
-        // Handle permission prompt keystrokes
+        match self.current_key_mode() {
+            KeyMode::Modal => self.handle_key_modal(key),
+            KeyMode::Streaming => self.handle_key_streaming(key),
+            KeyMode::Normal => self.handle_key_normal(key),
+        }
+    }
+
+    /// Handle the universal Ctrl+C interrupt. Distinct from the per-mode
+    /// dispatchers because Ctrl+C is the single cross-mode keystroke —
+    /// it must deny a pending permission prompt before quitting, and it
+    /// must close overlays cleanly. Centralising the precedence here is
+    /// what lets [`handle_key_modal`] / [`handle_key_streaming`] /
+    /// [`handle_key_normal`] each handle one shape without re-asserting
+    /// the global escape hatch.
+    fn handle_global_ctrl_c(&mut self) {
+        // If permission prompt is active, deny and dismiss without quitting.
+        if let Some(perm) = self.pending_permission.take() {
+            let _ = perm.reply.send(super::events::PermissionResponse::Deny);
+            return;
+        }
+        // If an overlay is open, close it instead of quitting — matches
+        // the pre-#364 behaviour where overlay handling ran before the
+        // global Ctrl+C check (so the overlay could swallow it).
+        if self.overlay.is_some() {
+            self.overlay = None;
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    /// Modal-mode keystrokes: an overlay owns the input. The keystroke
+    /// is forwarded to the active overlay, and its `OverlayAction`
+    /// return value drives state changes on the App. This is the only
+    /// path that may transition out of `KeyMode::Modal`.
+    fn handle_key_modal(&mut self, key: crossterm::event::KeyEvent) {
+        use super::components::{Overlay as _, OverlayAction};
+        let Some(overlay) = self.overlay.as_mut() else {
+            // The mode dispatcher only routes here when an overlay is
+            // active, but the explicit early-return keeps this method
+            // independently safe to call from tests.
+            return;
+        };
+        let action = match overlay {
+            ActiveOverlay::Help(o) => o.handle_key(key),
+            ActiveOverlay::LogSelector(o) => o.handle_key(key),
+        };
+        match action {
+            OverlayAction::Consumed => {}
+            OverlayAction::Close => {
+                self.overlay = None;
+            }
+            OverlayAction::ResumeSession(id) => {
+                self.overlay = None;
+                self.resume_session_by_id(&id);
+            }
+        }
+    }
+
+    /// Streaming-mode keystrokes: an API turn is in flight. Only
+    /// `Escape` (cancel the stream and re-enable input) is meaningful;
+    /// every other key is silently dropped so the user cannot accidentally
+    /// type into the input line while a response is being rendered. The
+    /// global Ctrl+C handler in [`handle_global_ctrl_c`] still applies.
+    fn handle_key_streaming(&mut self, key: crossterm::event::KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.is_waiting = false;
+            self.messages.finish_streaming();
+            self.messages
+                .add(DisplayMessage::system("[Response interrupted]"));
+        }
+    }
+
+    /// Normal-mode keystrokes: interactive editing. Permission-prompt
+    /// handling is the one sub-state because the prompt overlays the
+    /// input line without taking the App into modal-overlay state.
+    fn handle_key_normal(&mut self, key: crossterm::event::KeyEvent) {
         if self.pending_permission.is_some() {
             self.handle_permission_key(key);
             return;
         }
-
         self.handle_editing_key(key);
     }
 
@@ -1159,6 +1355,12 @@ impl App {
     /// Handle /export and /effort slash commands. Returns true if handled.
     fn handle_export_effort_slash(&mut self, text: &str) -> bool {
         if text == "/export" {
+            // Build the markdown body synchronously — needs `&self` and is
+            // bounded by session size. The blocking part is the disk write,
+            // which goes onto the tokio blocking-IO pool via spawn_fs
+            // (crosslink #270). This unblocks the TUI redraw thread for the
+            // duration of the `fs::write` syscall, which can stall on a
+            // slow / network-mounted home directory.
             use std::fmt::Write as _;
             let mut md = format!("# {}\n\n", self.chat_session.title);
             let _ = write!(
@@ -1177,14 +1379,12 @@ impl App {
                 let _ = write!(md, "**{role}:**\n{content}\n\n");
             }
             let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
-            match std::fs::write(&export_path, &md) {
-                Ok(()) => self
-                    .messages
-                    .add(DisplayMessage::system(format!("Exported to {export_path}"))),
-                Err(e) => self
-                    .messages
-                    .add(DisplayMessage::error(format!("Export failed: {e}"))),
-            }
+            let path_for_render = export_path.clone();
+            self.spawn_fs(SpawnTarget::Files, move || {
+                std::fs::write(&export_path, md.as_bytes())
+                    .map(|()| format!("Exported to {path_for_render}"))
+                    .map_err(|e| format!("Export failed: {e}"))
+            });
             return true;
         }
         if text.starts_with("/effort") {
@@ -1212,57 +1412,37 @@ impl App {
     }
 
     /// Handle slash commands. Returns true if the command was recognized.
+    ///
+    /// Six no-argument branches (`/quit`, `/exit`, `/help`, `?`, `/resume`,
+    /// `/continue`, `/clear`, `/status`, `/mode`, `/skill`, `/skills`) are
+    /// dispatched via the [`TUI_SLASH_TABLE`] lookup — the same OCP-clean
+    /// dispatch pattern the CLI's [`command_registry::registry`] uses
+    /// (crosslink #232 / #259). Branches that take arguments (`/load <id>`,
+    /// `/rewind N`, `/effort high`, …) stay in the longer-form
+    /// `handle_session_slash` / `handle_export_effort_slash` / etc.
+    /// helpers below because their dispatch is on a *prefix*, not a
+    /// canonical name, and the table is keyed by full canonical name to
+    /// keep the lookup O(1).
+    ///
+    /// REMAINING IF-BRANCHES (documented for the next migration pass):
+    ///
+    /// * `/load <id>` / `/continue <id>` — prefix dispatch.
+    /// * `/rewind` / `/rewind N` — prefix dispatch.
+    /// * `/undo`, `/redo` — would fit the table once helpers exist.
+    /// * `/sessions`, `/list` — would fit the table once helpers exist.
+    /// * `/export`, `/effort` / `/effort <lvl>` — prefix dispatch.
+    /// * `/rename <title>` — prefix dispatch.
+    /// * `/diff`, `/files [dir]`, `/doctor`, `/cost`, `/cwd`, `/copy`,
+    ///   `/init`, `/login`, `/agents`, `/model`, `/effort` peers in
+    ///   `handle_diagnostic_slash` and `handle_info_slash` — would fit
+    ///   the table once helpers exist.
+    ///
+    /// The next person to touch this file should hoist these remaining
+    /// branches into the table; each is a 3-line entry once a sibling
+    /// helper exists.
     fn handle_slash_command(&mut self, text: &str) -> bool {
-        if text == "/quit" || text == "/exit" {
-            self.should_quit = true;
-            return true;
-        }
-
-        if text == "/help" || text == "?" {
-            // Rich scrollable overlay — handled by the help component.
-            // Falls back to a plain inline message when the overlay is
-            // unavailable (e.g. during headless tests) — unreachable
-            // in the interactive TUI but kept for defence-in-depth.
-            self.open_help_overlay();
-            return true;
-        }
-
-        if text == "/resume" || text == "/continue" {
-            // No-arg form → open the picker overlay. Args form is
-            // handled by the existing `/load <id>` / `/continue <id>`
-            // branch below.
-            self.open_log_selector();
-            return true;
-        }
-
-        if text == "/clear" {
-            self.messages = MessageList::new();
-            // Reset session but keep system prompt
-            self.session_messages
-                .retain(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
-            return true;
-        }
-
-        if text == "/status" {
-            self.messages.add(DisplayMessage::system(format!(
-                "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
-                self.model,
-                self.provider,
-                self.effort_level,
-                self.session_messages.len(),
-                self.tokens,
-            )));
-            return true;
-        }
-
-        if text == "/mode" {
-            self.chat_session.toggle_mode();
-            self.mode = self.chat_session.mode;
-            self.messages.add(DisplayMessage::system(format!(
-                "Mode: {} — {}",
-                self.chat_session.mode,
-                self.chat_session.mode_description()
-            )));
+        if let Some(handler) = lookup_tui_slash(text) {
+            handler(self);
             return true;
         }
 
@@ -1274,24 +1454,6 @@ impl App {
             return true;
         }
 
-        if text == "/skill" || text == "/skills" {
-            let skills = crate::skills::load_skills();
-            if skills.is_empty() {
-                self.messages.add(DisplayMessage::system(
-                    "No skills found. Add .md files to .openclaudia/skills/",
-                ));
-            } else {
-                let list = skills
-                    .iter()
-                    .map(|s| format!("  /{} — {}", s.name, s.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.messages
-                    .add(DisplayMessage::system(format!("Available skills:\n{list}")));
-            }
-            return true;
-        }
-
         // Skill invocations and info/diagnostic commands starting with /
         if text.starts_with('/') {
             self.handle_info_slash(text);
@@ -1299,6 +1461,70 @@ impl App {
         }
 
         false
+    }
+
+    /// Table-handler entry point for `/quit` / `/exit`.
+    const fn slash_quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// Table-handler entry point for `/help` and `?`.
+    fn slash_help(&mut self) {
+        self.open_help_overlay();
+    }
+
+    /// Table-handler entry point for `/resume` / `/continue` (no-arg form).
+    fn slash_resume(&mut self) {
+        self.open_log_selector();
+    }
+
+    /// Table-handler entry point for `/clear`.
+    fn slash_clear(&mut self) {
+        self.messages = MessageList::new();
+        // Reset session but keep system prompt.
+        self.session_messages
+            .retain(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+    }
+
+    /// Table-handler entry point for `/status`.
+    fn slash_status(&mut self) {
+        self.messages.add(DisplayMessage::system(format!(
+            "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
+            self.model,
+            self.provider,
+            self.effort_level,
+            self.session_messages.len(),
+            self.tokens,
+        )));
+    }
+
+    /// Table-handler entry point for `/mode`.
+    fn slash_mode(&mut self) {
+        self.chat_session.toggle_mode();
+        self.mode = self.chat_session.mode;
+        self.messages.add(DisplayMessage::system(format!(
+            "Mode: {} — {}",
+            self.chat_session.mode,
+            self.chat_session.mode_description()
+        )));
+    }
+
+    /// Table-handler entry point for `/skill` / `/skills` (no-arg list form).
+    fn slash_skill_list(&mut self) {
+        let skills = crate::skills::load_skills();
+        if skills.is_empty() {
+            self.messages.add(DisplayMessage::system(
+                "No skills found. Add .md files to .openclaudia/skills/",
+            ));
+        } else {
+            let list = skills
+                .iter()
+                .map(|s| format!("  /{} — {}", s.name, s.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.messages
+                .add(DisplayMessage::system(format!("Available skills:\n{list}")));
+        }
     }
 
     /// Handle skill invocations and info/diagnostic commands.
@@ -1359,33 +1585,34 @@ impl App {
     }
 
     /// Handle the `/files [dir]` slash command.
-    fn handle_slash_files(&mut self, text: &str) {
-        let dir = text.strip_prefix("/files").unwrap_or("").trim();
-        let dir = if dir.is_empty() { "." } else { dir };
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                let mut items: Vec<String> = entries
-                    .flatten()
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) {
-                            "/"
-                        } else {
-                            ""
-                        };
-                        format!("  {name}{suffix}")
-                    })
-                    .collect();
-                items.sort();
-                self.messages.add(DisplayMessage::system(format!(
-                    "Files in {dir}:\n{}",
-                    items.join("\n")
-                )));
-            }
-            Err(e) => self
-                .messages
-                .add(DisplayMessage::error(format!("Failed to list {dir}: {e}"))),
-        }
+    ///
+    /// Dispatches the directory read through [`Self::spawn_fs`] (crosslink
+    /// #270) so a slow disk / network filesystem cannot stall the redraw
+    /// thread the way the previous synchronous `std::fs::read_dir` did.
+    /// The result is rendered when the matching
+    /// `AppEvent::ShellDone { target: SpawnTarget::Files, .. }` arrives.
+    fn handle_slash_files(&self, text: &str) {
+        let dir = text.strip_prefix("/files").unwrap_or("").trim().to_owned();
+        let dir = if dir.is_empty() { ".".to_string() } else { dir };
+        let dir_for_render = dir.clone();
+        self.spawn_fs(SpawnTarget::Files, move || {
+            let entries =
+                std::fs::read_dir(&dir).map_err(|e| format!("Failed to list {dir}: {e}"))?;
+            let mut items: Vec<String> = entries
+                .flatten()
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let suffix = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    format!("  {name}{suffix}")
+                })
+                .collect();
+            items.sort();
+            Ok(format!("Files in {dir_for_render}:\n{}", items.join("\n")))
+        });
     }
 
     /// Handle the `/diff` slash command (shows `git diff --stat`).
@@ -1408,7 +1635,7 @@ impl App {
             },
             format!("✓ Provider: {}", self.provider),
             format!("✓ Model: {}", self.model),
-            format!("✓ Endpoint: {}", self.endpoint),
+            format!("✓ Endpoint: {}", self.api_client.endpoint),
             format!("✓ Skills: {} loaded", crate::skills::load_skills().len()),
             if self.memory_db.is_some() {
                 "✓ Memory DB: connected".to_string()
@@ -1581,6 +1808,72 @@ impl App {
     /// single, total signature — it just posts an error `ShellDone`
     /// (`exit_code` = None, stderr explaining the missing runtime) via
     /// `std::thread::spawn`.
+    /// Run a synchronous filesystem closure off the TUI event loop on the
+    /// tokio blocking pool and emit a [`AppEvent::ShellDone`] when done
+    /// (crosslink #270 / #371 follow-up).
+    ///
+    /// `op` is run on `tokio::task::spawn_blocking` so a slow disk or a
+    /// network filesystem cannot stall the redraw thread the way the
+    /// previous synchronous `std::fs::read_dir` / `std::fs::write` calls
+    /// from `/files` and `/export` did. The closure returns either
+    /// `Ok(rendered_text)` or `Err(error_text)` — the helper translates
+    /// those into a `ShellDone` event with the right exit-code semantics
+    /// (`Some(0)` on success, `None` on error) so the existing receiver
+    /// in `handle_app_event` does the rendering with no special-casing.
+    ///
+    /// If no tokio runtime is bound yet (`runtime_handle == None`), the
+    /// helper synthesises an error `ShellDone` directly through the
+    /// channel — same shape as `spawn_shell`'s no-runtime branch. Tests
+    /// without a runtime still observe the event.
+    fn spawn_fs<F>(&self, target: SpawnTarget, op: F)
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        let tx = self.api_event_tx.clone();
+
+        let Some(handle) = self.runtime_handle.clone() else {
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: "no async runtime bound — cannot spawn fs task".to_string(),
+                    exit_code: None,
+                });
+            }
+            return;
+        };
+
+        // spawn_blocking puts the closure on the tokio blocking-IO pool
+        // (default 512 threads) so a slow read_dir() doesn't take down
+        // any of the async-runtime worker threads either.
+        handle.spawn(async move {
+            let join = tokio::task::spawn_blocking(op).await;
+            let evt = match join {
+                Ok(Ok(text)) => AppEvent::ShellDone {
+                    target,
+                    stdout: text,
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                },
+                Ok(Err(err)) => AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: err,
+                    exit_code: None,
+                },
+                Err(join_err) => AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: format!("fs task panicked: {join_err}"),
+                    exit_code: None,
+                },
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(evt);
+            }
+        });
+    }
+
     fn spawn_shell(&self, cmd: Vec<&str>, target: SpawnTarget) -> tokio::task::JoinHandle<()> {
         let tx = self.api_event_tx.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
@@ -1674,14 +1967,16 @@ impl App {
             return;
         };
 
-        let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
-        let headers = self.headers.clone();
+        // ApiClient owns the transport bundle (#253) — one clone instead of five.
+        let api = self.api_client.clone();
+        let client = api.client;
+        let endpoint = api.endpoint;
+        let headers = api.headers;
         let provider = self.provider.clone();
         let model = self.model.clone();
         let effort_level = self.effort_level;
-        let claude_code_token = self.claude_code_token.clone();
-        let prompt_blocks = self.prompt_blocks.clone();
+        let claude_code_token = api.claude_code_token;
+        let prompt_blocks = api.prompt_blocks;
         let hook_engine = self.hook_engine.clone();
         let session_id_for_task = self.chat_session.id.clone();
         let memory_db = self.memory_db.clone();
@@ -2356,9 +2651,160 @@ async fn handle_turn_result(
 #[cfg(test)]
 mod tests {
     use super::expand_file_refs;
-    use super::{App, AppEvent, SpawnTarget};
+    use super::{ApiClient, App, AppEvent, SpawnTarget};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    // ── ApiClient extraction (crosslink #253) ───────────────────────────
+
+    /// `ApiClient::new` initialises with empty transport state — no
+    /// endpoint, no headers, no token, no prompt blocks. The `reqwest::Client`
+    /// is a real fresh client.
+    #[test]
+    fn api_client_new_starts_empty() {
+        let api = ApiClient::new();
+        assert!(
+            api.endpoint.is_empty(),
+            "endpoint must start empty before set_api_config"
+        );
+        assert!(api.headers.is_empty(), "no headers until pipeline applied");
+        assert!(
+            api.claude_code_token.is_none(),
+            "no OAuth token until pipeline applied"
+        );
+        assert!(
+            api.prompt_blocks.is_none(),
+            "no prompt blocks until pipeline applied"
+        );
+    }
+
+    /// `App::new` wires `api_client` to a default `ApiClient` so the
+    /// constructor stays infallible (no I/O, no panic on missing config).
+    #[test]
+    fn app_new_initialises_api_client_default() {
+        let app = App::new("test-model", "anthropic");
+        assert!(app.api_client.endpoint.is_empty());
+        assert!(app.api_client.headers.is_empty());
+        assert!(app.api_client.claude_code_token.is_none());
+        // Sanity: model/provider stay on App (not migrated into ApiClient).
+        assert_eq!(app.model, "test-model");
+        assert_eq!(app.provider, "anthropic");
+    }
+
+    /// `set_api_config` writes through to `api_client`, not to ghost
+    /// fields on App. Pins the migration: the previous version of this
+    /// setter wrote `self.endpoint = ...`, which compiled but stayed in
+    /// the old struct shape.
+    #[test]
+    fn set_api_config_threads_through_api_client() {
+        let mut app = App::new("test-model", "anthropic");
+        app.set_api_config(
+            "https://example.com/v1".to_string(),
+            vec![("x-api-key".to_string(), "secret".to_string())],
+            "system prompt".to_string(),
+            None,
+            Some("oauth-token".to_string()),
+        );
+        assert_eq!(app.api_client.endpoint, "https://example.com/v1");
+        assert_eq!(
+            app.api_client.headers,
+            vec![("x-api-key".to_string(), "secret".to_string())]
+        );
+        assert_eq!(app.system_prompt, "system prompt");
+        assert_eq!(
+            app.api_client.claude_code_token.as_deref(),
+            Some("oauth-token")
+        );
+    }
+
+    // ── handle_key mode split (crosslink #364) ─────────────────────────
+
+    /// `current_key_mode` reports `Normal` for a fresh app — no overlay,
+    /// not streaming.
+    #[test]
+    fn key_mode_normal_by_default() {
+        use super::KeyMode;
+        let app = App::new("test", "anthropic");
+        assert_eq!(app.current_key_mode(), KeyMode::Normal);
+    }
+
+    /// `current_key_mode` reports `Streaming` while a turn is in flight.
+    /// `is_waiting` is the single observable that drives the mode — pin
+    /// that the dispatcher reads the live state and isn't cached.
+    #[test]
+    fn key_mode_streaming_when_is_waiting() {
+        use super::KeyMode;
+        let mut app = App::new("test", "anthropic");
+        app.is_waiting = true;
+        assert_eq!(app.current_key_mode(), KeyMode::Streaming);
+    }
+
+    /// `current_key_mode` reports `Modal` while an overlay is open.
+    #[test]
+    fn key_mode_modal_when_overlay_open() {
+        use super::KeyMode;
+        let mut app = App::new("test", "anthropic");
+        app.open_help_overlay();
+        assert_eq!(app.current_key_mode(), KeyMode::Modal);
+    }
+
+    /// `handle_key_streaming` accepts `Esc` as the cancel-stream key. The
+    /// state transitions back to Normal (`is_waiting` cleared).
+    #[test]
+    fn streaming_esc_cancels_stream() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.is_waiting = true;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.is_waiting, "Esc must clear is_waiting");
+    }
+
+    /// `handle_key_streaming` drops every key that isn't Esc — text
+    /// keystrokes do NOT land in the input buffer while a response is
+    /// streaming. Pins the regression #364 closes: the pre-split flow
+    /// would match `KeyCode::Char` and fall through to `input.insert(c)`.
+    #[test]
+    fn streaming_non_esc_keys_are_dropped() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.is_waiting = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        // Input buffer must be untouched.
+        assert!(
+            app.input.is_empty(),
+            "streaming mode must NOT capture text keystrokes into the input"
+        );
+        assert!(app.is_waiting, "non-Esc keys must not cancel the stream");
+    }
+
+    /// Global Ctrl+C escape hatch: while a modal overlay is open, Ctrl+C
+    /// closes the overlay instead of quitting the app. Pins the
+    /// pre-existing observable behaviour where overlay-handling ran
+    /// before the global Ctrl+C check.
+    #[test]
+    fn ctrl_c_in_modal_closes_overlay_without_quitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.open_help_overlay();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            app.overlay.is_none(),
+            "Ctrl+C in modal must close the overlay"
+        );
+        assert!(!app.should_quit, "Ctrl+C in modal must NOT quit the app");
+    }
+
+    /// Global Ctrl+C quits when no overlay or permission prompt is
+    /// active. The mode-split refactor must preserve this — the
+    /// universal quit behaviour was the second-most-load-bearing
+    /// observable in `handle_key`.
+    #[test]
+    fn ctrl_c_in_normal_quits_app() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+C in normal mode must quit");
+    }
 
     // =========================================================================
     // Behavior: spawn_shell — closes crosslink #371 by moving subprocess

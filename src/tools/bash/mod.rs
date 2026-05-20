@@ -9,6 +9,7 @@ pub use policy::{
     validate_command,
 };
 
+use crate::tools::args::{into_legacy, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -432,21 +433,46 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Execute a bash command.
+/// Execute a bash command and return a typed result.
 ///
-/// Applies the policy layer: length cap + denylist in [`validate_command`],
-/// and env scrubbing via [`apply_env_scrub`] (allowlist — only `PATH`, `HOME`,
-/// `USER`, `CARGO_HOME`, `RUSTUP_HOME`, LC_*, etc. are inherited; arbitrary
-/// credential-bearing names such as `DATABASE_URL` are dropped along with
-/// `ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`).
-/// See crosslink #257 and #730.
-pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
-    let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
-        return ("Missing 'command' argument".to_string(), true);
-    };
+/// This is the typed surface for `bash` (crosslink #222, #376): the same
+/// policy / spawn logic the old `execute_bash` performed, but expressed as
+/// `Result<ToolOutput, ToolError>` so callers can distinguish argument
+/// failures from validator rejections from upstream process errors without
+/// pattern-matching strings. Both forms share the same body; the legacy
+/// `(String, bool)` wrapper [`execute_bash`] collapses this result via
+/// `into_legacy` so the registry contract stays byte-stable.
+///
+/// A non-zero process exit still counts as a successful tool invocation —
+/// the renderer surfaces the stdout/stderr and the boolean exit-error flag
+/// has historically been encoded into the `(String, bool)` shape's bool.
+/// To preserve byte-identical output for downstream consumers (and the
+/// 80+ pinning tests), we return `Err(ToolError::External(...))` on
+/// non-zero exit so the collapsed tuple stays `(text, true)`. This is
+/// the load-bearing observable: do not "fix" it without updating the
+/// tests that pin the prior behaviour.
+///
+/// # Errors
+///
+/// - [`ToolError::InvalidArgument`] when the `command` arg is absent or
+///   not a JSON string.
+/// - [`ToolError::InvalidInput`] when [`validate_command`] rejects the
+///   command (length cap, denylist, structural rule).
+/// - [`ToolError::External`] when:
+///   * the spawned process fails to start (no shell, permission denied,
+///     OS resource exhaustion), or
+///   * a non-zero exit status is returned (the message carries the
+///     captured stdout / stderr so the legacy renderer keeps working).
+/// - [`ToolError::Other`] when the background shell manager refuses the
+///   spawn (e.g. cap reached). Preserves the existing message verbatim.
+pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, ToolError> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidInput("Missing 'command' argument".to_string()))?;
 
     if let Err(msg) = validate_command(command) {
-        return (msg, true);
+        return Err(ToolError::InvalidInput(msg));
     }
 
     // Diagnostic: log whether the command would qualify for auto-allow under
@@ -475,73 +501,94 @@ pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
         .unwrap_or(false);
 
     if run_in_background {
-        // Spawn background shell and return shell_id
-        match BACKGROUND_SHELLS.spawn(command) {
-            Ok(shell_id) => {
-                (format!("Background shell started with ID: {shell_id}\nUse bash_output with this shell_id to retrieve output."), false)
-            }
-            Err(e) => (e, true),
-        }
-    } else {
-        // Run synchronously (original behavior)
-        // On Windows, use Git Bash explicitly (not WSL bash)
-        // On Unix, use system bash
-        // IMPORTANT: Set current_dir to ensure bash runs in the same directory as the process
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
-        #[cfg(windows)]
-        let output = {
-            let mut cmd = match find_git_bash() {
-                Some(git_bash) => Command::new(git_bash),
-                None => Command::new("bash"),
-            };
-            cmd.args(["-c", command]).current_dir(&cwd);
-            apply_env_scrub(&mut cmd);
-            cmd.output()
-        };
-
-        #[cfg(not(windows))]
-        let output = {
-            let mut cmd = Command::new("bash");
-            cmd.args(["-c", command]).current_dir(&cwd);
-            apply_env_scrub(&mut cmd);
-            cmd.output()
-        };
-
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                let mut result = String::new();
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str("stderr: ");
-                    result.push_str(&stderr);
-                }
-                if result.is_empty() {
-                    result = "(command completed with no output)".to_string();
-                }
-
-                // Truncate if too long
-                if result.len() > 50000 {
-                    result = format!(
-                        "{}...\n(output truncated, {} total chars)",
-                        safe_truncate(&result, 50000),
-                        result.len()
-                    );
-                }
-
-                (result, !output.status.success())
-            }
-            Err(e) => (format!("Failed to execute command: {e}"), true),
-        }
+        // Spawn background shell and return shell_id.
+        let shell_id = BACKGROUND_SHELLS.spawn(command).map_err(ToolError::Other)?;
+        return Ok(ToolOutput::text(format!(
+            "Background shell started with ID: {shell_id}\nUse bash_output with this shell_id to retrieve output."
+        )));
     }
+
+    // Run synchronously (original behavior).
+    // On Windows, use Git Bash explicitly (not WSL bash).
+    // On Unix, use system bash.
+    // IMPORTANT: Set current_dir to ensure bash runs in the same directory as
+    // the process.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    #[cfg(windows)]
+    let output = {
+        let mut cmd = match find_git_bash() {
+            Some(git_bash) => Command::new(git_bash),
+            None => Command::new("bash"),
+        };
+        cmd.args(["-c", command]).current_dir(&cwd);
+        apply_env_scrub(&mut cmd);
+        cmd.output()
+    };
+
+    #[cfg(not(windows))]
+    let output = {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", command]).current_dir(&cwd);
+        apply_env_scrub(&mut cmd);
+        cmd.output()
+    };
+
+    let output =
+        output.map_err(|e| ToolError::External(format!("Failed to execute command: {e}")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("stderr: ");
+        result.push_str(&stderr);
+    }
+    if result.is_empty() {
+        result = "(command completed with no output)".to_string();
+    }
+
+    // Truncate if too long.
+    if result.len() > 50000 {
+        result = format!(
+            "{}...\n(output truncated, {} total chars)",
+            safe_truncate(&result, 50000),
+            result.len()
+        );
+    }
+
+    if output.status.success() {
+        Ok(ToolOutput::text(result))
+    } else {
+        // Non-zero exit collapses to `(message, true)` via `ToolError::External`
+        // so the legacy tuple shape stays byte-identical to the pre-migration
+        // executor. The message *is* the captured stdout+stderr.
+        Err(ToolError::External(result))
+    }
+}
+
+/// Execute a bash command, returning the legacy `(content, is_error)` tuple.
+///
+/// Thin shim over [`try_execute_bash`] preserved so the registry's
+/// `ToolHandler::execute` signature (which still returns `(String, bool)`)
+/// compiles untouched while the typed surface lands incrementally. New code
+/// should call [`try_execute_bash`] directly and use the structured error.
+///
+/// Applies the policy layer: length cap + denylist in [`validate_command`],
+/// and env scrubbing via [`apply_env_scrub`] (allowlist — only `PATH`, `HOME`,
+/// `USER`, `CARGO_HOME`, `RUSTUP_HOME`, LC_*, etc. are inherited; arbitrary
+/// credential-bearing names such as `DATABASE_URL` are dropped along with
+/// `ANTHROPIC_API_KEY`, `AWS_*`, `_TOKEN`/`_SECRET`/`_PASSWORD`).
+/// See crosslink #257 and #730.
+pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
+    into_legacy(try_execute_bash(args))
 }
 
 #[cfg(test)]
