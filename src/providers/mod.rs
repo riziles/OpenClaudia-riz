@@ -387,11 +387,11 @@ pub async fn fetch_models(
 
     let client = reqwest::Client::new();
 
-    // Normalize base_url: strip trailing slash and /v1 suffix to avoid double /v1/v1
-    let normalized_base = base_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/');
+    // Single source of truth for base-URL normalisation (crosslink #493 —
+    // this used to be a hand-inlined three-line trim that drifted from
+    // `proxy::normalize_base_url`; any future fix, e.g. also stripping
+    // `/v1beta` for Gemini, now only needs to land in one place).
+    let normalized_base = crate::proxy::normalize_base_url(base_url);
     let url = format!("{}{}", normalized_base, adapter.models_endpoint());
 
     let mut request = client.get(&url);

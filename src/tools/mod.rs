@@ -251,7 +251,11 @@ pub fn execute_tool_full(
     let args: HashMap<String, Value> =
         serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
 
-    // Check for subagent tools first (they need config)
+    // Check for subagent tools first (they need config). Each match arm
+    // produces the inner `(content, is_error)` pair; the `ToolResult`
+    // wrapping happens *after* the match so there is a single return point
+    // (crosslink #491 — previously the default arm returned mid-match,
+    // bypassing the wrapper and creating asymmetric control flow).
     let (content, is_error) = match tool_call.function.name.as_str() {
         "task" => app_config.map_or_else(
             || {
@@ -263,13 +267,15 @@ pub fn execute_tool_full(
             |config| subagent::execute_task_tool(&args, config),
         ),
         "agent_output" => subagent::execute_agent_output_tool(&args),
-        // For all other tools, delegate to the existing function.
+        // For all other tools, delegate to the existing function and
+        // unwrap its already-built `ToolResult` back into the pair so the
+        // single trailing constructor handles all arms uniformly.
         // The permission check has already run at the top of this function;
         // the inner `execute_tool_with_memory` call will re-consult the gate
         // with the same manager — Allowed is idempotent, so this is safe.
         _ => {
-            let result = execute_tool_with_memory(tool_call, memory_db, permission_mgr);
-            return result;
+            let inner = execute_tool_with_memory(tool_call, memory_db, permission_mgr);
+            (inner.content, inner.is_error)
         }
     };
 
@@ -790,6 +796,51 @@ mod tests {
         let (output, is_error) = bash::execute_bash(&args);
         assert!(!is_error);
         assert!(output.contains("hello"));
+    }
+
+    /// Regression test for crosslink #491.
+    ///
+    /// Previously, `execute_tool_full` had two arms (`task`, `agent_output`)
+    /// that fell through to a shared `ToolResult` wrapper at the bottom, and
+    /// a third (default) arm that `return`ed mid-match — bypassing the
+    /// wrapper. The refactor unifies the control flow so every arm produces
+    /// `(content, is_error)` and the wrapper runs once. This test pins the
+    /// invariant that the default arm's `tool_call_id` propagates through
+    /// the wrapper (it would still pass under the old code, but any future
+    /// refactor that drops the wrapper for the default arm — e.g. by
+    /// reintroducing the early return without setting `tool_call_id` —
+    /// will fail here).
+    #[test]
+    fn execute_tool_full_default_arm_wraps_with_tool_call_id() {
+        let call = ToolCall {
+            id: "call-#491-test".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
+                arguments: json!({ "command": "echo hello" }).to_string(),
+            },
+        };
+        let result = execute_tool_full(&call, None, None, None);
+        assert_eq!(
+            result.tool_call_id, "call-#491-test",
+            "default match arm must round-trip the tool_call_id through the single wrapper"
+        );
+        // Subagent arms behave the same — drive `agent_output` with no
+        // session so it produces a `(content, is_error=true)` pair and
+        // verify the wrapper attaches the id identically.
+        let agent_call = ToolCall {
+            id: "call-#491-agent".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "agent_output".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let agent_result = execute_tool_full(&agent_call, None, None, None);
+        assert_eq!(
+            agent_result.tool_call_id, "call-#491-agent",
+            "subagent match arm must round-trip the tool_call_id through the single wrapper"
+        );
     }
 
     #[test]

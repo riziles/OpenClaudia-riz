@@ -140,6 +140,32 @@ fn install_help_response() -> (String, bool) {
     }
 }
 
+/// Test-only escape hatch for the process-global `CHAINLINK_INSTALL_SHOWN`
+/// "show-the-install-help-once" latch.
+///
+/// The latch (set inside [`install_help_response`]) is intentionally shared
+/// across the whole process so the long install message appears at most
+/// once per session. That design is correct for the runtime but creates an
+/// order-dependent coupling between unit tests: whichever test runs first
+/// flips the latch, and every subsequent test sees the short
+/// `"Chainlink not available."` reply instead of the install hint.
+///
+/// Tests that need to assert behaviour against a *fresh* latch state must
+/// call this helper at the start of the test (and, if running in parallel,
+/// take a serialising mutex around the call). Production code MUST NOT call
+/// this — it is gated behind `#[cfg(test)]` so it does not exist outside
+/// test builds.
+///
+/// Visibility is plain (module-private) because `chainlink` itself is a
+/// private module; the helper only needs to be reachable from the
+/// in-file `tests` submodule via `super::`.
+///
+/// Crosslink #494.
+#[cfg(test)]
+fn reset_chainlink_install_shown_for_test() {
+    CHAINLINK_INSTALL_SHOWN.store(false, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +221,47 @@ mod tests {
     fn parses_quoted_multi_word_arg() {
         let tokens = shlex::split("create 'hello world'").unwrap();
         assert_eq!(tokens, vec!["create", "hello world"]);
+    }
+
+    /// Regression test for crosslink #494.
+    ///
+    /// Verifies the `#[cfg(test)]`-gated `reset_chainlink_install_shown_for_test`
+    /// helper actually re-arms the install-help latch so a second call to
+    /// `install_help_response` produces the full install message instead of
+    /// the short "Chainlink not available." fallback.
+    ///
+    /// We serialise the assertion through a process-wide mutex because the
+    /// underlying state is a global `AtomicBool` and parallel tests would
+    /// otherwise race for the latch.
+    #[test]
+    fn reset_helper_re_arms_install_message() {
+        use std::sync::Mutex;
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let _g = SERIAL.lock().unwrap();
+
+        // Start from a known state.
+        reset_chainlink_install_shown_for_test();
+        let (first, err1) = install_help_response();
+        assert!(err1);
+        assert!(
+            first.contains("Install from:"),
+            "first call after reset should show the install hint, got: {first}"
+        );
+
+        // Without reset, the latch is now flipped — subsequent calls
+        // return the short fallback.
+        let (second, err2) = install_help_response();
+        assert!(err2);
+        assert_eq!(second, "Chainlink not available.");
+
+        // Reset and confirm the install hint comes back. This is the
+        // behaviour the test-only escape hatch exists to enable.
+        reset_chainlink_install_shown_for_test();
+        let (third, err3) = install_help_response();
+        assert!(err3);
+        assert!(
+            third.contains("Install from:"),
+            "call after second reset should re-show install hint, got: {third}"
+        );
     }
 }

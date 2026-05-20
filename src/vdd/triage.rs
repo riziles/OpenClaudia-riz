@@ -5,8 +5,8 @@ use std::fmt::Write;
 
 use reqwest::Client;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::config::{AppConfig, VddConfig};
 use crate::providers::ApiKey;
@@ -60,7 +60,8 @@ pub fn parse_findings(adversary_response: &str, iteration: u32) -> Vec<Finding> 
 
     raw_findings
         .into_iter()
-        .map(|raw| {
+        .enumerate()
+        .map(|(idx, raw)| {
             let severity = parse_severity(raw.severity.as_deref().unwrap_or("INFO"));
             let line_range = raw.lines.and_then(|lines| {
                 if lines.len() >= 2 {
@@ -72,13 +73,29 @@ pub fn parse_findings(adversary_response: &str, iteration: u32) -> Vec<Finding> 
                 }
             });
 
+            let description = raw
+                .description
+                .unwrap_or_else(|| "No description".to_string());
+
+            // Deterministic id: SHA-256 over (iteration, ordinal, file, line_range,
+            // severity, cwe, description). Replaces the previous per-call
+            // `Uuid::new_v4()` which made tests non-deterministic and broke
+            // cross-iteration verdict lookup (crosslink #478).
+            let id = deterministic_finding_id(
+                iteration,
+                idx,
+                raw.file.as_deref(),
+                line_range,
+                &severity,
+                raw.cwe.as_deref(),
+                &description,
+            );
+
             Finding {
-                id: Uuid::new_v4().to_string(),
+                id,
                 severity,
                 cwe: raw.cwe,
-                description: raw
-                    .description
-                    .unwrap_or_else(|| "No description".to_string()),
+                description,
                 file_path: raw.file,
                 line_range,
                 status: FindingStatus::Genuine, // Default; triage will reclassify
@@ -87,6 +104,51 @@ pub fn parse_findings(adversary_response: &str, iteration: u32) -> Vec<Finding> 
             }
         })
         .collect()
+}
+
+/// Build a stable, content-derived id for a finding.
+///
+/// The id is a short hex prefix of SHA-256 over the iteration, the ordinal
+/// position of the finding inside the adversary response, and the finding's
+/// natural-key fields (file, line range, severity, CWE, description). The
+/// iteration + ordinal guarantee uniqueness when the same description is
+/// re-reported within a single response, while the natural-key fields keep
+/// the id stable across re-parses of the same input — which is what tests
+/// (and Chainlink) need for assertable, cross-iteration identity.
+fn deterministic_finding_id(
+    iteration: u32,
+    ordinal: usize,
+    file_path: Option<&str>,
+    line_range: Option<(usize, usize)>,
+    severity: &crate::vdd::finding::Severity,
+    cwe: Option<&str>,
+    description: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(iteration.to_le_bytes());
+    hasher.update(b"|");
+    hasher.update((ordinal as u64).to_le_bytes());
+    hasher.update(b"|");
+    hasher.update(file_path.unwrap_or("").as_bytes());
+    hasher.update(b"|");
+    let (lo, hi) = line_range.unwrap_or((0, 0));
+    hasher.update((lo as u64).to_le_bytes());
+    hasher.update(b":");
+    hasher.update((hi as u64).to_le_bytes());
+    hasher.update(b"|");
+    hasher.update(format!("{severity:?}").as_bytes());
+    hasher.update(b"|");
+    hasher.update(cwe.unwrap_or("").as_bytes());
+    hasher.update(b"|");
+    hasher.update(description.as_bytes());
+    let digest = hasher.finalize();
+    // 16 hex chars (64 bits) — collision probability negligible for the
+    // per-iteration finding population (small N).
+    let mut s = String::with_capacity(16);
+    for byte in &digest[..8] {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
 
 /// Inputs needed by the triage pipeline. Bundled into a struct so the
@@ -515,6 +577,37 @@ mod tests {
         let response = r#"{"findings": [], "assessment": "NO_FINDINGS"}"#;
         let findings = parse_findings(response, 1);
         assert!(findings.is_empty());
+    }
+
+    /// Regression test for crosslink #478: `parse_findings` used `Uuid::new_v4`
+    /// per finding, which made finding ids non-deterministic and broke
+    /// `HashMap`-keyed verdict lookup in tests. The replacement derives the id
+    /// from (`iteration`, `ordinal_index`, `file_path`, `line_range`,
+    /// `severity`, `cwe`, `description`), so repeated parses of the same
+    /// input yield equal ids.
+    #[test]
+    fn test_parse_findings_ids_are_deterministic() {
+        let response = r#"{"findings": [
+            {"severity": "HIGH", "cwe": "CWE-89", "description": "SQL injection", "file": "src/db.rs", "lines": [10, 20], "reasoning": "User input concatenated"},
+            {"severity": "MEDIUM", "cwe": "CWE-79", "description": "XSS in renderer", "file": "src/web.rs", "lines": [5, 7]}
+        ], "assessment": "FINDINGS_PRESENT"}"#;
+
+        let a = parse_findings(response, 1);
+        let b = parse_findings(response, 1);
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+        for (fa, fb) in a.iter().zip(b.iter()) {
+            assert_eq!(fa.id, fb.id, "finding ids must be stable across calls");
+        }
+        // Different ordinals must yield different ids — guards against a
+        // bug where two findings inside the same response collapse onto the
+        // same id and the second one's verdict overwrites the first.
+        assert_ne!(a[0].id, a[1].id);
+        // Iteration must be part of the key: same payload at iteration 2
+        // should not collide with iteration 1 (so verdicts from a prior
+        // iteration can't silently rebind to a new finding).
+        let c = parse_findings(response, 2);
+        assert_ne!(a[0].id, c[0].id);
     }
 
     /// Test that Layer 1 (duplicate detection) catches re-reported findings

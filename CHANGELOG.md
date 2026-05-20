@@ -155,6 +155,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- ToolInterceptor::to_tool_call mixes dispatch-layer name mapping with a second parameter-name mapping — two sources of truth for aliasing (#477)
 - Plugin manifest trust: no signature, origin, or integrity verification (#249)
 - proxy_chat_completions is a 308-line God function violating SRP (#247)
 - Blanket clippy suppressions at main.rs file scope hide real SRP violations (#461)
