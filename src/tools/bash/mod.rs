@@ -487,7 +487,7 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
     // `additionalWorkingDirectories`, commands touching paths outside the
     // allowed roots are refused with a user-facing explanation.
     if let Err(msg) = check_command_against_global(command) {
-        return (msg, true);
+        return Err(ToolError::PermissionDenied(msg));
     }
 
     // Diagnostic: log whether the command would qualify for auto-allow under

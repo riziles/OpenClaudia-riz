@@ -17,6 +17,7 @@
 //! convert them to an `AppHandles` param passed per dispatch.
 pub mod permission;
 pub mod task_queue;
+pub mod tasks;
 pub mod teammate;
 
 pub use permission::{LeaderPermissionBridge, QueuedPermission};

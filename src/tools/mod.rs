@@ -25,6 +25,7 @@ pub mod file_index;
 pub mod lsp;
 mod plan_mode;
 pub mod registry;
+pub mod remote_trigger;
 mod task;
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -47,6 +48,11 @@ pub use bash::{
     check_command_against_global as check_bash_path_against_global,
     clear_global_path_constraints, install_global_path_constraints, PathConstraints,
 };
+/// Process-wide background shell registry, re-exported so the
+/// coordinator's [`crate::coordinator::tasks::LocalShellTask`]
+/// (crosslink #611) can query running shells without taking a
+/// dependency on the private `bash` submodule.
+pub(crate) use bash::BACKGROUND_SHELLS;
 /// RAII guard that marks the current thread as executing inside a subagent
 /// task, so `execute_enter_plan_mode` refuses with the CC-parity error
 /// (crosslink #620). Subagent runners construct one of these for the

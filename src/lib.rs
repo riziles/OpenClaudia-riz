@@ -22,6 +22,7 @@ pub mod guardrails;
 pub mod hooks;
 pub mod keybindings;
 pub mod mcp;
+pub mod mcp_inprocess;
 pub mod memdir;
 pub mod memory;
 pub mod migrations;

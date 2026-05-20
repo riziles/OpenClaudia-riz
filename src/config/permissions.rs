@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 /// Tool permission system configuration.
@@ -40,6 +42,26 @@ pub struct PermissionsConfig {
     /// (command string for Bash, `file_path` for Edit/Write).
     #[serde(default)]
     pub default_allow: Vec<String>,
+    /// Per-server MCP tool allow-list (crosslink #619).
+    ///
+    /// Maps **server name** (the key under `mcp.servers` in
+    /// `config.yaml`) to the list of tool names exposed by that
+    /// server that the leader is allowed to invoke. A server absent
+    /// from the map is **not restricted** — every tool it exposes is
+    /// admissible; that matches the historical posture before #619
+    /// where MCP tools went through the generic permission pipeline
+    /// only. To restrict a server to a specific subset, list it here
+    /// with the explicit tools.
+    ///
+    /// An entry with an **empty** tool vector denies every tool on
+    /// that server — use this when you want to block a server entirely
+    /// without unloading it from the manager.
+    ///
+    /// Wildcards are not interpreted here: each tool name is compared
+    /// verbatim (case-sensitive). This avoids the unbounded-glob
+    /// foot-gun from `default_allow` and keeps the matrix grep-able.
+    #[serde(default)]
+    pub mcp: HashMap<String, Vec<String>>,
 }
 
 /// Returns the default value for `PermissionsConfig::enabled`.
@@ -56,6 +78,7 @@ impl Default for PermissionsConfig {
         Self {
             enabled: default_enabled(),
             default_allow: Vec::new(),
+            mcp: HashMap::new(),
         }
     }
 }
@@ -115,6 +138,29 @@ impl PermissionsConfig {
         }
         Ok(())
     }
+
+    /// Check whether `tool` on `server` is admissible under the
+    /// per-server MCP permissions map (crosslink #619).
+    ///
+    /// Semantics:
+    ///
+    /// * Server **absent from the map** → `true` (unrestricted; the
+    ///   generic permission pipeline still applies).
+    /// * Server present with **empty** tool list → `false` for every
+    ///   tool (server is blocked).
+    /// * Server present with a non-empty tool list → `true` iff
+    ///   `tool` is an exact case-sensitive match.
+    ///
+    /// This is **only** the per-server gate; the generic permission
+    /// system (`PermissionManager`) still gets the final say. Callers
+    /// should consult `mcp_tool_allowed` first and short-circuit when
+    /// it returns `false`.
+    #[must_use]
+    pub fn mcp_tool_allowed(&self, server: &str, tool: &str) -> bool {
+        self.mcp
+            .get(server)
+            .is_none_or(|allowed| allowed.iter().any(|t| t == tool))
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +172,7 @@ mod tests {
         let cfg = PermissionsConfig {
             enabled: true,
             default_allow: vec!["/project/**".into(), "git *".into(), "*.rs".into()],
+            mcp: HashMap::new(),
         };
         assert!(cfg.validate().is_ok());
     }
@@ -135,6 +182,7 @@ mod tests {
         let cfg = PermissionsConfig {
             enabled: true,
             default_allow: vec!["ok".into(), String::new()],
+            mcp: HashMap::new(),
         };
         let err = cfg.validate().expect_err("empty pattern must be rejected");
         assert!(err.contains("[1]"), "error must name the index: {err}");
@@ -150,6 +198,7 @@ mod tests {
             let cfg = PermissionsConfig {
                 enabled: true,
                 default_allow: vec![unbounded.into()],
+                mcp: HashMap::new(),
             };
             let err = cfg.validate().expect_err("unbounded glob must be rejected");
             assert!(
@@ -164,6 +213,7 @@ mod tests {
         let cfg = PermissionsConfig {
             enabled: true,
             default_allow: vec!["foo\u{1}bar".into()],
+            mcp: HashMap::new(),
         };
         let err = cfg.validate().expect_err("control chars must be rejected");
         assert!(
@@ -176,5 +226,66 @@ mod tests {
     fn validate_default_is_ok() {
         // Default is empty default_allow, so nothing to validate.
         assert!(PermissionsConfig::default().validate().is_ok());
+    }
+
+    // ── Crosslink #619: per-server MCP permissions ──────────────────────
+
+    #[test]
+    fn mcp_unrestricted_when_server_absent() {
+        let cfg = PermissionsConfig::default();
+        // No `mcp` entries → every server/tool is unrestricted at
+        // this layer.
+        assert!(cfg.mcp_tool_allowed("github", "create_issue"));
+        assert!(cfg.mcp_tool_allowed("anything", "anything"));
+    }
+
+    #[test]
+    fn mcp_allowlist_admits_exact_match_only() {
+        let mut mcp = HashMap::new();
+        mcp.insert(
+            "github".into(),
+            vec!["read_file".into(), "list_repos".into()],
+        );
+        let cfg = PermissionsConfig {
+            enabled: true,
+            default_allow: Vec::new(),
+            mcp,
+        };
+        assert!(cfg.mcp_tool_allowed("github", "read_file"));
+        assert!(cfg.mcp_tool_allowed("github", "list_repos"));
+        assert!(!cfg.mcp_tool_allowed("github", "delete_file"));
+        // Case-sensitive: capitalisation differences must not match.
+        assert!(!cfg.mcp_tool_allowed("github", "Read_File"));
+        // Unmentioned server is still wide-open.
+        assert!(cfg.mcp_tool_allowed("railway", "deploy"));
+    }
+
+    #[test]
+    fn mcp_empty_allowlist_denies_every_tool_on_server() {
+        let mut mcp = HashMap::new();
+        mcp.insert("blocked".into(), Vec::new());
+        let cfg = PermissionsConfig {
+            enabled: true,
+            default_allow: Vec::new(),
+            mcp,
+        };
+        assert!(!cfg.mcp_tool_allowed("blocked", "anything"));
+        assert!(!cfg.mcp_tool_allowed("blocked", ""));
+    }
+
+    #[test]
+    fn mcp_deserializes_from_yaml() {
+        let yaml = r"
+mcp:
+  github:
+    - read_file
+    - list_repos
+  blocked: []
+";
+        let cfg: PermissionsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.mcp_tool_allowed("github", "read_file"));
+        assert!(!cfg.mcp_tool_allowed("github", "delete_file"));
+        assert!(!cfg.mcp_tool_allowed("blocked", "anything"));
+        assert!(cfg.mcp_tool_allowed("absent", "anything"));
     }
 }
