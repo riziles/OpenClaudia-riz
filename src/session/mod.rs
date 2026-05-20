@@ -13,7 +13,10 @@ mod task;
 
 // Re-export all public types
 pub use audit::AuditLogger;
-pub use pricing::{calculate_cost, get_pricing, ModelPricing};
+pub use pricing::{
+    calculate_cost, calculate_cost_with_ttl, get_pricing, CacheWriteTtl, ModelPricing,
+    PricingError,
+};
 pub use state::{
     get_session_context, is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy,
     AllowedPrompt, PlanModePolicy, PlanModeState, TokenUsage, TurnMetrics, MCP_TOOL_PREFIX,

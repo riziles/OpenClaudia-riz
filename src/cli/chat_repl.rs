@@ -696,7 +696,10 @@ impl ChatRepl {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             };
-            if let Some(cost) = session::calculate_cost(&self.chat_session.model, &usage) {
+            // Display cost when pricing is known; on unknown-model we
+            // intentionally skip the line rather than show $0.00 (the
+            // bug #388 was filed against).
+            if let Ok(cost) = session::calculate_cost(&self.chat_session.model, &usage) {
                 println!("  Est cost:   ${cost:.4}");
             }
             println!(
@@ -1231,6 +1234,9 @@ impl ChatRepl {
         }
 
         let tokens = estimate_session_tokens(&self.chat_session) + full_content.len() / 4;
+        // `draw_status_bar` accepts `Option<f64>` and elides the cost
+        // segment when None; an unknown model therefore renders as a
+        // blank cost rather than $0.00.
         let cost = session::calculate_cost(
             &self.model,
             &openclaudia::session::TokenUsage {
@@ -1239,7 +1245,8 @@ impl ChatRepl {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
-        );
+        )
+        .ok();
         let duration = chrono::Utc::now().signed_duration_since(self.chat_session.created_at);
         let dur_str = format!("{}m", duration.num_minutes());
         tui::draw_status_bar(
@@ -1614,6 +1621,8 @@ impl ChatRepl {
         stream_usage: &openclaudia::session::TokenUsage,
     ) {
         let tokens = estimate_session_tokens(&self.chat_session) + full_content.len() / 4;
+        // Status bar accepts `Option<f64>`; unknown-model resolves to
+        // None and the cost segment is omitted.
         let cost = session::calculate_cost(
             &self.model,
             &openclaudia::session::TokenUsage {
@@ -1624,7 +1633,8 @@ impl ChatRepl {
                 cache_read_tokens: stream_usage.cache_read_tokens,
                 cache_write_tokens: stream_usage.cache_write_tokens,
             },
-        );
+        )
+        .ok();
         let duration = chrono::Utc::now().signed_duration_since(self.chat_session.created_at);
         let dur_str = format!("{}m", duration.num_minutes());
         tui::draw_status_bar(
