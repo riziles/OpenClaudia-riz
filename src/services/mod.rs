@@ -61,14 +61,46 @@ impl ServiceRegistry {
         self
     }
 
+    /// Borrow the analytics sink as a trait reference.
+    ///
+    /// Returns `&dyn AnalyticsSink` rather than `&Arc<dyn AnalyticsSink>`
+    /// so callers don't depend on the registry's smart-pointer choice
+    /// (crosslink #952). Replacing `Arc<dyn _>` with `Box<dyn _>` or a
+    /// `&'static dyn _` singleton would now leave every call site
+    /// unchanged. Callers that genuinely need a shared, long-lived
+    /// handle should use [`Self::analytics_arc`].
     #[must_use]
-    pub fn analytics(&self) -> &Arc<dyn AnalyticsSink> {
-        &self.analytics
+    pub fn analytics(&self) -> &dyn AnalyticsSink {
+        &*self.analytics
     }
 
+    /// Borrow the feature-flag source as a trait reference.
+    ///
+    /// See [`Self::analytics`] — same reasoning. The Arc-flavoured
+    /// accessor is [`Self::flags_arc`].
     #[must_use]
-    pub fn flags(&self) -> &Arc<dyn FeatureFlagSource> {
-        &self.flags
+    pub fn flags(&self) -> &dyn FeatureFlagSource {
+        &*self.flags
+    }
+
+    /// Explicit shared-ownership accessor for the analytics sink.
+    ///
+    /// Returns the underlying `Arc<dyn AnalyticsSink>` so a caller can
+    /// keep the sink alive past the registry's borrow lifetime
+    /// (e.g. to install it into a background task). This is the
+    /// "I really do need the Arc" escape hatch — preferring
+    /// [`Self::analytics`] keeps every other call site decoupled from
+    /// the smart-pointer choice.
+    #[must_use]
+    pub fn analytics_arc(&self) -> Arc<dyn AnalyticsSink> {
+        Arc::clone(&self.analytics)
+    }
+
+    /// Explicit shared-ownership accessor for the feature-flag source.
+    /// See [`Self::analytics_arc`] for the motivation.
+    #[must_use]
+    pub fn flags_arc(&self) -> Arc<dyn FeatureFlagSource> {
+        Arc::clone(&self.flags)
     }
 }
 

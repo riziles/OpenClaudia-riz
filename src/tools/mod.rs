@@ -24,6 +24,8 @@ pub mod lsp;
 mod plan_mode;
 pub mod registry;
 mod task;
+#[cfg(test)]
+pub(crate) mod testutil;
 mod todo;
 mod web;
 pub mod worktree;

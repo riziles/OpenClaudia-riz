@@ -37,6 +37,14 @@ use std::process::Command;
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
 
+/// Exponential-backoff polling schedule for `git_in`'s wait loop
+/// (crosslink #956). Each entry is the sleep duration in milliseconds
+/// between successive `try_wait` checks; the loop pins on the last
+/// entry once the schedule is exhausted. Tuned so trivial git plumbing
+/// commands (sub-millisecond exit) see <10 ms wall-clock overhead
+/// instead of the previous flat 100 ms.
+const GIT_WAIT_BACKOFF_MS: &[u64] = &[1, 2, 5, 10, 25, 50, 100];
+
 /// Validate a user-supplied branch name before it reaches any other `git`
 /// invocation (crosslink #408).
 ///
@@ -160,6 +168,16 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
 /// `cwd` is mandatory: every call site must say *where* the git command runs.
 /// This is the contract that lets us remove `set_current_dir` from this
 /// module entirely (crosslink #345).
+///
+/// The wait loop uses **exponential backoff** (1 → 2 → 5 → 10 → 25 →
+/// 50 → 100 ms, then sustained 100 ms) rather than a flat 100 ms
+/// sleep (crosslink #956). The prior fixed-100ms loop added up to a
+/// full 100 ms of latency to EVERY git command — even ones that
+/// returned in <1 ms (the common case for `rev-parse`, `check-ref-format`
+/// etc.). Backoff polling gives sub-millisecond exit detection for
+/// fast commands while still capping the loop at the same 100 ms
+/// upper bound for long-running ones, so the timeout-resolution
+/// behaviour is preserved.
 fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut child = Command::new("git")
         .args(args)
@@ -170,6 +188,7 @@ fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|e| format!("Failed to spawn git: {e}"))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
+    let mut step = 0usize;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -186,7 +205,10 @@ fn git_in(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
                         args.join(" ")
                     ));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let idx = step.min(GIT_WAIT_BACKOFF_MS.len() - 1);
+                let sleep_ms = GIT_WAIT_BACKOFF_MS[idx];
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                step = step.saturating_add(1);
             }
             Err(e) => return Err(format!("Git wait error: {e}")),
         }
@@ -602,16 +624,19 @@ fn get_current_branch_at(cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use crate::tools::testutil::process_cwd_lock;
+    use std::sync::MutexGuard;
 
-    /// Some tests still rely on observing the process CWD. The lock keeps
-    /// them sequential — but note that the production functions in this
-    /// module no longer touch `set_current_dir` at all (crosslink #345).
+    /// Local alias preserving call-site readability while delegating to the
+    /// shared process-wide CWD lock in [`crate::tools::testutil`]. The
+    /// previous implementation kept a private `static LOCK` here — that
+    /// did NOT serialise against the matching helper in `cron.rs` because
+    /// they were two distinct `OnceLock<Mutex<()>>` instances
+    /// (crosslink #945). Routing through `process_cwd_lock` collapses
+    /// them onto a single mutex so every CWD-mutating test in the
+    /// workspace is mutually exclusive.
     fn cwd_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        process_cwd_lock()
     }
 
     #[test]

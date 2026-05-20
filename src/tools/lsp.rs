@@ -247,12 +247,21 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
         );
     };
 
-    // Check if server is available
-    if Command::new("which")
-        .arg(server_cmd)
-        .output()
-        .map_or(true, |o| !o.status.success())
-    {
+    // Check if server is available. Use the `which` crate (in-process
+    // PATH walk) rather than spawning the `which(1)` subprocess
+    // (crosslink #955). The previous shell-out had three defects:
+    // 1. PATH-hijack class: a malicious `which` earlier in PATH would
+    //    answer the probe. Even though the LSP server itself is the
+    //    real attack surface, doing one fewer fork+exec from a
+    //    PATH-resolved binary shrinks the window.
+    // 2. `map_or(true, ...)` fell open: a `which` that failed to spawn
+    //    was treated as "not found", surfacing a misleading message.
+    // 3. A fork+exec syscall just to probe a binary that is exec'd
+    //    explicitly a few lines later anyway is pure overhead.
+    // `which::which` resolves the PATH ourselves and returns
+    // `Err(Which::CannotFindBinaryPath)` only when the binary really
+    // isn't on PATH.
+    if which::which(server_cmd).is_err() {
         return (
             format!("Language server '{server_cmd}' not found. Install it to use LSP features."),
             true,

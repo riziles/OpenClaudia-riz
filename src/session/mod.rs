@@ -43,13 +43,52 @@ use uuid::Uuid;
 /// serialised session JSON under ~500 KB for the default [`TurnMetrics`] size.
 pub const MAX_TURN_METRICS: usize = 1_000;
 
-/// Write data to a file atomically: write to a temp file, then rename.
-/// If the process crashes during the write, the original file is untouched.
+/// Write data to a file atomically: write to a uniquely-named temp file
+/// in the same directory, then rename.
+///
+/// The staging name is `<file>.<pid>.<uuid>.tmp` rather than
+/// `<file>.tmp`. The previous fixed `.tmp` extension meant two
+/// concurrent writers targeting the SAME final path (e.g. an autosave
+/// racing `end_session`) overwrote each other's staging file mid-write;
+/// the `rename` then surfaced an arbitrary winner's partial bytes
+/// (crosslink #949).
+///
+/// Using `(pid, uuid)` gives a name unique-per-call across every
+/// thread / process / async task on the host, so the staging files
+/// never collide and the rename always promotes the bytes that *this*
+/// caller wrote.
+///
+/// On rename failure the staging file is cleaned up so a crashing or
+/// erroring caller does not leave `<file>.<pid>.<uuid>.tmp` debris in
+/// the persist directory.
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = unique_staging_path(path);
     fs::write(&tmp_path, data)?;
-    fs::rename(&tmp_path, path)?;
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        // Best-effort cleanup; ignore the unlink error so the caller
+        // sees the original rename failure, which is the actionable one.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// Build `<file>.<pid>.<uuid>.tmp` next to `path`, guaranteed unique
+/// across concurrent writers. Returns the staging path; callers rename
+/// it onto `path` once the bytes are durable.
+fn unique_staging_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().map_or_else(
+        || "session".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let staging = format!(
+        "{file_name}.{pid}.{uuid}.tmp",
+        pid = std::process::id(),
+        uuid = Uuid::new_v4().simple(),
+    );
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(staging)
 }
 
 /// Session state indicating the agent mode

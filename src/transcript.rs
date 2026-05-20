@@ -152,6 +152,16 @@ pub fn envelope_for(
 /// creating the project directory on first use. Mode `0o600` on the
 /// file, `0o700` on the directory — matches Claude Code's permissions.
 ///
+/// On Unix the file and the project directory are *born* with the
+/// restricted mode via [`OpenOptionsExt::mode`] /
+/// [`DirBuilderExt::mode`]. The previous implementation
+/// `create_dir_all` + `OpenOptions::create` + post-create `chmod`
+/// briefly exposed the path at the umask-default permissions (typically
+/// `0o755` / `0o644`) between the `open(2)` and the `chmod(2)`. For a
+/// transcript that includes prompt context or tool-result snippets,
+/// that race let a concurrent reader on the same host see one line of
+/// session content (crosslink #948, same shape as #801).
+///
 /// # Errors
 ///
 /// Returns an error if the filesystem is inaccessible. The caller
@@ -164,31 +174,51 @@ pub fn append_entry(
 ) -> std::io::Result<()> {
     let path = transcript_path(cwd, session_id);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        set_secure_perms(parent, 0o700);
+        create_dir_all_secure(parent)?;
     }
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut file = open_append_secure(&path)?;
     writeln!(file, "{line}")?;
-    set_secure_perms(&path, 0o600);
     Ok(())
 }
 
+/// Open `path` for append, creating it with mode `0o600` on Unix so the
+/// file never exists at a wider permission than its final mode. On
+/// non-Unix targets the open is the standard append-create — NTFS ACLs
+/// handle confidentiality and there is no umask to defeat.
 #[cfg(unix)]
-fn set_secure_perms(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        if perms.mode() & 0o777 != mode {
-            perms.set_mode(mode);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
+fn open_append_secure(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(not(unix))]
-fn set_secure_perms(_path: &Path, _mode: u32) {
-    // On Windows the umask model doesn't apply; rely on NTFS ACLs.
+fn open_append_secure(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Create `path` (recursively) with mode `0o700` on Unix so the project
+/// directory is never observable at the default `0o755` between its
+/// creation and a follow-up `chmod`. Re-creating an existing directory
+/// is a no-op; the mode is enforced on first creation only, which
+/// matches Claude Code's behaviour and avoids paying a `chmod` syscall
+/// on every transcript append.
+#[cfg(unix)]
+fn create_dir_all_secure(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_secure(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// Sentinel content prefix used by

@@ -20,15 +20,22 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
 
     match fs::read_dir(&path) {
         Ok(entries) => {
-            let mut items: Vec<String> = Vec::new();
+            // (is_dir, name) tuples — sort puts every dir before every
+            // file (false < true under default Ord, so `is_dir`'s
+            // boolean is inverted via the `!` below). Within each
+            // bucket the alphabetical sort of `name` is preserved, so
+            // the output reads "dirs first, then files, each group
+            // sorted by name" — the standard `ls`-style layout
+            // (crosslink #953). The previous flat alphabetical sort
+            // intermixed dirs and files which made it hard for the
+            // model to scan candidates by kind.
+            let mut items: Vec<(bool, String)> = Vec::new();
             for entry in entries {
                 match entry {
                     Ok(entry) => {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        let file_type = entry
-                            .file_type()
-                            .map_or("", |ft| if ft.is_dir() { "/" } else { "" });
-                        items.push(format!("{name}{file_type}"));
+                        let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+                        items.push((is_dir, name));
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -39,8 +46,14 @@ pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
                     }
                 }
             }
-            items.sort();
-            (items.join("\n"), false)
+            // Primary key: dirs before files (so invert is_dir).
+            // Secondary key: name (case-sensitive lexicographic, same as before).
+            items.sort_by(|a, b| (!a.0).cmp(&!b.0).then_with(|| a.1.cmp(&b.1)));
+            let rendered: Vec<String> = items
+                .into_iter()
+                .map(|(is_dir, name)| if is_dir { format!("{name}/") } else { name })
+                .collect();
+            (rendered.join("\n"), false)
         }
         Err(e) => (
             format!("Failed to list directory '{}': {e}", path.display()),

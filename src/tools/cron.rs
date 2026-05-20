@@ -390,16 +390,17 @@ pub fn execute_cron_list(_args: &HashMap<String, Value>) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use crate::tools::testutil::process_cwd_lock;
+    use std::sync::MutexGuard;
 
-    /// `set_current_dir` is process-global. Tests that change cwd to a temp
-    /// dir (to control the schedules.json path) must hold this lock so they
-    /// don't race with each other or with worktree tests.
+    /// Local alias delegating to the shared process-wide CWD lock in
+    /// [`crate::tools::testutil`]. Prior to crosslink #945 this module
+    /// had its own `static LOCK: OnceLock<Mutex<()>>` — and so did
+    /// `worktree.rs` — so the two `cwd_lock`s did NOT actually serialise
+    /// against each other under parallel `cargo test`. They now share
+    /// a single mutex.
     fn cwd_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        process_cwd_lock()
     }
 
     #[test]

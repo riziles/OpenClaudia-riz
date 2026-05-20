@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Bash safety allowlist (`is_safe_for_auto_allow`) with CC-parity rejection of process/command substitution, pipe-to-interpreter, eval/exec/source, and find -exec (#589)
+- Resume subagent should reuse original agent_id for transcript/cache continuity (CC parity) (#582)
 - task_get not-found should return null result (non-error) to match CC TaskGetTool behavior (#588)
 - ask_user_question multi-select key bug: input.rs reads legacy multi_select but validator normalizes to multiSelect (#585)
 - FileEditTool: replace_all parameter unsupported in OC (silent flag drop) (#569)
