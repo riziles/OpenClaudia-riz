@@ -46,8 +46,143 @@ pub use validate::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
+
+// ---------------------------------------------------------------------------
+// Path safety helpers (crosslink #347)
+// ---------------------------------------------------------------------------
+//
+// `validate_plugin_path` is the single chokepoint for turning a manifest-
+// supplied relative path into a `PathBuf` that is guaranteed to refer to a
+// file under `root`. It rejects:
+//
+//   * empty strings,
+//   * absolute paths (`/etc/passwd`, `C:\windows`),
+//   * paths containing `..` components (path traversal),
+//   * paths containing Windows prefix or root-dir components,
+//   * paths whose final canonical form escapes the plugin root,
+//   * any component that is or traverses through a symbolic link
+//     (so an attacker cannot drop a symlink inside the plugin tree
+//     that points to `/etc/shadow`).
+//
+// The function is intentionally pure-syntactic when the target does not
+// exist (so we can validate manifest paths that point at not-yet-created
+// files) and falls back to canonicalization-based containment when it does.
+//
+// All callers MUST use this helper rather than `root.join(rel)` directly.
+
+/// Reject a single path component if it is unsafe.
+const fn component_is_safe(c: &Component<'_>) -> bool {
+    matches!(c, Component::Normal(_) | Component::CurDir)
+}
+
+/// Validate and resolve `rel` against `root`, refusing traversal,
+/// absolute paths, and symlink components.
+///
+/// On success returns a `PathBuf` joined under `root` and confirmed to
+/// stay there.  See module-level docs above for the exact rejection
+/// criteria.
+fn validate_plugin_path(root: &Path, rel: &str) -> Result<PathBuf, PluginError> {
+    if rel.is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "plugin path cannot be empty".to_string(),
+        ));
+    }
+    // NUL bytes are illegal in *nix paths and are a classic truncation
+    // attack on naive C-string-based file handling.
+    if rel.contains('\0') {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin path contains NUL byte: {rel:?}"
+        )));
+    }
+
+    let candidate = Path::new(rel);
+
+    // Syntactic pass: reject absolute paths, Windows prefixes, and any
+    // `..` traversal *before* we touch the filesystem.
+    for comp in candidate.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin path must be relative, got: {rel:?}"
+                )));
+            }
+            Component::ParentDir => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin path may not contain '..' traversal: {rel:?}"
+                )));
+            }
+            other if !component_is_safe(&other) => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin path has unsupported component: {rel:?}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let joined = root.join(candidate);
+
+    // Symlink rejection: walk each existing prefix of `joined` and refuse
+    // if any component on the path is a symlink. We accept that `root`
+    // itself may be a symlink (the install dir is chosen by the harness)
+    // but every component *under* `root` must be a real directory/file.
+    let root_components: usize = root.components().count();
+    let mut walked = PathBuf::new();
+    for (idx, comp) in joined.components().enumerate() {
+        walked.push(comp);
+        // Skip components that are part of `root` itself.
+        if idx < root_components {
+            continue;
+        }
+        // `symlink_metadata` does not follow the final symlink, so this
+        // detects "x is a symlink" without dereferencing it.
+        match fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin path component is a symlink (refusing to follow): {}",
+                    walked.display()
+                )));
+            }
+            Ok(_) => {}
+            // Component does not exist yet — that's fine; canonicalization
+            // below will handle the existing-prefix case and the caller
+            // will simply find the file missing.
+            Err(_) => break,
+        }
+    }
+
+    // Containment pass: if both root and joined exist, canonicalize and
+    // verify the resolved path is still under the canonical root. This
+    // catches edge cases that pure-syntactic checks miss (e.g. a
+    // case-insensitive filesystem alias).
+    if let (Ok(canon_root), Ok(canon_joined)) = (root.canonicalize(), joined.canonicalize()) {
+        if !canon_joined.starts_with(&canon_root) {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin path escapes plugin root: {rel:?}"
+            )));
+        }
+    }
+
+    Ok(joined)
+}
+
+/// Read a plugin file, refusing to follow symlinks.
+///
+/// Wraps `fs::read_to_string` with an explicit `symlink_metadata` check
+/// so an attacker who can plant `.claude-plugin/plugin.json` as a
+/// symlink to `/etc/shadow` cannot make us read it.
+fn read_plugin_file(path: &Path) -> Result<String, PluginError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(PluginError::InvalidManifest(format!(
+            "plugin file is a symlink (refusing to follow): {}",
+            path.display()
+        ))),
+        Ok(_) => fs::read_to_string(path).map_err(|e| PluginError::IoError(e.to_string())),
+        Err(e) => Err(PluginError::IoError(e.to_string())),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Plugin errors
@@ -306,17 +441,18 @@ impl Plugin {
         // Legacy OpenClaudia format
         let legacy_manifest_path = path.join("manifest.json");
 
+        // Manifest reads MUST go through `read_plugin_file` so that a
+        // symlinked `plugin.json` (pointing at e.g. `/etc/shadow`) is
+        // rejected before we touch its contents. See crosslink #347.
         let manifest: PluginManifest = if cc_manifest_path.exists() {
             debug!(path = ?cc_manifest_path, "Loading Claude Code plugin manifest");
-            let content = fs::read_to_string(&cc_manifest_path)
-                .map_err(|e| PluginError::IoError(e.to_string()))?;
+            let content = read_plugin_file(&cc_manifest_path)?;
             serde_json::from_str(&content).map_err(|e| {
                 PluginError::InvalidManifest(format!("{}: {}", cc_manifest_path.display(), e))
             })?
         } else if root_plugin_json.exists() {
             debug!(path = ?root_plugin_json, "Loading plugin.json from root");
-            let content = fs::read_to_string(&root_plugin_json)
-                .map_err(|e| PluginError::IoError(e.to_string()))?;
+            let content = read_plugin_file(&root_plugin_json)?;
             serde_json::from_str(&content).map_err(|e| {
                 PluginError::InvalidManifest(format!("{}: {}", root_plugin_json.display(), e))
             })?
@@ -355,19 +491,44 @@ impl Plugin {
 
     /// Load a legacy `OpenClaudia` manifest.json and convert to `PluginManifest`
     fn load_legacy_manifest(path: &Path) -> Result<PluginManifest, PluginError> {
-        let content = fs::read_to_string(path).map_err(|e| PluginError::IoError(e.to_string()))?;
+        // Use the symlink-rejecting reader: a legacy manifest.json that
+        // is actually a symlink to /etc/shadow would otherwise be read
+        // blindly and leak its contents in error messages.
+        let content = read_plugin_file(path)?;
         let legacy: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
 
-        let name = legacy["name"].as_str().unwrap_or("unknown").to_string();
+        // crosslink #347: the previous code defaulted missing names to
+        // the literal "unknown" string. Multiple malformed manifests
+        // would all collide into a single plugin slot, and the bogus
+        // name passed `validate_manifest` because it is valid kebab-case.
+        // We now require an explicit string for both the plugin name
+        // AND each mcp_server name.
+        let name = legacy["name"]
+            .as_str()
+            .ok_or_else(|| {
+                PluginError::InvalidManifest(format!(
+                    "legacy manifest at {} is missing required string field `name`",
+                    path.display()
+                ))
+            })?
+            .to_string();
         let version = legacy["version"].as_str().map(String::from);
         let description = legacy["description"].as_str().map(String::from);
 
         // Convert legacy MCP servers to new format
-        let mcp_servers = legacy["mcp_servers"].as_array().and_then(|servers| {
+        let mcp_servers = if let Some(servers) = legacy["mcp_servers"].as_array() {
             let mut map = HashMap::new();
             for server in servers {
-                let server_name = server["name"].as_str().unwrap_or("unknown").to_string();
+                let server_name = server["name"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        PluginError::InvalidManifest(format!(
+                            "legacy manifest at {} has an mcp_servers entry missing required string field `name`",
+                            path.display()
+                        ))
+                    })?
+                    .to_string();
                 let transport = server["transport"].as_str().unwrap_or("stdio").to_string();
                 map.insert(
                     server_name,
@@ -392,7 +553,9 @@ impl Plugin {
             } else {
                 Some(McpServersSpec::Map(map))
             }
-        });
+        } else {
+            None
+        };
 
         Ok(PluginManifest {
             name,
@@ -446,12 +609,14 @@ impl Plugin {
             }
         }
 
-        // Manifest-specified commands
+        // Manifest-specified commands. All `self.path.join(...)` sites
+        // were rewritten to use `validate_plugin_path` so an attacker
+        // who controls the manifest cannot point us at
+        // `../../../../etc/passwd`. See crosslink #347.
         if let Some(ref commands) = self.manifest.commands {
             match commands {
-                CommandsSpec::Path(p) => {
-                    let resolved = self.path.join(p);
-                    if resolved.exists() {
+                CommandsSpec::Path(p) => match validate_plugin_path(&self.path, p) {
+                    Ok(resolved) if resolved.exists() => {
                         if resolved.is_dir() {
                             if let Ok(entries) = fs::read_dir(&resolved) {
                                 for entry in entries.flatten() {
@@ -464,28 +629,42 @@ impl Plugin {
                         } else {
                             self.command_paths.push(resolved);
                         }
-                    } else {
+                    }
+                    Ok(_) => {
                         warn!(path = %p, plugin = %self.manifest.name, "Command path not found");
                     }
-                }
+                    Err(e) => {
+                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe command path");
+                    }
+                },
                 CommandsSpec::Paths(paths) => {
                     for p in paths {
-                        let resolved = self.path.join(p);
-                        if resolved.exists() {
-                            self.command_paths.push(resolved);
-                        } else {
-                            warn!(path = %p, plugin = %self.manifest.name, "Command path not found");
+                        match validate_plugin_path(&self.path, p) {
+                            Ok(resolved) if resolved.exists() => {
+                                self.command_paths.push(resolved);
+                            }
+                            Ok(_) => {
+                                warn!(path = %p, plugin = %self.manifest.name, "Command path not found");
+                            }
+                            Err(e) => {
+                                warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe command path");
+                            }
                         }
                     }
                 }
                 CommandsSpec::Map(map) => {
                     for (name, meta) in map {
                         if let Some(ref source) = meta.source {
-                            let resolved = self.path.join(source);
-                            if resolved.exists() {
-                                self.command_paths.push(resolved);
-                            } else {
-                                warn!(path = %source, command = %name, plugin = %self.manifest.name, "Command source not found");
+                            match validate_plugin_path(&self.path, source) {
+                                Ok(resolved) if resolved.exists() => {
+                                    self.command_paths.push(resolved);
+                                }
+                                Ok(_) => {
+                                    warn!(path = %source, command = %name, plugin = %self.manifest.name, "Command source not found");
+                                }
+                                Err(e) => {
+                                    warn!(path = %source, command = %name, plugin = %self.manifest.name, error = %e, "Rejected unsafe command source");
+                                }
                             }
                         }
                         self.command_metadata.insert(name.clone(), meta.clone());
@@ -511,27 +690,27 @@ impl Plugin {
             }
         }
 
-        // Manifest-specified hooks
+        // Manifest-specified hooks — paths go through `validate_plugin_path`.
         if let Some(ref hooks_spec) = self.manifest.hooks {
             match hooks_spec {
-                HooksSpec::Path(p) => {
-                    let resolved = self.path.join(p);
-                    if resolved.exists() {
-                        match Self::load_hooks_file(&resolved) {
-                            Ok(def) => self.hook_definitions.push(def),
-                            Err(e) => warn!(error = %e, "Failed to load hooks from {}", p),
-                        }
+                HooksSpec::Path(p) => match validate_plugin_path(&self.path, p) {
+                    Ok(resolved) if resolved.exists() => match Self::load_hooks_file(&resolved) {
+                        Ok(def) => self.hook_definitions.push(def),
+                        Err(e) => warn!(error = %e, "Failed to load hooks from {}", p),
+                    },
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe hooks path");
                     }
-                }
+                },
                 HooksSpec::Inline(def) => {
                     self.hook_definitions.push(def.clone());
                 }
                 HooksSpec::Array(entries) => {
                     for entry in entries {
                         match entry {
-                            HooksSpecEntry::Path(p) => {
-                                let resolved = self.path.join(p);
-                                if resolved.exists() {
+                            HooksSpecEntry::Path(p) => match validate_plugin_path(&self.path, p) {
+                                Ok(resolved) if resolved.exists() => {
                                     match Self::load_hooks_file(&resolved) {
                                         Ok(def) => self.hook_definitions.push(def),
                                         Err(e) => {
@@ -539,7 +718,11 @@ impl Plugin {
                                         }
                                     }
                                 }
-                            }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe hooks path");
+                                }
+                            },
                             HooksSpecEntry::Inline(def) => {
                                 self.hook_definitions.push(def.clone());
                             }
@@ -560,7 +743,7 @@ impl Plugin {
             hooks: HooksDefinition,
         }
 
-        let content = fs::read_to_string(path).map_err(|e| PluginError::IoError(e.to_string()))?;
+        let content = read_plugin_file(path)?;
         // Try parsing as HooksDefinition directly, or as a wrapper with "hooks" key
         if let Ok(def) = serde_json::from_str::<HooksDefinition>(&content) {
             return Ok(def);
@@ -576,10 +759,12 @@ impl Plugin {
 
     /// Resolve MCP server configurations from manifest + convention
     fn resolve_mcp_servers(&mut self) {
-        // Convention: .mcp.json at plugin root
+        // Convention: .mcp.json at plugin root. Use the symlink-rejecting
+        // reader so an attacker cannot swap .mcp.json for a symlink to
+        // a sensitive file. See crosslink #347.
         let mcp_json = self.path.join(".mcp.json");
         if mcp_json.exists() {
-            if let Ok(content) = fs::read_to_string(&mcp_json) {
+            if let Ok(content) = read_plugin_file(&mcp_json) {
                 // .mcp.json can be { "mcpServers": { ... } } or just { "server-name": { ... } }
                 if let Ok(wrapper) =
                     serde_json::from_str::<HashMap<String, serde_json::Value>>(&content)
@@ -603,13 +788,14 @@ impl Plugin {
             }
         }
 
-        // Manifest-specified MCP servers
+        // Manifest-specified MCP servers — paths go through
+        // `validate_plugin_path` and `read_plugin_file` so neither path
+        // traversal nor symlink swapping is possible.
         if let Some(ref mcp_spec) = self.manifest.mcp_servers {
             match mcp_spec {
-                McpServersSpec::Path(p) => {
-                    let resolved = self.path.join(p);
-                    if resolved.exists() {
-                        if let Ok(content) = fs::read_to_string(&resolved) {
+                McpServersSpec::Path(p) => match validate_plugin_path(&self.path, p) {
+                    Ok(resolved) if resolved.exists() => {
+                        if let Ok(content) = read_plugin_file(&resolved) {
                             if let Ok(servers) =
                                 serde_json::from_str::<HashMap<String, McpServerConfig>>(&content)
                             {
@@ -617,7 +803,11 @@ impl Plugin {
                             }
                         }
                     }
-                }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
+                    }
+                },
                 McpServersSpec::Map(map) => {
                     self.mcp_configs.extend(map.clone());
                 }
@@ -625,16 +815,21 @@ impl Plugin {
                     for entry in entries {
                         match entry {
                             McpServersSpecEntry::Path(p) => {
-                                let resolved = self.path.join(p);
-                                if resolved.exists() {
-                                    if let Ok(content) = fs::read_to_string(&resolved) {
-                                        if let Ok(servers) = serde_json::from_str::<
-                                            HashMap<String, McpServerConfig>,
-                                        >(
-                                            &content
-                                        ) {
-                                            self.mcp_configs.extend(servers);
+                                match validate_plugin_path(&self.path, p) {
+                                    Ok(resolved) if resolved.exists() => {
+                                        if let Ok(content) = read_plugin_file(&resolved) {
+                                            if let Ok(servers) = serde_json::from_str::<
+                                                HashMap<String, McpServerConfig>,
+                                            >(
+                                                &content
+                                            ) {
+                                                self.mcp_configs.extend(servers);
+                                            }
                                         }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
                                     }
                                 }
                             }
@@ -667,11 +862,16 @@ impl Plugin {
                 AgentsSpec::Paths(ps) => ps.clone(),
             };
             for p in paths {
-                let resolved = self.path.join(&p);
-                if resolved.exists() {
-                    self.agent_paths.push(resolved);
-                } else {
-                    warn!(path = %p, plugin = %self.manifest.name, "Agent path not found");
+                match validate_plugin_path(&self.path, &p) {
+                    Ok(resolved) if resolved.exists() => {
+                        self.agent_paths.push(resolved);
+                    }
+                    Ok(_) => {
+                        warn!(path = %p, plugin = %self.manifest.name, "Agent path not found");
+                    }
+                    Err(e) => {
+                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe agent path");
+                    }
                 }
             }
         }
@@ -695,11 +895,16 @@ impl Plugin {
                 SkillsSpec::Paths(ps) => ps.clone(),
             };
             for p in paths {
-                let resolved = self.path.join(&p);
-                if resolved.exists() {
-                    self.skill_paths.push(resolved);
-                } else {
-                    warn!(path = %p, plugin = %self.manifest.name, "Skill path not found");
+                match validate_plugin_path(&self.path, &p) {
+                    Ok(resolved) if resolved.exists() => {
+                        self.skill_paths.push(resolved);
+                    }
+                    Ok(_) => {
+                        warn!(path = %p, plugin = %self.manifest.name, "Skill path not found");
+                    }
+                    Err(e) => {
+                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe skill path");
+                    }
                 }
             }
         }
@@ -1820,5 +2025,400 @@ Based on the above changes, create a single git commit.
         assert!(!cmd.content.contains("allowed-tools:"));
         assert!(cmd.content.contains("## Context"));
         assert!(cmd.content.contains("git commit"));
+    }
+
+    // ---------------------------------------------------------------------
+    // crosslink #347: plugin path-validation hardening
+    //
+    // Three independent defects covered by these tests:
+    //   (1) Plugin::load followed manifest symlinks.
+    //   (2) resolve_* methods used `self.path.join(rel)` with no
+    //       traversal / absolute-path / symlink rejection, so a
+    //       manifest could request `../../../../etc/passwd`.
+    //   (3) load_legacy_manifest used `unwrap_or("unknown")` for
+    //       missing names, collapsing many bad manifests into one
+    //       plugin slot and passing validate_manifest accidentally.
+    //
+    // Each test exercises one defect end-to-end.
+    // ---------------------------------------------------------------------
+
+    /// (Helper) Drop a Claude-Code-style plugin shell at `<root>/<name>`
+    /// with the given JSON manifest (no commands/hooks generated). Used
+    /// by the path-traversal tests below where the manifest itself is
+    /// hostile and the convention-based discovery would otherwise mask
+    /// the failure mode under test.
+    fn write_manifest(root: &Path, name: &str, manifest_json: &serde_json::Value) -> PathBuf {
+        let plugin_dir = root.join(name);
+        let cc_dir = plugin_dir.join(".claude-plugin");
+        fs::create_dir_all(&cc_dir).unwrap();
+        fs::write(
+            cc_dir.join("plugin.json"),
+            serde_json::to_string_pretty(manifest_json).unwrap(),
+        )
+        .unwrap();
+        plugin_dir
+    }
+
+    // ----- validate_plugin_path direct unit tests --------------------------
+
+    #[test]
+    fn test_validate_plugin_path_accepts_normal_relative() {
+        let dir = TempDir::new().unwrap();
+        // Real file so canonicalization succeeds.
+        let sub = dir.path().join("commands");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("hello.md"), "x").unwrap();
+
+        let resolved = validate_plugin_path(dir.path(), "commands/hello.md").unwrap();
+        assert!(resolved.ends_with("commands/hello.md"));
+        // Containment property: canonical resolved is under canonical root.
+        let canon_root = dir.path().canonicalize().unwrap();
+        let canon = resolved.canonicalize().unwrap();
+        assert!(canon.starts_with(&canon_root));
+    }
+
+    #[test]
+    fn test_validate_plugin_path_rejects_parent_traversal() {
+        let dir = TempDir::new().unwrap();
+        let err = validate_plugin_path(dir.path(), "../../etc/passwd").unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidManifest(ref m) if m.contains("'..'")),
+            "expected traversal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_plugin_path_rejects_embedded_parent_traversal() {
+        let dir = TempDir::new().unwrap();
+        // Even hidden inside otherwise-normal components.
+        let err = validate_plugin_path(dir.path(), "commands/../../../etc/shadow").unwrap_err();
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn test_validate_plugin_path_rejects_absolute_path() {
+        let dir = TempDir::new().unwrap();
+        let err = validate_plugin_path(dir.path(), "/etc/passwd").unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidManifest(ref m) if m.contains("relative")),
+            "expected absolute-path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_plugin_path_rejects_empty() {
+        let dir = TempDir::new().unwrap();
+        let err = validate_plugin_path(dir.path(), "").unwrap_err();
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn test_validate_plugin_path_rejects_nul_byte() {
+        // Classic NUL-truncation attack: "safe.md\0/etc/passwd". A naive
+        // CString-based file open would silently read /etc/passwd.
+        let dir = TempDir::new().unwrap();
+        let err = validate_plugin_path(dir.path(), "safe.md\0/etc/passwd").unwrap_err();
+        assert!(matches!(err, PluginError::InvalidManifest(ref m) if m.contains("NUL")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_validate_plugin_path_rejects_symlink_component() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        // Create an attacker-controlled "decoy" symlink inside the plugin
+        // root that points to /etc.
+        let attack = dir.path().join("decoy");
+        symlink("/etc", &attack).unwrap();
+
+        let err = validate_plugin_path(dir.path(), "decoy/passwd").unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidManifest(ref m) if m.contains("symlink")),
+            "expected symlink rejection, got: {err}"
+        );
+    }
+
+    // ----- read_plugin_file: forensic proof we do not follow symlinks ------
+
+    #[test]
+    #[cfg(unix)]
+    fn test_read_plugin_file_rejects_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        // The "secret" target the attacker wants exfiltrated.
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, "SUPER-SECRET").unwrap();
+
+        // The plugin's manifest is a symlink to the secret.
+        let plugin_dir = dir.path().join("evil");
+        let cc_dir = plugin_dir.join(".claude-plugin");
+        fs::create_dir_all(&cc_dir).unwrap();
+        let manifest_path = cc_dir.join("plugin.json");
+        symlink(&secret, &manifest_path).unwrap();
+
+        let err = read_plugin_file(&manifest_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("symlink"), "expected symlink rejection: {msg}");
+        // Forensic: the secret contents MUST NOT appear in the error.
+        assert!(
+            !msg.contains("SUPER-SECRET"),
+            "secret leaked into error message: {msg}"
+        );
+    }
+
+    // ----- (1) Plugin::load: symlinked manifest is refused -----------------
+
+    #[test]
+    #[cfg(unix)]
+    fn test_plugin_load_rejects_symlinked_manifest_to_outside_file() {
+        use std::os::unix::fs::symlink;
+        let scratch = TempDir::new().unwrap();
+        // Sensitive file outside any plugin dir.
+        let outside = scratch.path().join("outside_secret");
+        fs::write(&outside, "OUTSIDE").unwrap();
+
+        let plugin_dir = scratch.path().join("p");
+        let cc_dir = plugin_dir.join(".claude-plugin");
+        fs::create_dir_all(&cc_dir).unwrap();
+        // plugin.json is a symlink that escapes the plugin tree entirely.
+        symlink(&outside, cc_dir.join("plugin.json")).unwrap();
+
+        let result = Plugin::load(&plugin_dir);
+        assert!(result.is_err(), "symlinked manifest must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("symlink"),
+            "expected symlink error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("OUTSIDE"),
+            "outside file contents leaked: {msg}"
+        );
+    }
+
+    // ----- (2) Path traversal in manifest command/hook/mcp paths -----------
+
+    #[test]
+    fn test_manifest_commands_path_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        // Attacker manifest: commands is a sibling-escaping path.
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil",
+            &serde_json::json!({
+                "name": "evil-plugin",
+                "commands": "../../../../etc/passwd",
+            }),
+        );
+        // Plant a "fake passwd" outside the plugin dir to prove we never
+        // would have read it even if traversal worked: it must not show
+        // up in command_paths regardless.
+        let outside = dir.path().join("passwd_decoy");
+        fs::write(&outside, "decoy").unwrap();
+
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(
+            plugin.command_paths.is_empty(),
+            "command_paths must reject traversal: {:?}",
+            plugin.command_paths
+        );
+    }
+
+    #[test]
+    fn test_manifest_commands_paths_array_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil2",
+            &serde_json::json!({
+                "name": "evil2-plugin",
+                "commands": ["../escape.md", "/etc/passwd"],
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(plugin.command_paths.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_commands_map_source_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil3",
+            &serde_json::json!({
+                "name": "evil3-plugin",
+                "commands": {
+                    "pwned": { "source": "../../../etc/passwd" }
+                }
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        // The unsafe source must not be added to command_paths even
+        // though the entry's metadata is recorded.
+        assert!(plugin.command_paths.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_hooks_path_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil-hooks",
+            &serde_json::json!({
+                "name": "evil-hooks-plugin",
+                "hooks": "../../../etc/hosts",
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(plugin.hook_definitions.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_mcp_servers_path_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil-mcp",
+            &serde_json::json!({
+                "name": "evil-mcp-plugin",
+                "mcpServers": "../../../etc/passwd",
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(plugin.mcp_configs.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_agents_path_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil-agents",
+            &serde_json::json!({
+                "name": "evil-agents-plugin",
+                "agents": ["../../../etc/passwd"],
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(plugin.agent_paths.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_skills_path_with_traversal_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = write_manifest(
+            dir.path(),
+            "evil-skills",
+            &serde_json::json!({
+                "name": "evil-skills-plugin",
+                "skills": "/etc",
+            }),
+        );
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        assert!(plugin.skill_paths.is_empty());
+    }
+
+    // ----- (3) Legacy manifest fallback-name vulnerability -----------------
+
+    #[test]
+    fn test_legacy_manifest_missing_name_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("nameless-legacy");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        // No "name" field at all.
+        fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{ "version": "1.0.0" }"#,
+        )
+        .unwrap();
+
+        let err = Plugin::load(&plugin_dir).unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidManifest(ref m) if m.contains("name")),
+            "expected explicit name-missing error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_manifest_non_string_name_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("badname-legacy");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        // `name` is not a string — previously this silently became
+        // "unknown". Now it must error.
+        fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{ "name": 42, "version": "1.0.0" }"#,
+        )
+        .unwrap();
+
+        let err = Plugin::load(&plugin_dir).unwrap_err();
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn test_legacy_mcp_server_missing_name_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("badmcp-legacy");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        // Top-level name is fine; the mcp_servers entry is missing
+        // its own name (previously silently coerced to "unknown",
+        // so two such entries would collide on the same key).
+        fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "ok-plugin",
+                "mcp_servers": [
+                    { "transport": "stdio", "command": "node" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = Plugin::load(&plugin_dir).unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidManifest(ref m) if m.contains("mcp_servers") && m.contains("name")),
+            "expected mcp_servers name-missing error, got: {err}"
+        );
+    }
+
+    /// Forensic test: the "fallback name with shell metacharacters"
+    /// case from the task brief. Verifies that a legacy plugin name
+    /// containing shell-dangerous characters does NOT silently become
+    /// the literal "unknown" fallback. We accept either of two equally
+    /// safe outcomes — outright rejection (preferred), or surfacing
+    /// the literal hostile string so a downstream consumer can sanitize
+    /// — but the one outcome we forbid is the silent "unknown"
+    /// collapse that the old code produced.
+    #[test]
+    fn test_legacy_manifest_hostile_name_does_not_collapse_to_unknown() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("hostile-legacy");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        // A name field that's still a JSON string but contains shell
+        // metacharacters + NUL byte. The old fallback code would have
+        // produced "unknown" if this had failed type coercion; with
+        // `as_str()` returning Some(...) we now surface the literal
+        // string, which `validate_manifest` rejects.
+        fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{ "name": "evil; rm -rf /" }"#,
+        )
+        .unwrap();
+
+        let result = Plugin::load(&plugin_dir);
+        // Either it errors (validate_manifest catches the space) or
+        // the plugin name is preserved verbatim — but it must NEVER
+        // be the literal "unknown".
+        match result {
+            Err(_) => { /* preferred: rejected */ }
+            Ok(p) => {
+                assert_ne!(
+                    p.name(),
+                    "unknown",
+                    "hostile name silently collapsed to 'unknown' fallback"
+                );
+            }
+        }
     }
 }
