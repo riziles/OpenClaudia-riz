@@ -3008,6 +3008,7 @@ mod vdd_tests {
             },
             guardrails: openclaudia::config::GuardrailsConfig::default(),
             permissions: openclaudia::config::PermissionsConfig::default(),
+            memory: openclaudia::config::MemoryConfig::default(),
             managed_settings_path: None,
         }
     }

@@ -214,6 +214,31 @@ impl TaskManager {
             None => None,
         };
 
+        // If setting to InProgress, enforce blocked_by: every blocker must be
+        // Completed. Pending or InProgress blockers reject the transition.
+        // Crosslink #593.
+        if new_status == Some(TaskStatus::InProgress) {
+            let blockers: Vec<String> = self
+                .get_task(task_id)
+                .map(|t| t.blocked_by.clone())
+                .unwrap_or_default();
+            for blocker_id in &blockers {
+                match self.get_task(blocker_id).map(|t| &t.status) {
+                    Some(TaskStatus::Completed) => {}
+                    Some(status) => {
+                        return Err(format!(
+                            "Task '{task_id}' cannot transition to in_progress: blocker '{blocker_id}' is {status}"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "Task '{task_id}' references nonexistent blocker '{blocker_id}'"
+                        ));
+                    }
+                }
+            }
+        }
+
         // If setting to InProgress, demote any currently in-progress task
         if new_status == Some(TaskStatus::InProgress) {
             for task in &mut self.tasks {
@@ -758,6 +783,163 @@ mod tests {
             t2.blocked_by.contains(&"task-1".to_string()),
             "task-2.blocked_by must contain task-1 after add_blocks"
         );
+    }
+
+    // ── crosslink #593: blocked_by enforcement on InProgress transition ─────
+
+    /// #593 — A task with empty `blocked_by` can always transition to `InProgress`.
+    #[test]
+    fn issue_593_empty_blocked_by_allows_in_progress() {
+        let mut tm = TaskManager::new();
+        tm.create_task("Solo".to_string(), "d".to_string(), None);
+        let res = tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_ok(), "empty blocked_by must allow InProgress");
+        assert_eq!(
+            tm.get_task("task-1").unwrap().status,
+            TaskStatus::InProgress
+        );
+    }
+
+    /// #593 — All blockers Completed → `InProgress` transition succeeds.
+    #[test]
+    fn issue_593_all_blockers_completed_allows_in_progress() {
+        let mut tm = TaskManager::new();
+        tm.create_task("A".to_string(), "d".to_string(), None);
+        tm.create_task("B".to_string(), "d".to_string(), None);
+        tm.create_task("C".to_string(), "d".to_string(), None);
+
+        // task-3 is blocked by task-1 and task-2
+        tm.update_task(
+            "task-3",
+            TaskUpdateParams {
+                add_blocked_by: Some(vec!["task-1".to_string(), "task-2".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Complete both blockers
+        tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // task-3 should now be allowed to transition
+        let res = tm.update_task(
+            "task-3",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        );
+        assert!(
+            res.is_ok(),
+            "all-Completed blockers must allow InProgress, got: {res:?}"
+        );
+        assert_eq!(
+            tm.get_task("task-3").unwrap().status,
+            TaskStatus::InProgress
+        );
+    }
+
+    /// #593 — A Pending blocker rejects the `InProgress` transition with a
+    /// clear error message naming the blocker.
+    #[test]
+    fn issue_593_pending_blocker_rejects_in_progress() {
+        let mut tm = TaskManager::new();
+        tm.create_task("Setup".to_string(), "d".to_string(), None);
+        tm.create_task("Build".to_string(), "d".to_string(), None);
+
+        // task-2 blocked by task-1 (Pending by default)
+        tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                add_blocked_by: Some(vec!["task-1".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let res = tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_err(), "Pending blocker must reject InProgress");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("task-1") && msg.contains("pending"),
+            "error must name blocker and its status, got: {msg}"
+        );
+        // Status must not have changed.
+        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
+    }
+
+    /// #593 — An `InProgress` blocker rejects the transition.
+    #[test]
+    fn issue_593_in_progress_blocker_rejects_in_progress() {
+        let mut tm = TaskManager::new();
+        tm.create_task("Setup".to_string(), "d".to_string(), None);
+        tm.create_task("Build".to_string(), "d".to_string(), None);
+
+        // task-2 blocked by task-1
+        tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                add_blocked_by: Some(vec!["task-1".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // task-1 is now InProgress (single-in-progress rule still holds)
+        tm.update_task(
+            "task-1",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let res = tm.update_task(
+            "task-2",
+            TaskUpdateParams {
+                status: Some(TaskUpdateStatus::InProgress),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_err(), "InProgress blocker must reject InProgress");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("task-1") && msg.contains("in_progress"),
+            "error must name blocker and its in_progress status, got: {msg}"
+        );
+        // task-1 must remain InProgress (rejection happens before demote pass).
+        assert_eq!(
+            tm.get_task("task-1").unwrap().status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(tm.get_task("task-2").unwrap().status, TaskStatus::Pending);
     }
 
     /// Spec — `format_task_detail` contains all key fields.

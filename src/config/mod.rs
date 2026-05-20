@@ -9,6 +9,7 @@
 mod guardrails;
 mod hooks;
 mod keybindings;
+mod memory;
 mod path_validation;
 mod permissions;
 mod provider;
@@ -25,6 +26,7 @@ pub use keybindings::{
     parse_chord, ChordResolveResult, KeyAction, KeyContext, KeybindingResolver, KeybindingsConfig,
     ParsedKeystroke,
 };
+pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
 pub use permissions::PermissionsConfig;
 pub use provider::{ProviderConfig, ThinkingConfig};
@@ -61,6 +63,10 @@ pub struct AppConfig {
     pub guardrails: GuardrailsConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    /// Memory subsystem configuration (per-user + optional shared team store).
+    /// See crosslink #604 for the team-memory parity work.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Path to enterprise managed settings file, if one was loaded.
     /// Managed settings override all user and project settings.
     #[serde(skip)]
@@ -301,6 +307,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
             managed_settings_path: None,
         };
 
@@ -345,6 +352,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
             managed_settings_path: None,
         };
 
@@ -367,6 +375,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
             managed_settings_path: None,
         };
 
@@ -390,6 +399,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
             managed_settings_path: managed,
         }
     }

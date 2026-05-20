@@ -556,6 +556,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: crate::config::GuardrailsConfig::default(),
             permissions: crate::config::PermissionsConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
             managed_settings_path: None,
         }
     }

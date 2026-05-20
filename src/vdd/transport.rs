@@ -330,6 +330,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
             managed_settings_path: None,
         }
     }

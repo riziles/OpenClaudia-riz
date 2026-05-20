@@ -2565,8 +2565,8 @@ mod tests {
     fn issue719_app_config() -> AppConfig {
         use crate::config::ThinkingConfig;
         use crate::config::{
-            GuardrailsConfig, HooksConfig, KeybindingsConfig, PermissionsConfig, ProviderConfig,
-            ProxyConfig, SessionConfig, VddConfig,
+            GuardrailsConfig, HooksConfig, KeybindingsConfig, MemoryConfig, PermissionsConfig,
+            ProviderConfig, ProxyConfig, SessionConfig, VddConfig,
         };
 
         let mut providers = HashMap::new();
@@ -2591,6 +2591,7 @@ mod tests {
             vdd: VddConfig::default(),
             guardrails: GuardrailsConfig::default(),
             permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
             managed_settings_path: None,
         }
     }

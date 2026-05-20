@@ -40,6 +40,7 @@ pub mod skills;
 pub mod slash_commands;
 pub mod state;
 pub mod subagent;
+pub mod team_memory;
 pub mod thinking;
 pub mod tool_intercept;
 pub mod tools;
