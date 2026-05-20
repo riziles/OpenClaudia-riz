@@ -6,6 +6,7 @@
 //! 3. `~/.openclaudia/config.yaml` in home directory
 //! 4. Environment variables with `OPENCLAUDIA_` prefix
 
+mod acp;
 mod guardrails;
 mod hooks;
 mod keybindings;
@@ -17,6 +18,7 @@ mod proxy;
 mod session;
 mod vdd;
 
+pub use acp::AcpConfig;
 pub use guardrails::{
     BlastRadiusConfig, DiffMonitorConfig, GuardrailAction, GuardrailMode, GuardrailsConfig,
     QualityCheck, QualityGatesConfig, RunAfter,

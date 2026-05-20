@@ -494,7 +494,17 @@ impl App {
     fn persist_transcript_tail(&mut self) {
         let cwd = self.transcript_cwd.clone();
         let session_id = self.chat_session.id.clone();
-        for msg in &self.session_messages[self.transcript_watermark..] {
+        // crosslink #709: track ONLY the entries that were actually
+        // persisted. The previous implementation unconditionally jumped
+        // the watermark to `session_messages.len()` after an early break,
+        // which silently dropped every message past the failure point
+        // from the transcript permanently (the next call would skip them
+        // entirely). Advance by the appended count so retried calls
+        // resume exactly where the failure occurred.
+        let start = self.transcript_watermark;
+        let total = self.session_messages.len();
+        let mut appended: usize = 0;
+        for msg in &self.session_messages[start..] {
             let kind = msg
                 .get("role")
                 .and_then(|r| r.as_str())
@@ -502,12 +512,21 @@ impl App {
                 .to_string();
             let entry =
                 crate::transcript::envelope_for(&kind, &cwd, &session_id, Some(msg.clone()));
-            if let Err(err) = crate::transcript::append_entry(&cwd, &session_id, &entry) {
-                tracing::warn!(error = %err, "transcript append failed");
-                break;
+            match crate::transcript::append_entry(&cwd, &session_id, &entry) {
+                Ok(()) => appended += 1,
+                Err(err) => {
+                    let remaining = total - start - appended;
+                    tracing::warn!(
+                        error = %err,
+                        appended,
+                        remaining,
+                        "transcript append failed; watermark advanced only over persisted entries"
+                    );
+                    break;
+                }
             }
         }
-        self.transcript_watermark = self.session_messages.len();
+        self.transcript_watermark = start + appended;
     }
 
     /// Set the API connection details needed to make requests.
@@ -2208,5 +2227,107 @@ mod tests {
         // Stress: 1 000 '@' characters in a row must not panic or overflow.
         let input = "@".repeat(1_000);
         let _ = expand_file_refs(&input);
+    }
+
+    // =========================================================================
+    // Behavior: persist_transcript_tail watermark — crosslink #709
+    // =========================================================================
+
+    /// Drop guard restoring `CLAUDE_CONFIG_HOME_DIR` to its previous
+    /// value (or unsetting it) when the scope exits, even on panic.
+    /// Holds the crate-wide [`crate::transcript::env_lock`] for the
+    /// guard's lifetime so concurrent tests in other modules that
+    /// mutate the same env var cannot observe a half-mutated state.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+        // Field exists to hold the lock for the EnvGuard's lifetime.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &std::path::Path) -> Self {
+            let lock = crate::transcript::env_lock();
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn persist_transcript_tail_advances_watermark_to_len_on_success() {
+        // Happy path: every queued message persists successfully, so the
+        // watermark moves all the way to session_messages.len(). The
+        // transcript writes land under `CLAUDE_CONFIG_HOME_DIR/projects/...`
+        // which we redirect into a tempdir so the test can't pollute
+        // the user's real `~/.claude/projects/` tree.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+
+        let mut app = App::new("test-model", "test-provider");
+        app.transcript_cwd = tmp.path().to_path_buf();
+        app.session_messages = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+        ];
+        app.transcript_watermark = 0;
+
+        app.persist_transcript_tail();
+
+        assert_eq!(
+            app.transcript_watermark,
+            3,
+            "watermark advances to len when every append succeeds"
+        );
+    }
+
+    #[test]
+    fn persist_transcript_tail_only_advances_for_persisted_entries_on_failure() {
+        // crosslink #709 regression: when `append_entry` fails, the
+        // watermark must NOT jump to session_messages.len() (which would
+        // permanently drop the un-persisted tail). Instead it must
+        // advance only by the count actually written.
+        //
+        // Failure is injected by placing a regular FILE at the path
+        // `create_dir_all` would otherwise create as a directory
+        // (`<CLAUDE_CONFIG_HOME_DIR>/projects/`). `create_dir_all`
+        // then errors with "Not a directory" on every append, so zero
+        // entries persist and the watermark must stay at 0 (the bug
+        // jumped it straight to 3).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("projects"), b"not a directory")
+            .expect("write blocker file");
+        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+
+        let mut app = App::new("test-model", "test-provider");
+        app.transcript_cwd = tmp.path().to_path_buf();
+        app.session_messages = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+        ];
+        app.transcript_watermark = 0;
+
+        app.persist_transcript_tail();
+
+        assert_eq!(
+            app.transcript_watermark, 0,
+            "watermark must NOT advance past entries that failed to persist (was: {})",
+            app.transcript_watermark
+        );
     }
 }

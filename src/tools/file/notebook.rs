@@ -320,11 +320,20 @@ fn resolve_locator(parsed: &ParsedArgs, cells: &[Value]) -> Result<Locator, Tool
     Ok(Locator { index, target_desc })
 }
 
-/// Replace-mode dispatch. `cell_id` or `cell_number` is required; index
-/// must be in range (`index == len` is rejected, NOT silently promoted to
-/// insert — see test `notebook_replace_out_of_bounds_returns_error_not_insert`).
+/// Replace-mode dispatch. `cell_id` or `cell_number` is required.
+///
+/// Bounds policy: a request at `index == cells.len()` is promoted to an
+/// append-at-end insert (CC parity, crosslink #704). Promotion requires
+/// `cell_type` because the new cell needs a kind. Indices strictly past
+/// the end still error.
+///
+/// Code-cell side-effects: when the resulting cell is a code cell, the
+/// stale `outputs` array and `execution_count` from the previous source
+/// are reset to `[]` and `null` respectively (crosslink #702). The old
+/// values describe code that no longer exists; preserving them produces
+/// a notebook whose displayed output is from source that's been replaced.
 fn apply_replace(
-    cells: &mut [Value],
+    cells: &mut Vec<Value>,
     locator: &Locator,
     parsed: &ParsedArgs,
 ) -> Result<EditOutcome, ToolFailure> {
@@ -334,7 +343,25 @@ fn apply_replace(
             true,
         )
     })?;
-    if index >= cells.len() {
+    // crosslink #704: index == cells.len() (one past the end) is promoted
+    // to insert-at-end — matches CC's silent promotion. Requires cell_type
+    // because the new cell needs a kind.
+    if index == cells.len() {
+        if parsed.cell_type.is_none() {
+            return Err((
+                format!(
+                    "Cell {} is out of bounds for replace. Notebook has {} cells. \
+                     To append a new cell at the end via replace, pass 'cell_type' \
+                     (the request is promoted to insert).",
+                    locator.target_desc,
+                    cells.len(),
+                ),
+                true,
+            ));
+        }
+        return apply_insert(cells, locator, parsed);
+    }
+    if index > cells.len() {
         return Err((
             format!(
                 "Cell {} is out of bounds. Notebook has {} cells (valid range: 0-{}).",
@@ -346,30 +373,39 @@ fn apply_replace(
         ));
     }
     cells[index]["source"] = source_to_line_array(&parsed.new_source);
+    // Resolve the effective cell type for this replace: an explicit
+    // `cell_type` override takes precedence, otherwise we read the kind
+    // already attached to the cell (defaulting to code for cells that
+    // somehow lack a type, since the code-cell side-effects are the
+    // strictest and the safest default).
+    let effective_ct = parsed.cell_type.unwrap_or_else(|| {
+        cells[index]
+            .get("cell_type")
+            .and_then(Value::as_str)
+            .map_or(CellType::Code, |s| match s {
+                "markdown" => CellType::Markdown,
+                "raw" => CellType::Raw,
+                _ => CellType::Code,
+            })
+    });
     if let Some(ct) = parsed.cell_type {
-        // crosslink #985: when the caller switches a cell's type, normalise
-        // the type-specific fields so the resulting notebook satisfies
-        // nbformat. Markdown / raw cells must NOT carry code-only fields
-        // (`outputs`, `execution_count`); code cells MUST carry both, even
-        // when empty. Without this, switching a code cell to markdown
-        // leaves stale `outputs: [...]` data in the JSON — which Jupyter
-        // either rejects or renders incorrectly.
         cells[index]["cell_type"] = json!(ct.as_str());
-        let cell_obj = &mut cells[index];
-        match ct {
-            CellType::Code => {
-                if !cell_obj.get("outputs").is_some_and(Value::is_array) {
-                    cell_obj["outputs"] = json!([]);
-                }
-                if cell_obj.get("execution_count").is_none() {
-                    cell_obj["execution_count"] = Value::Null;
-                }
-            }
-            CellType::Markdown | CellType::Raw => {
-                if let Some(obj) = cell_obj.as_object_mut() {
-                    obj.remove("outputs");
-                    obj.remove("execution_count");
-                }
+    }
+    // crosslink #985 + #702: normalise the type-specific fields so the
+    // notebook satisfies nbformat. Markdown / raw cells must NOT carry
+    // code-only fields. Code cells MUST carry both, AND the previous
+    // execution state is dropped — the source has changed, so the old
+    // outputs and execution_count are stale by definition.
+    let cell_obj = &mut cells[index];
+    match effective_ct {
+        CellType::Code => {
+            cell_obj["outputs"] = json!([]);
+            cell_obj["execution_count"] = Value::Null;
+        }
+        CellType::Markdown | CellType::Raw => {
+            if let Some(obj) = cell_obj.as_object_mut() {
+                obj.remove("outputs");
+                obj.remove("execution_count");
             }
         }
     }
@@ -782,10 +818,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn notebook_replace_out_of_bounds_returns_error_not_insert() {
-        // Behavior 7 edge: index == cells.len() in OC returns out-of-bounds error.
-        // CC silently promotes to insert (line 372-376 of CC source).
-        // Pinned as current OC behavior.
+    fn notebook_replace_at_len_without_cell_type_errors() {
+        // crosslink #704: index == cells.len() is now promoted to an
+        // append-at-end insert (CC parity), but the promotion requires
+        // `cell_type` because the new cell needs a kind. Without it the
+        // tool returns an error pointing at the missing field — the file
+        // must NOT be mutated.
         let nb = make_notebook(&json!([
             {"cell_type": "code", "source": "only", "metadata": {}, "outputs": [], "execution_count": null}
         ]));
@@ -795,12 +833,47 @@ mod tests {
         let (msg, is_err) = execute_notebook_edit(&args);
         assert!(
             is_err,
-            "out-of-bounds replace must error in OC (CC parity gap — CC promotes to insert): {msg}"
+            "replace at index == len without cell_type must error: {msg}"
         );
-        assert!(msg.contains("out of bounds"), "message: {msg}");
+        assert!(
+            msg.contains("cell_type"),
+            "message should mention the missing cell_type: {msg}"
+        );
         // File must be unchanged
         let cells = read_cells(&path);
         assert_eq!(cells.len(), 1, "cell count unchanged");
+    }
+
+    #[test]
+    fn notebook_replace_at_len_with_cell_type_appends() {
+        // crosslink #704: index == cells.len() with cell_type silently
+        // promotes to an insert-at-end (CC parity).
+        let nb = make_notebook(&json!([
+            {"cell_type": "code", "source": "only", "metadata": {}, "outputs": [], "execution_count": null}
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+        let mut args = args_replace_by_number(&path, 1, "appended via replace");
+        args.insert("cell_type".to_string(), json!("markdown"));
+        let (msg, is_err) = execute_notebook_edit(&args);
+        assert!(!is_err, "replace at len with cell_type must succeed: {msg}");
+        let cells = read_cells(&path);
+        assert_eq!(cells.len(), 2, "cell appended at end");
+        assert_eq!(cells[1]["cell_type"], json!("markdown"));
+    }
+
+    #[test]
+    fn notebook_replace_strictly_past_end_still_errors() {
+        // index > cells.len() (strictly past one-past-end) remains a hard
+        // out-of-bounds error — only the exact `len()` promotes.
+        let nb = make_notebook(&json!([
+            {"cell_type": "code", "source": "only", "metadata": {}, "outputs": [], "execution_count": null}
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+        let mut args = args_replace_by_number(&path, 5, "way past");
+        args.insert("cell_type".to_string(), json!("code"));
+        let (msg, is_err) = execute_notebook_edit(&args);
+        assert!(is_err, "replace strictly past end must still error: {msg}");
+        assert!(msg.contains("out of bounds"), "message: {msg}");
     }
 
     // =========================================================================
@@ -808,10 +881,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn notebook_replace_code_cell_does_not_reset_outputs() {
-        // Behavior 7 edge (GAP): CC resets execution_count=null and outputs=[]
-        // on code-cell replace (CC source line 420-423). OC does NOT reset them.
-        // Pinned as current OC behavior; gap noted in #525 spec.
+    fn notebook_replace_code_cell_resets_execution_count_and_outputs() {
+        // crosslink #702: a code-cell source replace MUST clear the stale
+        // `outputs` array and reset `execution_count` to null. The old
+        // outputs describe code that no longer exists; preserving them
+        // produces a notebook whose displayed output is from source that's
+        // been overwritten.
         let nb = make_notebook(&json!([
             {
                 "id": "cell-x",
@@ -827,17 +902,42 @@ mod tests {
         let (msg, is_err) = execute_notebook_edit(&args);
         assert!(!is_err, "replace must succeed: {msg}");
         let cells = read_cells(&path);
-        // OC: execution_count and outputs are preserved (not reset to null/[])
-        // CC parity: CC would reset both. Pinned as current OC behavior.
+        assert_eq!(
+            cells[0]["outputs"],
+            json!([]),
+            "code-cell replace clears stale outputs"
+        );
+        assert_eq!(
+            cells[0]["execution_count"],
+            Value::Null,
+            "code-cell replace resets execution_count to null"
+        );
+    }
+
+    #[test]
+    fn notebook_replace_markdown_cell_does_not_grow_outputs() {
+        // Companion to #702: replacing a markdown cell must NOT grow
+        // an `outputs` array (markdown cells don't carry one in nbformat).
+        let nb = make_notebook(&json!([
+            {
+                "id": "md",
+                "cell_type": "markdown",
+                "source": "# hi",
+                "metadata": {}
+            }
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+        let args = args_replace_by_id(&path, "md", "# bye");
+        let (msg, is_err) = execute_notebook_edit(&args);
+        assert!(!is_err, "markdown replace must succeed: {msg}");
+        let cells = read_cells(&path);
         assert!(
-            !cells[0]["outputs"]
-                .as_array()
-                .is_none_or(std::vec::Vec::is_empty),
-            "OC does NOT clear outputs on replace (CC parity gap — CC clears them)"
+            cells[0].get("outputs").is_none(),
+            "markdown cell must not carry an outputs field"
         );
         assert!(
-            cells[0]["execution_count"] != Value::Null,
-            "OC does NOT reset execution_count on replace (CC parity gap)"
+            cells[0].get("execution_count").is_none(),
+            "markdown cell must not carry an execution_count field"
         );
     }
 

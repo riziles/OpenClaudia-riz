@@ -379,24 +379,28 @@ pub fn find_transcript_by_id(session_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Serialize every test (across modules) that touches the shared
+/// `CLAUDE_CONFIG_HOME_DIR` env var. Cargo's default parallel test
+/// runner otherwise races between tests that point the var at
+/// different `TempDir`s, producing flaky path / `list_transcripts`
+/// assertions. Crosslink #709 promoted this lock to crate-visible so
+/// the TUI `persist_transcript_tail` tests can share the same gate as
+/// the transcript module's own tests rather than ship a second mutex
+/// for the same global.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
-
-    /// Serialize every test in this module that touches the shared
-    /// `CLAUDE_CONFIG_HOME_DIR` env var. Without this, cargo's default
-    /// parallel test runner races between tests that point the var at
-    /// different `TempDir`s, causing flaky `list_transcripts` / path
-    /// sanitization assertions.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     struct EnvGuard {
         key: &'static str,

@@ -834,7 +834,13 @@ impl AcpServer {
             }
         };
         let client = reqwest::Client::new();
-        let max_iterations = 50; // Safety limit
+        // crosslink #717: the iteration ceiling is now resolved from
+        // `AcpConfig` (default 50, matches the previous hard-coded
+        // value). Operators raising the cap to support long-horizon
+        // agents no longer need to recompile — set it via the
+        // `acp.max_iterations` YAML key or the
+        // `OPENCLAUDIA_ACP_MAX_ITERATIONS` env var.
+        let max_iterations = crate::config::AcpConfig::load().max_iterations;
 
         for iteration in 0..max_iterations {
             if self.cancel_flag.load(Ordering::SeqCst) {
@@ -855,7 +861,22 @@ impl AcpServer {
             } else {
                 Some(rules_content.as_str())
             };
-            let system_prompt = crate::prompt::build_system_prompt(None, rules_arg, None);
+            // crosslink #717: pass the working directory through so the
+            // ACP-served prompt names the same cwd block the proxy path
+            // injects. Skipping this dropped the `current working dir`
+            // hint from every ACP turn — tools that resolve relative
+            // paths inherited a different mental model than the model
+            // was given. Best-effort: a failed `current_dir` call simply
+            // omits the block (matches the proxy-path behaviour).
+            let cwd_string = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let system_prompt = crate::prompt::build_system_prompt_with_cwd(
+                None,
+                rules_arg,
+                None,
+                cwd_string.as_deref(),
+            );
 
             // Prepend system prompt to messages
             let mut all_messages: Vec<crate::proxy::ChatMessage> =
