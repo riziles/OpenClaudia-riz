@@ -171,24 +171,36 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
         return (format!("Failed to read file '{path}': {e}"), true);
     }
 
-    if !content.contains(old_string) {
-        return (
-            format!(
-                "Could not find the specified text in '{path}'. Make sure old_string matches exactly."
-            ),
-            true,
-        );
-    }
-
-    let count = content.matches(old_string).count();
-    if count > 1 && !replace_all {
-        return (
-            format!(
-                "Found {count} occurrences of the text. Please provide a more specific old_string that matches uniquely, or set replace_all: true to replace every occurrence."
-            ),
-            true,
-        );
-    }
+    // crosslink #470: single-pass dedup. The previous implementation walked
+    // `content` three times (`contains` → `matches().count()` → `replace`/
+    // `replacen`). On a 100 KB haystack that is three full scans for every
+    // edit. Collect the match offsets once and branch on the slice shape; the
+    // downstream replace still does one pass but the bookkeeping is free.
+    let match_offsets: Vec<usize> = content
+        .match_indices(old_string)
+        .map(|(idx, _)| idx)
+        .collect();
+    let count = match match_offsets.as_slice() {
+        [] => {
+            return (
+                format!(
+                    "Could not find the specified text in '{path}'. Make sure old_string matches exactly."
+                ),
+                true,
+            );
+        }
+        [_] => 1usize,
+        many if !replace_all => {
+            return (
+                format!(
+                    "Found {} occurrences of the text. Please provide a more specific old_string that matches uniquely, or set replace_all: true to replace every occurrence.",
+                    many.len()
+                ),
+                true,
+            );
+        }
+        many => many.len(),
+    };
 
     let lines_removed = u32::try_from(old_string.lines().count())
         .unwrap_or(u32::MAX)
@@ -481,6 +493,52 @@ mod tests {
         assert!(!is_err, "regular-file edit must succeed: {msg}");
         let after = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(after, "alpha BETA gamma\n");
+    }
+
+    // ===== crosslink #470: single-pass match_indices replaces triple-scan =====
+
+    #[test]
+    fn fix470_edit_unique_old_string_succeeds() {
+        // crosslink #470: regression — the single-pass match_indices path must
+        // still handle the [single] arm without an off-by-one.
+        let (_f, path) = tmp_readable("one two three\n");
+        let args = make_args(&path, "two", "TWO");
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(!is_err, "unique match must succeed: {msg}");
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "one TWO three\n");
+    }
+
+    #[test]
+    fn fix470_edit_absent_old_string_returns_not_found_error() {
+        // crosslink #470: the [] arm must return the "Could not find" error,
+        // not silently fall through to the multi-match arm.
+        let (_f, path) = tmp_readable("alpha beta\n");
+        let args = make_args(&path, "gamma", "GAMMA");
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(is_err, "absent old_string must error: {msg}");
+        assert!(
+            msg.contains("Could not find the specified text"),
+            "expected not-found error, got: {msg}"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "alpha beta\n", "file must be unmodified");
+    }
+
+    #[test]
+    fn fix470_edit_two_plus_matches_returns_specific_error() {
+        // crosslink #470: the multi-match arm without replace_all must report
+        // the exact occurrence count from the collected match_indices slice.
+        let (_f, path) = tmp_readable("abc abc abc abc\n");
+        let args = make_args(&path, "abc", "XYZ");
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(is_err, "multi-match without replace_all must error: {msg}");
+        assert!(
+            msg.contains("Found 4 occurrences"),
+            "error must name the count from the single-pass scan: {msg}"
+        );
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "abc abc abc abc\n", "file must be unmodified");
     }
 
     #[test]

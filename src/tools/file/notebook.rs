@@ -135,10 +135,22 @@ fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> 
         .get("cell_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let cell_number = args
-        .get("cell_number")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    // crosslink #470: do NOT saturate a u64 cell_number into usize::MAX. On a
+    // 32-bit target the silent truncation would let `cell_number = u64::MAX`
+    // through to the downstream "cell N out of bounds" check with a misleading
+    // length comparison. Reject anything that does not fit `usize` up front so
+    // the error names the real cause (out-of-range index, not "out of bounds
+    // for a 1-cell notebook"). The `?` returns `(message, true)` via the
+    // ToolFailure shape used throughout this module.
+    let cell_number = match args.get("cell_number").and_then(serde_json::Value::as_u64) {
+        None => None,
+        Some(n) => Some(usize::try_from(n).map_err(|_| {
+            (
+                format!("Cell number {n} is out of range for this platform."),
+                true,
+            )
+        })?),
+    };
     let cell_type = args
         .get("cell_type")
         .and_then(|v| v.as_str())
@@ -846,6 +858,52 @@ mod tests {
         let (msg, is_err) = execute_notebook_edit(&args);
         assert!(is_err, "invalid edit_mode must error: {msg}");
         assert!(msg.contains("Invalid edit_mode"), "message: {msg}");
+    }
+
+    // ===== crosslink #470: cell_number is range-checked, not silently truncated =====
+
+    #[test]
+    fn fix470_notebook_cell_number_u64_max_returns_out_of_range_error() {
+        // crosslink #470: passing cell_number = u64::MAX previously saturated
+        // to usize::MAX via `usize::try_from(n).unwrap_or(usize::MAX)`, then
+        // tripped the downstream bounds check with a misleading "out of bounds
+        // for a 1-cell notebook" message. The fix uses a checked conversion
+        // so the error message names the real cause: an out-of-range index.
+        //
+        // This test is only meaningful when u64 does not fit in usize (i.e.
+        // 32-bit targets). On 64-bit targets the conversion succeeds and we
+        // fall through to the existing out-of-bounds path; assert that the
+        // file is still unmodified there so the test stays useful under both.
+        let nb = make_notebook(&json!([
+            {"cell_type": "code", "source": "only", "metadata": {}, "outputs": [], "execution_count": null}
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+        let args = args_replace_by_number(&path, u64::MAX, "boom");
+        let (msg, is_err) = execute_notebook_edit(&args);
+        assert!(is_err, "u64::MAX cell_number must error: {msg}");
+        // On 32-bit: hits the new checked-conversion branch.
+        // On 64-bit: hits the existing bounds check (the cast succeeds since
+        // u64::MAX fits a 64-bit usize). Either way the error must NOT be a
+        // silent success and the file must be untouched.
+        if usize::try_from(u64::MAX).is_err() {
+            assert!(
+                msg.contains("out of range"),
+                "32-bit must surface the checked-conversion error: {msg}"
+            );
+        } else {
+            assert!(
+                msg.contains("out of bounds"),
+                "64-bit must surface the bounds-check error: {msg}"
+            );
+        }
+        let cells = read_cells(&path);
+        assert_eq!(cells.len(), 1, "cell count unchanged");
+        let src: String = match &cells[0]["source"] {
+            Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+            Value::String(s) => s.clone(),
+            _ => panic!("unexpected source type"),
+        };
+        assert_eq!(src, "only", "cell source must be untouched");
     }
 
     // ===== crosslink #417: notebook_edit rejects symlink-swap on the leaf =====
