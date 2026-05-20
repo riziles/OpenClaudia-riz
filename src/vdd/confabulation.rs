@@ -2,12 +2,16 @@
 //!
 //! Tracks false positive rates across adversarial iterations to detect when
 //! the adversary starts hallucinating problems (confabulation threshold).
-//! Also provides string similarity and common false positive pattern matching.
+//! Also provides finding signature hashing for deterministic duplicate
+//! detection and common false positive pattern matching.
 
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+use crate::vdd::finding::{Finding, Severity};
 
 // ==========================================================================
 // Compiled regex patterns for false-positive detection (crosslink #346)
@@ -169,27 +173,107 @@ pub(crate) fn is_common_false_positive(description: &str, reasoning: &str) -> bo
     false
 }
 
-/// Simple string similarity based on shared word overlap (Jaccard-like).
-pub(crate) fn string_similarity(a: &str, b: &str) -> f32 {
-    let words_a: HashSet<&str> = a.split_whitespace().collect();
-    let words_b: HashSet<&str> = b.split_whitespace().collect();
+/// Identifying tuple used to deduplicate findings across iterations.
+///
+/// Captures just enough to recompute a strong or weak signature for a
+/// previously seen false positive without retaining the whole `Finding`.
+/// See crosslink #349 — the previous Jaccard-over-whitespace similarity
+/// was both false-negative (synonyms missed) and false-positive
+/// (stop-word collisions); deterministic tuple hashing replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingIdentity {
+    pub file_path: Option<String>,
+    pub severity: Severity,
+    pub cwe: Option<String>,
+    pub line_range: Option<(usize, usize)>,
+    /// Kept only for the weak-fallback path used when both `cwe` and
+    /// `line_range` are absent (no other signal to distinguish findings).
+    pub description: String,
+}
 
-    if words_a.is_empty() && words_b.is_empty() {
-        return 1.0;
+impl FindingIdentity {
+    #[must_use]
+    pub fn from_finding(f: &Finding) -> Self {
+        Self {
+            file_path: f.file_path.clone(),
+            severity: f.severity.clone(),
+            cwe: f.cwe.clone(),
+            line_range: f.line_range,
+            description: f.description.clone(),
+        }
     }
 
-    let intersection = words_a.intersection(&words_b).count();
-    let union = words_a.union(&words_b).count();
-
-    if union == 0 {
-        return 0.0;
+    /// Returns `true` when neither `cwe` nor `line_range` are populated and
+    /// the strong tuple would be too coarse to be meaningful.
+    #[must_use]
+    pub const fn is_weak(&self) -> bool {
+        self.cwe.is_none() && self.line_range.is_none()
     }
 
-    #[allow(clippy::cast_precision_loss)] // word counts are small
-    {
-        intersection as f32 / union as f32
+    /// Strong-tuple signature equivalent to [`finding_signature`].
+    #[must_use]
+    pub fn signature(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        "strong".hash(&mut hasher);
+        self.file_path
+            .as_deref()
+            .map(str::to_lowercase)
+            .hash(&mut hasher);
+        self.severity.hash(&mut hasher);
+        self.cwe.as_deref().map(str::to_lowercase).hash(&mut hasher);
+        self.line_range.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Weak-tuple signature equivalent to [`weak_finding_signature`].
+    #[must_use]
+    pub fn weak_signature(&self) -> u64 {
+        const PREFIX_BYTES: usize = 80;
+
+        let mut hasher = DefaultHasher::new();
+        "weak".hash(&mut hasher);
+        self.file_path
+            .as_deref()
+            .map(str::to_lowercase)
+            .hash(&mut hasher);
+        self.severity.hash(&mut hasher);
+        let lower = self.description.to_lowercase();
+        let cutoff = lower
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= PREFIX_BYTES)
+            .last()
+            .unwrap_or(0);
+        let prefix = &lower[..cutoff.min(lower.len())];
+        prefix.hash(&mut hasher);
+        hasher.finish()
     }
 }
+
+/// Hash the normalized `(file_path, severity, cwe, line_range)` tuple into
+/// a deterministic 64-bit signature for finding deduplication.
+///
+/// `file_path` and `cwe` are normalized to lowercase so trivial casing
+/// differences from the adversary's output cannot defeat dedup. Delegates
+/// to [`FindingIdentity::signature`] so the in-memory identity and the
+/// finding itself always produce the same hash.
+#[must_use]
+pub fn finding_signature(f: &Finding) -> u64 {
+    FindingIdentity::from_finding(f).signature()
+}
+
+/// Hash a deliberately weaker tuple — `(file_path, severity, description
+/// prefix)` — for findings where both `cwe` and `line_range` are absent.
+///
+/// Used only as a fallback when [`FindingIdentity::is_weak`] is `true`;
+/// callers are expected to log a warning before relying on it because
+/// description-based matching is fragile (see crosslink #349). Delegates
+/// to [`FindingIdentity::weak_signature`].
+#[must_use]
+pub fn weak_finding_signature(f: &Finding) -> u64 {
+    FindingIdentity::from_finding(f).weak_signature()
+}
+
 
 // ==========================================================================
 // Tests
@@ -310,29 +394,165 @@ mod tests {
         assert!(!tracker.should_terminate());
     }
 
-    #[test]
-    fn test_string_similarity_identical() {
-        assert!((string_similarity("hello world", "hello world") - 1.0).abs() < 0.01);
+    fn make_finding(
+        file: Option<&str>,
+        severity: Severity,
+        cwe: Option<&str>,
+        lines: Option<(usize, usize)>,
+        description: &str,
+    ) -> Finding {
+        use crate::vdd::finding::FindingStatus;
+        Finding {
+            id: "test".to_string(),
+            severity,
+            cwe: cwe.map(str::to_string),
+            description: description.to_string(),
+            file_path: file.map(str::to_string),
+            line_range: lines,
+            status: FindingStatus::Genuine,
+            adversary_reasoning: String::new(),
+            iteration: 0,
+        }
     }
 
+    /// Two findings with identical (file, severity, cwe, line_range) hash
+    /// to the same signature — the second is a duplicate of the first.
+    /// This is the crosslink #349 happy path: deterministic tuple dedup.
     #[test]
-    fn test_string_similarity_disjoint() {
-        assert!((string_similarity("hello world", "foo bar")).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_string_similarity_partial() {
-        let sim = string_similarity(
-            "sql injection in query builder",
-            "sql injection in db module",
+    fn finding_signature_identical_tuples_collide() {
+        let a = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            Some((10, 20)),
+            "SQL injection in users query",
         );
-        assert!(sim > 0.3 && sim < 0.8);
+        let b = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            Some((10, 20)),
+            "String concatenation vulnerability in users table lookup",
+        );
+        assert_eq!(
+            finding_signature(&a),
+            finding_signature(&b),
+            "synonym-worded findings with the same tuple must produce \
+             the same signature (Jaccard would have missed this)"
+        );
     }
 
+    /// Different cwe on the same file+severity → different signatures.
     #[test]
-    fn test_string_similarity_empty() {
-        assert!((string_similarity("", "") - 1.0).abs() < 0.01);
-        assert!((string_similarity("hello", "")).abs() < 0.01);
+    fn finding_signature_differs_on_cwe() {
+        let a = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            None,
+            "issue",
+        );
+        let b = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-79"),
+            None,
+            "issue",
+        );
+        assert_ne!(finding_signature(&a), finding_signature(&b));
+    }
+
+    /// Different line_range on the same file+cwe+severity → different
+    /// signatures (two genuinely different findings in the same file).
+    #[test]
+    fn finding_signature_differs_on_line_range() {
+        let a = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            Some((10, 20)),
+            "issue",
+        );
+        let b = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            Some((45, 50)),
+            "issue",
+        );
+        assert_ne!(finding_signature(&a), finding_signature(&b));
+    }
+
+    /// Case differences in file_path / cwe must not defeat dedup.
+    #[test]
+    fn finding_signature_normalizes_casing() {
+        let a = make_finding(
+            Some("src/DB.rs"),
+            Severity::High,
+            Some("cwe-89"),
+            Some((10, 20)),
+            "x",
+        );
+        let b = make_finding(
+            Some("src/db.rs"),
+            Severity::High,
+            Some("CWE-89"),
+            Some((10, 20)),
+            "x",
+        );
+        assert_eq!(finding_signature(&a), finding_signature(&b));
+    }
+
+    /// A weak finding (no cwe, no line_range) is flagged as such and the
+    /// weak signature still collides for the same file+severity+description-prefix.
+    #[test]
+    fn weak_finding_signature_collides_on_same_prefix() {
+        let a = make_finding(
+            Some("src/x.rs"),
+            Severity::Medium,
+            None,
+            None,
+            "Possible panic in helper if input is malformed",
+        );
+        let b = make_finding(
+            Some("src/x.rs"),
+            Severity::Medium,
+            None,
+            None,
+            "Possible panic in helper if input is malformed — additional context",
+        );
+        let id = FindingIdentity::from_finding(&a);
+        assert!(id.is_weak(), "no cwe + no line_range must be weak");
+        assert_eq!(weak_finding_signature(&a), weak_finding_signature(&b));
+    }
+
+    /// Long descriptions heavy in stop-words but with different files/severity
+    /// must NOT collide under the weak signature — this was the Jaccard FP
+    /// the previous implementation suffered from.
+    #[test]
+    fn weak_finding_signature_does_not_collapse_unrelated_findings() {
+        // Both descriptions start with the same generic stop-word phrase,
+        // but the file differs — the previous Jaccard impl would happily
+        // collapse them; the tuple signature must not.
+        let a = make_finding(
+            Some("src/auth.rs"),
+            Severity::Medium,
+            None,
+            None,
+            "the issue is that a value in the helper is not checked",
+        );
+        let b = make_finding(
+            Some("src/db.rs"),
+            Severity::Medium,
+            None,
+            None,
+            "the issue is that a value in the helper is not checked",
+        );
+        assert_ne!(
+            weak_finding_signature(&a),
+            weak_finding_signature(&b),
+            "different files must produce different weak signatures"
+        );
     }
 
     #[test]

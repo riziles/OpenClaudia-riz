@@ -12,7 +12,7 @@ use crate::providers::{get_adapter, ApiKey};
 use crate::proxy::ChatCompletionRequest;
 use crate::session::TokenUsage;
 
-use crate::vdd::confabulation::ConfabulationTracker;
+use crate::vdd::confabulation::{ConfabulationTracker, FindingIdentity};
 use crate::vdd::error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 use crate::vdd::finding::{Finding, FindingStatus};
 use crate::vdd::helpers::{extract_user_task, format_findings_for_injection};
@@ -38,7 +38,7 @@ struct IterationContext<'a> {
     original_task: &'a str,
     static_results: &'a [StaticAnalysisResult],
     iteration: u32,
-    previous_fps: &'a [String],
+    previous_fps: &'a [FindingIdentity],
     builder_provider: &'a str,
     builder_api_key: Option<&'a ApiKey>,
 }
@@ -317,7 +317,7 @@ impl VddEngine {
         let original_task = extract_user_task(original_request);
         let mut current_builder_text = initial_builder_text.to_string();
         let mut current_builder_response = initial_builder_response.clone();
-        let mut previous_fps: Vec<String> = Vec::new();
+        let mut previous_fps: Vec<FindingIdentity> = Vec::new();
 
         // Crosslink #483 + #487: charge the INITIAL builder response's
         // tokens to the session's builder ledger before the loop starts.
@@ -675,12 +675,16 @@ impl VddEngine {
     }
 }
 
-/// Append false-positive descriptions from this iteration to the running
+/// Append false-positive identities from this iteration to the running
 /// list used by the next iteration's duplicate-detection layer.
-fn collect_false_positives(findings: &[Finding], previous_fps: &mut Vec<String>) {
+///
+/// Crosslink #349: stores the full `(file, severity, cwe, line_range,
+/// description)` identity so the next iteration can hash the tuple
+/// deterministically rather than comparing free-text descriptions.
+fn collect_false_positives(findings: &[Finding], previous_fps: &mut Vec<FindingIdentity>) {
     for f in findings {
         if f.status == FindingStatus::FalsePositive {
-            previous_fps.push(f.description.clone());
+            previous_fps.push(FindingIdentity::from_finding(f));
         }
     }
 }

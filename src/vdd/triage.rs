@@ -1,6 +1,6 @@
 //! Three-layer finding triage: duplicate detection, pattern heuristics, AI verification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use reqwest::Client;
@@ -12,7 +12,9 @@ use crate::config::{AppConfig, VddConfig};
 use crate::providers::ApiKey;
 use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 
-use crate::vdd::confabulation::{is_common_false_positive, string_similarity};
+use crate::vdd::confabulation::{
+    finding_signature, is_common_false_positive, weak_finding_signature, FindingIdentity,
+};
 use crate::vdd::error::VddError;
 use crate::vdd::finding::{Finding, FindingStatus};
 use crate::vdd::helpers::truncate_output;
@@ -93,7 +95,11 @@ pub struct TriageContext<'a> {
     pub client: &'a Client,
     pub config: &'a VddConfig,
     pub app_config: &'a AppConfig,
-    pub previous_fps: &'a [String],
+    /// Identities of confirmed false positives seen in earlier iterations.
+    /// Used by Layer 1 to mark re-reports as `FalsePositive` via tuple-hash
+    /// dedup (see crosslink #349 — replaces the prior Jaccard-on-words
+    /// similarity, which was both false-negative and false-positive).
+    pub previous_fps: &'a [FindingIdentity],
     pub builder_code: &'a str,
     pub builder_provider: &'a str,
     pub builder_api_key: Option<&'a ApiKey>,
@@ -138,16 +144,51 @@ pub async fn triage_findings(findings: &mut [Finding], ctx: &TriageContext<'_>) 
     }
 }
 
-/// Layer 1: mark findings whose descriptions closely match a previously
-/// confirmed false positive.
-fn apply_duplicate_layer(findings: &mut [Finding], previous_fps: &[String]) {
+/// Layer 1: mark findings whose `(file_path, severity, cwe, line_range)`
+/// tuple matches a previously confirmed false positive.
+///
+/// Crosslink #349: this replaces the prior Jaccard-on-whitespace similarity
+/// with a deterministic tuple-hash dedup. Re-reported FPs (which by
+/// definition cite the same code at the same severity) collapse cleanly;
+/// findings whose only signal is a free-text description fall through to a
+/// weaker description-prefix signature (with a warn log) so we still
+/// dedupe obvious re-reports without depending on word-overlap heuristics.
+fn apply_duplicate_layer(findings: &mut [Finding], previous_fps: &[FindingIdentity]) {
+    if previous_fps.is_empty() {
+        return;
+    }
+
+    // Pre-compute the seen sets once per call.
+    let mut strong_seen: HashSet<u64> = HashSet::with_capacity(previous_fps.len());
+    let mut weak_seen: HashSet<u64> = HashSet::new();
+
+    for id in previous_fps {
+        if id.is_weak() {
+            weak_seen.insert(id.weak_signature());
+        } else {
+            strong_seen.insert(id.signature());
+        }
+    }
+
     for finding in findings.iter_mut() {
-        let desc_lower = finding.description.to_lowercase();
-        for fp_desc in previous_fps {
-            if string_similarity(&desc_lower, &fp_desc.to_lowercase()) > 0.7 {
+        let id = FindingIdentity::from_finding(finding);
+        if id.is_weak() {
+            // Weak finding — both cwe and line_range absent. Fall back to
+            // the description-prefix signature and warn the operator that
+            // dedup quality is reduced for this finding (per #349 mandate).
+            warn!(
+                file = ?finding.file_path,
+                severity = %finding.severity,
+                "VDD dedup: finding has no CWE and no line range — \
+                 using weak description-prefix signature for duplicate \
+                 detection. Adversary output quality should be improved \
+                 upstream."
+            );
+            if weak_seen.contains(&weak_finding_signature(finding)) {
                 finding.status = FindingStatus::FalsePositive;
-                break;
             }
+        } else if strong_seen.contains(&finding_signature(finding)) {
+            finding.status = FindingStatus::FalsePositive;
         }
     }
 }
@@ -477,8 +518,9 @@ mod tests {
     }
 
     /// Test that Layer 1 (duplicate detection) catches re-reported findings
-    /// before the AI verification layer is reached.  The AI layer requires
-    /// an API call, but duplicates are caught cheaply via string similarity.
+    /// before the AI verification layer is reached. The AI layer requires
+    /// an API call, but duplicates are caught cheaply via tuple-hash dedup
+    /// (see crosslink #349).
     #[tokio::test]
     async fn test_triage_marks_duplicate_as_fp() {
         let config = VddConfig::default();
@@ -487,26 +529,212 @@ mod tests {
 
         let mut findings = vec![Finding {
             id: "1".to_string(),
-            severity: Severity::Medium,
-            cwe: None,
+            severity: Severity::High,
+            cwe: Some("CWE-89".to_string()),
             description: "SQL injection in query builder module".to_string(),
-            file_path: None,
+            file_path: Some("src/db.rs".to_string()),
+            line_range: Some((10, 20)),
+            status: FindingStatus::Genuine,
+            adversary_reasoning: String::new(),
+            iteration: 2,
+        }];
+
+        // Previously confirmed FP at the same tuple — synonym-worded
+        // description should still collapse to a duplicate.
+        let previous_fps = vec![FindingIdentity {
+            file_path: Some("src/db.rs".to_string()),
+            severity: Severity::High,
+            cwe: Some("CWE-89".to_string()),
+            line_range: Some((10, 20)),
+            description: "String concatenation vulnerability in users table".to_string(),
+        }];
+        let ctx = TriageContext {
+            client: &client,
+            config: &config,
+            app_config: &app_config,
+            previous_fps: &previous_fps,
+            builder_code: "let q = format!(\"SELECT * FROM users WHERE id = {}\", x);",
+            builder_provider: "test",
+            builder_api_key: None,
+        };
+        triage_findings(&mut findings, &ctx).await;
+        assert_eq!(findings[0].status, FindingStatus::FalsePositive);
+    }
+
+    /// Two findings with the same (file, severity) but different CWE must
+    /// both survive Layer 1. Regression test for crosslink #349 — the old
+    /// Jaccard impl could collapse them via stop-word overlap.
+    #[tokio::test]
+    async fn test_triage_keeps_distinct_cwe_on_same_file() {
+        let config = VddConfig::default();
+        let app_config = test_app_config();
+        let client = Client::new();
+
+        let mut findings = vec![Finding {
+            id: "1".to_string(),
+            severity: Severity::High,
+            cwe: Some("CWE-79".to_string()),
+            description: "XSS in template renderer".to_string(),
+            file_path: Some("src/web.rs".to_string()),
+            line_range: Some((100, 110)),
+            status: FindingStatus::Genuine,
+            adversary_reasoning: String::new(),
+            iteration: 2,
+        }];
+
+        let previous_fps = vec![FindingIdentity {
+            file_path: Some("src/web.rs".to_string()),
+            severity: Severity::High,
+            cwe: Some("CWE-89".to_string()), // different CWE
+            line_range: Some((100, 110)),
+            description: "SQL injection in template renderer".to_string(),
+        }];
+        let ctx = TriageContext {
+            client: &client,
+            config: &config,
+            app_config: &app_config,
+            previous_fps: &previous_fps,
+            builder_code: "let html = format!(\"<div>{}</div>\", user_input);",
+            builder_provider: "nonexistent-provider", // AI layer will fail; we expect Genuine
+            builder_api_key: None,
+        };
+        triage_findings(&mut findings, &ctx).await;
+        assert_eq!(
+            findings[0].status,
+            FindingStatus::Genuine,
+            "different CWE must not be treated as duplicate"
+        );
+    }
+
+    /// Same file+cwe+severity but different line ranges → not duplicates.
+    /// Two genuinely different findings in the same file must both survive.
+    #[tokio::test]
+    async fn test_triage_keeps_distinct_line_ranges() {
+        let config = VddConfig::default();
+        let app_config = test_app_config();
+        let client = Client::new();
+
+        let mut findings = vec![Finding {
+            id: "1".to_string(),
+            severity: Severity::High,
+            cwe: Some("CWE-89".to_string()),
+            description: "SQL injection at second call site".to_string(),
+            file_path: Some("src/db.rs".to_string()),
+            line_range: Some((200, 210)),
+            status: FindingStatus::Genuine,
+            adversary_reasoning: String::new(),
+            iteration: 2,
+        }];
+
+        let previous_fps = vec![FindingIdentity {
+            file_path: Some("src/db.rs".to_string()),
+            severity: Severity::High,
+            cwe: Some("CWE-89".to_string()),
+            line_range: Some((10, 20)), // different range
+            description: "SQL injection at first call site".to_string(),
+        }];
+        let ctx = TriageContext {
+            client: &client,
+            config: &config,
+            app_config: &app_config,
+            previous_fps: &previous_fps,
+            builder_code: "fn x() {} fn y() {}",
+            builder_provider: "nonexistent-provider",
+            builder_api_key: None,
+        };
+        triage_findings(&mut findings, &ctx).await;
+        assert_eq!(
+            findings[0].status,
+            FindingStatus::Genuine,
+            "different line range must not be treated as duplicate"
+        );
+    }
+
+    /// Stop-word-heavy descriptions with DIFFERENT tuples must not collapse.
+    /// Regression test for the prior Jaccard-on-whitespace false positive:
+    /// "the issue is in the helper" shares enough stop words with itself
+    /// across two files to trip the 0.7 threshold, yet the findings target
+    /// completely different code.
+    #[tokio::test]
+    async fn test_triage_does_not_collapse_stopword_heavy_unrelated_findings() {
+        let config = VddConfig::default();
+        let app_config = test_app_config();
+        let client = Client::new();
+
+        let mut findings = vec![Finding {
+            id: "1".to_string(),
+            severity: Severity::Medium,
+            cwe: Some("CWE-20".to_string()),
+            description: "the issue is that the value in the helper is not checked properly"
+                .to_string(),
+            file_path: Some("src/auth.rs".to_string()),
+            line_range: Some((30, 35)),
+            status: FindingStatus::Genuine,
+            adversary_reasoning: String::new(),
+            iteration: 2,
+        }];
+
+        let previous_fps = vec![FindingIdentity {
+            file_path: Some("src/db.rs".to_string()), // different file
+            severity: Severity::Medium,
+            cwe: Some("CWE-20".to_string()),
+            line_range: Some((30, 35)),
+            description: "the issue is that the value in the helper is not checked properly"
+                .to_string(),
+        }];
+        let ctx = TriageContext {
+            client: &client,
+            config: &config,
+            app_config: &app_config,
+            previous_fps: &previous_fps,
+            builder_code: "fn auth_helper() {} fn db_helper() {}",
+            builder_provider: "nonexistent-provider",
+            builder_api_key: None,
+        };
+        triage_findings(&mut findings, &ctx).await;
+        assert_eq!(
+            findings[0].status,
+            FindingStatus::Genuine,
+            "stop-word-heavy descriptions at different files must NOT collapse"
+        );
+    }
+
+    /// Weak fallback: when both cwe and line_range are absent, dedup falls
+    /// back to (file, severity, description-prefix) — same tuple should
+    /// still collapse.
+    #[tokio::test]
+    async fn test_triage_weak_fallback_collapses_obvious_reissue() {
+        let config = VddConfig::default();
+        let app_config = test_app_config();
+        let client = Client::new();
+
+        let mut findings = vec![Finding {
+            id: "1".to_string(),
+            severity: Severity::Low,
+            cwe: None,
+            description: "Possible panic in helper if input is malformed".to_string(),
+            file_path: Some("src/x.rs".to_string()),
             line_range: None,
             status: FindingStatus::Genuine,
             adversary_reasoning: String::new(),
             iteration: 2,
         }];
 
-        let previous_fps = vec!["SQL injection in query builder module".to_string()];
-        // Layer 1 (duplicate detection) catches this before Layer 3 (AI)
-        // would be reached, so no API call is made.
+        let previous_fps = vec![FindingIdentity {
+            file_path: Some("src/x.rs".to_string()),
+            severity: Severity::Low,
+            cwe: None,
+            line_range: None,
+            description: "Possible panic in helper if input is malformed (re-reported)"
+                .to_string(),
+        }];
         let ctx = TriageContext {
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
-            builder_code: "fn main() {}",
-            builder_provider: "test",
+            builder_code: "fn helper(s: &str) {}",
+            builder_provider: "nonexistent-provider",
             builder_api_key: None,
         };
         triage_findings(&mut findings, &ctx).await;

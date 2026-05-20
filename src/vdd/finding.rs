@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 // ==========================================================================
 
 /// Severity classification for adversary findings
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
     Critical,
