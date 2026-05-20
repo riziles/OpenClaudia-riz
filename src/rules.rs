@@ -7,52 +7,64 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-/// File extension to language name mapping
+/// Single source-of-truth for `language -> extensions` mapping.
+///
+/// Both [`extension_to_language`] and [`known_languages`] are derived from
+/// this table so adding a new language requires editing exactly one place
+/// (crosslink #354).
+pub(crate) const LANGUAGES: &[(&str, &[&str])] = &[
+    ("rust", &["rs"]),
+    ("python", &["py", "pyw"]),
+    ("javascript", &["js", "mjs", "cjs"]),
+    ("typescript", &["ts", "mts", "cts"]),
+    ("tsx", &["tsx"]),
+    ("jsx", &["jsx"]),
+    ("go", &["go"]),
+    ("java", &["java"]),
+    ("kotlin", &["kt", "kts"]),
+    ("swift", &["swift"]),
+    ("c", &["c", "h"]),
+    ("cpp", &["cpp", "cc", "cxx", "hpp", "hxx"]),
+    ("csharp", &["cs"]),
+    ("ruby", &["rb"]),
+    ("php", &["php"]),
+    ("scala", &["scala"]),
+    ("elixir", &["ex", "exs"]),
+    ("erlang", &["erl", "hrl"]),
+    ("haskell", &["hs"]),
+    ("clojure", &["clj", "cljs", "cljc"]),
+    ("lua", &["lua"]),
+    ("r", &["r"]),
+    ("julia", &["jl"]),
+    ("dart", &["dart"]),
+    ("zig", &["zig"]),
+    ("nim", &["nim"]),
+    ("vlang", &["v"]),
+    ("sql", &["sql"]),
+    ("shell", &["sh", "bash", "zsh"]),
+    ("powershell", &["ps1", "psm1"]),
+    ("yaml", &["yml", "yaml"]),
+    ("json", &["json"]),
+    ("toml", &["toml"]),
+    ("xml", &["xml"]),
+    ("html", &["html", "htm"]),
+    ("css", &["css"]),
+    ("scss", &["scss", "sass"]),
+    ("less", &["less"]),
+    ("markdown", &["md", "markdown"]),
+    ("vue", &["vue"]),
+    ("svelte", &["svelte"]),
+];
+
+/// File extension to language name mapping (derived from [`LANGUAGES`]).
 fn extension_to_language(ext: &str) -> Option<&'static str> {
-    match ext.to_lowercase().as_str() {
-        "rs" => Some("rust"),
-        "py" | "pyw" => Some("python"),
-        "js" | "mjs" | "cjs" => Some("javascript"),
-        "ts" | "mts" | "cts" => Some("typescript"),
-        "tsx" => Some("tsx"),
-        "jsx" => Some("jsx"),
-        "go" => Some("go"),
-        "java" => Some("java"),
-        "kt" | "kts" => Some("kotlin"),
-        "swift" => Some("swift"),
-        "c" | "h" => Some("c"),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Some("cpp"),
-        "cs" => Some("csharp"),
-        "rb" => Some("ruby"),
-        "php" => Some("php"),
-        "scala" => Some("scala"),
-        "ex" | "exs" => Some("elixir"),
-        "erl" | "hrl" => Some("erlang"),
-        "hs" => Some("haskell"),
-        "clj" | "cljs" | "cljc" => Some("clojure"),
-        "lua" => Some("lua"),
-        "r" | "R" => Some("r"),
-        "jl" => Some("julia"),
-        "dart" => Some("dart"),
-        "zig" => Some("zig"),
-        "nim" => Some("nim"),
-        "v" => Some("vlang"),
-        "sql" => Some("sql"),
-        "sh" | "bash" | "zsh" => Some("shell"),
-        "ps1" | "psm1" => Some("powershell"),
-        "yml" | "yaml" => Some("yaml"),
-        "json" => Some("json"),
-        "toml" => Some("toml"),
-        "xml" => Some("xml"),
-        "html" | "htm" => Some("html"),
-        "css" => Some("css"),
-        "scss" | "sass" => Some("scss"),
-        "less" => Some("less"),
-        "md" | "markdown" => Some("markdown"),
-        "vue" => Some("vue"),
-        "svelte" => Some("svelte"),
-        _ => None,
+    let lower = ext.to_lowercase();
+    for (lang, exts) in LANGUAGES {
+        if exts.contains(&lower.as_str()) {
+            return Some(lang);
+        }
     }
+    None
 }
 
 /// A loaded rule with its metadata
@@ -152,54 +164,11 @@ impl RulesEngine {
             return (filename.to_string(), vec![]);
         }
 
-        // Check if filename starts with a known language
-        let known_languages = [
-            "rust",
-            "python",
-            "javascript",
-            "typescript",
-            "tsx",
-            "jsx",
-            "go",
-            "java",
-            "kotlin",
-            "swift",
-            "c",
-            "cpp",
-            "csharp",
-            "ruby",
-            "php",
-            "scala",
-            "elixir",
-            "erlang",
-            "haskell",
-            "clojure",
-            "lua",
-            "r",
-            "julia",
-            "dart",
-            "zig",
-            "nim",
-            "vlang",
-            "sql",
-            "shell",
-            "powershell",
-            "yaml",
-            "json",
-            "toml",
-            "xml",
-            "html",
-            "css",
-            "scss",
-            "less",
-            "markdown",
-            "vue",
-            "svelte",
-        ];
-
-        for lang in known_languages {
-            if lower == lang || lower.starts_with(&format!("{lang}-")) {
-                return (filename.to_string(), vec![lang.to_string()]);
+        // Check if filename starts with a known language. Derived from the
+        // single LANGUAGES table so both directions stay in sync.
+        for (lang, _) in LANGUAGES {
+            if lower == *lang || lower.starts_with(&format!("{lang}-")) {
+                return (filename.to_string(), vec![(*lang).to_string()]);
             }
         }
 
@@ -351,6 +320,28 @@ mod tests {
         assert_eq!(extension_to_language("py"), Some("python"));
         assert_eq!(extension_to_language("ts"), Some("typescript"));
         assert_eq!(extension_to_language("unknown"), None);
+    }
+
+    /// Crosslink #354: every (language, extensions) entry in the canonical
+    /// table must round-trip through `extension_to_language`, names are
+    /// kebab-case-ish (lowercase), and every entry has at least one ext.
+    #[test]
+    fn test_languages_table_consistency() {
+        for (lang, exts) in LANGUAGES {
+            assert!(!exts.is_empty(), "language {lang} has zero extensions");
+            assert!(
+                lang.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "language name {lang} must be lowercase / kebab-case"
+            );
+            for ext in *exts {
+                assert_eq!(
+                    extension_to_language(ext),
+                    Some(*lang),
+                    "extension {ext} did not resolve to {lang}"
+                );
+            }
+        }
     }
 
     #[test]

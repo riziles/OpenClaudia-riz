@@ -297,14 +297,6 @@ impl TaskManager {
         // We need to re-borrow after the first mutable borrow ends
         let task_id_owned = task_id.to_string();
 
-        // For add_blocks: if task A blocks task B, then B.blocked_by should include A
-        if let Some(s) = status {
-            // Re-read the blocks that were just added (they're on the task now)
-            // Actually we need the original add_blocks/add_blocked_by args, but they've been moved.
-            // We handle this by doing a second pass.
-            let _ = s; // suppress unused warning
-        }
-
         // Second pass: sync reverse dependencies
         // Collect the current blocks and blocked_by for the target task
         let current_blocks: Vec<String> = self
