@@ -2505,7 +2505,9 @@ mod token_tracking {
         }
 
         // Persist and reload
-        manager.end_session(Some("Token tracking test"));
+        manager
+            .end_session(Some("Token tracking test"))
+            .expect("end_session must succeed for active session");
 
         let loaded = manager.load_session(&session_id).expect("Should load");
 
@@ -2918,7 +2920,9 @@ mod token_tracking {
                 cache_write_tokens: 0,
             });
         }
-        manager.end_session(Some("First session done"));
+        manager
+            .end_session(Some("First session done"))
+            .expect("end_session must succeed for active session");
 
         // Second session should start with clean token counters
         let second = manager.get_or_create_session().clone();

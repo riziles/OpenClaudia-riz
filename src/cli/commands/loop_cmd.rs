@@ -2,7 +2,7 @@ use openclaudia::{
     config, guardrails,
     hooks::{HookEngine, HookEvent, HookInput},
     proxy,
-    session::SessionManager,
+    session::{EndSessionError, SessionManager},
 };
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -159,7 +159,15 @@ pub async fn cmd_loop(
     let handoff = format!(
         "Loop mode completed after {iteration} iterations.\nSession ended at iteration {iteration}."
     );
-    session_manager.end_session(Some(&handoff));
+    // #356: end_session is now fallible.  Log persist failures here rather
+    // than propagating, since the loop has already done its work — but do
+    // NOT swallow them silently as the old implementation did.
+    match session_manager.end_session(Some(&handoff)) {
+        Ok(_) | Err(EndSessionError::NotFound) => {}
+        Err(e @ EndSessionError::PersistFailed { .. }) => {
+            error!(error = %e, "Failed to persist session at end of loop mode");
+        }
+    }
 
     info!("Loop mode ended after {} iterations", iteration);
     Ok(())

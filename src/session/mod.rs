@@ -29,8 +29,34 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use thiserror::Error;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Errors produced by [`SessionManager::end_session`].
+///
+/// Replaces the previous `Option<Session>` return which silently conflated
+/// "no current session" with "persist failed".  Callers can now distinguish
+/// and react appropriately (see #356).
+#[derive(Debug, Error)]
+pub enum EndSessionError {
+    /// `end_session` was called but no current session was active.
+    ///
+    /// Previously surfaced as a silent `None`.
+    #[error("no current session is active")]
+    NotFound,
+
+    /// Persistence of the session (any of `session.id.json`, `latest.json`,
+    /// `handoff.md`) failed.  The in-memory session has already been
+    /// `take`n from the manager; recovery requires the caller to either
+    /// retry persistence externally or accept loss.
+    #[error("failed to persist session to disk: {source}")]
+    PersistFailed {
+        /// The underlying I/O / serialisation error.
+        #[source]
+        source: anyhow::Error,
+    },
+}
 
 /// Maximum number of [`TurnMetrics`] entries retained in [`Session::turn_metrics`].
 ///
@@ -536,28 +562,41 @@ impl SessionManager {
             .expect("session must exist after assignment")
     }
 
-    /// End the current session and persist it
-    pub fn end_session(&mut self, handoff_notes: Option<&str>) -> Option<Session> {
-        if let Some(mut session) = self.current_session.take() {
-            if let Some(notes) = handoff_notes {
-                session.set_handoff_notes(notes);
-            }
+    /// End the current session and persist it.
+    ///
+    /// # Errors
+    ///
+    /// * [`EndSessionError::NotFound`] — no current session was active
+    ///   (previously returned `None` silently, conflating with persist
+    ///   failure; see #356).
+    /// * [`EndSessionError::PersistFailed`] — persistence of one of the
+    ///   session files failed.  The in-memory session has already been
+    ///   removed from the manager when this is returned.
+    pub fn end_session(
+        &mut self,
+        handoff_notes: Option<&str>,
+    ) -> Result<Session, EndSessionError> {
+        let mut session = self
+            .current_session
+            .take()
+            .ok_or(EndSessionError::NotFound)?;
 
-            // Persist the session
-            if let Err(e) = self.persist_session(&session) {
-                warn!(error = %e, "Failed to persist session");
-            }
-
-            info!(
-                session_id = %session.id,
-                requests = session.request_count,
-                "Ended session"
-            );
-
-            Some(session)
-        } else {
-            None
+        if let Some(notes) = handoff_notes {
+            session.set_handoff_notes(notes);
         }
+
+        // Persist the session; failure must surface to the caller, not be
+        // swallowed via warn!() as it was prior to #356.
+        self.persist_session(&session)
+            .map_err(|source| EndSessionError::PersistFailed { source })?;
+
+        info!(
+            session_id = %session.id,
+            requests = session.request_count,
+            "Ended session"
+        );
+
+        Ok(session)
     }
 
     /// Persist a session to disk using atomic write-to-temp-then-rename.
@@ -672,6 +711,108 @@ impl SessionManager {
             }
         }
     }
+
+    /// Create a new initializer (or coding-continuation) session and return
+    /// an [`OwnedSessionGuard`] whose `Drop` calls [`Self::end_session`].
+    ///
+    /// This closes the temporal-coupling hole identified in #356: if the
+    /// caller panics or returns early without explicitly ending the session,
+    /// the guard still attempts to persist on unwind.  Persist failures in
+    /// `Drop` are logged via `tracing::error!` (there is no way to return
+    /// from `Drop`); callers that need the failure surfaced should call
+    /// [`OwnedSessionGuard::end`] explicitly and propagate the `Result`.
+    pub fn create_session_guard(&mut self) -> OwnedSessionGuard<'_> {
+        // Eagerly materialise the session so the guard's invariant ("a
+        // session is active") holds for the lifetime of the borrow.
+        self.get_or_create_session();
+        OwnedSessionGuard {
+            manager: Some(self),
+            handoff_notes: None,
+        }
+    }
+}
+
+/// RAII guard that ensures the active session is persisted when dropped.
+///
+/// Obtain one from [`SessionManager::create_session_guard`].  When the
+/// guard goes out of scope it calls [`SessionManager::end_session`] on the
+/// borrowed manager; persist failures are logged at `ERROR` level because
+/// `Drop` cannot return a `Result`.  Callers that need failure visibility
+/// should consume the guard via [`Self::end`] instead.
+///
+/// See #356 for the temporal-coupling motivation.
+#[must_use = "OwnedSessionGuard persists on Drop; bind it to a variable"]
+pub struct OwnedSessionGuard<'m> {
+    /// `Option` so [`Self::end`] can move the borrow out before `Drop` runs.
+    manager: Option<&'m mut SessionManager>,
+    /// Handoff notes recorded into the session on end.
+    handoff_notes: Option<String>,
+}
+
+impl OwnedSessionGuard<'_> {
+    /// Set handoff notes that will be applied when the guard ends the
+    /// session (either explicitly via [`Self::end`] or implicitly on drop).
+    pub fn set_handoff_notes(&mut self, notes: impl Into<String>) {
+        self.handoff_notes = Some(notes.into());
+    }
+
+    /// Borrow the active session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the guard has already been consumed via [`Self::end`].
+    #[must_use]
+    pub const fn session(&self) -> &Session {
+        // `as_ref` + `expect` on `Option` keep this `const`-compatible on
+        // stable rustc — the panic message is only evaluated on the error
+        // path.
+        match self.manager.as_ref() {
+            Some(m) => match m.get_session() {
+                Some(s) => s,
+                None => panic!("guard invariant: a session is active"),
+            },
+            None => panic!("guard is live"),
+        }
+    }
+
+    /// Explicitly end the session, returning the persisted `Session` or an
+    /// [`EndSessionError`].  After this call the guard's `Drop` is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any error returned by [`SessionManager::end_session`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a guard whose backing manager reference has
+    /// already been taken — this is unreachable for a guard obtained via
+    /// [`SessionManager::create_session_guard`], because `end` consumes
+    /// `self` by value.
+    pub fn end(mut self) -> Result<Session, EndSessionError> {
+        let manager = self
+            .manager
+            .take()
+            .expect("OwnedSessionGuard::end called on a drained guard");
+        manager.end_session(self.handoff_notes.as_deref())
+    }
+}
+
+impl Drop for OwnedSessionGuard<'_> {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.take() else {
+            // `end()` already consumed the manager; nothing to do.
+            return;
+        };
+        match manager.end_session(self.handoff_notes.as_deref()) {
+            Ok(_) | Err(EndSessionError::NotFound) => {}
+            Err(EndSessionError::PersistFailed { source }) => {
+                error!(
+                    error = %source,
+                    "OwnedSessionGuard: failed to persist session on drop",
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -731,7 +872,9 @@ mod tests {
         let session = manager.get_or_create_session().clone();
         assert_eq!(session.mode, SessionMode::Initializer);
 
-        manager.end_session(Some("Test handoff notes"));
+        manager
+            .end_session(Some("Test handoff notes"))
+            .expect("end_session must succeed for active session");
 
         // Load it back
         let loaded = manager.load_session(&session.id);
@@ -746,7 +889,9 @@ mod tests {
 
         // First session
         let first = manager.get_or_create_session().clone();
-        manager.end_session(None);
+        manager
+            .end_session(None)
+            .expect("end_session must succeed for active session");
 
         // Second session should be coding mode
         let second = manager.get_or_create_session().clone();
@@ -901,7 +1046,9 @@ mod tests {
 
         // Create and persist a session so there IS history
         manager.get_or_create_session();
-        manager.end_session(None);
+        manager
+            .end_session(None)
+            .expect("end_session must succeed for active session");
 
         // Force an initializer even though history exists
         let session = manager.start_initializer().clone();
@@ -1036,6 +1183,195 @@ mod tests {
         assert_eq!(
             session.cumulative_usage.output_tokens, turns as u64,
             "cumulative output_tokens must count all turns, not just retained ones"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // #356 — end_session error orchestration & RAII guard
+    //
+    // Pre-fix: end_session returned Option<Session>; persist failures were
+    // swallowed via warn!() and the caller still received Some(session),
+    // unable to distinguish "no session active" from "persist failed".
+    //
+    // Post-fix: returns Result<Session, EndSessionError> with distinct
+    // NotFound / PersistFailed variants.  OwnedSessionGuard provides RAII
+    // so panics no longer leak in-memory session state.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Replace `path` (a directory) with a regular file so subsequent
+    /// `fs::write` to anything under it fails with ENOTDIR.  Used to drive
+    /// [`SessionManager::persist_session`] into the error branch.
+    fn sabotage_persist_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("cleanup persist dir");
+        fs::write(path, b"sabotage").expect("write sentinel file");
+    }
+
+    /// (1) `end_session` on a known/active session returns `Ok(session)`.
+    #[test]
+    fn end_session_happy_path_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+
+        let id = manager.get_or_create_session().id.clone();
+        let result = manager.end_session(Some("ok"));
+        let session = result.expect("happy path must be Ok");
+        assert_eq!(session.id, id, "returned session must be the active one");
+        assert_eq!(
+            session.progress.handoff_notes, "ok",
+            "handoff notes must be applied before persist"
+        );
+        assert!(
+            manager.get_session().is_none(),
+            "current_session must be cleared after end_session"
+        );
+    }
+
+    /// (2) `end_session` with no active session returns `Err(NotFound)`,
+    ///     not a silent `None`.  This is the central #356 contract change.
+    #[test]
+    fn end_session_unknown_returns_not_found() {
+        let dir = TempDir::new().unwrap();
+        let mut manager = SessionManager::new(dir.path().join("sessions"));
+
+        // No get_or_create_session() — manager has no active session.
+        let err = manager
+            .end_session(None)
+            .expect_err("end_session with no active session must be Err");
+        assert!(
+            matches!(err, EndSessionError::NotFound),
+            "expected EndSessionError::NotFound, got {err:?}"
+        );
+    }
+
+    /// (3) `end_session` with a broken persist dir returns
+    ///     `Err(PersistFailed { .. })` — failures are NOT swallowed.
+    #[test]
+    fn end_session_persist_failure_surfaces() {
+        let dir = TempDir::new().unwrap();
+        let persist_dir = dir.path().join("sessions");
+        let mut manager = SessionManager::new(&persist_dir);
+
+        manager.get_or_create_session();
+        sabotage_persist_dir(&persist_dir);
+
+        let err = manager
+            .end_session(Some("will fail"))
+            .expect_err("persist failure must surface as Err");
+        assert!(
+            matches!(err, EndSessionError::PersistFailed { .. }),
+            "expected EndSessionError::PersistFailed, got {err:?}"
+        );
+        // The in-memory session has been consumed; the manager is back to
+        // the "no current session" state.
+        assert!(
+            manager.get_session().is_none(),
+            "current_session must be cleared even on persist failure",
+        );
+    }
+
+    /// (4) `OwnedSessionGuard` `end_session`-on-`Drop` happy path persists.
+    #[test]
+    fn owned_session_guard_persists_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let persist_dir = dir.path().join("sessions");
+        let mut manager = SessionManager::new(&persist_dir);
+
+        let session_id = {
+            let mut guard = manager.create_session_guard();
+            guard.set_handoff_notes("drop-persist");
+            // Capture the id via the guard while the session is still
+            // live (the guard's borrow of `manager` is exclusive).
+            guard.session().id.clone()
+        };
+        // ^^ `guard` is dropped here; Drop must call end_session and persist.
+
+        assert!(
+            manager.get_session().is_none(),
+            "guard Drop must clear current_session"
+        );
+
+        // The session file must now exist on disk.
+        let session_path = persist_dir.join(format!("{session_id}.json"));
+        assert!(
+            session_path.exists(),
+            "guard Drop must have persisted {session_path:?}"
+        );
+
+        // And `latest.json` should also be present, with handoff notes
+        // applied.
+        let latest = persist_dir.join("latest.json");
+        let body = fs::read_to_string(&latest).expect("latest.json must exist");
+        assert!(
+            body.contains("drop-persist"),
+            "handoff notes set on the guard must reach the persisted JSON"
+        );
+    }
+
+    /// (5) `OwnedSessionGuard` `end_session`-on-`Drop` persist-failure logs
+    ///     `error!` (captured via a tracing subscriber) — silent loss is
+    ///     impossible.
+    #[test]
+    fn owned_session_guard_drop_logs_persist_failure() {
+        use std::sync::{Arc, Mutex};
+        use tracing::subscriber;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+        impl CapturedWriter {
+            fn contents(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+        impl std::io::Write for CapturedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CapturedWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CapturedWriter::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .finish();
+
+        subscriber::with_default(sub, || {
+            let dir = TempDir::new().unwrap();
+            let persist_dir = dir.path().join("sessions");
+            let mut manager = SessionManager::new(&persist_dir);
+
+            {
+                let _guard = manager.create_session_guard();
+                // Break the persist dir while the guard is live so Drop's
+                // end_session hits PersistFailed.
+                sabotage_persist_dir(&persist_dir);
+            } // guard drops here
+
+            assert!(
+                manager.get_session().is_none(),
+                "guard Drop must clear current_session even on failure"
+            );
+        });
+
+        let log = captured.contents();
+        assert!(
+            log.contains("ERROR"),
+            "Drop must emit an ERROR-level tracing event, got: {log}"
+        );
+        assert!(
+            log.contains("failed to persist session on drop"),
+            "Drop's error message must mention persist failure, got: {log}"
         );
     }
 }
