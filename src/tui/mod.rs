@@ -36,12 +36,28 @@ static SYNTAX_SET: std::sync::LazyLock<SyntaxSet> =
     std::sync::LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: std::sync::LazyLock<ThemeSet> = std::sync::LazyLock::new(ThemeSet::load_defaults);
 
-/// Purple color for branding (from logo)
-const PURPLE: Color = Color::Rgb(147, 112, 219);
-/// Gold color for accents (from logo)
-const GOLD: Color = Color::Rgb(218, 165, 32);
-/// Dim gray for borders
-const DIM: Color = Color::Rgb(128, 128, 128);
+// ─── Brand palette ──────────────────────────────────────────────────────────
+//
+// Single source of truth for the TUI's RGB brand colors (crosslink #442).
+// Submodules (`app`, `messages`) import these instead of re-typing
+// `Color::Rgb(…)` literals at every call site — that's how the palette
+// drifted in the first place.
+
+/// Purple color for branding (from logo).
+pub(crate) const PURPLE: Color = Color::Rgb(147, 112, 219);
+/// Gold color for accents (from logo).
+pub(crate) const GOLD: Color = Color::Rgb(218, 165, 32);
+/// Dim gray for borders and secondary chrome.
+pub(crate) const DIM: Color = Color::Rgb(128, 128, 128);
+/// Cool blue used for the user role header.
+pub(crate) const USER_BLUE: Color = Color::Rgb(100, 180, 255);
+
+/// Braille-dot spinner frames used by the input area while a turn is in flight.
+///
+/// Lives in `mod.rs` (not `app.rs`) so the brand chrome is colocated with the
+/// brand palette (crosslink #442).
+pub(crate) const SPINNER_FRAMES: &[&str] =
+    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ─── Theme support ──────────────────────────────────────────────────────────
 
@@ -1370,6 +1386,28 @@ mod tests {
     fn test_find_closing_char() {
         let chars: Vec<char> = "hello`world".chars().collect();
         assert_eq!(find_closing_char(&chars, 0, '`'), Some(5));
+    }
+
+    /// Regression for crosslink #442: the brand palette constants must
+    /// resolve to the exact RGB triples that were previously inlined at
+    /// every call site. If anyone "tweaks" the purple to look slightly
+    /// different, this test fails and they re-think it deliberately.
+    #[test]
+    fn brand_palette_rgb_values_are_stable() {
+        assert_eq!(PURPLE, Color::Rgb(147, 112, 219), "PURPLE drifted");
+        assert_eq!(GOLD, Color::Rgb(218, 165, 32), "GOLD drifted");
+        assert_eq!(DIM, Color::Rgb(128, 128, 128), "DIM drifted");
+        assert_eq!(USER_BLUE, Color::Rgb(100, 180, 255), "USER_BLUE drifted");
+    }
+
+    /// Regression for crosslink #442: spinner frames live with the brand
+    /// palette in `mod.rs`. Keep the canonical Braille-dot sequence so the
+    /// spinner animation matches what users expect.
+    #[test]
+    fn spinner_frames_are_braille_sequence() {
+        assert_eq!(SPINNER_FRAMES.len(), 10, "spinner must have 10 frames");
+        assert_eq!(SPINNER_FRAMES[0], "⠋", "first frame must be ⠋");
+        assert_eq!(SPINNER_FRAMES[9], "⠏", "last frame must be ⠏");
     }
 
     #[test]

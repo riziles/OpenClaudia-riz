@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 
+use super::{GOLD, PURPLE, USER_BLUE};
+
 // ─── MessageKind ────────────────────────────────────────────────────────────
 
 /// The semantic kind of a [`DisplayMessage`].
@@ -423,23 +425,23 @@ impl MessageList {
                     Span::styled(
                         "OpenClaudia",
                         Style::default()
-                            .fg(Color::Rgb(147, 112, 219))
+                            .fg(PURPLE)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         &line["OpenClaudia".len()..],
-                        Style::default().fg(Color::Rgb(218, 165, 32)),
+                        Style::default().fg(GOLD),
                     ),
                 ])
             } else if line.starts_with("Provider:") {
                 Line::from(Span::styled(
                     line,
-                    Style::default().fg(Color::Rgb(147, 112, 219)),
+                    Style::default().fg(PURPLE),
                 ))
             } else if line.starts_with("Model:") {
                 Line::from(Span::styled(
                     line,
-                    Style::default().fg(Color::Rgb(218, 165, 32)),
+                    Style::default().fg(GOLD),
                 ))
             } else if line.starts_with("Welcome") {
                 Line::from(Span::styled(
@@ -510,7 +512,7 @@ impl MessageList {
                 out.push(Line::from(Span::styled(
                     "\u{203A} user",
                     Style::default()
-                        .fg(Color::Rgb(100, 180, 255))
+                        .fg(USER_BLUE)
                         .add_modifier(Modifier::BOLD),
                 )));
                 for line in msg.content.lines() {
@@ -522,7 +524,7 @@ impl MessageList {
                 out.push(Line::from(Span::styled(
                     "\u{23BF} Claudia",
                     Style::default()
-                        .fg(Color::Rgb(147, 112, 219))
+                        .fg(PURPLE)
                         .add_modifier(Modifier::BOLD),
                 )));
                 for line in msg.content.lines() {
@@ -574,7 +576,7 @@ impl MessageList {
             lines.push(Line::from(Span::styled(
                 "\u{23BF} Claudia",
                 Style::default()
-                    .fg(Color::Rgb(147, 112, 219))
+                    .fg(PURPLE)
                     .add_modifier(Modifier::BOLD),
             )));
             for line in self.streaming_text.lines() {
@@ -583,7 +585,7 @@ impl MessageList {
             // Cursor indicator
             lines.push(Line::from(Span::styled(
                 "  \u{2588}",
-                Style::default().fg(Color::Rgb(147, 112, 219)),
+                Style::default().fg(PURPLE),
             )));
         }
 

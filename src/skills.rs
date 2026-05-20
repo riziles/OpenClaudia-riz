@@ -42,6 +42,31 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 use std::time::SystemTime;
+use thiserror::Error;
+
+/// Structured failure modes for [`parse_skill_file`].
+///
+/// Returning a typed error (instead of `Option`) lets call sites discriminate
+/// between "this isn't a skill file" (`FrontmatterMissing`) and real corruption
+/// (`YamlFailed`, `ReadFailed`). The public scan path in [`load_skills`]
+/// converts this back to `Option` and logs each failure with full context via
+/// `tracing::warn!` so users can diagnose silently-dropped skills (crosslink
+/// #441 / #432).
+#[derive(Debug, Error)]
+pub enum SkillParseError {
+    /// The skill file could not be read from disk (missing, permission denied, etc).
+    #[error("failed to read skill file: {0}")]
+    ReadFailed(#[from] std::io::Error),
+    /// The file did not begin with the YAML frontmatter `---` delimiter,
+    /// or the closing `---` was missing. The file is silently treated as
+    /// "not a skill" — every plain `.md` in a skills dir hits this path.
+    #[error("skill file has no YAML frontmatter (`---` delimiters)")]
+    FrontmatterMissing,
+    /// The frontmatter delimiters were present but the contents failed to
+    /// deserialize into a [`SkillDefinition`].
+    #[error("failed to parse skill frontmatter as YAML: {0}")]
+    YamlFailed(#[from] serde_yaml::Error),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillDefinition {
@@ -97,49 +122,82 @@ fn current_mtimes(dirs: &[PathBuf]) -> DirMtimes {
 
 /// Parse a skill file (YAML frontmatter + markdown body).
 ///
-/// Returns `None` for files without `---` frontmatter, files we cannot read,
-/// or files whose frontmatter fails to parse as a [`SkillDefinition`]. Parse
-/// failures and IO errors are logged at `WARN` via `tracing` so the user can
-/// diagnose silently-dropped skills (crosslink #432).
-#[must_use]
-pub fn parse_skill_file(path: &Path) -> Option<SkillDefinition> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                skill_path = %path.display(),
-                error = %e,
-                "failed to read skill file"
-            );
-            return None;
-        }
+/// Returns [`SkillParseError`] for files without `---` frontmatter, files we
+/// cannot read, or files whose frontmatter fails to parse as a
+/// [`SkillDefinition`]. Call sites in [`load_skills`] convert the error back
+/// to `Option`, logging each failure at `WARN` via `tracing` so users can
+/// diagnose silently-dropped skills (crosslink #441 / #432).
+///
+/// Normalizes two common editor artifacts before parsing:
+/// * **UTF-8 BOM** (`U+FEFF`) at the very start of the file — Windows editors
+///   like Notepad emit this; without stripping it the frontmatter check
+///   (`starts_with("---")`) fails and the skill is silently dropped.
+/// * **CRLF line endings** — `serde_yaml` accepts CRLF, but our manual
+///   delimiter search would treat `\r---` differently from `---`, so we
+///   normalize to `\n` first for stable behavior across platforms.
+///
+/// # Errors
+///
+/// Returns [`SkillParseError::ReadFailed`] if the file cannot be read,
+/// [`SkillParseError::FrontmatterMissing`] if the leading or trailing `---`
+/// is absent, or [`SkillParseError::YamlFailed`] if the frontmatter is not
+/// valid YAML for a [`SkillDefinition`].
+pub fn parse_skill_file(path: &Path) -> Result<SkillDefinition, SkillParseError> {
+    let raw = std::fs::read_to_string(path)?;
+
+    // Strip UTF-8 BOM (Windows editors emit this) and normalize CRLF → LF
+    // before any delimiter inspection. Both are no-ops for already-clean
+    // files, so well-formed Unix UTF-8 skills are unaffected.
+    let stripped = raw.trim_start_matches('\u{FEFF}');
+    let content: String = if stripped.contains('\r') {
+        stripped.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        stripped.to_string()
     };
 
     // Split frontmatter from body
     if !content.starts_with("---") {
-        return None;
+        return Err(SkillParseError::FrontmatterMissing);
     }
 
     let rest = &content[3..];
-    let end = rest.find("---")?;
+    let end = rest.find("---").ok_or(SkillParseError::FrontmatterMissing)?;
     let frontmatter = rest[..end].trim();
     let body = rest[end + 3..].trim();
 
-    let mut skill: SkillDefinition = match serde_yaml::from_str(frontmatter) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                skill_path = %path.display(),
-                error = %e,
-                "failed to parse skill frontmatter as YAML; skill will not load"
-            );
-            return None;
-        }
-    };
+    let mut skill: SkillDefinition = serde_yaml::from_str(frontmatter)?;
     skill.prompt = body.to_string();
     skill.path = path.to_path_buf();
 
-    Some(skill)
+    Ok(skill)
+}
+
+/// Adapter that converts a [`parse_skill_file`] error into an `Option`,
+/// logging the failure with full structured context. Keeps the scan loop
+/// in [`scan_one_dir`] terse while preserving the per-file `tracing::warn!`
+/// behavior the previous `Option`-returning API had.
+fn parse_skill_file_logged(path: &Path) -> Option<SkillDefinition> {
+    match parse_skill_file(path) {
+        Ok(skill) => Some(skill),
+        // Files without frontmatter are *expected* — every README.md or
+        // notes.md in a skills dir hits this path. Log at TRACE rather
+        // than WARN so it doesn't pollute the user's stderr.
+        Err(SkillParseError::FrontmatterMissing) => {
+            tracing::trace!(
+                skill_path = %path.display(),
+                "skipping file without YAML frontmatter"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                skill_path = %path.display(),
+                error = %err,
+                "failed to load skill; file will be ignored"
+            );
+            None
+        }
+    }
 }
 
 /// Scan a single directory for skill definitions, appending into `out`.
@@ -154,7 +212,7 @@ fn scan_one_dir(dir: &Path, out: &mut Vec<SkillDefinition>) {
             // Look for SKILL.md inside subdirectory
             let skill_file = path.join("SKILL.md");
             if skill_file.exists() {
-                if let Some(mut skill) = parse_skill_file(&skill_file) {
+                if let Some(mut skill) = parse_skill_file_logged(&skill_file) {
                     if skill.name.is_empty() {
                         skill.name = path
                             .file_name()
@@ -167,7 +225,7 @@ fn scan_one_dir(dir: &Path, out: &mut Vec<SkillDefinition>) {
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             // Direct .md file in skills dir
-            if let Some(mut skill) = parse_skill_file(&path) {
+            if let Some(mut skill) = parse_skill_file_logged(&path) {
                 if skill.name.is_empty() {
                     skill.name = path
                         .file_stem()
@@ -279,7 +337,10 @@ mod tests {
     fn test_parse_skill_no_frontmatter() {
         let tmp = std::env::temp_dir().join("no_fm.md");
         std::fs::write(&tmp, "Just plain text").unwrap();
-        assert!(parse_skill_file(&tmp).is_none());
+        assert!(matches!(
+            parse_skill_file(&tmp),
+            Err(SkillParseError::FrontmatterMissing)
+        ));
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -306,15 +367,20 @@ mod tests {
 
     // ── #432: cache + mtime invalidation + YAML error logging ───────────────
 
-    /// Parse failure on bad YAML returns `None` (the warn-log side effect is
-    /// observed via cargo test stderr; this asserts the user-visible behavior).
+    /// Parse failure on bad YAML returns a `YamlFailed` error (the warn-log
+    /// side effect is observed via cargo test stderr; this asserts the
+    /// user-visible behavior).
     #[test]
-    fn parse_skill_file_returns_none_on_bad_yaml() {
+    fn parse_skill_file_returns_err_on_bad_yaml() {
         let tmp = std::env::temp_dir().join("openclaudia_bad_yaml_skill.md");
         // Frontmatter is structurally present (--- ... ---) but the YAML body
         // is invalid (unclosed bracket, no required fields).
         std::fs::write(&tmp, "---\nname: [unterminated\n---\n\nbody").unwrap();
-        assert!(parse_skill_file(&tmp).is_none(), "bad YAML must yield None");
+        let err = parse_skill_file(&tmp).expect_err("bad YAML must yield Err");
+        assert!(
+            matches!(err, SkillParseError::YamlFailed(_)),
+            "expected YamlFailed, got {err:?}"
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -380,6 +446,85 @@ mod tests {
         assert_ne!(
             m1, m2,
             "adding a file must change the dir mtime fingerprint"
+        );
+    }
+
+    // ── #441: BOM + CRLF normalization + structured errors ─────────────────
+
+    /// A UTF-8 BOM (`U+FEFF`) at the start of the file must not prevent the
+    /// `---` frontmatter from being detected. Windows editors like Notepad
+    /// emit a BOM by default; pre-#441 we silently dropped these skills.
+    #[test]
+    fn parse_skill_file_strips_utf8_bom() {
+        let bom = "\u{FEFF}";
+        let body = "---\nname: bom-skill\ndescription: BOM prefixed\n---\n\nBOM body.";
+        let content = format!("{bom}{body}");
+        let tmp = std::env::temp_dir().join("openclaudia_bom_skill.md");
+        std::fs::write(&tmp, content).unwrap();
+
+        let skill = parse_skill_file(&tmp).expect("BOM-prefixed file must parse");
+        assert_eq!(skill.name, "bom-skill");
+        assert_eq!(skill.description, "BOM prefixed");
+        assert_eq!(skill.prompt, "BOM body.");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Windows-style CRLF line endings around the frontmatter delimiters
+    /// must parse identically to LF-only input. Pre-#441 the embedded `\r`
+    /// in `\r---\r` confused the manual delimiter search.
+    #[test]
+    fn parse_skill_file_normalizes_crlf() {
+        let content =
+            "---\r\nname: crlf-skill\r\ndescription: CRLF endings\r\n---\r\n\r\nCRLF body.\r\n";
+        let tmp = std::env::temp_dir().join("openclaudia_crlf_skill.md");
+        std::fs::write(&tmp, content).unwrap();
+
+        let skill = parse_skill_file(&tmp).expect("CRLF file must parse");
+        assert_eq!(skill.name, "crlf-skill");
+        assert_eq!(skill.description, "CRLF endings");
+        assert_eq!(
+            skill.prompt, "CRLF body.",
+            "body must be CRLF-normalized and trimmed"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Combined: BOM + CRLF (the most common "Windows Notepad" trifecta)
+    /// must parse cleanly without producing a `FrontmatterMissing` error.
+    #[test]
+    fn parse_skill_file_handles_bom_and_crlf_together() {
+        let content =
+            "\u{FEFF}---\r\nname: win-skill\r\ndescription: Windows-style\r\n---\r\n\r\nbody";
+        let tmp = std::env::temp_dir().join("openclaudia_bom_crlf_skill.md");
+        std::fs::write(&tmp, content).unwrap();
+
+        let skill = parse_skill_file(&tmp).expect("BOM+CRLF file must parse");
+        assert_eq!(skill.name, "win-skill");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// The logged adapter must convert a `YamlFailed` into `None` and let
+    /// `scan_one_dir` continue (this is the `load_skills` path's contract).
+    #[test]
+    fn parse_skill_file_logged_returns_none_on_bad_yaml() {
+        let tmp = std::env::temp_dir().join("openclaudia_logged_bad_yaml.md");
+        std::fs::write(&tmp, "---\nname: [bad\n---\n\nbody").unwrap();
+        assert!(
+            parse_skill_file_logged(&tmp).is_none(),
+            "logged adapter must convert YamlFailed → None for scan_one_dir"
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// A nonexistent path surfaces as `ReadFailed`, not a panic.
+    #[test]
+    fn parse_skill_file_missing_path_is_read_failed() {
+        let tmp = std::env::temp_dir().join("openclaudia_definitely_not_present_skill.md");
+        std::fs::remove_file(&tmp).ok();
+        let err = parse_skill_file(&tmp).expect_err("missing file must yield Err");
+        assert!(
+            matches!(err, SkillParseError::ReadFailed(_)),
+            "expected ReadFailed, got {err:?}"
         );
     }
 

@@ -480,52 +480,52 @@ fn b3_github_repo_match_case_insensitive() {
 // B4 — `parse_skill_file` contracts
 // ---------------------------------------------------------------------------
 
-/// B4-a: Missing closing `---` returns `None` — no panic.
+/// B4-a: Missing closing `---` returns an error — no panic.
 #[test]
-fn b4_missing_closing_delimiter_returns_none() {
+fn b4_missing_closing_delimiter_returns_err() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("unclosed.md");
     fs::write(&path, "---\nname: foo\ndescription: bar\n").unwrap();
     assert!(
-        parse_skill_file(&path).is_none(),
-        "missing closing --- must return None"
+        parse_skill_file(&path).is_err(),
+        "missing closing --- must return Err"
     );
 }
 
-/// B4-b: Invalid YAML in frontmatter returns `None` — no panic.
+/// B4-b: Invalid YAML in frontmatter returns an error — no panic.
 #[test]
-fn b4_invalid_yaml_frontmatter_returns_none() {
+fn b4_invalid_yaml_frontmatter_returns_err() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bad_yaml.md");
     // Deliberately malformed YAML: unclosed bracket.
     fs::write(&path, "---\nname: [unclosed\n---\n\nBody.\n").unwrap();
     assert!(
-        parse_skill_file(&path).is_none(),
-        "invalid YAML must return None, not panic"
+        parse_skill_file(&path).is_err(),
+        "invalid YAML must return Err, not panic"
     );
 }
 
-/// B4-c: Content that does not start with `---` returns `None`.
+/// B4-c: Content that does not start with `---` returns an error.
 #[test]
-fn b4_no_frontmatter_delimiter_returns_none() {
+fn b4_no_frontmatter_delimiter_returns_err() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("plain.md");
     fs::write(&path, "# Just a plain markdown file\n\nNo frontmatter.\n").unwrap();
     assert!(
-        parse_skill_file(&path).is_none(),
-        "file without leading --- must return None"
+        parse_skill_file(&path).is_err(),
+        "file without leading --- must return Err"
     );
 }
 
-/// B4-d: Unreadable / nonexistent file returns `None` — no panic.
+/// B4-d: Unreadable / nonexistent file returns an error — no panic.
 #[test]
-fn b4_unreadable_file_returns_none() {
+fn b4_unreadable_file_returns_err() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("nonexistent.md");
     // path does not exist at all — read_to_string will fail.
     assert!(
-        parse_skill_file(&path).is_none(),
-        "nonexistent file must return None"
+        parse_skill_file(&path).is_err(),
+        "nonexistent file must return Err"
     );
 }
 
@@ -813,7 +813,7 @@ fn b5_parse_skill_file_absolute_path() {
     write_skill(&path, "standalone", "Standalone skill", "Standalone body.");
     let result = parse_skill_file(&path);
     assert!(
-        result.is_some(),
+        result.is_ok(),
         "parse_skill_file must succeed for a valid absolute path"
     );
     assert_eq!(result.unwrap().name, "standalone");
@@ -830,7 +830,7 @@ fn b5_directory_format_skill_file_parseable() {
     let skill_md = subdir.join("SKILL.md");
     write_skill(&skill_md, "my-skill", "A dir skill", "Dir skill body.");
     let result = parse_skill_file(&skill_md);
-    assert!(result.is_some(), "SKILL.md in subdir must be parseable");
+    assert!(result.is_ok(), "SKILL.md in subdir must be parseable");
     assert_eq!(result.unwrap().name, "my-skill");
 }
 

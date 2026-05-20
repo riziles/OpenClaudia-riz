@@ -7,6 +7,7 @@
 use super::events::{AppEvent, EventHandler};
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
+use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
 use crossterm::{
     event::{KeyCode, KeyModifiers},
     execute,
@@ -19,8 +20,6 @@ use ratatui::{
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
-
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Chat session state — compatible with the CLI's `ChatSession` JSON format
 /// so sessions saved by one can be loaded by the other.
@@ -1451,7 +1450,7 @@ impl App {
         // ── Input area ──
         let input_block = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Rgb(128, 128, 128)));
+            .border_style(Style::default().fg(DIM));
 
         let prompt_text = if self.is_waiting {
             format!("{} ", SPINNER_FRAMES[self.spinner_frame])
@@ -1488,7 +1487,7 @@ impl App {
         let status_text = format!(" {left_text}{}{right_text} ", " ".repeat(padding));
 
         let status =
-            Paragraph::new(status_text).style(Style::default().fg(Color::Rgb(128, 128, 128)));
+            Paragraph::new(status_text).style(Style::default().fg(DIM));
         frame.render_widget(status, chunks[3]);
 
         // ── Permission prompt overlay ──
@@ -1555,11 +1554,11 @@ impl App {
                     .title(" Permission Required ")
                     .title_style(
                         Style::default()
-                            .fg(Color::Rgb(218, 165, 32))
+                            .fg(GOLD)
                             .add_modifier(Modifier::BOLD),
                     )
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(218, 165, 32))),
+                    .border_style(Style::default().fg(GOLD)),
             )
             .style(Style::default().bg(Color::Black));
         frame.render_widget(dialog, dialog_area);
@@ -1574,19 +1573,19 @@ impl App {
             Span::styled(
                 "OpenClaudia",
                 Style::default()
-                    .fg(Color::Rgb(147, 112, 219))
+                    .fg(PURPLE)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" v{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(Color::Rgb(218, 165, 32)),
+                Style::default().fg(GOLD),
             ),
         ]);
 
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(147, 112, 219)));
+            .border_style(Style::default().fg(PURPLE));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1628,11 +1627,11 @@ impl App {
             Line::from(""),
             Line::from(Span::styled(
                 format!("Provider: {}", super::capitalize_first(&self.provider)),
-                Style::default().fg(Color::Rgb(147, 112, 219)),
+                Style::default().fg(PURPLE),
             )),
             Line::from(Span::styled(
                 format!("Model: {}", self.model),
-                Style::default().fg(Color::Rgb(218, 165, 32)),
+                Style::default().fg(GOLD),
             )),
             Line::from(Span::styled(cwd, Style::default().fg(Color::DarkGray))),
         ])
@@ -1644,7 +1643,7 @@ impl App {
         let right = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Tips",
-                Style::default().fg(Color::Rgb(218, 165, 32)),
+                Style::default().fg(GOLD),
             )),
             Line::from(Span::styled(
                 tips[0].to_string(),
@@ -1653,7 +1652,7 @@ impl App {
             Line::from(""),
             Line::from(Span::styled(
                 "Recent activity",
-                Style::default().fg(Color::Rgb(218, 165, 32)),
+                Style::default().fg(GOLD),
             )),
             Line::from(Span::styled(
                 "No recent activity",
