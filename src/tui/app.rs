@@ -4,7 +4,7 @@
 //! Provides a scrollable message view, text input area, status bar,
 //! and streaming response display wired to the real API pipeline.
 
-use super::events::{AppEvent, EventHandler};
+use super::events::{AppEvent, EventHandler, SpawnTarget};
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
@@ -680,9 +680,111 @@ impl App {
                     reply,
                 });
             }
+            Ok(AppEvent::ShellDone {
+                target,
+                stdout,
+                stderr,
+                exit_code,
+            }) => {
+                self.handle_shell_done(target, &stdout, &stderr, exit_code);
+            }
             Err(_) => return false,
         }
         true
+    }
+
+    /// Render the result of a backgrounded shell call dispatched via
+    /// [`Self::spawn_shell`]. Closes crosslink #371: the same rendering
+    /// logic that used to live inline next to a blocking `.output()` call
+    /// now runs on the UI thread *after* the child has exited on the
+    /// tokio runtime, so the event loop never stalls.
+    fn handle_shell_done(
+        &mut self,
+        target: SpawnTarget,
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+    ) {
+        match target {
+            SpawnTarget::Diff => {
+                let content = if exit_code.is_none() {
+                    format!("Failed to run git diff: {stderr}")
+                } else if stdout.is_empty() {
+                    "No uncommitted changes.".to_string()
+                } else {
+                    format!("Uncommitted changes:\n{stdout}")
+                };
+                self.messages.add(DisplayMessage::system(content));
+            }
+            SpawnTarget::Review => {
+                let content = if exit_code.is_none() {
+                    format!("Failed to run git diff: {stderr}")
+                } else if stdout.is_empty() {
+                    "No changes to review.".to_string()
+                } else {
+                    let total = stdout.lines().count();
+                    let lines: Vec<&str> = stdout.lines().take(100).collect();
+                    if total > 100 {
+                        format!("{}\n... (truncated, {total} total lines)", lines.join("\n"))
+                    } else {
+                        lines.join("\n")
+                    }
+                };
+                self.messages.add(DisplayMessage::system(content));
+            }
+            SpawnTarget::Init => {
+                let content = if exit_code.is_none() {
+                    format!("Init failed: {stderr}")
+                } else {
+                    stdout.to_string()
+                };
+                self.messages.add(DisplayMessage::system(content));
+            }
+            SpawnTarget::Files | SpawnTarget::Doctor => {
+                // Reserved for follow-up #371 migration — these branches are
+                // not yet routed through spawn_shell (they don't invoke a
+                // child process today), so receiving one is a logic bug
+                // rather than user-visible state. Render defensively.
+                let content = if exit_code.is_none() {
+                    format!("Command failed: {stderr}")
+                } else {
+                    stdout.to_string()
+                };
+                self.messages.add(DisplayMessage::system(content));
+            }
+            SpawnTarget::ShellCommand { displayed } => {
+                let success = matches!(exit_code, Some(0));
+                let mut result = String::new();
+                if !stdout.is_empty() {
+                    result.push_str(stdout);
+                }
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(stderr);
+                }
+                let header = format!("$ {displayed}");
+                if exit_code.is_none() {
+                    self.messages.add(DisplayMessage {
+                        kind: MessageKind::ToolErr { name: header },
+                        content: format!("Failed: {stderr}"),
+                    });
+                    return;
+                }
+                if result.is_empty() {
+                    result = "(no output)".to_string();
+                }
+                self.messages.add(DisplayMessage {
+                    kind: if success {
+                        MessageKind::ToolOk { name: header }
+                    } else {
+                        MessageKind::ToolErr { name: header }
+                    },
+                    content: result,
+                });
+            }
+        }
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -1174,22 +1276,14 @@ impl App {
     }
 
     /// Handle the `/diff` slash command (shows `git diff --stat`).
-    fn handle_slash_diff(&mut self) {
-        let content = match std::process::Command::new("git")
-            .args(["diff", "--stat"])
-            .output()
-        {
-            Ok(out) => {
-                let s = String::from_utf8_lossy(&out.stdout);
-                if s.is_empty() {
-                    "No uncommitted changes.".to_string()
-                } else {
-                    format!("Uncommitted changes:\n{s}")
-                }
-            }
-            Err(e) => format!("Failed to run git diff: {e}"),
-        };
-        self.messages.add(DisplayMessage::system(content));
+    ///
+    /// Dispatches to the tokio runtime via [`Self::spawn_shell`] — see
+    /// crosslink #371. The rendering of the result happens on the next
+    /// `AppEvent::ShellDone` tick handled in `handle_app_event`.
+    fn handle_slash_diff(&self) {
+        // Drop the JoinHandle explicitly: the slash-command call site is
+        // fire-and-forget, the receiver lives in the mpsc channel.
+        drop(self.spawn_shell(vec!["git", "diff", "--stat"], SpawnTarget::Diff));
     }
 
     /// Handle the `/doctor` slash command (environment diagnostics).
@@ -1300,53 +1394,26 @@ impl App {
     }
 
     /// Execute a shell command and display its output.
-    fn handle_shell_command(&mut self, cmd: &str) {
+    ///
+    /// Dispatches to the tokio runtime via [`Self::spawn_shell`] (crosslink
+    /// #371). The previous implementation blocked the sync event loop on
+    /// `std::process::Command::new("bash").output()` for the full lifetime
+    /// of the child — long-running commands froze the spinner and queued
+    /// keypresses. We now post the result back via
+    /// [`AppEvent::ShellDone`] for the receiver in `handle_app_event` to
+    /// render with the same `$ <cmd>` header as before.
+    fn handle_shell_command(&self, cmd: &str) {
         if cmd.is_empty() {
             return;
         }
-        let output = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
-            .output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(&stderr);
-                }
-                if result.is_empty() {
-                    result = "(no output)".to_string();
-                }
-                self.messages.add(DisplayMessage {
-                    kind: if out.status.success() {
-                        MessageKind::ToolOk {
-                            name: format!("$ {cmd}"),
-                        }
-                    } else {
-                        MessageKind::ToolErr {
-                            name: format!("$ {cmd}"),
-                        }
-                    },
-                    content: result,
-                });
-            }
-            Err(e) => {
-                self.messages.add(DisplayMessage {
-                    kind: MessageKind::ToolErr {
-                        name: format!("$ {cmd}"),
-                    },
-                    content: format!("Failed: {e}"),
-                });
-            }
-        }
+        // Drop the JoinHandle explicitly: the shell escape is
+        // fire-and-forget, results arrive via AppEvent::ShellDone.
+        drop(self.spawn_shell(
+            vec!["bash", "-c", cmd],
+            SpawnTarget::ShellCommand {
+                displayed: cmd.to_string(),
+            },
+        ));
     }
 
     /// Send a user message to the API.
@@ -1377,6 +1444,102 @@ impl App {
         crate::guardrails::reset_turn();
         self.is_waiting = true;
         self.spawn_api_turn();
+    }
+
+    /// Spawn a subprocess on the tokio runtime and post the result back
+    /// to the TUI event loop as [`AppEvent::ShellDone`].
+    ///
+    /// This is the seam that closes crosslink #371. Slash commands like
+    /// `/diff` and the `!<cmd>` shell escape used to call
+    /// `std::process::Command::new(...).output()` directly on the sync
+    /// event loop thread, which blocked rendering for the full lifetime
+    /// of the child. The helper instead dispatches the work to
+    /// `runtime_handle.spawn(...)` using `tokio::process::Command` so
+    /// the loop keeps ticking; results arrive asynchronously via the
+    /// existing mpsc channel that already carries streaming API events.
+    ///
+    /// `cmd[0]` is the program; `cmd[1..]` are its args. The empty
+    /// vector is a logic bug — we return a no-op join handle instead of
+    /// panicking on `split_first` because the caller can be exercised
+    /// from outside `run()` (e.g. tests).
+    ///
+    /// If no runtime is bound yet (`self.runtime_handle == None`) the
+    /// helper still returns a `JoinHandle<()>` so the call site has a
+    /// single, total signature — it just posts an error `ShellDone`
+    /// (`exit_code` = None, stderr explaining the missing runtime) via
+    /// `std::thread::spawn`.
+    fn spawn_shell(&self, cmd: Vec<&str>, target: SpawnTarget) -> tokio::task::JoinHandle<()> {
+        let tx = self.api_event_tx.clone();
+        // Eagerly own the argv as Strings — the future outlives `&self`.
+        let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
+
+        let Some(handle) = self.runtime_handle.clone() else {
+            // No runtime — surface as a failed ShellDone so the receiver
+            // still gets called. We need a real JoinHandle to satisfy the
+            // return type; spawn an immediately-ready future via a
+            // detached single-threaded runtime would re-introduce
+            // blocking, so instead we synthesize one through a
+            // best-effort tokio::spawn that may itself fail. Falling
+            // back to a thread keeps the contract.
+            if let Some(tx) = tx {
+                let _ = tx.send(AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: "no async runtime bound — cannot spawn shell".to_string(),
+                    exit_code: None,
+                });
+            }
+            // We still owe a JoinHandle. Spawn a no-op future on a
+            // throwaway runtime so the type checks. This branch is
+            // only reachable before `run()` initialises the handle.
+            return tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_or_else(
+                    |_| {
+                        // As a last resort, panic — there is literally
+                        // no way to manufacture a JoinHandle without a
+                        // runtime, and being here means the test
+                        // harness is misconfigured.
+                        panic!("spawn_shell called with no runtime_handle and no fallback runtime");
+                    },
+                    |rt| rt.spawn(async {}),
+                );
+        };
+
+        handle.spawn(async move {
+            let Some((exe, rest)) = argv.split_first() else {
+                if let Some(tx) = tx {
+                    let _ = tx.send(AppEvent::ShellDone {
+                        target,
+                        stdout: String::new(),
+                        stderr: "spawn_shell called with empty argv".to_string(),
+                        exit_code: None,
+                    });
+                }
+                return;
+            };
+
+            let result = tokio::process::Command::new(exe).args(rest).output().await;
+
+            let evt = match result {
+                Ok(out) => AppEvent::ShellDone {
+                    target,
+                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    exit_code: out.status.code(),
+                },
+                Err(e) => AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: format!("{e}"),
+                    exit_code: None,
+                },
+            };
+
+            if let Some(tx) = tx {
+                let _ = tx.send(evt);
+            }
+        })
     }
 
     /// Spawn an async API turn on the tokio runtime.
@@ -1487,8 +1650,7 @@ impl App {
         let padding = bar_width.saturating_sub(content_len);
         let status_text = format!(" {left_text}{}{right_text} ", " ".repeat(padding));
 
-        let status =
-            Paragraph::new(status_text).style(Style::default().fg(DIM));
+        let status = Paragraph::new(status_text).style(Style::default().fg(DIM));
         frame.render_widget(status, chunks[3]);
 
         // ── Permission prompt overlay ──
@@ -1553,11 +1715,7 @@ impl App {
             .block(
                 Block::default()
                     .title(" Permission Required ")
-                    .title_style(
-                        Style::default()
-                            .fg(GOLD)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    .title_style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(GOLD)),
             )
@@ -1573,9 +1731,7 @@ impl App {
         let title = Line::from(vec![
             Span::styled(
                 "OpenClaudia",
-                Style::default()
-                    .fg(PURPLE)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" v{}", env!("CARGO_PKG_VERSION")),
@@ -1642,19 +1798,13 @@ impl App {
         // Right column: tips and recent activity
         let tips = super::get_tips();
         let right = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Tips",
-                Style::default().fg(GOLD),
-            )),
+            Line::from(Span::styled("Tips", Style::default().fg(GOLD))),
             Line::from(Span::styled(
                 tips[0].to_string(),
                 Style::default().fg(Color::White),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                "Recent activity",
-                Style::default().fg(GOLD),
-            )),
+            Line::from(Span::styled("Recent activity", Style::default().fg(GOLD))),
             Line::from(Span::styled(
                 "No recent activity",
                 Style::default().fg(Color::DarkGray),
@@ -1906,6 +2056,123 @@ async fn run_api_turn_async(p: ApiTurnParams) {
 #[cfg(test)]
 mod tests {
     use super::expand_file_refs;
+    use super::{App, AppEvent, SpawnTarget};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // =========================================================================
+    // Behavior: spawn_shell — closes crosslink #371 by moving subprocess
+    // execution off the sync TUI event loop and onto the tokio runtime.
+    // =========================================================================
+
+    /// Build an App wired to a tokio runtime handle and a fresh mpsc channel.
+    /// Returns the receiver so the test can observe `AppEvent::ShellDone`.
+    fn wire_app(app: &mut App) -> mpsc::Receiver<AppEvent> {
+        app.runtime_handle = tokio::runtime::Handle::try_current().ok();
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        app.api_event_tx = Some(tx);
+        rx
+    }
+
+    /// Block the current thread on `rx` for up to `timeout`, returning the
+    /// first `ShellDone` event seen — or `None` if nothing arrives in time.
+    /// Other event variants are skipped (the sync loop would handle them
+    /// separately).
+    fn recv_shell_done(
+        rx: &mpsc::Receiver<AppEvent>,
+        timeout: Duration,
+    ) -> Option<(SpawnTarget, String, String, Option<i32>)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            if let AppEvent::ShellDone {
+                target,
+                stdout,
+                stderr,
+                exit_code,
+            } = rx.recv_timeout(remaining).ok()?
+            {
+                return Some((target, stdout, stderr, exit_code));
+            }
+            // Other event variants belong to the real event loop — skip
+            // them and keep waiting for our ShellDone.
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_returns_immediately_and_runs_in_background() {
+        // The helper must not block the calling (event-loop) thread. We
+        // ask it to launch `sleep 0.4` and measure that the *call itself*
+        // returns in < 100ms — well below the child's lifetime — and
+        // that the JoinHandle eventually completes.
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+
+        let call_start = Instant::now();
+        let join = app.spawn_shell(vec!["sleep", "0.4"], SpawnTarget::Diff);
+        let call_elapsed = call_start.elapsed();
+
+        // Pre-#371 implementation blocked for the full child lifetime.
+        // 100ms is generous: spawning a tokio task is microseconds.
+        assert!(
+            call_elapsed < Duration::from_millis(100),
+            "spawn_shell blocked the caller for {call_elapsed:?} — should return immediately"
+        );
+
+        // The handle must actually resolve once the child exits.
+        join.await.expect("spawn_shell task panicked");
+
+        // And the receiver must have observed the ShellDone event.
+        let done = recv_shell_done(&rx, Duration::from_millis(500))
+            .expect("expected ShellDone event after join");
+        assert!(matches!(done.0, SpawnTarget::Diff));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_success_delivers_stdout() {
+        // `echo hello-371` writes "hello-371\n" to stdout and exits 0.
+        // ShellDone must carry that stdout and an exit_code of Some(0).
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+
+        let join = app.spawn_shell(vec!["echo", "hello-371"], SpawnTarget::Diff);
+        join.await.expect("spawn_shell task panicked");
+
+        let (target, stdout, _stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(500))
+            .expect("expected ShellDone event from successful echo");
+        assert!(matches!(target, SpawnTarget::Diff));
+        assert_eq!(exit_code, Some(0), "echo should exit 0");
+        assert!(
+            stdout.contains("hello-371"),
+            "expected stdout to contain 'hello-371', got {stdout:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_failure_delivers_nonzero_exit() {
+        // `bash -c 'exit 7'` exits with code 7. ShellDone must surface
+        // exit_code = Some(7) so the renderer picks the ToolErr branch.
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+
+        let join = app.spawn_shell(
+            vec!["bash", "-c", "exit 7"],
+            SpawnTarget::ShellCommand {
+                displayed: "exit 7".to_string(),
+            },
+        );
+        join.await.expect("spawn_shell task panicked");
+
+        let (target, _stdout, _stderr, exit_code) =
+            recv_shell_done(&rx, Duration::from_millis(500))
+                .expect("expected ShellDone event from failing bash");
+        assert!(matches!(target, SpawnTarget::ShellCommand { .. }));
+        assert_eq!(
+            exit_code,
+            Some(7),
+            "bash -c 'exit 7' should report exit_code = Some(7)"
+        );
+    }
 
     // =========================================================================
     // Behavior: expand_file_refs — panic-free regex handling (#292)

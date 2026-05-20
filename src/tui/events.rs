@@ -17,6 +17,30 @@ pub enum PermissionResponse {
     AlwaysDeny,
 }
 
+/// Which slash-command branch dispatched a backgrounded shell call, so the
+/// UI thread knows how to render the resulting [`AppEvent::ShellDone`].
+///
+/// Closes crosslink #371 — the TUI used to call `std::process::Command::new()
+/// .output()` directly on the sync event loop, freezing the render loop for
+/// however long the child took to exit. The shell now runs on the tokio
+/// runtime via `App::spawn_shell` and the receiver matches on this tag to
+/// decide which message-shape to emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnTarget {
+    /// `/diff` — render stdout (or "No uncommitted changes.") as a system message.
+    Diff,
+    /// `/review` — truncated `git diff HEAD` as a system message.
+    Review,
+    /// `/init` — output of `openclaudia init` as a system message.
+    Init,
+    /// `/files` — directory listing (reserved for future migration).
+    Files,
+    /// `/doctor` — diagnostics output (reserved for future migration).
+    Doctor,
+    /// `!<cmd>` shell escape — render under a `$ <displayed>` tool header.
+    ShellCommand { displayed: String },
+}
+
 /// Application events from multiple sources.
 pub enum AppEvent {
     /// Terminal key event
@@ -51,6 +75,14 @@ pub enum AppEvent {
         tool_name: String,
         tool_args: String,
         reply: std::sync::mpsc::Sender<PermissionResponse>,
+    },
+    /// A subprocess dispatched via `App::spawn_shell` has finished.
+    /// The UI thread renders this according to [`SpawnTarget`].
+    ShellDone {
+        target: SpawnTarget,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
     },
 }
 
