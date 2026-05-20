@@ -743,57 +743,70 @@ impl MemoryDb {
     /// Returns an error if the mutex is poisoned or a non-FTS read
     /// fails (for example, hydrating tags for a returned row).
     /// FTS-parse / FTS-query errors are *not* propagated.
-    #[allow(clippy::significant_drop_tightening)] // conn must outlive stmt which borrows it
     pub fn memory_search(&self, query: &str, limit: usize) -> Result<Vec<ArchivalMemory>> {
+        // Delegate to a free helper that takes `&Connection`.  Same
+        // pattern as `memory_search_by_tag`: the lock guard drops at
+        // the end of this statement, so the inner search never holds
+        // the mutex while iterating rows.  Avoids a per-call
+        // `#[allow(clippy::significant_drop_tightening)]`.
+        Self::memory_search_on(&*self.lock_conn()?, query, limit)
+    }
+
+    /// Inner FTS5 search helper.  See [`MemoryDb::memory_search`] for
+    /// the public contract.
+    ///
+    /// Any rusqlite error from prepare / `query_map` / row collection
+    /// is converted to `Ok(Vec::new())` — surfacing it would weaponise
+    /// a single hostile query into a feature outage (crosslink #501).
+    /// The rusqlite message is intentionally not returned: an attacker
+    /// who can drive `query` should not learn the `SQLite` version or
+    /// precise FTS internals via error text.
+    fn memory_search_on(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ArchivalMemory>> {
         let phrase_query = escape_fts5_phrase(query);
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.lock_conn()?;
 
-        // The FTS5 MATCH lives in an inner scope so the `Statement`
-        // borrow ends before tag hydration.  Any rusqlite error here is
-        // converted to `Ok(Vec::new())` — surfacing it would weaponise
-        // a single hostile query into a feature outage (crosslink
-        // #501).  The rusqlite message is intentionally not returned:
-        // an attacker who can drive `query` should not learn the
-        // SQLite version or precise FTS internals via error text.
-        let rows: Vec<(i64, String, String, String)> = {
-            let mut stmt = match conn.prepare(
-                r"SELECT am.id, am.content, am.created_at, am.updated_at,
-                       bm25(archival_memory_fts) as rank
-                FROM archival_memory_fts
-                JOIN archival_memory am ON archival_memory_fts.rowid = am.id
-                WHERE archival_memory_fts MATCH ?1
-                ORDER BY rank
-                LIMIT ?2",
-            ) {
-                Ok(s) => s,
-                Err(_e) => return Ok(Vec::new()),
-            };
-            // Collect rows without tags first; then hydrate tags via a
-            // per-row look-up so the FTS query plan stays simple and
-            // we don't have to wrestle with GROUP_CONCAT.  N+1 here is
-            // bounded by `limit`, which the caller already chose; for
-            // the typical limit of <= 100 this is fine.
-            let mapped = stmt.query_map(params![phrase_query, limit_i64], |row| {
+        let mut stmt = match conn.prepare(
+            r"SELECT am.id, am.content, am.created_at, am.updated_at,
+                   bm25(archival_memory_fts) as rank
+            FROM archival_memory_fts
+            JOIN archival_memory am ON archival_memory_fts.rowid = am.id
+            WHERE archival_memory_fts MATCH ?1
+            ORDER BY rank
+            LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_e) => return Ok(Vec::new()),
+        };
+        // Collect rows without tags first; then hydrate tags via a
+        // per-row look-up so the FTS query plan stays simple and
+        // we don't have to wrestle with GROUP_CONCAT.  N+1 here is
+        // bounded by `limit`, which the caller already chose; for
+        // the typical limit of <= 100 this is fine.
+        let rows: Vec<(i64, String, String, String)> = match stmt.query_map(
+            params![phrase_query, limit_i64],
+            |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                 ))
-            });
-            match mapped {
-                Ok(iter) => match iter.collect::<rusqlite::Result<Vec<_>>>() {
-                    Ok(rs) => rs,
-                    Err(_e) => return Ok(Vec::new()),
-                },
+            },
+        ) {
+            Ok(iter) => match iter.collect::<rusqlite::Result<Vec<_>>>() {
+                Ok(rs) => rs,
                 Err(_e) => return Ok(Vec::new()),
-            }
+            },
+            Err(_e) => return Ok(Vec::new()),
         };
 
         let mut memories = Vec::with_capacity(rows.len());
         for (id, content, created_at, updated_at) in rows {
-            let tags = Self::load_tags_for(&conn, id)?;
+            let tags = Self::load_tags_for(conn, id)?;
             memories.push(ArchivalMemory {
                 id,
                 content,
@@ -2422,6 +2435,35 @@ mod tests {
                     "non-word query {q:?} must not match real rows"
                 );
             }
+        }
+    }
+
+    /// #501-h: end-to-end MATCH for `(foo OR bar)` is treated as a
+    /// literal phrase — it does NOT decompose into the FTS5 boolean
+    /// expression `foo OR bar` grouped by parens, so a row containing
+    /// only the word "foo" must NOT match.  Pins the contract that
+    /// quote-wrapping fully neutralizes operator interpretation.
+    #[test]
+    fn issue_501_paren_or_expression_is_literal() {
+        let dir = tempdir().unwrap();
+        let db = MemoryDb::open(&dir.path().join("test.db")).unwrap();
+        db.memory_save("foo by itself", &[]).unwrap();
+        db.memory_save("bar by itself", &[]).unwrap();
+        db.memory_save("contains (foo OR bar) verbatim", &[])
+            .unwrap();
+
+        // Pre-fix this would parse as `(foo OR bar)` and match the
+        // first two rows.  Post-fix it is one quoted phrase — matches
+        // only the row that contains the literal substring.
+        let hits = db
+            .memory_search("(foo OR bar)", 10)
+            .expect("paren-or query must not error");
+        for h in &hits {
+            assert!(
+                h.content.contains("(foo OR bar)"),
+                "matched row {:?} must contain the literal phrase",
+                h.content
+            );
         }
     }
 
