@@ -128,6 +128,26 @@ impl HookEvent {
             _ => None,
         }
     }
+
+    /// Whether this event is a *deny-intent* event — one where a hook's
+    /// purpose is to gate/block an action (`PreToolUse`, `PermissionRequest`).
+    ///
+    /// Used by [`HookEngine::matches_entry`] to choose the fail-mode when a
+    /// matcher regex fails to compile or evaluate:
+    ///
+    /// - Deny-intent events (`is_deny_intent() == true`) **fail closed**:
+    ///   a malformed matcher is treated as a match so the hook runs and can
+    ///   block the action. Crosslink #758 — failing open would silently
+    ///   convert deny hooks into no-ops on the slightest regex typo.
+    /// - Observe-intent events (everything else, e.g. `PostToolUse`,
+    ///   `Notification`) **fail open**: a malformed matcher is treated as
+    ///   "does not match" so an audit/observability hook never accidentally
+    ///   fires on an unrelated tool. Audit failures are surfaced elsewhere
+    ///   (see [`HookEngine::fire_post_tool`]).
+    #[must_use]
+    pub const fn is_deny_intent(self) -> bool {
+        matches!(self, Self::PreToolUse | Self::PermissionRequest)
+    }
 }
 
 impl HooksConfig {
@@ -376,7 +396,21 @@ impl HookEngine {
             "tool_output",
             serde_json::Value::String(tool_output.to_string()),
         );
-        let _ = self.run(event, &input).await;
+        // Crosslink #778 (OWASP A09): never silently discard hook errors here.
+        // `fire_post_tool` is fire-and-forget by design — failing audit hooks
+        // must not abort the tool call — but the error itself MUST hit the
+        // audit trail via `tracing::error!` so operator dashboards can alert.
+        let result = self.run(event, &input).await;
+        for (hook_error_index, hook_error) in result.errors.iter().enumerate() {
+            error!(
+                event = ?event,
+                tool = %tool_name,
+                session_id = ?session_id,
+                hook_error_index,
+                error = %hook_error,
+                "fire_post_tool: hook execution failed (not propagated to caller)"
+            );
+        }
     }
 
     /// Run all matching hooks for an event
@@ -389,10 +423,12 @@ impl HookEngine {
 
         let matcher_context = Self::get_matcher_context(input);
 
-        // Filter entries by matcher
+        // Filter entries by matcher. Pass `event` so a matcher-regex failure
+        // on a deny-intent event (PreToolUse / PermissionRequest) fails CLOSED
+        // — the hook still runs and can block. Crosslink #758.
         let matching_entries: Vec<&HookEntry> = entries
             .iter()
-            .filter(|entry| Self::matches_entry(entry, &matcher_context))
+            .filter(|entry| Self::matches_entry(entry, &matcher_context, event))
             .collect();
 
         if matching_entries.is_empty() {
@@ -505,17 +541,42 @@ impl HookEngine {
         input.event.config_key().to_string()
     }
 
-    /// Check if a hook entry matches the current context
-    fn matches_entry(entry: &HookEntry, context: &str) -> bool {
-        entry.matcher.as_ref().is_none_or(|pattern| {
-            match Self::validate_and_match(pattern, context) {
-                Ok(matched) => matched,
-                Err(e) => {
-                    warn!(pattern = %pattern, error = %e, "Matcher validation failed");
-                    false
-                }
+    /// Check if a hook entry matches the current context.
+    ///
+    /// On matcher-regex failure (compile error, oversize pattern, empty
+    /// pattern) the fail-mode is chosen by [`HookEvent::is_deny_intent`]:
+    ///
+    /// - Deny-intent events (e.g. `PreToolUse`, `PermissionRequest`)
+    ///   **fail CLOSED** — return `true` so the hook still runs and can
+    ///   enforce its block. A typo in a deny-hook matcher must never silently
+    ///   disable the gate. Crosslink #758.
+    /// - All other (observe-intent) events **fail OPEN** — return `false` so
+    ///   a malformed audit/observability hook does not accidentally fire on
+    ///   unrelated tool calls.
+    ///
+    /// Both paths emit a structured `tracing::warn!` with the event, pattern,
+    /// underlying error, and the `fail_closed` flag so operators can spot
+    /// silently-misconfigured matchers.
+    fn matches_entry(entry: &HookEntry, context: &str, event: HookEvent) -> bool {
+        let Some(pattern) = entry.matcher.as_ref() else {
+            return true; // No matcher → always matches (unchanged behaviour)
+        };
+
+        match Self::validate_and_match(pattern, context) {
+            Ok(matched) => matched,
+            Err(e) => {
+                let fail_closed = event.is_deny_intent();
+                warn!(
+                    event = ?event,
+                    pattern = %pattern,
+                    error = %e,
+                    fail_closed,
+                    "Hook matcher regex failed; defaulting per event intent \
+                     (deny-intent events fail closed so the hook still runs)"
+                );
+                fail_closed
             }
-        })
+        }
     }
 
     /// Validate regex pattern and check for match
@@ -1754,6 +1815,332 @@ mod tests {
             "no-policy mode must allow any binary"
         );
         assert!(result.allowed);
+    }
+
+    // ========================================================================
+    // Crosslink #758 — matcher fail-closed for deny intent / fail-open for
+    // observe intent, plus structured tracing.
+    // Crosslink #778 — fire_post_tool surfaces hook errors via tracing::error!
+    // ========================================================================
+
+    use std::sync::{Arc, Mutex};
+    use tracing::subscriber;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Shared buffer that satisfies `MakeWriter` so tests can capture the
+    /// `tracing` output emitted by the hook engine.
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `HookEvent::is_deny_intent` covers exactly `PreToolUse` and
+    /// `PermissionRequest`. Every other event is observe-intent.
+    #[test]
+    fn is_deny_intent_covers_pre_tool_use_and_permission_request_only() {
+        // Deny-intent events
+        assert!(HookEvent::PreToolUse.is_deny_intent());
+        assert!(HookEvent::PermissionRequest.is_deny_intent());
+
+        // Observe-intent events — must all fail-open on matcher errors
+        for ev in [
+            HookEvent::SessionStart,
+            HookEvent::SessionEnd,
+            HookEvent::PostToolUse,
+            HookEvent::PostToolUseFailure,
+            HookEvent::UserPromptSubmit,
+            HookEvent::Stop,
+            HookEvent::SubagentStart,
+            HookEvent::SubagentStop,
+            HookEvent::PreCompact,
+            HookEvent::Notification,
+            HookEvent::PreAdversaryReview,
+            HookEvent::PostAdversaryReview,
+            HookEvent::VddConflict,
+            HookEvent::VddConverged,
+        ] {
+            assert!(
+                !ev.is_deny_intent(),
+                "{ev:?} must NOT be deny-intent (would change fail-mode)"
+            );
+        }
+    }
+
+    /// Crosslink #758: a `PreToolUse` (deny-intent) hook whose matcher regex
+    /// cannot compile must FAIL CLOSED — the entry still matches so the hook
+    /// runs and can block. A malformed matcher must never silently disable a
+    /// security gate.
+    #[tokio::test]
+    async fn pre_tool_use_with_malformed_matcher_fails_closed_and_blocks() {
+        let entry = HookEntry {
+            // `(unclosed` is not a valid regex → validate_and_match returns Err
+            matcher: Some("(unclosed".to_string()),
+            hooks: vec![Hook::Prompt {
+                prompt: "deny".to_string(),
+                timeout: 5,
+            }],
+        };
+        // Deny-intent event must treat the bad matcher as a match.
+        assert!(
+            HookEngine::matches_entry(&entry, "Write", HookEvent::PreToolUse),
+            "PreToolUse with malformed matcher MUST fail-closed (return true)"
+        );
+        assert!(
+            HookEngine::matches_entry(&entry, "Write", HookEvent::PermissionRequest),
+            "PermissionRequest with malformed matcher MUST fail-closed"
+        );
+    }
+
+    /// Crosslink #758: observe-intent events (e.g. `PostToolUse`) with a
+    /// malformed matcher must FAIL OPEN — the hook is skipped, not fired on
+    /// an unrelated tool.
+    #[tokio::test]
+    async fn post_tool_use_with_malformed_matcher_fails_open_and_skips() {
+        let entry = HookEntry {
+            matcher: Some("(unclosed".to_string()),
+            hooks: vec![Hook::Prompt {
+                prompt: "observe".to_string(),
+                timeout: 5,
+            }],
+        };
+        // Observe-intent → fail-open
+        assert!(
+            !HookEngine::matches_entry(&entry, "Write", HookEvent::PostToolUse),
+            "PostToolUse with malformed matcher MUST fail-open (return false)"
+        );
+        assert!(
+            !HookEngine::matches_entry(&entry, "Write", HookEvent::Notification),
+            "Notification with malformed matcher MUST fail-open"
+        );
+        assert!(
+            !HookEngine::matches_entry(&entry, "Write", HookEvent::UserPromptSubmit),
+            "UserPromptSubmit with malformed matcher MUST fail-open"
+        );
+    }
+
+    /// Crosslink #758: on a `PreToolUse` matcher failure the warning carries
+    /// the structured fields `event`, `pattern`, `error`, and
+    /// `fail_closed=true` so operator dashboards can flag silently broken
+    /// deny matchers.
+    #[tokio::test]
+    async fn pre_tool_use_matcher_failure_emits_warn_with_fail_closed_field() {
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        subscriber::with_default(subscriber, || {
+            let entry = HookEntry {
+                matcher: Some("(broken".to_string()),
+                hooks: vec![],
+            };
+            let matched = HookEngine::matches_entry(&entry, "bash", HookEvent::PreToolUse);
+            assert!(matched, "deny-intent must fail-closed (return true)");
+        });
+
+        let log = captured.contents();
+        assert!(log.contains("WARN"), "expected WARN level, got: {log}");
+        assert!(
+            log.contains("fail_closed=true"),
+            "warn must include fail_closed=true; got: {log}"
+        );
+        assert!(
+            log.contains("PreToolUse"),
+            "warn must include event=PreToolUse; got: {log}"
+        );
+        assert!(
+            log.contains("(broken"),
+            "warn must include the offending pattern; got: {log}"
+        );
+        assert!(
+            log.contains("Hook matcher regex failed"),
+            "warn must use the standard message; got: {log}"
+        );
+    }
+
+    /// Crosslink #758: observe-intent matcher failure emits the same warning
+    /// shape but with `fail_closed=false`, so operators can distinguish the
+    /// two paths in their log pipelines.
+    #[tokio::test]
+    async fn post_tool_use_matcher_failure_emits_warn_with_fail_closed_false() {
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        subscriber::with_default(subscriber, || {
+            let entry = HookEntry {
+                matcher: Some("(broken".to_string()),
+                hooks: vec![],
+            };
+            let matched = HookEngine::matches_entry(&entry, "bash", HookEvent::PostToolUse);
+            assert!(!matched, "observe-intent must fail-open (return false)");
+        });
+
+        let log = captured.contents();
+        assert!(log.contains("WARN"), "expected WARN level, got: {log}");
+        assert!(
+            log.contains("fail_closed=false"),
+            "warn must include fail_closed=false; got: {log}"
+        );
+        assert!(
+            log.contains("PostToolUse"),
+            "warn must include event=PostToolUse; got: {log}"
+        );
+    }
+
+    /// Crosslink #778 (OWASP A09): when `fire_post_tool` runs hooks that
+    /// fail, the errors are not propagated to the caller — but they MUST
+    /// land on the audit trail via `tracing::error!` with structured fields
+    /// (`event`, `tool`, `session_id`, `hook_error_index`, `error`).
+    ///
+    /// We force a `HookError::Denied` by configuring an empty allowlist and
+    /// running a `post_tool_use` command hook whose binary is not listed.
+    #[tokio::test]
+    async fn fire_post_tool_surfaces_hook_errors_via_tracing_error() {
+        use std::collections::HashSet;
+
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .finish();
+
+        // Empty allowlist (Some(empty)) denies every binary, forcing
+        // HookError::Denied on every command-hook invocation.
+        let policy = HookPolicy {
+            allowed_commands: Some(HashSet::new()),
+            sandbox: SandboxMode::EnvScrub,
+        };
+        let config = HooksConfig {
+            policy: Some(policy),
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        };
+        let engine = HookEngine::new(config);
+
+        // `set_default` returns a guard that installs the subscriber on the
+        // current thread until dropped — works inside a tokio runtime where
+        // `with_default(... block_on(...))` would double-block.
+        let guard = subscriber::set_default(subscriber);
+        engine
+            .fire_post_tool(
+                true,
+                "bash",
+                serde_json::json!({"command": "ls"}),
+                "ok",
+                Some("sess-778"),
+            )
+            .await;
+        drop(guard);
+
+        let log = captured.contents();
+        assert!(
+            log.contains("ERROR"),
+            "expected ERROR-level tracing output, got: {log}"
+        );
+        assert!(
+            log.contains("fire_post_tool: hook execution failed"),
+            "missing fire_post_tool error message in: {log}"
+        );
+        assert!(
+            log.contains("tool=\"bash\"") || log.contains("tool=bash"),
+            "error must mention tool=bash; got: {log}"
+        );
+        assert!(
+            log.contains("sess-778"),
+            "error must mention session_id sess-778; got: {log}"
+        );
+        assert!(
+            log.contains("hook_error_index=0"),
+            "error must include hook_error_index=0; got: {log}"
+        );
+        assert!(
+            log.contains("denied by allowlist") || log.contains("Denied"),
+            "error must include the underlying HookError; got: {log}"
+        );
+    }
+
+    /// Crosslink #778 counter-test: a successful `fire_post_tool` call must
+    /// be SILENT — no spurious ERROR-level output when no hook fails.
+    /// Confirms the error-surfacing is gated on `result.errors`, not always-on.
+    #[tokio::test]
+    async fn fire_post_tool_silent_when_hooks_succeed() {
+        let captured = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .finish();
+
+        // A succeeding command hook with no policy gate.
+        let config = HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..Default::default()
+        };
+        let engine = HookEngine::new(config);
+
+        let guard = subscriber::set_default(subscriber);
+        engine
+            .fire_post_tool(
+                true,
+                "bash",
+                serde_json::json!({"command": "true"}),
+                "ok",
+                Some("sess-happy"),
+            )
+            .await;
+        drop(guard);
+
+        let log = captured.contents();
+        assert!(
+            !log.contains("ERROR"),
+            "fire_post_tool happy path must not emit ERROR; got: {log}"
+        );
+        assert!(
+            !log.contains("fire_post_tool: hook execution failed"),
+            "no fire_post_tool failure message expected; got: {log}"
+        );
     }
 
     #[tokio::test]
