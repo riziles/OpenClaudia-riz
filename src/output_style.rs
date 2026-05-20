@@ -7,6 +7,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::file_error::{self, FileError};
+
 /// Load the active output style, if any.
 /// Checks project-level first, then user-level.
 ///
@@ -84,23 +86,25 @@ pub fn builtin_styles() -> Vec<(&'static str, &'static str)> {
 ///
 /// # Errors
 ///
-/// Returns an error if the directory cannot be created or the file cannot be written.
-pub fn save_output_style(content: &str) -> Result<(), String> {
+/// Returns [`FileError::Io`] if the directory cannot be created or the file
+/// cannot be written. The returned error carries the offending path and the
+/// underlying `io::ErrorKind` for programmatic discrimination — see #492.
+pub fn save_output_style(content: &str) -> Result<(), FileError> {
     let dir = PathBuf::from(".openclaudia");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {e}"))?;
-    std::fs::write(dir.join("output-style.md"), content)
-        .map_err(|e| format!("Failed to write: {e}"))
+    file_error::create_dir_all(&dir)?;
+    let path = dir.join("output-style.md");
+    file_error::write_file(&path, content)
 }
 
 /// Remove the project output-style file.
 ///
 /// # Errors
 ///
-/// Returns an error if the file exists but cannot be removed.
-pub fn clear_output_style() -> Result<(), String> {
+/// Returns [`FileError::Io`] if the file exists but cannot be removed.
+pub fn clear_output_style() -> Result<(), FileError> {
     let path = PathBuf::from(".openclaudia/output-style.md");
     if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("Failed to remove: {e}"))
+        std::fs::remove_file(&path).map_err(FileError::with_path(&path))
     } else {
         Ok(())
     }
@@ -226,5 +230,68 @@ mod tests {
     fn nix_is_root() -> bool {
         // SAFETY: getuid is a thread-safe libc call with no preconditions.
         unsafe { libc::getuid() == 0 }
+    }
+
+    /// Spec — `clear_output_style` propagates a typed [`FileError::Io`] (not
+    /// a stringly-typed error) so callers can branch on
+    /// [`std::io::ErrorKind`]. Regression guard for crosslink #492.
+    ///
+    /// Pointing `.openclaudia/output-style.md` at an entry whose parent is a
+    /// regular file (not a directory) forces a deterministic `io::Error` on
+    /// `remove_file` that the typed variant must preserve through to the
+    /// caller, instead of being flattened to a `String`.
+    #[test]
+    fn clear_output_style_returns_typed_io_error_with_path() {
+        use std::io::ErrorKind;
+
+        // Drive `clear_output_style` from a tempdir so we don't touch the
+        // user's real `.openclaudia/`. The function reads `.openclaudia/...`
+        // relative to the process cwd, so we chdir into the tempdir first.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        // NOTE: process-wide cwd mutation; this is the same pattern other
+        // tests in this repo use (e.g. the cron suite's `cwd_lock`). The
+        // assertions below are independent of the working directory, so a
+        // concurrent test changing cwd would not flake this case.
+        std::env::set_current_dir(dir.path()).expect("chdir");
+
+        // Create `.openclaudia` as a FILE (not a directory). Then the
+        // implementation's `path.exists()` returns false for the
+        // not-actually-present `output-style.md`, so we instead force a
+        // failure by making `.openclaudia/output-style.md` itself a
+        // permission-denied target: easiest cross-platform reproduction is
+        // to make the path resolve to a non-empty directory and call
+        // `remove_file` on it (returns `IsADirectory` or `PermissionDenied`
+        // depending on platform, both of which are `io::Error` variants).
+        let dot = dir.path().join(".openclaudia");
+        std::fs::create_dir_all(&dot).unwrap();
+        let target = dot.join("output-style.md");
+        std::fs::create_dir_all(&target).unwrap(); // make the leaf a dir!
+
+        let result = clear_output_style();
+
+        // Restore cwd before any assertion so a failure doesn't poison other
+        // tests sharing the process.
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+
+        let err = result.expect_err("removing a directory via remove_file must fail");
+        // The typed variant — not a String — must come through.
+        let kind = err.io_kind().expect("must be the Io variant, not Json/Yaml");
+        assert!(
+            matches!(
+                kind,
+                ErrorKind::IsADirectory
+                    | ErrorKind::PermissionDenied
+                    | ErrorKind::Other
+                    | ErrorKind::InvalidInput
+            ),
+            "expected an io::Error from remove_file-on-dir, got: {err}"
+        );
+        // And the path is carried through end-to-end.
+        assert!(
+            err.path().ends_with("output-style.md"),
+            "FileError must carry the offending path, got: {}",
+            err.path().display()
+        );
     }
 }

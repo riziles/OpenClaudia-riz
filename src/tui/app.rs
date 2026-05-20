@@ -21,6 +21,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::file_error::{self, FileError};
+
 /// Chat session state — compatible with the CLI's `ChatSession` JSON format
 /// so sessions saved by one can be loaded by the other.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -234,12 +236,11 @@ fn iso_of_systemtime(t: std::time::SystemTime) -> String {
     }
 }
 
-fn save_session(session: &TuiSession) -> Result<(), String> {
+fn save_session(session: &TuiSession) -> Result<(), FileError> {
     let dir = sessions_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    file_error::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
-    let json = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    file_error::write_json_pretty(&path, session)
 }
 
 fn list_sessions() -> Vec<TuiSession> {

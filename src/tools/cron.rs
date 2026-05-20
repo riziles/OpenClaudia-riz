@@ -27,6 +27,8 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use crate::file_error::{self, FileError};
+
 const SCHEDULES_FILE: &str = ".openclaudia/schedules.json";
 const LOCK_SUFFIX: &str = ".lock";
 const TMP_SUFFIX: &str = ".tmp";
@@ -132,22 +134,22 @@ impl ScheduleStore {
     /// Serializes to a `.tmp` sibling and `rename(2)`s it over the
     /// destination. POSIX `rename` is atomic on the same filesystem,
     /// so a crash mid-write cannot leave a truncated `schedules.json`.
-    fn save_locked(&self, path: &Path) -> Result<(), String> {
+    fn save_locked(&self, path: &Path) -> Result<(), FileError> {
+        // Each filesystem step surfaces a typed `FileError` carrying the
+        // exact path and underlying `io::ErrorKind`, so callers (and the
+        // test suite) can distinguish missing-parent from disk-full from
+        // permission-denied without restringing — see crosslink #492.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {e}"))?;
+            file_error::create_dir_all(parent)?;
         }
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| format!("Serialization error: {e}"))?;
+        let json = serde_json::to_string_pretty(self).map_err(FileError::json_with_path(path))?;
 
         let mut tmp_path = path.as_os_str().to_owned();
         tmp_path.push(TMP_SUFFIX);
         let tmp_path = PathBuf::from(tmp_path);
 
-        std::fs::write(&tmp_path, json)
-            .map_err(|e| format!("Failed to write schedule tempfile: {e}"))?;
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| format!("Failed to atomically rename schedule file: {e}"))
+        file_error::write_file(&tmp_path, &json)?;
+        std::fs::rename(&tmp_path, path).map_err(FileError::with_path(path))
     }
 }
 

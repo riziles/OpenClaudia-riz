@@ -292,14 +292,19 @@ fn run_lsp_request(
     character: u32,
     action: LspAction,
 ) -> Result<LspResult, String> {
-    let abs_path =
-        std::fs::canonicalize(file_path).map_err(|e| format!("Cannot resolve path: {e}"))?;
+    // File-resolve and read flow through typed `FileError` so the path and
+    // `io::ErrorKind` are preserved through the source chain — see #492. We
+    // stringify only at this boundary because `run_lsp_request` returns
+    // `Result<_, String>` to its caller; the rendered message now always
+    // names the offending file.
+    let abs_path = std::fs::canonicalize(file_path)
+        .map_err(crate::file_error::FileError::with_path(file_path))
+        .map_err(|e| e.to_string())?;
     let root_uri = find_project_root(&abs_path);
     let file_uri = format!("file://{}", abs_path.display());
 
     // Read file content for textDocument/didOpen
-    let content =
-        std::fs::read_to_string(&abs_path).map_err(|e| format!("Cannot read file: {e}"))?;
+    let content = crate::file_error::read_file(&abs_path).map_err(|e| e.to_string())?;
 
     // Spawn the server.  stderr is captured into a ring buffer (last 1 KiB) so
     // that crash diagnostics survive instead of being silently discarded

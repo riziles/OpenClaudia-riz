@@ -112,6 +112,13 @@ impl CredentialLock {
             let _ = std::fs::create_dir_all(parent);
         }
 
+        // Note (crosslink #492 follow-up): this `OpenOptions::open` site is a
+        // remaining candidate for `FileError`. The focused #492 pass left it on
+        // `String` because converting `CredentialLock` to return `FileError`
+        // would also require accommodating the libc::flock branch below
+        // (an OS syscall, not file-content I/O). Tracked for a follow-up pass
+        // so the public `acquire(...) -> Result<_, String>` contract stays
+        // stable until that wider change is scoped.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -178,11 +185,18 @@ pub async fn load_credentials() -> Result<LoadedCredentials, String> {
         ));
     }
 
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    // File I/O and JSON parsing flow through the typed `FileError` enum so
+    // the underlying io::ErrorKind / serde_json::Error are preserved on the
+    // way out — see crosslink #492. We stringify here at the public boundary
+    // because `load_credentials` still returns `Result<_, String>` for
+    // backwards-compat with existing callers; the rendered message now
+    // always names the file and the source chain.
+    let content =
+        crate::file_error::read_file(&path).map_err(|e: crate::file_error::FileError| e.to_string())?;
 
-    let creds: CredentialsFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse credentials: {e}"))?;
+    let creds: CredentialsFile = serde_json::from_str(&content)
+        .map_err(crate::file_error::FileError::json_with_path(&path))
+        .map_err(|e| e.to_string())?;
 
     let oauth = creds
         .claude_ai_oauth
@@ -350,7 +364,8 @@ async fn refresh_and_load(
         ));
     }
 
-    std::fs::write(path, json).map_err(|e| format!("Failed to write updated credentials: {e}"))?;
+    // Same typed-error rationale as the read path above — see crosslink #492.
+    crate::file_error::write_file(path, &json).map_err(|e| e.to_string())?;
 
     // Preserve original file permissions (0600)
     #[cfg(unix)]
