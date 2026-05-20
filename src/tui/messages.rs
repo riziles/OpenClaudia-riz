@@ -361,11 +361,14 @@ impl MessageList {
         self.scroll_to_bottom();
     }
 
-    /// Remove the last N messages from the display list.
+    /// Remove the last `count` messages from the display list.
+    ///
+    /// Saturates at zero — passing a `count` larger than the current length
+    /// truncates the entire list rather than panicking, and `count == 0` is a
+    /// no-op.
     pub fn pop_last(&mut self, count: usize) {
-        for _ in 0..count {
-            self.messages.pop();
-        }
+        self.messages
+            .truncate(self.messages.len().saturating_sub(count));
     }
 
     /// Number of messages in the display list.
@@ -815,6 +818,35 @@ mod tests {
         assert_eq!(ml.messages.len(), 1);
         assert_eq!(ml.messages[0].kind, MessageKind::Thinking);
         assert!(ml.messages[0].content.starts_with("Thought for "));
+    }
+
+    #[test]
+    fn pop_last_handles_saturating_and_zero_edges() {
+        let mut ml = MessageList::new();
+        ml.add(DisplayMessage::user("a"));
+        ml.add(DisplayMessage::user("b"));
+        ml.add(DisplayMessage::user("c"));
+        assert_eq!(ml.messages.len(), 3);
+
+        // Edge 1: count == 0 is a no-op (must not touch the list).
+        ml.pop_last(0);
+        assert_eq!(ml.messages.len(), 3, "count == 0 must leave list intact");
+
+        // Edge 2: count > len saturates at zero (must not panic).
+        ml.pop_last(usize::MAX);
+        assert_eq!(
+            ml.messages.len(),
+            0,
+            "count > len must truncate to empty without panicking"
+        );
+
+        // Sanity: a normal in-range count still works.
+        ml.add(DisplayMessage::user("x"));
+        ml.add(DisplayMessage::user("y"));
+        ml.add(DisplayMessage::user("z"));
+        ml.pop_last(2);
+        assert_eq!(ml.messages.len(), 1);
+        assert_eq!(ml.messages[0].content, "x");
     }
 
     #[test]
