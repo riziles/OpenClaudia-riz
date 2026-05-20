@@ -910,24 +910,13 @@ impl Plugin {
     }
 
     /// Read and parse a manifest-referenced MCP servers file. Logs every
-    /// failure with full context (crosslink #799).
+    /// failure with full context (crosslink #799). Honours both the
+    /// `{ "mcpServers": { ... } }` wrapper form and the bare-map form so
+    /// manifest-Path branches and the convention `.mcp.json` branch agree
+    /// on accepted shapes (crosslink #919).
     fn load_mcp_servers_from_path(&mut self, declared: &str, resolved: &Path) {
         match read_plugin_file(resolved) {
-            Ok(content) => match serde_json::from_str::<HashMap<String, McpServerConfig>>(&content)
-            {
-                Ok(servers) => {
-                    self.mcp_configs.extend(servers);
-                }
-                Err(e) => {
-                    warn!(
-                        declared = %declared,
-                        resolved = ?resolved,
-                        plugin = %self.manifest.name,
-                        error = %e,
-                        "Plugin manifest mcp_servers file failed to decode as McpServerConfig map"
-                    );
-                }
-            },
+            Ok(content) => self.parse_mcp_json_file(resolved, &content),
             Err(e) => {
                 warn!(
                     declared = %declared,
