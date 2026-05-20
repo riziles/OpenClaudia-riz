@@ -364,6 +364,18 @@ fn validate_cron(expr: &str) -> Result<(), String> {
 }
 
 pub fn execute_cron_create(args: &HashMap<String, Value>) -> (String, bool) {
+    execute_cron_create_at(args, &schedules_path())
+}
+
+/// Path-explicit variant of [`execute_cron_create`].
+///
+/// crosslink #984: the public entry point resolves the schedule store
+/// against the process cwd, which forced tests to `set_current_dir`
+/// into a temp dir — a process-global mutation that poisons sibling
+/// tests run in parallel. This inner helper takes the schedule store
+/// path as a parameter so tests thread an absolute path through
+/// without ever touching the process cwd.
+fn execute_cron_create_at(args: &HashMap<String, Value>, path: &Path) -> (String, bool) {
     // crosslink #675: typed accessors replace per-site
     // `args.get(k).and_then(|v| v.as_str())` extraction. Error wording
     // normalises from "Error: name is required" to "Missing 'name' argument".
@@ -384,7 +396,7 @@ pub fn execute_cron_create(args: &HashMap<String, Value>) -> (String, bool) {
         return (format!("Invalid cron expression: {e}"), true);
     }
 
-    let path = schedules_path();
+    let path = path.to_path_buf();
     // Hold an exclusive flock for the full load-modify-save sequence
     // (crosslink #403): two concurrent `cron_create` calls would
     // otherwise both load the original store, each push their own
@@ -456,6 +468,12 @@ pub fn execute_cron_create(args: &HashMap<String, Value>) -> (String, bool) {
 }
 
 pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
+    execute_cron_delete_at(args, &schedules_path())
+}
+
+/// Path-explicit variant of [`execute_cron_delete`] — see
+/// [`execute_cron_create_at`] for the #984 rationale.
+fn execute_cron_delete_at(args: &HashMap<String, Value>, path: &Path) -> (String, bool) {
     // crosslink #987: `name` is the primary identifier. `index` (1-based
     // position in the `cron_list` output) is a human-friendly fallback so a
     // user reading the listing can say "delete #2" without typing a name.
@@ -473,7 +491,7 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
         );
     }
 
-    let path = schedules_path();
+    let path = path.to_path_buf();
     // Same locking discipline as `execute_cron_create` — see #403.
     let _lock = match ScheduleLock::acquire(&path) {
         Ok(l) => l,
@@ -511,10 +529,7 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
     store.schedules.retain(|s| s.name != target_name);
 
     if store.schedules.len() == initial_len {
-        return (
-            format!("No schedule found matching '{target_name}'"),
-            true,
-        );
+        return (format!("No schedule found matching '{target_name}'"), true);
     }
 
     if let Err(e) = store.save_locked(&path) {
@@ -524,8 +539,14 @@ pub fn execute_cron_delete(args: &HashMap<String, Value>) -> (String, bool) {
     (format!("Deleted schedule '{target_name}'"), false)
 }
 
-pub fn execute_cron_list(_args: &HashMap<String, Value>) -> (String, bool) {
-    let path = schedules_path();
+pub fn execute_cron_list(args: &HashMap<String, Value>) -> (String, bool) {
+    execute_cron_list_at(args, &schedules_path())
+}
+
+/// Path-explicit variant of [`execute_cron_list`] — see
+/// [`execute_cron_create_at`] for the #984 rationale.
+fn execute_cron_list_at(_args: &HashMap<String, Value>, path: &Path) -> (String, bool) {
+    let path = path.to_path_buf();
     // Hold the same exclusive lock as writers so a list cannot observe
     // a partial mid-update state — combined with the atomic rename in
     // `save_locked`, readers always see a fully consistent snapshot.
@@ -564,18 +585,11 @@ pub fn execute_cron_list(_args: &HashMap<String, Value>) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::testutil::process_cwd_lock;
-    use std::sync::MutexGuard;
 
-    /// Local alias delegating to the shared process-wide CWD lock in
-    /// [`crate::tools::testutil`]. Prior to crosslink #945 this module
-    /// had its own `static LOCK: OnceLock<Mutex<()>>` — and so did
-    /// `worktree.rs` — so the two `cwd_lock`s did NOT actually serialise
-    /// against each other under parallel `cargo test`. They now share
-    /// a single mutex.
-    fn cwd_lock() -> MutexGuard<'static, ()> {
-        process_cwd_lock()
-    }
+    // crosslink #984: tests no longer mutate the process cwd — they
+    // thread an explicit `schedules.json` path through the `*_at`
+    // helpers in this module. The previous `cwd_lock()` shim is gone
+    // because there is nothing global to serialise against.
 
     #[test]
     fn test_validate_cron_valid() {
@@ -694,17 +708,21 @@ mod tests {
         );
     }
 
+    /// Helper: build a fresh per-test schedules.json path under a `TempDir`
+    /// the caller keeps alive. crosslink #984 — tests must NOT mutate the
+    /// process cwd; they thread this path through `*_at` helpers instead.
+    fn temp_schedules_path(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join(SCHEDULES_FILE)
+    }
+
     /// Contract: duplicate `name` is rejected with `is_error=true`.
     /// OC deduplicates by name (CC does not deduplicate at all — pin this
     /// OC-specific behaviour).
     #[test]
     fn cron_create_rejects_duplicate_name() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
-        // Run in a temp dir so we control the schedules.json path.
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("dupjob".to_string()));
@@ -714,29 +732,23 @@ mod tests {
         );
         args.insert("prompt".to_string(), Value::String("hello".to_string()));
 
-        let (_, first_err) = execute_cron_create(&args);
+        let (_, first_err) = execute_cron_create_at(&args, &path);
         assert!(!first_err, "first create must succeed");
 
-        let (msg, second_err) = execute_cron_create(&args);
+        let (msg, second_err) = execute_cron_create_at(&args, &path);
         assert!(second_err, "duplicate name must fail");
         assert!(
             msg.contains("already exists"),
             "error must say 'already exists'; got: {msg}"
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Contract: valid `cron_create` stores the schedule so `cron_list` returns it.
     #[test]
     fn cron_create_then_list_round_trip() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("roundtrip".to_string()));
@@ -749,33 +761,27 @@ mod tests {
             Value::String("check status".to_string()),
         );
 
-        let (create_msg, create_err) = execute_cron_create(&args);
+        let (create_msg, create_err) = execute_cron_create_at(&args, &path);
         assert!(!create_err, "create must succeed; got: {create_msg}");
         assert!(
             create_msg.contains("roundtrip"),
             "create message must echo the name"
         );
 
-        let (list_msg, list_err) = execute_cron_list(&HashMap::new());
+        let (list_msg, list_err) = execute_cron_list_at(&HashMap::new(), &path);
         assert!(!list_err);
         assert!(
             list_msg.contains("roundtrip"),
             "list must show the newly created schedule; got: {list_msg}"
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Contract: `cron_delete` by name removes the schedule.
     #[test]
     fn cron_delete_by_name_removes_schedule() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         // Create
         let mut create_args = HashMap::new();
@@ -785,26 +791,22 @@ mod tests {
             Value::String("0 0 * * *".to_string()),
         );
         create_args.insert("prompt".to_string(), Value::String("noop".to_string()));
-        let (_, err) = execute_cron_create(&create_args);
+        let (_, err) = execute_cron_create_at(&create_args, &path);
         assert!(!err);
 
         // Delete by name
         let mut del_args = HashMap::new();
         del_args.insert("name".to_string(), Value::String("todelete".to_string()));
-        let (del_msg, del_err) = execute_cron_delete(&del_args);
+        let (del_msg, del_err) = execute_cron_delete_at(&del_args, &path);
         assert!(!del_err, "delete must succeed; got: {del_msg}");
         assert!(del_msg.contains("todelete"));
 
         // List must now be empty
-        let (list_msg, _) = execute_cron_list(&HashMap::new());
+        let (list_msg, _) = execute_cron_list_at(&HashMap::new(), &path);
         assert!(
             !list_msg.contains("todelete"),
             "deleted schedule must not appear in list"
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Pin gap #621: OC has no `recurring` or `durable` fields in the input
@@ -813,10 +815,8 @@ mod tests {
     #[test]
     fn cron_create_ignores_recurring_and_durable_fields_gap621() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("gap621job".to_string()));
@@ -832,15 +832,11 @@ mod tests {
         args.insert("recurring".to_string(), Value::Bool(false));
         args.insert("durable".to_string(), Value::Bool(false));
 
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create_at(&args, &path);
         assert!(
             !is_err,
             "gap #621: unknown CC fields must not cause an error; got: {msg}"
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Pin gap #621: OC has no max-jobs cap (CC enforces ≤50).
@@ -850,10 +846,8 @@ mod tests {
     #[test]
     fn cron_create_has_no_max_jobs_cap_gap621() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("captest".to_string()));
@@ -863,7 +857,7 @@ mod tests {
         );
         args.insert("prompt".to_string(), Value::String("ping".to_string()));
 
-        let (msg, is_err) = execute_cron_create(&args);
+        let (msg, is_err) = execute_cron_create_at(&args, &path);
         assert!(
             !is_err,
             "gap #621: must not reject with a max-jobs message; got: {msg}"
@@ -872,10 +866,6 @@ mod tests {
             !msg.contains("too many") && !msg.contains("max"),
             "gap #621: no max-jobs guard present; got: {msg}"
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Contract: invalid cron expression (wrong field count) is rejected.
@@ -959,10 +949,8 @@ mod tests {
     #[test]
     fn schedule_id_is_16_hex_chars() {
         use tempfile::TempDir;
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("idtest".to_string()));
@@ -971,26 +959,26 @@ mod tests {
             Value::String("0 * * * *".to_string()),
         );
         args.insert("prompt".to_string(), Value::String("p".to_string()));
-        let (_, is_err) = execute_cron_create(&args);
+        let (_, is_err) = execute_cron_create_at(&args, &path);
         assert!(!is_err);
 
-        let path = schedules_path();
         let store = ScheduleStore::load_locked(&path);
         let s = store
             .schedules
             .iter()
             .find(|s| s.name == "idtest")
             .expect("created schedule missing");
-        assert_eq!(s.id.len(), 16, "schedule id must be 16 hex chars, got {}", s.id);
+        assert_eq!(
+            s.id.len(),
+            16,
+            "schedule id must be 16 hex chars, got {}",
+            s.id
+        );
         assert!(
             s.id.chars().all(|c| c.is_ascii_hexdigit()),
             "schedule id must be hex; got {}",
             s.id
         );
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     // ─── #403: file-locked load-modify-save preserves writes ────────────────
@@ -1008,13 +996,12 @@ mod tests {
 
         const N: usize = 8;
 
-        let _lock = cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let path = temp_schedules_path(&tmp);
 
         let mut handles = Vec::with_capacity(N);
         for i in 0..N {
+            let path = path.clone();
             handles.push(thread::spawn(move || {
                 let mut args = HashMap::new();
                 args.insert(
@@ -1026,7 +1013,7 @@ mod tests {
                     Value::String("0 * * * *".to_string()),
                 );
                 args.insert("prompt".to_string(), Value::String(format!("p{i}")));
-                let (msg, is_err) = execute_cron_create(&args);
+                let (msg, is_err) = execute_cron_create_at(&args, &path);
                 assert!(!is_err, "concurrent create #{i} failed: {msg}");
             }));
         }
@@ -1036,7 +1023,6 @@ mod tests {
 
         // All N schedules must be present — without the flock, several would
         // be silently lost.
-        let path = schedules_path();
         let store = ScheduleStore::load_locked(&path);
         assert_eq!(
             store.schedules.len(),
@@ -1053,10 +1039,6 @@ mod tests {
                 "missing schedule concurrent_job_{i}; got {names:?}"
             );
         }
-
-        if let Some(orig) = original {
-            let _ = std::env::set_current_dir(orig);
-        }
     }
 
     /// Forensic: a second `ScheduleLock::acquire` on the same path from
@@ -1072,7 +1054,6 @@ mod tests {
         use std::time::{Duration, Instant};
         use tempfile::TempDir;
 
-        let _cwd = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("schedules.json");
 
@@ -1112,7 +1093,6 @@ mod tests {
     fn schedule_lock_acquire_surfaces_open_failure() {
         use tempfile::TempDir;
 
-        let _cwd = cwd_lock();
         let tmp = TempDir::new().unwrap();
 
         // Create a regular file where we want a directory — `create_dir_all`
@@ -1141,7 +1121,6 @@ mod tests {
     fn schedule_save_locked_is_atomic_via_rename() {
         use tempfile::TempDir;
 
-        let _cwd = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("schedules.json");
 
@@ -1210,7 +1189,6 @@ mod tests {
     fn fix909_save_locked_replaces_atomically_under_repeat_writes() {
         use tempfile::TempDir;
 
-        let _cwd = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("schedules.json");
 

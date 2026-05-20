@@ -1123,8 +1123,16 @@ impl MemoryDb {
         issues_worked: &[String],
         started_at: &str,
     ) -> Result<i64> {
-        let files_str = files_modified.join("\n");
-        let issues_str = issues_worked.join("\n");
+        // crosslink #409: encode as JSON arrays so SQL queries can
+        // `json_each(files_modified)` over the column. The column type
+        // stays TEXT — only the on-disk representation changes from
+        // newline-joined to JSON. Use `serde_json::to_string` (compact)
+        // so the resulting text is unambiguous JSON the loader can
+        // detect by leading `[`.
+        let files_str =
+            serde_json::to_string(files_modified).context("encode files_modified as JSON array")?;
+        let issues_str =
+            serde_json::to_string(issues_worked).context("encode issues_worked as JSON array")?;
         let conn = self.lock_conn()?;
         conn.execute(
             r"INSERT OR REPLACE INTO recent_sessions
@@ -1133,6 +1141,36 @@ impl MemoryDb {
             params![session_id, summary, files_str, issues_str, started_at],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Decode a `files_modified` / `issues_worked` column value.
+    ///
+    /// crosslink #409: the column historically stored a literal
+    /// `"foo\nbar"` newline-joined blob, but is now written as a JSON
+    /// array (`["foo","bar"]`) so `json_each` queries work over it.
+    /// This helper transparently handles both shapes so rows written
+    /// before the migration still load — the leading byte is enough
+    /// to disambiguate because newline-joined entries never start with
+    /// `[` (file paths and issue refs both begin with `/`, `#`, or
+    /// alphanumerics).
+    fn decode_string_list_column(raw: &str) -> Vec<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        if trimmed.starts_with('[') {
+            // New format — JSON array. Fall through to legacy if it
+            // somehow fails to parse (defence in depth; should never
+            // happen for our own writes).
+            if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+                return parsed;
+            }
+        }
+        // Legacy newline-joined format.
+        raw.lines()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
     }
 
     /// Get recent sessions (within expiry window).
@@ -1159,18 +1197,8 @@ impl MemoryDb {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
                     summary: row.get(2)?,
-                    files_modified: row
-                        .get::<_, String>(3)?
-                        .lines()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect(),
-                    issues_worked: row
-                        .get::<_, String>(4)?
-                        .lines()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect(),
+                    files_modified: Self::decode_string_list_column(&row.get::<_, String>(3)?),
+                    issues_worked: Self::decode_string_list_column(&row.get::<_, String>(4)?),
                     started_at: row.get(5)?,
                     ended_at: row.get(6)?,
                 })
@@ -2014,6 +2042,112 @@ mod tests {
         assert_eq!(sessions[0].session_id, "session-123");
         assert_eq!(sessions[0].files_modified.len(), 2);
         assert_eq!(sessions[0].issues_worked.len(), 2);
+    }
+
+    /// crosslink #409: persisted `files_modified` / `issues_worked` are
+    /// now JSON arrays (not newline-joined blobs) so SQL queries can
+    /// `json_each` over them.
+    #[test]
+    fn session_summary_persists_as_json_array_409() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MemoryDb::open(&db_path).unwrap();
+        db.save_session_summary(
+            "s-json",
+            "summary",
+            &["src/a.rs".into(), "src/b.rs".into()],
+            &["#1".into(), "#2".into()],
+            "2024-01-01 00:00:00",
+        )
+        .unwrap();
+
+        // Read the raw column so we can pin the on-disk shape.
+        let conn = db.lock_conn().unwrap();
+        let (files_raw, issues_raw): (String, String) = conn
+            .query_row(
+                "SELECT files_modified, issues_worked FROM recent_sessions \
+                 WHERE session_id = ?1",
+                params!["s-json"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // SQL `json_each` must be able to iterate the array — the entire
+        // point of switching encodings. Count rows it yields.
+        let json_each_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recent_sessions, \
+                 json_each(recent_sessions.files_modified) \
+                 WHERE recent_sessions.session_id = ?1",
+                params!["s-json"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(
+            files_raw.starts_with('[') && files_raw.ends_with(']'),
+            "files_modified must be a JSON array; got {files_raw}"
+        );
+        let parsed: Vec<String> = serde_json::from_str(&files_raw).unwrap();
+        assert_eq!(parsed, vec!["src/a.rs", "src/b.rs"]);
+        let parsed_i: Vec<String> = serde_json::from_str(&issues_raw).unwrap();
+        assert_eq!(parsed_i, vec!["#1", "#2"]);
+        assert_eq!(
+            json_each_count, 2,
+            "json_each must expand the array into 2 rows"
+        );
+    }
+
+    /// crosslink #409 migration: legacy rows written before the JSON
+    /// switch (newline-joined blob) still load through the new decoder.
+    #[test]
+    fn session_summary_loads_legacy_newline_blob_409() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MemoryDb::open(&db_path).unwrap();
+
+        // Hand-write a row in the OLD shape, bypassing `save_session_summary`.
+        {
+            let conn = db.lock_conn().unwrap();
+            conn.execute(
+                r"INSERT INTO recent_sessions
+                   (session_id, summary, files_modified, issues_worked, started_at, ended_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                params![
+                    "s-legacy",
+                    "old summary",
+                    "src/old1.rs\nsrc/old2.rs",
+                    "#100\n#101",
+                    "2024-01-01 00:00:00",
+                ],
+            )
+            .unwrap();
+        }
+
+        let sessions = db.get_recent_sessions(10).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.session_id == "s-legacy")
+            .expect("legacy row must be returned");
+        assert_eq!(row.files_modified, vec!["src/old1.rs", "src/old2.rs"]);
+        assert_eq!(row.issues_worked, vec!["#100", "#101"]);
+    }
+
+    /// Empty list round-trips as an empty JSON array, and decodes to an
+    /// empty `Vec` rather than a single empty-string entry.
+    #[test]
+    fn session_summary_empty_lists_round_trip_409() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = MemoryDb::open(&db_path).unwrap();
+        db.save_session_summary("s-empty", "", &[], &[], "2024-01-01 00:00:00")
+            .unwrap();
+        let sessions = db.get_recent_sessions(10).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.session_id == "s-empty")
+            .expect("row must be present");
+        assert!(row.files_modified.is_empty());
+        assert!(row.issues_worked.is_empty());
     }
 
     #[test]

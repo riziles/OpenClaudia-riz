@@ -106,6 +106,54 @@ impl TeammateState {
     pub const fn is_available(&self) -> bool {
         matches!(self, Self::Idle)
     }
+
+    /// Discriminant name used for [`TransitionError`] reporting.
+    /// Kept private to the module; callers should match on the enum
+    /// directly rather than string-compare.
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Spawning => "Spawning",
+            Self::Running => "Running",
+            Self::Idle => "Idle",
+            Self::Dead(_) => "Dead",
+        }
+    }
+
+    /// Whether `self` may legally transition into `next` according to
+    /// the state machine documented on the enum.
+    ///
+    /// Allowed edges:
+    ///   * `Spawning → Running`         (subagent acknowledged)
+    ///   * `Spawning → Dead(_)`         (spawn failed)
+    ///   * `Running  → Idle`            (task finished cleanly)
+    ///   * `Running  → Dead(_)`         (task errored)
+    ///   * `Idle     → Running`         (assigned next task)
+    ///   * `Idle     → Dead(_)`         (coordinator shut it down)
+    ///
+    /// Notably forbidden: any edge OUT OF [`Self::Dead`] (terminal)
+    /// and `Spawning → Idle` (must transit through `Running`).
+    #[must_use]
+    const fn can_transition_to(&self, next: &Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Spawning | Self::Idle, Self::Running)
+                | (Self::Spawning | Self::Running | Self::Idle, Self::Dead(_))
+                | (Self::Running, Self::Idle)
+        )
+    }
+}
+
+/// Reason a [`Teammate::try_transition_to`] call was refused.
+///
+/// Carries both endpoints so coordinator logs can identify the offending
+/// caller without re-deriving them from a panic backtrace.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid teammate state transition: {from} → {to}")]
+pub struct TransitionError {
+    /// Discriminant name of the current state.
+    pub from: &'static str,
+    /// Discriminant name of the requested new state.
+    pub to: &'static str,
 }
 
 /// Per-teammate bookkeeping the coordinator uses to route tasks
@@ -170,6 +218,30 @@ impl Teammate {
             state: TeammateState::Spawning,
             session_id: session_id.into(),
             transcript_path,
+        }
+    }
+
+    /// Attempt to advance this teammate's lifecycle state.
+    ///
+    /// crosslink #834: prior callers wrote `tm.state = new` unchecked,
+    /// permitting illegal jumps such as `Dead → Active`. This routes
+    /// every mutation through the state-machine table on
+    /// [`TeammateState::can_transition_to`] so an illegal edge surfaces
+    /// as [`TransitionError`] instead of corrupting the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransitionError`] when the edge `self.state → next`
+    /// is not one of the documented legal transitions.
+    pub fn try_transition_to(&mut self, next: TeammateState) -> Result<(), TransitionError> {
+        if self.state.can_transition_to(&next) {
+            self.state = next;
+            Ok(())
+        } else {
+            Err(TransitionError {
+                from: self.state.label(),
+                to: next.label(),
+            })
         }
     }
 }
@@ -260,6 +332,99 @@ mod tests {
         assert_eq!(tm.color, AgentColor::Red);
         assert!(matches!(tm.state, TeammateState::Spawning));
         assert!(!tm.state.is_available());
+    }
+
+    // ── crosslink #834: state-machine transitions ────────────────────
+
+    fn fresh_teammate() -> Teammate {
+        Teammate::new(
+            AgentType::Explore,
+            0,
+            "session-x",
+            PathBuf::from("/tmp/x.jsonl"),
+        )
+    }
+
+    #[test]
+    fn try_transition_spawning_to_running_ok() {
+        let mut tm = fresh_teammate();
+        tm.try_transition_to(TeammateState::Running)
+            .expect("Spawning→Running is legal");
+        assert!(matches!(tm.state, TeammateState::Running));
+    }
+
+    #[test]
+    fn try_transition_running_to_idle_ok() {
+        let mut tm = fresh_teammate();
+        tm.try_transition_to(TeammateState::Running).unwrap();
+        tm.try_transition_to(TeammateState::Idle)
+            .expect("Running→Idle is legal");
+        assert!(matches!(tm.state, TeammateState::Idle));
+    }
+
+    #[test]
+    fn try_transition_idle_to_running_ok() {
+        let mut tm = fresh_teammate();
+        tm.try_transition_to(TeammateState::Running).unwrap();
+        tm.try_transition_to(TeammateState::Idle).unwrap();
+        tm.try_transition_to(TeammateState::Running)
+            .expect("Idle→Running is legal");
+    }
+
+    #[test]
+    fn try_transition_to_dead_from_any_alive_state_ok() {
+        for start in [
+            TeammateState::Spawning,
+            TeammateState::Running,
+            TeammateState::Idle,
+        ] {
+            let mut tm = fresh_teammate();
+            tm.state = start;
+            tm.try_transition_to(TeammateState::Dead("err".into()))
+                .expect("any alive state → Dead must be legal");
+            assert!(!tm.state.is_alive());
+        }
+    }
+
+    #[test]
+    fn try_transition_dead_is_terminal() {
+        let mut tm = fresh_teammate();
+        tm.state = TeammateState::Dead("crashed".into());
+        for next in [
+            TeammateState::Spawning,
+            TeammateState::Running,
+            TeammateState::Idle,
+        ] {
+            let err = tm
+                .try_transition_to(next)
+                .expect_err("Dead → anything must be rejected");
+            assert_eq!(err.from, "Dead");
+        }
+    }
+
+    #[test]
+    fn try_transition_skipping_running_rejected() {
+        // Spawning → Idle must be rejected (must transit through Running).
+        let mut tm = fresh_teammate();
+        let err = tm
+            .try_transition_to(TeammateState::Idle)
+            .expect_err("Spawning→Idle must be rejected");
+        assert_eq!(err.from, "Spawning");
+        assert_eq!(err.to, "Idle");
+        // state unchanged on rejection
+        assert!(matches!(tm.state, TeammateState::Spawning));
+    }
+
+    #[test]
+    fn try_transition_dead_to_active_rejected() {
+        // The exact illegal jump called out in #834.
+        let mut tm = fresh_teammate();
+        tm.state = TeammateState::Dead("inactive".into());
+        let err = tm
+            .try_transition_to(TeammateState::Running)
+            .expect_err("DeadInactive→Active must be rejected");
+        assert_eq!(err.from, "Dead");
+        assert_eq!(err.to, "Running");
     }
 }
 

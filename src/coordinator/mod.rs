@@ -21,7 +21,7 @@ pub mod teammate;
 
 pub use permission::{LeaderPermissionBridge, QueuedPermission};
 pub use task_queue::{Task, TaskId, TaskQueue, TaskQueueError, TaskState};
-pub use teammate::{AgentColor, Teammate, TeammateId, TeammateState};
+pub use teammate::{AgentColor, Teammate, TeammateId, TeammateState, TransitionError};
 
 use std::collections::HashMap;
 
@@ -56,20 +56,39 @@ impl Coordinator {
         }
     }
 
-    /// Read-only view of the queue. Phase 2+ will also expose
-    /// mutable access via a dedicated `submit` helper that returns
-    /// a `TaskId` — for now, tests construct tasks directly and
-    /// call `queue_mut` to submit.
+    /// Read-only view of the queue. Mutation goes through the focused
+    /// [`Self::submit`] and [`Self::add_dependency`] methods instead
+    /// of exposing `&mut TaskQueue` across the module boundary
+    /// (crosslink #852).
     #[must_use]
     pub const fn queue(&self) -> &TaskQueue {
         &self.queue
     }
 
-    /// Mutable access to the queue — used during Phase 1 tests and
-    /// by the Phase 2 dispatch loop. Tighten the visibility to
-    /// `pub(crate)` when a stable submit API lands.
-    pub const fn queue_mut(&mut self) -> &mut TaskQueue {
-        &mut self.queue
+    /// Submit a task to the queue and return its [`TaskId`].
+    ///
+    /// Focused mutator that replaces direct external access to
+    /// [`Self::queue_mut`]: callers describe *what* they want to do
+    /// (submit a task) without grabbing the entire queue handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskQueueError`] if submission fails (e.g. cycle
+    /// detection via dependency declarations).
+    pub fn submit(&mut self, task: Task) -> Result<TaskId, TaskQueueError> {
+        self.queue.submit(task)
+    }
+
+    /// Declare that `from` depends on `to`. Same `TaskQueueError` surface
+    /// as the underlying queue method — cycles are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskQueueError::CycleDetected`] if the new edge would
+    /// close a cycle, or [`TaskQueueError::UnknownTask`] if either id
+    /// is not present in the queue.
+    pub fn add_dependency(&mut self, from: TaskId, to: TaskId) -> Result<(), TaskQueueError> {
+        self.queue.add_dependency(from, to)
     }
 
     /// Live teammate registry (empty in Phase 1).
@@ -126,16 +145,11 @@ mod tests {
     #[test]
     fn queue_accepts_linear_chain() {
         let mut co = Coordinator::new();
-        let a = co
-            .queue_mut()
-            .submit(Task::new(AgentType::Explore, "scan"))
-            .unwrap();
+        let a = co.submit(Task::new(AgentType::Explore, "scan")).unwrap();
         let b = co
-            .queue_mut()
             .submit(Task::new(AgentType::Plan, "design").depends_on(vec![a]))
             .unwrap();
         let _c = co
-            .queue_mut()
             .submit(Task::new(AgentType::GeneralPurpose, "implement").depends_on(vec![b]))
             .unwrap();
         assert_eq!(co.queue().len(), 3);
@@ -144,20 +158,13 @@ mod tests {
     #[test]
     fn queue_rejects_cycle() {
         let mut co = Coordinator::new();
-        let a = co
-            .queue_mut()
-            .submit(Task::new(AgentType::Explore, "a"))
-            .unwrap();
+        let a = co.submit(Task::new(AgentType::Explore, "a")).unwrap();
         // Submit `b` with `a` as a dep, then try to re-parent `a`
         // on top of `b` — that closes the loop.
         let b = co
-            .queue_mut()
             .submit(Task::new(AgentType::Plan, "b").depends_on(vec![a]))
             .unwrap();
-        let err = co
-            .queue_mut()
-            .add_dependency(a, b)
-            .expect_err("cycle must be rejected");
+        let err = co.add_dependency(a, b).expect_err("cycle must be rejected");
         assert!(matches!(err, TaskQueueError::CycleDetected { .. }));
     }
 }
@@ -190,9 +197,7 @@ mod phase2_spec_pins {
     #[test]
     fn b2_pending_tasks_not_executed_by_dispatch() {
         let mut co = Coordinator::new();
-        co.queue_mut()
-            .submit(Task::new(AgentType::Explore, "task-a"))
-            .unwrap();
+        co.submit(Task::new(AgentType::Explore, "task-a")).unwrap();
         let len_before = co.queue().len();
 
         let result = co.dispatch();

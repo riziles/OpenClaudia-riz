@@ -803,7 +803,9 @@ pub fn slash_login() -> SlashCommandResult {
                         creds.rate_limit_tier.as_deref().unwrap_or("default")
                     );
                 } else {
-                    println!("  (credential details unavailable — cannot block on current runtime)");
+                    println!(
+                        "  (credential details unavailable — cannot block on current runtime)"
+                    );
                 }
             }
             Err(_) => {
@@ -1581,8 +1583,7 @@ fn plugin_action_manage(plugin_manager: &plugins::PluginManager) {
 /// Remove a plugin from install tracking, delete its on-disk directory,
 /// and refresh the in-memory manager.
 fn plugin_action_uninstall(plugin: &str, plugin_manager: &mut plugins::PluginManager) {
-    let project_root =
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut installed = plugins::InstalledPlugins::load(&project_root);
     if installed.remove(plugin) {
         if let Err(e) = installed.save(&project_root) {
@@ -1610,13 +1611,6 @@ fn plugin_action_reload(plugin_manager: &mut plugins::PluginManager) {
         eprintln!("  Error: {err}");
     }
     println!();
-}
-
-/// Backwards-compatible free function — call sites that haven't migrated
-/// to [`PluginActionRunner::apply`] still work. New code should use the
-/// trait method directly.
-pub fn handle_plugin_action(action: PluginAction, plugin_manager: &mut plugins::PluginManager) {
-    action.apply(plugin_manager);
 }
 
 fn plugin_install(

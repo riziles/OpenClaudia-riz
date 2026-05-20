@@ -38,8 +38,7 @@ use crate::file_error::{self, FileError};
 /// TUI invocation will exit immediately. That is intentional: a
 /// shutdown request that survives a restart is what an embedded host
 /// (or a watchdog) wants.
-pub static TUI_SHUTDOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static TUI_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Signal the TUI event loop to exit at the next tick.
 ///
@@ -305,7 +304,10 @@ fn save_session(session: &TuiSession) -> Result<(), FileError> {
 ///
 /// The path is reused (no second `create_dir_all` needed — the original
 /// `save_session` already created the directory).
-fn save_session_with_recovery(session: &TuiSession, path: &std::path::Path) -> Result<(), FileError> {
+fn save_session_with_recovery(
+    session: &TuiSession,
+    path: &std::path::Path,
+) -> Result<(), FileError> {
     let mut salvaged = session.clone();
     let mut lost = 0usize;
     for msg in &mut salvaged.messages {
@@ -903,9 +905,9 @@ impl App {
         // matters: overlay handling comes BEFORE the global Ctrl+C
         // quit so dismissing the overlay with Ctrl+C doesn't tear
         // down the whole app.
-        if self.overlay.is_some() {
+        if let Some(overlay) = self.overlay.as_mut() {
             use super::components::{Overlay as _, OverlayAction};
-            let action = match self.overlay.as_mut().unwrap() {
+            let action = match overlay {
                 ActiveOverlay::Help(o) => o.handle_key(key),
                 ActiveOverlay::LogSelector(o) => o.handle_key(key),
             };

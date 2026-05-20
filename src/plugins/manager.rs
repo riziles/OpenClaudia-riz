@@ -1861,8 +1861,13 @@ mod install_decomp_tests {
     /// is the single owner of.
     #[test]
     fn register_install_persists_entry_with_commit_sha() {
+        // crosslink #984 follow-up: `register_install` reads the process
+        // cwd to derive its project root, so this test must mutate it.
+        // Hold the shared cwd lock for the duration so concurrent tests
+        // do not observe a partially-mutated cwd (the same lock the
+        // worktree/cron suites once used).
+        let _cwd = crate::tools::testutil::process_cwd_lock();
         let tmp = TempDir::new().unwrap();
-        // register_install reads cwd to derive project_root; pin it.
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 

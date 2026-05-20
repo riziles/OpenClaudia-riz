@@ -30,7 +30,7 @@ use crate::cli::repl::session_io::{
     save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
-    handle_activity_command, handle_memory_command, handle_plugin_action, handle_slash_command,
+    handle_activity_command, handle_memory_command, handle_slash_command, PluginActionRunner,
     SlashCommandResult,
 };
 use crate::cli::repl::vim::{self, VimState};
@@ -582,7 +582,9 @@ impl ChatRepl {
                 handle_activity_command(&args, &self.chat_session.id, memory_db);
             }
             SlashCommandResult::Plugin(action) => {
-                handle_plugin_action(action, &mut self.plugin_manager);
+                // crosslink #898: dispatch through the Tell-Don't-Ask trait
+                // method directly. The free-function shim has been removed.
+                action.apply(&mut self.plugin_manager);
             }
             SlashCommandResult::ThemeChanged(name) => {
                 if let Some(theme) = tui::Theme::from_name(&name) {
