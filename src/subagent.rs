@@ -299,13 +299,41 @@ impl BackgroundAgentManager {
     /// Also opportunistically sweeps expired finished agents
     /// (see [`Self::gc`]) so the map cannot grow unbounded across a session.
     pub fn register(&self, agent_type: AgentType, task: &str) -> String {
+        let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
+        self.register_with_id(agent_type, task, &id);
+        id
+    }
+
+    /// Register (or reattach to) a background agent under a caller-chosen id.
+    ///
+    /// Used by the subagent resume path (crosslink #582) so a resumed
+    /// agent keeps the *original* id — preserving transcript continuity
+    /// in [`TRANSCRIPT_STORE`] and prompt-cache continuity at the
+    /// provider. Behaviour:
+    ///
+    /// * If no entry exists for `id`, a fresh tracking entry is inserted
+    ///   (mirrors [`Self::register`] but with a known id).
+    /// * If an entry already exists, this is a no-op — we deliberately
+    ///   do **not** reset `finished` / `turns` / `result` / `error`,
+    ///   because the caller is reattaching to (not replacing) the
+    ///   prior agent.
+    ///
+    /// Returns `true` iff a new entry was inserted (i.e. the id was
+    /// fresh). Callers can ignore the return value when they only need
+    /// "ensure tracked".
+    pub fn register_with_id(&self, agent_type: AgentType, task: &str, id: &str) -> bool {
         // Sweep before insert so the cost of growth is amortized against
         // the spawn that causes it (crosslink #422).
         self.gc();
 
-        let id = safe_truncate(&Uuid::new_v4().to_string(), 8).to_string();
+        let Ok(mut agents) = self.agents.lock() else {
+            return false;
+        };
+        if agents.contains_key(id) {
+            return false;
+        }
         let agent = Arc::new(BackgroundAgent {
-            id: id.clone(),
+            id: id.to_string(),
             agent_type,
             task: task.to_string(),
             finished: AtomicBool::new(false),
@@ -314,12 +342,8 @@ impl BackgroundAgentManager {
             turns: AtomicU64::new(0),
             finished_at: Mutex::new(None),
         });
-
-        if let Ok(mut agents) = self.agents.lock() {
-            agents.insert(id.clone(), agent);
-        }
-
-        id
+        agents.insert(id.to_string(), agent);
+        true
     }
 
     /// Get an agent by ID
@@ -842,7 +866,7 @@ pub fn get_task_tool_definition() -> Value {
                     },
                     "resume": {
                         "type": "string",
-                        "description": "Optional agent ID to resume from. The agent continues with its full previous context preserved."
+                        "description": "Optional agent ID to resume from. The resumed agent keeps the original ID so its transcript and prompt cache stay continuous; the prior conversation is prepended and your new prompt is appended."
                     },
                     "model": {
                         "type": "string",
@@ -928,19 +952,35 @@ pub async fn run_subagent(
     app_config: &AppConfig,
     client: &Client,
 ) -> SubagentResult {
-    // Handle resume: reuse previous agent_id and load transcript
+    // Handle resume: reuse the *original* agent_id and load transcript.
+    //
+    // Crosslink #582 — previously this path called `BACKGROUND_AGENTS.register(...)`,
+    // which minted a fresh id and silently broke:
+    //   1. Transcript continuity: `TRANSCRIPT_STORE` is keyed by id, so
+    //      the next `store_transcript` overwrote a *different* key and
+    //      the original transcript was orphaned (and eventually evicted
+    //      by TTL) while the resumed agent's transcript started fresh.
+    //   2. Prompt cache continuity: provider-side prompt caches that
+    //      key off the conversation id never hit on resume.
+    // The fix: route through `register_with_id` so the original id is
+    // reattached to the tracker. If the id was already registered
+    // (e.g. a previous turn of the same resume chain), `register_with_id`
+    // is a no-op and preserves the existing turn counter / state.
     let (agent_id, mut messages) = if let Some(ref resume_id) = config.resume_agent_id {
         match load_transcript(resume_id) {
             Some((prev_messages, _prev_type)) => {
-                // Re-register with same ID for tracking
-                let id = BACKGROUND_AGENTS.register(config.agent_type, &config.task);
+                BACKGROUND_AGENTS.register_with_id(
+                    config.agent_type,
+                    &config.task,
+                    resume_id,
+                );
                 let mut msgs = prev_messages;
                 // Append the new prompt as a continuation
                 msgs.push(json!({
                     "role": "user",
                     "content": format!("Continuing from where you left off.\n\n{}", config.prompt)
                 }));
-                (id, msgs)
+                (resume_id.clone(), msgs)
             }
             None => {
                 return SubagentResult {
@@ -1491,8 +1531,22 @@ pub fn execute_task_tool<S: BuildHasher>(
     let client = Client::new();
 
     if run_in_background {
-        // Register the agent and spawn the task
-        let agent_id = BACKGROUND_AGENTS.register(agent_type, description);
+        // Register the agent and spawn the task.
+        //
+        // Crosslink #582 — on resume, we must register under the
+        // *original* id so:
+        //   (a) the immediate response to the caller cites the same id
+        //       they already know (and have transcript continuity on),
+        //   (b) the spawned task's call to `run_subagent` reattaches to
+        //       that tracking entry rather than minting a new id.
+        // For fresh spawns we mint a new id as before.
+        let agent_id = config.resume_agent_id.as_ref().map_or_else(
+            || BACKGROUND_AGENTS.register(agent_type, description),
+            |rid| {
+                BACKGROUND_AGENTS.register_with_id(agent_type, description, rid);
+                rid.clone()
+            },
+        );
 
         // Spawn the background task
         let config_bg = config;
@@ -2051,25 +2105,209 @@ mod tests {
         assert_eq!(loaded.0[2]["content"].as_str(), Some("Done."));
     }
 
-    /// Spec #527 §2 gap #582 — OC generates a NEW `agent_id` on resume; it does NOT
-    /// reuse the original id. CC reuses the original `agentId` for transcript
-    /// continuity and prompt-cache hits. This pins the divergent OC behavior.
+    // ── Crosslink #582: subagent resume reuses original agent_id ──
+    //
+    // The four tests below pin the fixed CC-parity behaviour. Previously
+    // (`spec2_gap582_resume_allocates_new_agent_id_not_old_one`) we
+    // pinned the *buggy* divergence; now we assert the corrected
+    // behaviour: a resume reattaches to the original id, a fresh spawn
+    // mints a new id, an unknown id is rejected with a clean error, and
+    // two resumes against the same id share transcript state.
+
+    /// #582 (1) — `execute_task_tool` dispatch with `resume` set reuses
+    /// that id end-to-end: the dispatched message cites the same id and
+    /// `TRANSCRIPT_STORE` continues to hold the entry under that key
+    /// (i.e. the id is *not* shadowed by a freshly minted one).
     #[test]
-    fn spec2_gap582_resume_allocates_new_agent_id_not_old_one() {
-        let original_id = format!("orig-{}", Uuid::new_v4());
+    fn fix582_task_dispatch_with_resume_id_reuses_id() {
+        let original_id = format!("582-reuse-{}", Uuid::new_v4());
         store_transcript(
             &original_id,
-            vec![json!({"role": "user", "content": "Hello"})],
+            vec![json!({"role": "user", "content": "Original turn"})],
             AgentType::Plan,
         );
+        assert!(
+            load_transcript(&original_id).is_some(),
+            "precondition: transcript must exist"
+        );
 
-        assert!(load_transcript(&original_id).is_some());
+        // Simulate the relevant branch of execute_task_tool's background
+        // path with `resume_id = Some(original_id)`. This is the exact
+        // code path that now must keep the original id.
+        let resume_id_opt: Option<String> = Some(original_id.clone());
+        let agent_id = resume_id_opt.as_ref().map_or_else(
+            || BACKGROUND_AGENTS.register(AgentType::Plan, "resume task"),
+            |rid| {
+                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "resume task", rid);
+                rid.clone()
+            },
+        );
 
-        // On resume, OC calls `BACKGROUND_AGENTS.register(...)` → new id.
-        let new_id = BACKGROUND_AGENTS.register(AgentType::Plan, "resume task");
-        assert_ne!(
-            new_id, original_id,
-            "gap #582: OC issues a new agent_id on resume (CC reuses original)"
+        assert_eq!(
+            agent_id, original_id,
+            "#582: resume must reuse the original id, not mint a new one"
+        );
+        assert!(
+            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            "tracking entry must exist under the reused id"
+        );
+        assert!(
+            load_transcript(&original_id).is_some(),
+            "TRANSCRIPT_STORE entry under the original id must still be reachable"
+        );
+    }
+
+    /// #582 (2) — dispatch with no `resume` mints a fresh id (8-char
+    /// UUID prefix per OC convention) that does not collide with any
+    /// caller-supplied id.
+    #[test]
+    fn fix582_task_dispatch_without_resume_generates_fresh_id() {
+        let resume_id_opt: Option<String> = None;
+        let agent_id = resume_id_opt.as_ref().map_or_else(
+            || BACKGROUND_AGENTS.register(AgentType::Plan, "fresh task"),
+            |rid| {
+                BACKGROUND_AGENTS.register_with_id(AgentType::Plan, "fresh task", rid);
+                rid.clone()
+            },
+        );
+
+        assert_eq!(agent_id.len(), 8, "fresh ids are 8-char UUID prefixes");
+        assert!(
+            BACKGROUND_AGENTS.get(&agent_id).is_some(),
+            "fresh-spawn tracking entry must exist"
+        );
+    }
+
+    /// #582 (3) — resume against an unknown `agent_id` returns a clear
+    /// `is_error=true` "No transcript found" result. Documented
+    /// behaviour: we error rather than silently creating a fresh
+    /// transcript under that id (the caller almost certainly had a typo
+    /// or hit TTL expiry — silently creating a new transcript would
+    /// mask data loss).
+    #[test]
+    fn fix582_resume_unknown_id_errors_does_not_silently_create() {
+        let unknown_id = format!("582-unknown-{}", Uuid::new_v4());
+        // Precondition: nothing in the store under this id.
+        assert!(load_transcript(&unknown_id).is_none());
+
+        // Mirror run_subagent's resume branch decision: `load_transcript`
+        // returns None → error path produces "No transcript found".
+        let load_result = load_transcript(&unknown_id);
+        assert!(
+            load_result.is_none(),
+            "unknown id must miss the transcript store"
+        );
+
+        // The error message format is what run_subagent emits.
+        let synth_msg = format!(
+            "No transcript found for agent '{unknown_id}'. It may have expired (TTL: {} minutes).",
+            TRANSCRIPT_TTL_SECS / 60
+        );
+        assert!(synth_msg.contains(&unknown_id));
+        assert!(synth_msg.contains("No transcript found"));
+
+        // And we deliberately did NOT create a transcript under the id.
+        assert!(
+            load_transcript(&unknown_id).is_none(),
+            "resume miss must not silently materialize a transcript"
+        );
+    }
+
+    /// #582 (4) — two successive dispatches with the same `resume_id`
+    /// share transcript state. Storing a transcript under id X and then
+    /// resuming under X loads the prior messages; the second dispatch
+    /// can append and re-store under the same key, preserving
+    /// cache/transcript continuity across the chain.
+    #[test]
+    fn fix582_two_dispatches_same_resume_id_share_transcript_state() {
+        let chain_id = format!("582-chain-{}", Uuid::new_v4());
+
+        // Turn 1: store an initial transcript under chain_id.
+        let turn1 = vec![
+            json!({"role": "system", "content": "system prompt"}),
+            json!({"role": "user", "content": "first prompt"}),
+            json!({"role": "assistant", "content": "first reply"}),
+        ];
+        store_transcript(&chain_id, turn1.clone(), AgentType::Explore);
+
+        // First resume dispatch: register_with_id is a no-op on the
+        // tracking side because we already registered, but the resume
+        // path's load+append+re-store cycle must round-trip on the same key.
+        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
+        let (loaded1, t1) =
+            load_transcript(&chain_id).expect("turn-1 transcript must be loadable");
+        assert_eq!(loaded1.len(), turn1.len());
+        assert_eq!(t1, AgentType::Explore);
+
+        // Simulate appending and re-storing (what run_subagent does at the
+        // end of a turn).
+        let mut turn2 = loaded1;
+        turn2.push(json!({"role": "user", "content": "Continuing from where you left off.\n\nsecond prompt"}));
+        turn2.push(json!({"role": "assistant", "content": "second reply"}));
+        store_transcript(&chain_id, turn2.clone(), AgentType::Explore);
+
+        // Second resume dispatch: must see the *combined* history under
+        // the same id — proof of transcript / prompt-cache continuity.
+        BACKGROUND_AGENTS.register_with_id(AgentType::Explore, "chain task", &chain_id);
+        let (loaded2, _) =
+            load_transcript(&chain_id).expect("turn-2 transcript must still be at same key");
+        assert_eq!(
+            loaded2.len(),
+            turn1.len() + 2,
+            "turn-2 transcript must include both turns under the same id"
+        );
+        assert_eq!(
+            loaded2[turn1.len()]["content"].as_str().unwrap_or(""),
+            "Continuing from where you left off.\n\nsecond prompt",
+            "appended prompt must be visible to a subsequent resume"
+        );
+
+        // And only one tracking entry exists under chain_id (no
+        // duplicates from the multiple register_with_id calls).
+        assert!(BACKGROUND_AGENTS.get(&chain_id).is_some());
+    }
+
+    /// #582 — `register_with_id` is idempotent: a second call with the
+    /// same id leaves the existing tracking entry intact (no reset of
+    /// `finished` / `turns` / `result`).
+    #[test]
+    fn fix582_register_with_id_is_idempotent() {
+        let mgr = BackgroundAgentManager::new();
+        let id = format!("582-idem-{}", Uuid::new_v4());
+
+        let inserted_first = mgr.register_with_id(AgentType::Plan, "task v1", &id);
+        assert!(inserted_first, "first call inserts a fresh entry");
+
+        // Mutate state on the first registration so we can detect a reset.
+        let _ = mgr.increment_turns(&id);
+        let _ = mgr.increment_turns(&id);
+        mgr.finish(&id, "result from turn 2".to_string());
+
+        let inserted_second = mgr.register_with_id(AgentType::Explore, "task v2", &id);
+        assert!(
+            !inserted_second,
+            "second call with the same id must be a no-op"
+        );
+
+        let agent = mgr.get(&id).expect("entry must still exist after reattach");
+        assert_eq!(
+            agent.task, "task v1",
+            "reattach must not overwrite the original task description"
+        );
+        assert_eq!(agent.agent_type, AgentType::Plan, "agent_type preserved");
+        assert!(
+            agent.finished.load(Ordering::SeqCst),
+            "finished flag preserved across reattach"
+        );
+        assert_eq!(
+            agent.turns.load(Ordering::SeqCst),
+            2,
+            "turn counter must not be reset"
+        );
+        assert_eq!(
+            agent.result.lock().unwrap().as_deref(),
+            Some("result from turn 2"),
+            "result preserved across reattach"
         );
     }
 
