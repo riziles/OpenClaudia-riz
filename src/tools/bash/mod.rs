@@ -238,10 +238,25 @@ impl BackgroundShellManager {
     /// Get output from a background shell (returns new output since last call)
     #[allow(clippy::significant_drop_tightening)] // shells lock must be held while accessing shell
     pub(crate) fn get_output(&self, shell_id: &str) -> Result<(String, bool, Option<i32>), String> {
-        let shells = self
-            .shells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Crosslink #678: the shells map holds an entry-per-shell HashMap with
+        // no cross-field invariant — every recoverable state is fully
+        // represented inside an individual BackgroundShell, and HashMap
+        // insert/get/remove are atomic. A poisoned mutex therefore reflects
+        // a panic in unrelated code paths, not a corrupted shells-map
+        // structure. We recover the inner state but loudly log so operators
+        // see the poison event in audit logs rather than treating it as
+        // invisible silent absorption.
+        let shells = self.shells.lock().unwrap_or_else(|p| {
+            tracing::error!(
+                target: "openclaudia::bash",
+                event = "mutex_poisoned",
+                op = "get_output",
+                shell_id,
+                "background shell manager mutex poisoned; recovering inner state \
+                 (see crosslink #678 for invariant rationale)"
+            );
+            p.into_inner()
+        });
         let shell = shells
             .get(shell_id)
             .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
@@ -311,10 +326,20 @@ impl BackgroundShellManager {
     /// if needed. Only removes the shell from tracking after the process has
     /// been terminated.
     pub(crate) fn kill(&self, shell_id: &str) -> Result<String, String> {
-        let mut shells = self
-            .shells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Crosslink #678: see get_output for poison-recovery rationale. The
+        // log carries shell_id so the audit trail names the specific call
+        // that observed poisoning.
+        let mut shells = self.shells.lock().unwrap_or_else(|p| {
+            tracing::error!(
+                target: "openclaudia::bash",
+                event = "mutex_poisoned",
+                op = "kill",
+                shell_id,
+                "background shell manager mutex poisoned; recovering inner state \
+                 (see crosslink #678 for invariant rationale)"
+            );
+            p.into_inner()
+        });
 
         if let Some(shell) = shells.remove(shell_id) {
             if !shell.finished.load(Ordering::SeqCst) {
@@ -340,10 +365,17 @@ impl BackgroundShellManager {
 
     /// List all background shells
     pub(crate) fn list(&self) -> Vec<(String, String, bool)> {
-        let shells = self
-            .shells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Crosslink #678: see get_output for poison-recovery rationale.
+        let shells = self.shells.lock().unwrap_or_else(|p| {
+            tracing::error!(
+                target: "openclaudia::bash",
+                event = "mutex_poisoned",
+                op = "list",
+                "background shell manager mutex poisoned; recovering inner state \
+                 (see crosslink #678 for invariant rationale)"
+            );
+            p.into_inner()
+        });
         shells
             .iter()
             .map(|(id, shell)| {

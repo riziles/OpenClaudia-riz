@@ -1673,12 +1673,44 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
     };
 
     if block && !agent.finished.load(Ordering::SeqCst) {
-        // Wait for completion (up to 5 minutes)
+        // Wait for completion (up to 5 minutes).
+        //
+        // Crosslink #682: the prior implementation used
+        // `std::thread::sleep` directly. The tool-execution layer is sync,
+        // but it is typically driven from a tokio worker thread; a bare
+        // sleep blocks that worker — for up to 5 minutes — and starves
+        // every other future on the same runtime. The fix mirrors
+        // `dispatch_subagent_sync`'s runtime-aware pattern: on a
+        // multi-threaded runtime use `block_in_place` so tokio can move
+        // other tasks off this thread for the duration; on a
+        // current-thread runtime fall back to a much shorter polling
+        // tick (the single worker cannot be moved aside, so we keep
+        // sleep granularity small and yield through the scheduler);
+        // off-runtime we keep the original thread sleep.
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_mins(5);
+        let poll = std::time::Duration::from_millis(500);
 
-        while !agent.finished.load(Ordering::SeqCst) && start.elapsed() < timeout {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    while !agent.finished.load(Ordering::SeqCst) && start.elapsed() < timeout {
+                        handle.block_on(tokio::time::sleep(poll));
+                    }
+                });
+            } else {
+                // Current-thread (or other) flavour: cannot
+                // `block_in_place`. Use a shorter granularity so the
+                // single worker recovers reasonably between polls.
+                let short_poll = std::time::Duration::from_millis(50);
+                while !agent.finished.load(Ordering::SeqCst) && start.elapsed() < timeout {
+                    std::thread::sleep(short_poll);
+                }
+            }
+        } else {
+            while !agent.finished.load(Ordering::SeqCst) && start.elapsed() < timeout {
+                std::thread::sleep(poll);
+            }
         }
     }
 
