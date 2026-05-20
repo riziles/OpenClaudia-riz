@@ -14,12 +14,15 @@ mod task;
 // Re-export all public types
 pub use audit::AuditLogger;
 pub use pricing::{
-    calculate_cost, calculate_cost_with_ttl, get_pricing, CacheWriteTtl, ModelPricing, PricingError,
+    calculate_cost, calculate_cost_fast_mode, calculate_cost_full, calculate_cost_with_extras,
+    calculate_cost_with_ttl, clear_unknown_model_cost, get_pricing, has_unknown_model_cost,
+    web_search_cost, CacheWriteTtl, ModelPricing, PricingError, FAST_MODE_INPUT_PER_MILLION,
+    FAST_MODE_OUTPUT_PER_MILLION, WEB_SEARCH_REQUEST_USD,
 };
 pub use state::{
     get_session_context, is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy,
-    AllowedPrompt, PlanModePolicy, PlanModeState, TokenUsage, TurnMetrics, MCP_TOOL_PREFIX,
-    PLAN_MODE_ALLOWED_TOOLS, PLUGIN_TOOL_PREFIX,
+    AllowedPrompt, PlanModePolicy, PlanModeState, TokenUsage, TurnMetrics, UsageExtras,
+    MCP_TOOL_PREFIX, PLAN_MODE_ALLOWED_TOOLS, PLUGIN_TOOL_PREFIX,
 };
 pub use task::{Task, TaskManager, TaskStatus, TaskUpdateParams, TaskUpdateStatus};
 

@@ -23,9 +23,60 @@
 //! to [`calculate_cost_with_ttl`].  The shorter [`calculate_cost`] entry
 //! point defaults to 5 m, matching the Anthropic API default when
 //! `cache_control.ttl` is omitted.
+//!
+//! ## Web-search per-request charge (#641)
+//!
+//! Anthropic also bills `server_tool_use.web_search_requests` as a flat
+//! per-call charge on top of token usage; CC mirrors this at $0.01/req
+//! (see `cost-tracker.ts:294` / `modelCost.ts:139`).  The count travels
+//! on [`TokenUsage::web_search_requests`] and is added to every cost
+//! computation through [`WEB_SEARCH_REQUEST_USD`].
+//!
+//! ## Fast-mode pricing tier (#642)
+//!
+//! Opus 4.6+ in `/fast` mode bills at the `COST_TIER_30_150` sheet
+//! ($30 input / $150 output per Mtok).  Per-model overrides live on
+//! [`ModelPricing::fast_mode_input_per_million`] /
+//! [`ModelPricing::fast_mode_output_per_million`] and the
+//! [`calculate_cost_fast_mode`] entry point swaps those rates in when
+//! set, falling back to the standard rates when not.
+//!
+//! ## Unknown-model analytics flag (#646)
+//!
+//! When `calculate_cost` resolves an unknown model it emits a structured
+//! `tracing::warn!(target = "openclaudia::analytics", event =
+//! "unknown_model_cost", ...)` and sets a thread-local flag observable
+//! through [`has_unknown_model_cost`] / [`clear_unknown_model_cost`].
+//! This mirrors CC's `tengu_unknown_model_cost` event and feeds the
+//! "costs may be inaccurate" session warning.
+//!
+//! ## Per-request `cost_tracked` event (#649)
+//!
+//! Every successful cost calculation emits a structured
+//! `tracing::info!(target = "openclaudia::analytics", event =
+//! "cost_tracked", ...)` carrying model, token buckets, web-search
+//! requests, the TTL bucket, fast-mode flag, and the computed
+//! `cost_usd`.  Mirrors CC's OTEL `getCostCounter().add()` /
+//! `getTokenCounter().add()` per-request emission (see
+//! `cost-tracker.ts:291-302`).
 
-use super::state::TokenUsage;
+use super::state::{TokenUsage, UsageExtras};
+use std::cell::Cell;
 use thiserror::Error;
+
+/// Flat USD charge applied per `server_tool_use.web_search_requests`
+/// (crosslink #641).  Matches CC `modelCost.ts:139`.
+pub const WEB_SEARCH_REQUEST_USD: f64 = 0.01;
+
+/// Fast-mode (Opus 4.6+ `/fast`) input rate per million tokens
+/// (`COST_TIER_30_150`).  Used as the default for the Opus 4.6+
+/// `fast_mode_input_per_million` slot — see #642.
+pub const FAST_MODE_INPUT_PER_MILLION: f64 = 30.0;
+
+/// Fast-mode (Opus 4.6+ `/fast`) output rate per million tokens
+/// (`COST_TIER_30_150`).  Used as the default for the Opus 4.6+
+/// `fast_mode_output_per_million` slot — see #642.
+pub const FAST_MODE_OUTPUT_PER_MILLION: f64 = 150.0;
 
 /// Errors returned by [`calculate_cost`] / [`calculate_cost_with_ttl`].
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -77,10 +128,22 @@ pub struct ModelPricing {
     /// don't expose a 1 h tier mirror the 5 m multiplier here so the
     /// selection logic stays uniform.
     pub cache_write_1hr_multiplier: f64,
+    /// Per-million-token input rate to bill when the request is issued
+    /// in fast mode (`/fast`).  `None` for models without a fast tier;
+    /// [`calculate_cost_fast_mode`] then falls back to
+    /// [`Self::input_per_million`].  Populated to `Some(30.0)` for Opus
+    /// 4.6+ to mirror CC `COST_TIER_30_150` (see #642).
+    pub fast_mode_input_per_million: Option<f64>,
+    /// Per-million-token output rate to bill in fast mode.  Same
+    /// fallback rules as [`Self::fast_mode_input_per_million`].
+    pub fast_mode_output_per_million: Option<f64>,
 }
 
 impl ModelPricing {
     /// Anthropic-style pricing: 0.1× cache-read, 1.25× cache-write-5m, 2.0× cache-write-1h.
+    ///
+    /// No fast-mode override by default; use
+    /// [`Self::anthropic_with_fast_mode`] for the Opus 4.6+ tier.
     const fn anthropic(input_per_million: f64, output_per_million: f64) -> Self {
         Self {
             input_per_million,
@@ -88,6 +151,29 @@ impl ModelPricing {
             cache_read_multiplier: 0.1,
             cache_write_5m_multiplier: 1.25,
             cache_write_1hr_multiplier: 2.0,
+            fast_mode_input_per_million: None,
+            fast_mode_output_per_million: None,
+        }
+    }
+
+    /// Anthropic pricing with an explicit fast-mode tier (#642).
+    ///
+    /// Used for Opus 4.6+ to map `/fast` requests onto
+    /// `COST_TIER_30_150` ($30 in / $150 out per Mtok).
+    const fn anthropic_with_fast_mode(
+        input_per_million: f64,
+        output_per_million: f64,
+        fast_input: f64,
+        fast_output: f64,
+    ) -> Self {
+        Self {
+            input_per_million,
+            output_per_million,
+            cache_read_multiplier: 0.1,
+            cache_write_5m_multiplier: 1.25,
+            cache_write_1hr_multiplier: 2.0,
+            fast_mode_input_per_million: Some(fast_input),
+            fast_mode_output_per_million: Some(fast_output),
         }
     }
 
@@ -103,6 +189,8 @@ impl ModelPricing {
             cache_read_multiplier: 0.1,
             cache_write_5m_multiplier: 1.25,
             cache_write_1hr_multiplier: 1.25,
+            fast_mode_input_per_million: None,
+            fast_mode_output_per_million: None,
         }
     }
 
@@ -113,6 +201,32 @@ impl ModelPricing {
             CacheWriteTtl::FiveMinutes => self.cache_write_5m_multiplier,
             CacheWriteTtl::OneHour => self.cache_write_1hr_multiplier,
         }
+    }
+
+    /// Effective per-million input rate after applying any fast-mode
+    /// override.  Returns [`Self::input_per_million`] when `fast` is
+    /// false or no override is configured.
+    #[must_use]
+    pub const fn effective_input_per_million(&self, fast: bool) -> f64 {
+        if fast {
+            if let Some(rate) = self.fast_mode_input_per_million {
+                return rate;
+            }
+        }
+        self.input_per_million
+    }
+
+    /// Effective per-million output rate after applying any fast-mode
+    /// override.  Returns [`Self::output_per_million`] when `fast` is
+    /// false or no override is configured.
+    #[must_use]
+    pub const fn effective_output_per_million(&self, fast: bool) -> f64 {
+        if fast {
+            if let Some(rate) = self.fast_mode_output_per_million {
+                return rate;
+            }
+        }
+        self.output_per_million
     }
 }
 
@@ -146,6 +260,29 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("claude-3-opus", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-3-sonnet", ModelPricing::anthropic(3.0, 15.0)),
     ("claude-haiku-4", ModelPricing::anthropic(1.0, 5.0)),
+    // Opus 4.6+ carries a fast-mode tier ($30/$150) per CC
+    // `COST_TIER_30_150` (modelCost.ts:147-153 — see #642).  These
+    // specific-suffix rows MUST precede the generic `claude-opus-4-`
+    // prefix below, otherwise the ordered prefix table would resolve a
+    // bare-rate row first and lose the fast-mode override.
+    (
+        "claude-opus-4-6",
+        ModelPricing::anthropic_with_fast_mode(
+            15.0,
+            75.0,
+            FAST_MODE_INPUT_PER_MILLION,
+            FAST_MODE_OUTPUT_PER_MILLION,
+        ),
+    ),
+    (
+        "claude-opus-4-7",
+        ModelPricing::anthropic_with_fast_mode(
+            15.0,
+            75.0,
+            FAST_MODE_INPUT_PER_MILLION,
+            FAST_MODE_OUTPUT_PER_MILLION,
+        ),
+    ),
     ("claude-opus-4-", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-opus-4", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-sonnet-4-", ModelPricing::anthropic(3.0, 15.0)),
@@ -208,11 +345,59 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("qwq-32b", ModelPricing::other(0.50, 2.0)),
 ];
 
+thread_local! {
+    /// Thread-local "this thread has computed a cost for an unknown
+    /// model" flag (#646).  Set by `calculate_cost_*` whenever the
+    /// pricing lookup misses; observable via [`has_unknown_model_cost`]
+    /// and resettable via [`clear_unknown_model_cost`].
+    ///
+    /// Thread-local rather than `static AtomicBool` because cost
+    /// calculation runs on per-session worker tasks and a global flag
+    /// would bleed signal between unrelated sessions running on the
+    /// same process.  Callers that need a session-scoped read should
+    /// invoke the accessor from the thread that just called
+    /// `calculate_cost`.
+    static UNKNOWN_MODEL_COST_SEEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` if any `calculate_cost*` call on **this thread** has
+/// failed pricing lookup since the last [`clear_unknown_model_cost`].
+///
+/// Mirrors CC's `hasUnknownModelCost` session flag (#646), which feeds
+/// the "costs may be inaccurate" warning.  Use this for session-level
+/// reporting; the per-call analytics event is emitted independently
+/// (target `openclaudia::analytics`, event `unknown_model_cost`).
+#[must_use]
+pub fn has_unknown_model_cost() -> bool {
+    UNKNOWN_MODEL_COST_SEEN.with(Cell::get)
+}
+
+/// Reset the [`has_unknown_model_cost`] flag on the current thread.
+///
+/// Intended to be called at session start or after surfacing the
+/// inaccuracy warning to the user so subsequent unknown-model events
+/// can be detected again.
+pub fn clear_unknown_model_cost() {
+    UNKNOWN_MODEL_COST_SEEN.with(|c| c.set(false));
+}
+
+/// Mark the thread-local "unknown model cost seen" flag (#646).
+///
+/// Centralised so the set semantics stay in one place.
+fn mark_unknown_model_cost() {
+    UNKNOWN_MODEL_COST_SEEN.with(|c| c.set(true));
+}
+
 /// Look up pricing for a model by ordered prefix match (case-insensitive).
 ///
 /// Returns the first [`PRICING_TABLE`] entry whose prefix the lower-cased
 /// `model` starts with, or [`None`] if no entry matches.  Emits a single
 /// `tracing::warn!` on miss so unknown models surface in operator logs.
+///
+/// **Side-effect-free with respect to the unknown-model session flag**
+/// (#646) — the flag is set by `calculate_cost_*`, not by this
+/// primitive, so pricing-table introspection (e.g. for status-bar
+/// display) does not pollute the session-level inaccuracy signal.
 #[must_use]
 pub fn get_pricing(model: &str) -> Option<ModelPricing> {
     let key = model.to_lowercase();
@@ -226,12 +411,28 @@ pub fn get_pricing(model: &str) -> Option<ModelPricing> {
     hit
 }
 
+/// Flat per-request charge for `server_tool_use.web_search_requests`
+/// (#641).  Extracted so the rate is referenced from exactly one place.
+#[must_use]
+pub fn web_search_cost(requests: u64) -> f64 {
+    f64_from_tokens(requests) * WEB_SEARCH_REQUEST_USD
+}
+
 /// Calculate the cost for given token usage and model.
 ///
 /// Defaults to the 5 m ephemeral cache-write multiplier — equivalent to
-/// the Anthropic API behaviour when `cache_control.ttl` is omitted.
+/// the Anthropic API behaviour when `cache_control.ttl` is omitted —
+/// and to zero [`UsageExtras`] (i.e. no `web_search_requests`).
 /// Callers that have an explicit TTL should use
-/// [`calculate_cost_with_ttl`].
+/// [`calculate_cost_with_ttl`]; callers operating in `/fast` mode
+/// should use [`calculate_cost_fast_mode`] (#642); callers carrying
+/// web-search request counts should use [`calculate_cost_with_extras`]
+/// or [`calculate_cost_full`] (#641).
+///
+/// On success this emits a structured `cost_tracked` analytics event
+/// (#649); on unknown-model failure it emits an `unknown_model_cost`
+/// event and sets the thread-local [`has_unknown_model_cost`] flag
+/// (#646).
 ///
 /// # Errors
 ///
@@ -245,6 +446,9 @@ pub fn calculate_cost(model: &str, usage: &TokenUsage) -> Result<f64, PricingErr
 
 /// Calculate cost with explicit cache-write TTL.
 ///
+/// Standard (non-fast) mode, zero extras.  Emits the same analytics
+/// events as [`calculate_cost`].
+///
 /// # Errors
 ///
 /// Returns [`PricingError::UnknownModel`] when `model` does not match any
@@ -254,21 +458,147 @@ pub fn calculate_cost_with_ttl(
     usage: &TokenUsage,
     ttl: CacheWriteTtl,
 ) -> Result<f64, PricingError> {
-    let pricing = get_pricing(model).ok_or_else(|| PricingError::UnknownModel(model.to_string()))?;
+    calculate_cost_impl(model, usage, UsageExtras::ZERO, ttl, /*fast=*/ false)
+}
+
+/// Calculate cost with explicit [`UsageExtras`] (web-search requests
+/// etc.) — #641 entry point.
+///
+/// Defaults to standard mode and 5 m cache-write TTL.
+///
+/// # Errors
+///
+/// Returns [`PricingError::UnknownModel`] when `model` does not match any
+/// entry in [`PRICING_TABLE`].
+pub fn calculate_cost_with_extras(
+    model: &str,
+    usage: &TokenUsage,
+    extras: &UsageExtras,
+) -> Result<f64, PricingError> {
+    calculate_cost_impl(
+        model,
+        usage,
+        *extras,
+        CacheWriteTtl::FiveMinutes,
+        /*fast=*/ false,
+    )
+}
+
+/// Calculate cost using the model's fast-mode rate tier (#642).
+///
+/// Equivalent to [`calculate_cost`] for models without a configured
+/// fast tier (so it is safe to call unconditionally when the request
+/// is in `/fast` mode regardless of model family).  Defaults to the
+/// 5 m cache-write TTL and zero extras.
+///
+/// # Errors
+///
+/// Returns [`PricingError::UnknownModel`] when `model` does not match any
+/// entry in [`PRICING_TABLE`].
+pub fn calculate_cost_fast_mode(model: &str, usage: &TokenUsage) -> Result<f64, PricingError> {
+    calculate_cost_impl(
+        model,
+        usage,
+        UsageExtras::ZERO,
+        CacheWriteTtl::FiveMinutes,
+        /*fast=*/ true,
+    )
+}
+
+/// Calculate cost with full control over TTL, fast-mode, and extras.
+///
+/// Lower-level entry point used by callers that need control over all
+/// three dimensions; the typical caller wants [`calculate_cost`],
+/// [`calculate_cost_with_ttl`], [`calculate_cost_fast_mode`], or
+/// [`calculate_cost_with_extras`].
+///
+/// # Errors
+///
+/// Returns [`PricingError::UnknownModel`] when `model` does not match any
+/// entry in [`PRICING_TABLE`].
+pub fn calculate_cost_full(
+    model: &str,
+    usage: &TokenUsage,
+    extras: &UsageExtras,
+    ttl: CacheWriteTtl,
+    fast: bool,
+) -> Result<f64, PricingError> {
+    calculate_cost_impl(model, usage, *extras, ttl, fast)
+}
+
+/// Shared implementation backing all `calculate_cost*` entry points.
+///
+/// On unknown-model: emits the `unknown_model_cost` analytics event,
+/// sets the thread-local session flag (#646), and returns
+/// `PricingError::UnknownModel`.  On success: emits the `cost_tracked`
+/// analytics event (#649) and returns the USD cost.
+fn calculate_cost_impl(
+    model: &str,
+    usage: &TokenUsage,
+    extras: UsageExtras,
+    ttl: CacheWriteTtl,
+    fast: bool,
+) -> Result<f64, PricingError> {
+    let Some(pricing) = get_pricing(model) else {
+        // Per #646: structured analytics event + thread-local session
+        // flag so downstream UI can surface "costs may be inaccurate".
+        // The event target/name mirror CC's `tengu_unknown_model_cost`.
+        mark_unknown_model_cost();
+        tracing::warn!(
+            target: "openclaudia::analytics",
+            event = "unknown_model_cost",
+            model = %model,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_tokens = usage.cache_read_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            web_search_requests = extras.web_search_requests,
+            fast_mode = fast,
+            "unknown model for cost lookup; costs may be inaccurate",
+        );
+        return Err(PricingError::UnknownModel(model.to_string()));
+    };
 
     let input = f64_from_tokens(usage.input_tokens);
     let output = f64_from_tokens(usage.output_tokens);
     let cache_read = f64_from_tokens(usage.cache_read_tokens);
     let cache_write = f64_from_tokens(usage.cache_write_tokens);
 
-    let input_cost = input * pricing.input_per_million / 1_000_000.0;
-    let output_cost = output * pricing.output_per_million / 1_000_000.0;
+    let input_rate = pricing.effective_input_per_million(fast);
+    let output_rate = pricing.effective_output_per_million(fast);
+
+    let input_cost = input * input_rate / 1_000_000.0;
+    let output_cost = output * output_rate / 1_000_000.0;
+    // Cache multipliers stay anchored to the *standard* input rate (not
+    // the fast-mode rate): cache reads/writes are billed at Anthropic's
+    // base ratios irrespective of `/fast`, matching CC behaviour.
     let cache_read_cost =
         cache_read * pricing.input_per_million * pricing.cache_read_multiplier / 1_000_000.0;
     let cache_write_cost =
         cache_write * pricing.input_per_million * pricing.cache_write_multiplier(ttl) / 1_000_000.0;
+    // Per #641: flat per-request charge for server-side web search.
+    let web_search = web_search_cost(extras.web_search_requests);
 
-    Ok(input_cost + output_cost + cache_read_cost + cache_write_cost)
+    let cost = input_cost + output_cost + cache_read_cost + cache_write_cost + web_search;
+
+    // Per #649: per-request analytics event, mirroring CC's OTEL
+    // `getCostCounter().add()` / `getTokenCounter().add()` emission.
+    tracing::info!(
+        target: "openclaudia::analytics",
+        event = "cost_tracked",
+        model = %model,
+        input_tokens = usage.input_tokens,
+        output_tokens = usage.output_tokens,
+        cache_read_tokens = usage.cache_read_tokens,
+        cache_write_tokens = usage.cache_write_tokens,
+        web_search_requests = extras.web_search_requests,
+        cache_write_ttl = ?ttl,
+        fast_mode = fast,
+        cost_usd = cost,
+        "per-request cost tracked",
+    );
+
+    Ok(cost)
 }
 
 /// Lossless `u64 -> f64` conversion for token counts.
@@ -643,5 +973,254 @@ mod tests {
         );
         // And the rates themselves still match the family's price sheet.
         assert!((opus3.input_per_million - opus4.input_per_million).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // #641 — web_search_requests are billed at a flat $0.01/req on top of
+    // token usage.  Validates both the standalone helper and the
+    // through-`calculate_cost_with_extras` path.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn web_search_requests_billed_at_one_cent_each() {
+        // Helper: 100 requests = $1.00.
+        let cost = web_search_cost(100);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "100 web-search requests must cost $1.00 (got {cost})"
+        );
+        // End-to-end: web_search_requests adds $0.01 each on top of any
+        // token cost.  Use a known model and zero token usage so the
+        // resulting cost isolates the per-request charge.
+        let usage = TokenUsage::default();
+        let extras = UsageExtras {
+            web_search_requests: 5,
+        };
+        let cost = calculate_cost_with_extras("claude-sonnet-4-5", &usage, &extras)
+            .expect("sonnet must resolve");
+        assert!(
+            (cost - 0.05).abs() < 1e-9,
+            "5 web-search requests at $0.01 each must total $0.05 (got {cost})"
+        );
+
+        // And the charge is *additive* on top of the standard token
+        // pricing — not a replacement for it.
+        let usage_with_tokens = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let cost_no_search = calculate_cost("claude-sonnet-4-5", &usage_with_tokens)
+            .expect("sonnet must resolve");
+        let cost_with_search =
+            calculate_cost_with_extras("claude-sonnet-4-5", &usage_with_tokens, &extras)
+                .expect("sonnet must resolve");
+        assert!(
+            (cost_with_search - cost_no_search - 0.05).abs() < 1e-9,
+            "web-search charge must be additive on top of token cost \
+             (cost_no_search={cost_no_search}, cost_with_search={cost_with_search})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #642 — fast-mode tier swaps in $30/$150 rates for Opus 4.6+ and
+    // leaves other models at their standard rates.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fast_mode_uses_thirty_one_fifty_for_opus_4_6_plus() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        // Standard tier: $15 in + $75 out = $90 for 1M+1M.
+        let standard = calculate_cost("claude-opus-4-6", &usage).expect("opus-4-6 must resolve");
+        assert!(
+            (standard - 90.0).abs() < 1e-9,
+            "opus-4-6 standard tier: 1M input + 1M output = $90 (got {standard})"
+        );
+        // Fast tier: $30 in + $150 out = $180 for the same usage.
+        let fast =
+            calculate_cost_fast_mode("claude-opus-4-6", &usage).expect("opus-4-6 must resolve");
+        assert!(
+            (fast - 180.0).abs() < 1e-9,
+            "opus-4-6 fast tier: 1M input + 1M output = $180 (got {fast})"
+        );
+        // Opus 4.7 inherits the same fast-mode override.
+        let fast47 =
+            calculate_cost_fast_mode("claude-opus-4-7", &usage).expect("opus-4-7 must resolve");
+        assert!(
+            (fast47 - 180.0).abs() < 1e-9,
+            "opus-4-7 fast tier: 1M input + 1M output = $180 (got {fast47})"
+        );
+    }
+
+    /// #642 — `calculate_cost_fast_mode` on a model with no fast tier
+    /// configured returns the same number as standard `calculate_cost`.
+    /// This is the "safe to call unconditionally in /fast mode" contract.
+    #[test]
+    fn fast_mode_falls_back_for_models_without_override() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        // claude-opus-4-5 has no fast-mode override — must equal standard.
+        let standard =
+            calculate_cost("claude-opus-4-5", &usage).expect("opus-4-5 must resolve");
+        let fast =
+            calculate_cost_fast_mode("claude-opus-4-5", &usage).expect("opus-4-5 must resolve");
+        assert!(
+            (standard - fast).abs() < f64::EPSILON,
+            "models without fast-mode override must produce identical cost in either entry point \
+             (standard={standard}, fast={fast})"
+        );
+        // Same for an OpenAI model that has no fast tier at all.
+        let s2 = calculate_cost("gpt-4o", &usage).expect("gpt-4o must resolve");
+        let f2 = calculate_cost_fast_mode("gpt-4o", &usage).expect("gpt-4o must resolve");
+        assert!(
+            (s2 - f2).abs() < f64::EPSILON,
+            "gpt-4o has no fast tier — fast-mode call must equal standard call \
+             (standard={s2}, fast={f2})"
+        );
+    }
+
+    /// #642 — the ordered prefix table puts opus-4-6 / opus-4-7
+    /// BEFORE `claude-opus-4-`, otherwise the fast-mode override would
+    /// be silently lost.  Regression guard against re-ordering.
+    #[test]
+    fn fast_mode_rows_precede_generic_opus_4_prefix() {
+        let idx_46 = PRICING_TABLE
+            .iter()
+            .position(|(p, _)| *p == "claude-opus-4-6")
+            .expect("table must contain claude-opus-4-6");
+        let idx_47 = PRICING_TABLE
+            .iter()
+            .position(|(p, _)| *p == "claude-opus-4-7")
+            .expect("table must contain claude-opus-4-7");
+        let idx_generic = PRICING_TABLE
+            .iter()
+            .position(|(p, _)| *p == "claude-opus-4-")
+            .expect("table must contain claude-opus-4-");
+        assert!(
+            idx_46 < idx_generic,
+            "claude-opus-4-6 ({idx_46}) must precede claude-opus-4- ({idx_generic}) — \
+             otherwise the ordered table loses the fast-mode override"
+        );
+        assert!(
+            idx_47 < idx_generic,
+            "claude-opus-4-7 ({idx_47}) must precede claude-opus-4- ({idx_generic})"
+        );
+        // And the override actually lands on lookup.
+        let p46 = get_pricing("claude-opus-4-6").expect("must resolve");
+        assert_eq!(p46.fast_mode_input_per_million, Some(30.0));
+        assert_eq!(p46.fast_mode_output_per_million, Some(150.0));
+        let p47 = get_pricing("claude-opus-4-7").expect("must resolve");
+        assert_eq!(p47.fast_mode_input_per_million, Some(30.0));
+        assert_eq!(p47.fast_mode_output_per_million, Some(150.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // #646 — unknown_model_cost sets a thread-local session flag that
+    // downstream UI can read to surface "costs may be inaccurate".
+    // -----------------------------------------------------------------------
+    #[test]
+    fn unknown_model_sets_thread_local_session_flag() {
+        // Reset state for this test (flag is thread-local so other
+        // tests on the same thread can pollute it).
+        clear_unknown_model_cost();
+        assert!(
+            !has_unknown_model_cost(),
+            "flag must start cleared after clear_unknown_model_cost()"
+        );
+
+        // A successful lookup must NOT set the flag.
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let _ = calculate_cost("claude-3-haiku-20240307", &usage)
+            .expect("haiku must resolve");
+        assert!(
+            !has_unknown_model_cost(),
+            "successful pricing lookup must not set the unknown-model flag"
+        );
+
+        // A failing lookup must set the flag and surface an Err.
+        let err = calculate_cost("totally-unknown-model-zzz", &usage).unwrap_err();
+        assert_eq!(
+            err,
+            PricingError::UnknownModel("totally-unknown-model-zzz".to_string())
+        );
+        assert!(
+            has_unknown_model_cost(),
+            "unknown-model lookup must set the session flag (#646)"
+        );
+
+        // clear_unknown_model_cost resets it.
+        clear_unknown_model_cost();
+        assert!(
+            !has_unknown_model_cost(),
+            "clear_unknown_model_cost() must reset the flag"
+        );
+
+        // The lookup primitive get_pricing must NOT touch the flag —
+        // pricing-table introspection (status bar, etc.) shouldn't
+        // pollute the session-level inaccuracy signal.
+        assert!(get_pricing("totally-unknown-model-zzz").is_none());
+        assert!(
+            !has_unknown_model_cost(),
+            "get_pricing miss must not set the unknown-model flag — only calculate_cost* does"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #642/#641 — calculate_cost_full is the lower-level entry point and
+    // composes correctly with both the fast-mode flag and extras.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn calculate_cost_full_composes_fast_mode_and_extras() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let extras = UsageExtras {
+            web_search_requests: 10,
+        };
+        // Fast tier on opus-4-6: 1M input @ $30/M = $30, plus 10
+        // searches @ $0.01 = $0.10 → $30.10 total.
+        let cost = calculate_cost_full(
+            "claude-opus-4-6",
+            &usage,
+            &extras,
+            CacheWriteTtl::FiveMinutes,
+            /*fast=*/ true,
+        )
+        .expect("opus-4-6 must resolve");
+        assert!(
+            (cost - 30.10).abs() < 1e-9,
+            "fast-mode + 10 web-search reqs must total $30.10 (got {cost})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UsageExtras::accumulate sums web-search counts across turns.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn usage_extras_accumulate_sums_web_search_requests() {
+        let mut acc = UsageExtras::default();
+        acc.accumulate(&UsageExtras {
+            web_search_requests: 3,
+        });
+        acc.accumulate(&UsageExtras {
+            web_search_requests: 7,
+        });
+        assert_eq!(acc.web_search_requests, 10);
     }
 }

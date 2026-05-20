@@ -38,6 +38,43 @@ impl TokenUsage {
     }
 }
 
+/// Server-side per-call usage charges not measured in tokens (#641).
+///
+/// Threaded **alongside** [`TokenUsage`] so the token struct, which is
+/// constructed at many call sites including those locked against
+/// modification (e.g. `pipeline.rs`), stays binary-compatible.  Add
+/// new flat-fee counters here as Anthropic introduces them.
+///
+/// Defaults to all-zero so callers that have nothing to report can
+/// pass `&UsageExtras::default()` (or use the
+/// [`UsageExtras::ZERO`] constant).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageExtras {
+    /// Number of `server_tool_use.web_search_requests` issued in this
+    /// turn (#641).  Each is billed at a flat per-call rate (CC:
+    /// $0.01/req — see
+    /// [`crate::session::pricing::WEB_SEARCH_REQUEST_USD`]).  Tracked
+    /// here rather than on [`TokenUsage`] because the cost is a flat
+    /// USD fee, not a token charge, and conflating the two would
+    /// silently corrupt token-budget math.
+    #[serde(default)]
+    pub web_search_requests: u64,
+}
+
+impl UsageExtras {
+    /// All-zero extras — handy when a call site has no flat-fee usage
+    /// to report but [`crate::session::pricing::calculate_cost_full`]
+    /// still requires an extras argument.
+    pub const ZERO: Self = Self {
+        web_search_requests: 0,
+    };
+
+    /// Accumulate one set of extras into another.
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.web_search_requests += other.web_search_requests;
+    }
+}
+
 /// Metrics for a single API turn (round-trip)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnMetrics {
