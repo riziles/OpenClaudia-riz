@@ -2281,6 +2281,11 @@ mod phase2_spec_pins {
             "cron_create",        // schedule registration (gated separately)
             "cron_delete",        // schedule removal (gated separately)
             "cron_list",          // schedule read
+            // crosslink #612 / #614 — pure read-side: skill loads a markdown
+            // body from disk; tool_search returns schemas from the registry.
+            // Neither mutates user state.
+            "skill",
+            "tool_search",
         ];
 
         for handler in iter_handlers() {

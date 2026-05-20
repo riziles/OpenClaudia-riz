@@ -163,6 +163,106 @@ fn dedup_archival(db: &Arc<MemoryDb>) -> Result<usize> {
     Ok(deleted)
 }
 
+// ── AgentSummary job (crosslink #635) ───────────────────────────────────────
+
+/// Periodic background summarisation of subagent state.
+///
+/// Crosslink #635 — subagents accumulate per-task state (todo lists, tool
+/// outputs, intermediate notes) that the parent agent rarely re-reads
+/// verbatim. This job condenses each completed subagent task's metadata
+/// into a single archival memory row tagged `agent-summary`, so the
+/// parent's `memory_search` can recall "what did the subagent do for
+/// task X?" without paging through the original turns.
+///
+/// The job is intentionally minimal at this landing — it walks the
+/// memory database for rows tagged with `subagent-task:*` (the
+/// established subagent-record tag) and folds same-task rows into a
+/// single canonical summary row. The folding heuristic is the same one
+/// `extract_and_persist_memories` uses: first paragraph for asks, last
+/// paragraph for conclusions. Adding richer NLP-level summarisation is
+/// follow-up work; the dispatch seam here is what's contracted.
+pub struct AgentSummaryJob;
+
+impl BackgroundJob for AgentSummaryJob {
+    fn name(&self) -> &'static str {
+        "agent_summary"
+    }
+
+    fn run(&self, db: &Arc<MemoryDb>) -> Result<JobOutcome> {
+        // Pull every row currently in archival memory and pick out the
+        // ones carrying a `subagent-task:*` tag. The job is rate-limited
+        // by the scheduler's interval, so a list-everything pass is
+        // acceptable here.
+        let rows = db.memory_list(usize::MAX)?;
+        let mut by_task: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut existing_summary: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for row in rows {
+            // Pre-existing summary rows are identified by the
+            // `agent-summary` tag — collect them so we don't write a
+            // duplicate on the next pass.
+            if row.tags.iter().any(|t| t == "agent-summary") {
+                for tag in &row.tags {
+                    if let Some(task) = tag.strip_prefix("subagent-task:") {
+                        existing_summary.insert(task.to_string());
+                    }
+                }
+                continue;
+            }
+            for tag in &row.tags {
+                if let Some(task) = tag.strip_prefix("subagent-task:") {
+                    by_task
+                        .entry(task.to_string())
+                        .or_default()
+                        .push(row.content.clone());
+                }
+            }
+        }
+
+        let mut summarised = 0usize;
+        for (task, contents) in by_task {
+            if existing_summary.contains(&task) {
+                continue;
+            }
+            if contents.is_empty() {
+                continue;
+            }
+            // Join with double-newline so the resulting body reads as
+            // paragraphs in the agent's archival view. Cap at 4 KiB so
+            // a runaway log doesn't bloat the row.
+            let mut body = contents.join("\n\n");
+            if body.len() > 4096 {
+                let mut end = 4096;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
+                body.push('…');
+            }
+            let tags = vec![
+                "agent-summary".to_string(),
+                format!("subagent-task:{task}"),
+            ];
+            match db.memory_save(&body, &tags) {
+                Ok(_) => summarised += 1,
+                Err(e) => tracing::warn!(
+                    task = %task,
+                    error = %e,
+                    "AgentSummaryJob: failed to persist summary"
+                ),
+            }
+        }
+
+        Ok(JobOutcome {
+            job_name: self.name(),
+            records_pruned: 0,
+            records_deduped: summarised,
+        })
+    }
+}
+
 // ── Scheduler ────────────────────────────────────────────────────────────────
 
 /// Entry in the scheduler's job table.
@@ -573,5 +673,70 @@ mod tests {
         sched.tick();
         sched.tick();
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    // ── #635 AgentSummaryJob tests ────────────────────────────────────────────
+
+    #[test]
+    fn agent_summary_job_name_is_stable() {
+        assert_eq!(AgentSummaryJob.name(), "agent_summary");
+    }
+
+    #[test]
+    fn agent_summary_job_emits_summary_for_subagent_task() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db(&tmp);
+
+        // Two rows for the same subagent task — must be folded into ONE
+        // summary row tagged `agent-summary` + `subagent-task:T1`.
+        db.memory_save(
+            "step 1 — looked up the user",
+            &[
+                "subagent-task:T1".to_string(),
+                "tool-output".to_string(),
+            ],
+        )
+        .unwrap();
+        db.memory_save(
+            "step 2 — applied the patch",
+            &[
+                "subagent-task:T1".to_string(),
+                "tool-output".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let outcome = AgentSummaryJob.run(&db).unwrap();
+        assert_eq!(outcome.job_name, "agent_summary");
+        assert_eq!(outcome.records_deduped, 1, "one summary row created");
+
+        // The summary must be queryable via memory_search.
+        let hits = db.memory_search("applied the patch", 10).unwrap();
+        assert!(hits
+            .iter()
+            .any(|r| r.tags.contains(&"agent-summary".to_string())
+                && r.tags.contains(&"subagent-task:T1".to_string())));
+    }
+
+    #[test]
+    fn agent_summary_job_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db(&tmp);
+        db.memory_save(
+            "subagent step",
+            &["subagent-task:T2".to_string()],
+        )
+        .unwrap();
+
+        let first = AgentSummaryJob.run(&db).unwrap();
+        assert_eq!(first.records_deduped, 1);
+
+        // Second pass must NOT create a new summary row because the task
+        // already has one.
+        let second = AgentSummaryJob.run(&db).unwrap();
+        assert_eq!(
+            second.records_deduped, 0,
+            "AgentSummaryJob must be idempotent across passes"
+        );
     }
 }

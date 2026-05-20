@@ -26,10 +26,12 @@ pub mod lsp;
 mod plan_mode;
 pub mod registry;
 pub mod remote_trigger;
+pub mod skill;
 mod task;
 #[cfg(test)]
 pub(crate) mod testutil;
 mod todo;
+pub mod tool_search;
 mod web;
 pub mod worktree;
 

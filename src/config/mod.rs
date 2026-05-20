@@ -78,6 +78,14 @@ pub struct AppConfig {
     /// allowlist consulted by the permission layer. See crosslink #603.
     #[serde(default)]
     pub web_fetch: WebFetchConfig,
+    /// Enterprise policy block (crosslink #637).
+    ///
+    /// Token caps, per-tool invocation caps, and a model allowlist. All
+    /// fields are optional; `default()` leaves every check disabled so
+    /// existing deployments are unaffected until a `policy:` block is
+    /// added to the config file.
+    #[serde(default)]
+    pub policy: crate::services::policy::EnterprisePolicy,
     /// Path to enterprise managed settings file, if one was loaded.
     /// Managed settings override all user and project settings.
     #[serde(skip)]
@@ -327,6 +335,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
 
@@ -373,6 +382,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
 
@@ -397,6 +407,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
 
@@ -422,6 +433,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: managed,
         }
     }

@@ -781,9 +781,8 @@ impl ContextCompactor {
         // Each message is stored in archival_memory with tags
         // ["auto-compacted", "session:<id>"] so the model can retrieve
         // full context later via memory_search.
-        let archive_ids: Vec<i64> = memory_db.as_ref().map_or_else(Vec::new, |db| {
-            archive_compacted_messages(&messages_to_summarize, session_id, db)
-        });
+        let archive_ids: Vec<i64> =
+            archive_with_memory_extraction(&messages_to_summarize, session_id, memory_db.as_ref());
 
         // Generate summary of old messages
         let summary = Self::generate_summary(&messages_to_summarize, session_id);
@@ -992,10 +991,209 @@ impl ContextCompactor {
         summary
     }
 
+    /// Partial / token-budget-aware compaction (crosslink #634).
+    ///
+    /// `microcompact` is the surgical sibling of [`Self::compact`]. Where
+    /// `compact` summarises everything outside the protected window in one
+    /// pass, `microcompact` walks the eligible messages from oldest to
+    /// newest and stops as soon as the estimated request size is at or
+    /// under `target_tokens`. Messages that were never visited remain
+    /// untouched.
+    ///
+    /// Useful for the case where the conversation is mildly above budget
+    /// (say 20% over) and a full compaction would discard far more than
+    /// necessary, sacrificing recent-but-not-protected context. The
+    /// caller picks the budget; this method does the targeted slice.
+    ///
+    /// The current implementation summarises the eligible window in one
+    /// span (the underlying summarizer cost is dominated by template
+    /// boilerplate, not per-message work, so cumulative per-chunk passes
+    /// would be wasteful). The "partial" behaviour comes from the
+    /// `messages_to_summarize` selection: we pick a *prefix* of the
+    /// summarizable window large enough to free `current - target`
+    /// tokens, instead of the full window.
+    ///
+    /// Returns `Ok(CompactionResult { compacted: false, .. })` when the
+    /// request already fits the budget; never errors on "already under".
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`Self::compact_with_hint`]: `HookBlocked` if a `PreCompact`
+    /// hook rejects, `Failed` for genuine logic failures.
+    pub async fn microcompact(
+        &self,
+        request: &mut ChatCompletionRequest,
+        target_tokens: usize,
+        hook_engine: Option<&HookEngine>,
+        session_id: Option<&str>,
+        memory_db: Option<Arc<MemoryDb>>,
+    ) -> Result<CompactionResult, CompactionError> {
+        // Fast path — under budget, nothing to do.
+        let current = estimate_request_tokens(request);
+        if current <= target_tokens {
+            return Ok(CompactionResult {
+                compacted: false,
+                original_tokens: current,
+                new_tokens: current,
+                messages_summarized: 0,
+                summary: None,
+            });
+        }
+
+        // Reuse the full analyzer to pick the eligible-summarizable window
+        // (it already honours preserve_system / preserve_recent / pinned
+        // tool-call windows). We then trim that list to a prefix sized for
+        // the budget we actually want to free.
+        let mut analysis = self.analyze_with_hint(request, None);
+
+        if analysis.messages_to_summarize.is_empty() {
+            return Ok(CompactionResult {
+                compacted: false,
+                original_tokens: current,
+                new_tokens: current,
+                messages_summarized: 0,
+                summary: None,
+            });
+        }
+
+        let must_free = current.saturating_sub(target_tokens);
+
+        // Walk the candidate prefix accumulating the tokens we would
+        // recover by summarising it; stop when the prefix would meet
+        // (heuristically) the must-free budget. The estimator gives us
+        // a stable monotonic measurement so we keep the first prefix
+        // that crosses the threshold.
+        let mut freed_estimate: usize = 0;
+        let mut keep = 0usize;
+        for (idx, &msg_idx) in analysis.messages_to_summarize.iter().enumerate() {
+            keep = idx + 1;
+            if let Some(msg) = request.messages.get(msg_idx) {
+                freed_estimate =
+                    freed_estimate.saturating_add(estimate_message_tokens(msg));
+            }
+            if freed_estimate >= must_free {
+                break;
+            }
+        }
+        // Truncate to the prefix we settled on. `analyze_with_hint`
+        // returned the indices in original order, so the prefix is
+        // contiguous in `messages` as well.
+        analysis.messages_to_summarize.truncate(keep);
+
+        // From here we fall through to the same machinery as `compact`,
+        // just driven by the trimmed analysis. We inline only what is
+        // needed because `compact_with_hint` re-runs `analyze_with_hint`
+        // internally and would discard our truncation.
+        self.apply_analysis(request, &analysis, hook_engine, session_id, memory_db)
+            .await
+    }
+
+    /// Shared "apply a prepared `CompactionAnalysis` to a request" path used
+    /// by [`Self::microcompact`].
+    ///
+    /// Split out so the byte-for-byte equivalent body in `compact_with_hint`
+    /// can stay where it is for the standard path while microcompact
+    /// drives its hand-tuned analysis through the same hook + archive +
+    /// summary + boundary-marker pipeline.
+    async fn apply_analysis(
+        &self,
+        request: &mut ChatCompletionRequest,
+        analysis: &CompactionAnalysis,
+        hook_engine: Option<&HookEngine>,
+        session_id: Option<&str>,
+        memory_db: Option<Arc<MemoryDb>>,
+    ) -> Result<CompactionResult, CompactionError> {
+        if let Some(engine) = hook_engine {
+            let mut hook_input = HookInput::new(HookEvent::PreCompact)
+                .with_extra("current_tokens", serde_json::json!(analysis.current_tokens))
+                .with_extra("max_tokens", serde_json::json!(analysis.max_tokens))
+                .with_extra("partial", serde_json::json!(true));
+            if let Some(sid) = session_id {
+                hook_input = hook_input.with_session_id(sid);
+            }
+            let hook_result = engine.run(HookEvent::PreCompact, &hook_input).await;
+            if !hook_result.allowed {
+                return Err(CompactionError::HookBlocked(
+                    hook_result
+                        .outputs
+                        .first()
+                        .and_then(|o| o.reason.clone())
+                        .unwrap_or_else(|| "Hook blocked compaction".to_string()),
+                ));
+            }
+        }
+
+        let messages_to_summarize: Vec<&ChatMessage> = analysis
+            .messages_to_summarize
+            .iter()
+            .filter_map(|&i| request.messages.get(i))
+            .collect();
+
+        if messages_to_summarize.is_empty() {
+            return Ok(CompactionResult {
+                compacted: false,
+                original_tokens: analysis.current_tokens,
+                new_tokens: analysis.current_tokens,
+                messages_summarized: 0,
+                summary: None,
+            });
+        }
+
+        let archive_ids: Vec<i64> =
+            archive_with_memory_extraction(&messages_to_summarize, session_id, memory_db.as_ref());
+
+        let summary = Self::generate_summary(&messages_to_summarize, session_id);
+        let summarized_count = messages_to_summarize.len();
+        drop(messages_to_summarize);
+
+        let original_messages = request.messages.clone();
+        let new_messages = Self::build_compacted_messages(
+            analysis,
+            &request.messages,
+            &summary,
+            archive_ids,
+            session_id.map(str::to_owned),
+        );
+        request.messages = new_messages;
+        let new_tokens = estimate_request_tokens(request);
+
+        if new_tokens >= analysis.current_tokens {
+            request.messages = original_messages;
+            return Ok(CompactionResult {
+                compacted: false,
+                original_tokens: analysis.current_tokens,
+                new_tokens: analysis.current_tokens,
+                messages_summarized: 0,
+                summary: None,
+            });
+        }
+
+        Ok(CompactionResult {
+            compacted: true,
+            original_tokens: analysis.current_tokens,
+            new_tokens,
+            messages_summarized: summarized_count,
+            summary: Some(summary),
+        })
+    }
+
     /// Get the current configuration
     #[must_use]
     pub const fn config(&self) -> &CompactionConfig {
         &self.config
+    }
+
+    /// Public accessor for the analysis decision used by [`AutoCompactor`]
+    /// (crosslink #632). Lets the orchestrator decide "should I compact?"
+    /// without re-implementing the predicate.
+    #[must_use]
+    pub fn needs_compaction(
+        &self,
+        request: &ChatCompletionRequest,
+        actual_input_tokens: Option<usize>,
+    ) -> bool {
+        self.analyze_with_hint(request, actual_input_tokens)
+            .needs_compaction
     }
 
     /// Update configuration
@@ -1040,6 +1238,128 @@ pub fn archive_compacted_messages(
         }
     }
     ids
+}
+
+/// Run the full memory-extraction + raw-archive pass for crosslink #633.
+///
+/// When `memory_db` is `None` this is a cheap no-op returning an empty
+/// vec; otherwise it runs [`extract_and_persist_memories`] for the
+/// structured-memory side and [`archive_compacted_messages`] for the
+/// raw-transcript side. Returns the archive row IDs the boundary marker
+/// embeds.
+fn archive_with_memory_extraction(
+    messages: &[&ChatMessage],
+    session_id: Option<&str>,
+    memory_db: Option<&Arc<MemoryDb>>,
+) -> Vec<i64> {
+    let Some(db) = memory_db else {
+        return Vec::new();
+    };
+    let extracted = extract_and_persist_memories(messages, session_id, db);
+    tracing::debug!(
+        extracted = extracted.len(),
+        "Persisted extracted memories alongside compaction archive"
+    );
+    archive_compacted_messages(messages, session_id, db)
+}
+
+/// Distil structured "memories" from a message slice and persist them.
+///
+/// Crosslink #633 — complements [`archive_compacted_messages`] (which
+/// stores raw turns) by extracting the most salient lines from each
+/// message and writing them as additional `MemoryDb` rows tagged
+/// `extracted-memory`. The extracted rows are queryable independently
+/// of the bulky raw archives, so a downstream `memory_search` can
+/// surface the facts without paging through full transcripts.
+///
+/// Extraction is intentionally heuristic — first non-empty paragraph
+/// of each user message and the final sentence of each assistant
+/// message — because the alternative (calling the model to summarise
+/// during compaction) is slow and recursive. The boundary is exactly
+/// where the model would have written a summary anyway: this captures
+/// the "the user wanted X; I did Y" beats without an extra LLM round
+/// trip.
+///
+/// Returns the row IDs of the persisted memories. Archival failures
+/// are non-fatal — they log at WARN and the affected slice is skipped.
+pub fn extract_and_persist_memories(
+    messages: &[&ChatMessage],
+    session_id: Option<&str>,
+    db: &MemoryDb,
+) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for msg in messages {
+        let text = match &msg.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let Some(snippet) = distil_memory_snippet(&msg.role, &text) else {
+            continue;
+        };
+        let mut tags = vec![
+            "extracted-memory".to_string(),
+            format!("role:{}", msg.role),
+        ];
+        if let Some(sid) = session_id {
+            tags.push(format!("session:{sid}"));
+        }
+        match db.memory_save(&snippet, &tags) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                warn!(
+                    role = %msg.role,
+                    error = %e,
+                    "Failed to persist extracted memory"
+                );
+            }
+        }
+    }
+    ids
+}
+
+/// Extract a single high-signal snippet from a message body.
+///
+/// User messages → first non-empty paragraph (the "ask").
+/// Assistant messages → last non-empty paragraph (the "conclusion").
+/// Other roles (system, tool) are skipped entirely — those messages
+/// aren't user-meaningful memories.
+///
+/// Returns `None` when the body is empty after the chosen slice.
+fn distil_memory_snippet(role: &str, body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let paragraphs: Vec<&str> = trimmed
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if paragraphs.is_empty() {
+        return None;
+    }
+    let snippet = match role {
+        "user" => paragraphs.first().copied(),
+        "assistant" => paragraphs.last().copied(),
+        _ => None,
+    }?;
+    // Cap at 1000 chars so an unbounded paragraph cannot blow up the
+    // archival store; the boundary is conservative and preserves UTF-8
+    // char boundaries.
+    let snippet = if snippet.len() <= 1000 {
+        snippet.to_string()
+    } else {
+        let mut end = 1000;
+        while end > 0 && !snippet.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &snippet[..end])
+    };
+    Some(snippet)
 }
 
 /// Result of a compaction operation
@@ -2948,5 +3268,82 @@ mod tests {
         let default_user = CompactionConfig::default();
         let noop = CompactionOverrides::from_user_config(&default_user);
         assert_eq!(noop, CompactionOverrides::default());
+    }
+
+    // ── #633 extracted-memory tests ───────────────────────────────────────────
+
+    /// Distillation picks the first paragraph for user messages.
+    #[test]
+    fn extracted_memory_user_picks_first_paragraph() {
+        let snippet = distil_memory_snippet(
+            "user",
+            "Please explain ownership.\n\nAlso mention borrowing rules.",
+        )
+        .unwrap();
+        assert_eq!(snippet, "Please explain ownership.");
+    }
+
+    /// Distillation picks the last paragraph for assistant messages.
+    #[test]
+    fn extracted_memory_assistant_picks_last_paragraph() {
+        let snippet = distil_memory_snippet(
+            "assistant",
+            "Here is the explanation.\n\nIn summary: ownership ensures memory safety.",
+        )
+        .unwrap();
+        assert_eq!(
+            snippet,
+            "In summary: ownership ensures memory safety."
+        );
+    }
+
+    /// Distillation skips non-user / non-assistant roles.
+    #[test]
+    fn extracted_memory_skips_system_and_tool_roles() {
+        assert!(distil_memory_snippet("system", "boot prompt").is_none());
+        assert!(distil_memory_snippet("tool", "tool output").is_none());
+    }
+
+    /// Empty body → no snippet.
+    #[test]
+    fn extracted_memory_empty_body_yields_none() {
+        assert!(distil_memory_snippet("user", "   \n\n   ").is_none());
+    }
+
+    /// Long snippets are truncated at 1000 bytes with an ellipsis suffix.
+    #[test]
+    fn extracted_memory_truncates_long_snippet() {
+        let huge = "a".repeat(3000);
+        let snippet = distil_memory_snippet("user", &huge).unwrap();
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.len() <= 1004); // 1000 byte prefix + 3 byte ellipsis
+    }
+
+    /// Persisting writes one row per eligible message and tags it
+    /// `extracted-memory`. Confirms the integration with `MemoryDb`.
+    #[test]
+    fn reg633_extract_and_persist_writes_tagged_rows() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = MemoryDb::open(&dir.path().join("mem.db")).expect("open db");
+
+        let messages = [
+            create_test_message("user", "Track this fact: foo is bar."),
+            create_test_message("assistant", "I will remember.\n\nfoo is bar — noted."),
+            create_test_message("system", "boot"), // skipped
+        ];
+        let refs: Vec<&ChatMessage> = messages.iter().collect();
+
+        let ids = extract_and_persist_memories(&refs, Some("sess-633"), &db);
+        // user + assistant = 2 rows; system skipped.
+        assert_eq!(ids.len(), 2);
+
+        let results = db.memory_search("foo is bar", 10).expect("search");
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .any(|r| r.tags.contains(&"extracted-memory".to_string())));
+        assert!(results
+            .iter()
+            .any(|r| r.tags.contains(&"session:sess-633".to_string())));
     }
 }

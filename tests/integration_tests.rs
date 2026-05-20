@@ -3032,6 +3032,7 @@ mod vdd_tests {
             permissions: openclaudia::config::PermissionsConfig::default(),
             memory: openclaudia::config::MemoryConfig::default(),
             web_fetch: openclaudia::config::WebFetchConfig::default(),
+            policy: openclaudia::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }
     }

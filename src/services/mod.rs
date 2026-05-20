@@ -17,12 +17,27 @@
 //! real implementation.
 
 pub mod analytics;
+pub mod auto_compactor;
 pub mod background;
 pub mod feature_flags;
+pub mod lsp_diagnostics;
+pub mod lsp_pool;
+pub mod policy;
+pub mod rate_limit_mock;
 
 pub use analytics::{AnalyticsEvent, AnalyticsSink, NoopAnalytics, TracingAnalytics};
-pub use background::{BackgroundJob, JobOutcome, JobScheduler, MemoryConsolidationJob};
+pub use auto_compactor::{AutoCompactPolicy, AutoCompactor};
+pub use background::{
+    AgentSummaryJob, BackgroundJob, JobOutcome, JobScheduler, MemoryConsolidationJob,
+};
 pub use feature_flags::{FeatureFlagSource, StaticFlags};
+pub use lsp_diagnostics::{
+    DefaultDiagnosticInjector, Diagnostic, DiagnosticInjector, DiagnosticRegistry,
+    DiagnosticSeverity, NoopDiagnosticInjector,
+};
+pub use lsp_pool::{ChildHandle, LspServerManager, LspSpawner};
+pub use policy::{EnterprisePolicy, PolicyDecision, PolicyError};
+pub use rate_limit_mock::{MockRateLimit, RateLimitMock};
 
 use std::sync::Arc;
 

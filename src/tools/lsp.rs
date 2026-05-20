@@ -356,7 +356,14 @@ fn stderr_snippet(buf: &Arc<Mutex<Vec<u8>>>) -> String {
     }
 }
 
-/// LSP operation types
+/// LSP operation types.
+///
+/// Crosslink #645 adds five new actions for parity with CC's LSP surface:
+/// `WorkspaceSymbol`, `GoToImplementation`, `PrepareCallHierarchy`,
+/// `IncomingCalls`, `OutgoingCalls`. These are wired to their canonical LSP
+/// methods in [`run_lsp_request`] and parsed through the existing
+/// [`parse_locations`] / [`parse_symbols`] helpers (with `LocationLink`
+/// normalisation from crosslink #643 applied uniformly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LspAction {
@@ -364,6 +371,22 @@ pub enum LspAction {
     FindReferences,
     Hover,
     DocumentSymbols,
+    /// `workspace/symbol` — search project-wide by symbol name. Uses the
+    /// `query` argument supplied by the caller; falls back to empty string
+    /// (which most servers treat as "all symbols").
+    WorkspaceSymbol,
+    /// `textDocument/implementation` — jump from an interface/trait to its
+    /// implementations. Same position-arg shape as `GoToDefinition`.
+    GoToImplementation,
+    /// `textDocument/prepareCallHierarchy` — phase 1 of the call-hierarchy
+    /// protocol. Returns the `CallHierarchyItem` at the cursor.
+    PrepareCallHierarchy,
+    /// `callHierarchy/incomingCalls` — phase 2. Requires the caller to
+    /// supply a previously-obtained `CallHierarchyItem` via the
+    /// `hierarchy_item` argument (opaque JSON pass-through).
+    IncomingCalls,
+    /// `callHierarchy/outgoingCalls` — phase 2 (the other direction).
+    OutgoingCalls,
 }
 
 /// Result from an LSP operation
@@ -565,23 +588,118 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
         "findReferences" | "references" => LspAction::FindReferences,
         "hover" => LspAction::Hover,
         "documentSymbols" | "symbols" => LspAction::DocumentSymbols,
+        // crosslink #645: five-op expansion.
+        "workspaceSymbol" => LspAction::WorkspaceSymbol,
+        "goToImplementation" | "implementation" => LspAction::GoToImplementation,
+        "prepareCallHierarchy" => LspAction::PrepareCallHierarchy,
+        "incomingCalls" => LspAction::IncomingCalls,
+        "outgoingCalls" => LspAction::OutgoingCalls,
         _ => {
             return (
                 format!(
-                    "Unknown LSP action: {action_str}. Use: goToDefinition, findReferences, hover, documentSymbols"
+                    "Unknown LSP action: {action_str}. Use: goToDefinition, findReferences, \
+                     hover, documentSymbols, workspaceSymbol, goToImplementation, \
+                     prepareCallHierarchy, incomingCalls, outgoingCalls"
                 ),
                 true,
             )
         }
     };
 
+    // crosslink #645: workspace/symbol takes a `query` string instead of a
+    // text-document position; the call-hierarchy phase-2 ops require a
+    // pre-fetched `hierarchy_item` (the value returned by
+    // prepareCallHierarchy). Both are optional pass-through context.
+    let extras = LspRequestExtras {
+        query: args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        hierarchy_item: args.get("hierarchy_item").cloned(),
+    };
+
     // Run the server, send initialize + request, get response
-    match run_lsp_request(server_cmd, &server_args, file_path, line, character, action) {
+    match run_lsp_request(
+        server_cmd,
+        &server_args,
+        file_path,
+        line,
+        character,
+        action,
+        &extras,
+    ) {
         Ok(result) => (
             serde_json::to_string_pretty(&result).unwrap_or_default(),
             false,
         ),
         Err(e) => (format!("LSP error: {e}"), true),
+    }
+}
+
+/// Optional per-call context for the new actions added in crosslink #645.
+///
+/// `query` is consumed by `workspaceSymbol`; `hierarchy_item` by the two
+/// `callHierarchy/*` phase-2 ops. Both default to `None` for backwards
+/// compatibility with callers that only use the original four actions.
+#[derive(Debug, Default, Clone)]
+struct LspRequestExtras {
+    query: Option<String>,
+    hierarchy_item: Option<Value>,
+}
+
+/// Map an [`LspAction`] to its `(method, params)` JSON-RPC pair. Extracted
+/// so [`run_lsp_request`] stays under the project's per-function line
+/// budget after the crosslink #645 five-op expansion.
+fn build_action_request(
+    action: LspAction,
+    file_uri: &str,
+    line: u32,
+    character: u32,
+    extras: &LspRequestExtras,
+) -> (&'static str, Value) {
+    let pos = || json!({"line": line.saturating_sub(1), "character": character});
+    let td = || json!({"uri": file_uri});
+    match action {
+        LspAction::GoToDefinition => (
+            "textDocument/definition",
+            json!({"textDocument": td(), "position": pos()}),
+        ),
+        LspAction::FindReferences => (
+            "textDocument/references",
+            json!({
+                "textDocument": td(),
+                "position": pos(),
+                "context": {"includeDeclaration": true}
+            }),
+        ),
+        LspAction::Hover => (
+            "textDocument/hover",
+            json!({"textDocument": td(), "position": pos()}),
+        ),
+        LspAction::DocumentSymbols => (
+            "textDocument/documentSymbol",
+            json!({"textDocument": td()}),
+        ),
+        LspAction::WorkspaceSymbol => (
+            "workspace/symbol",
+            json!({"query": extras.query.as_deref().unwrap_or("")}),
+        ),
+        LspAction::GoToImplementation => (
+            "textDocument/implementation",
+            json!({"textDocument": td(), "position": pos()}),
+        ),
+        LspAction::PrepareCallHierarchy => (
+            "textDocument/prepareCallHierarchy",
+            json!({"textDocument": td(), "position": pos()}),
+        ),
+        LspAction::IncomingCalls => (
+            "callHierarchy/incomingCalls",
+            json!({"item": extras.hierarchy_item.clone().unwrap_or(Value::Null)}),
+        ),
+        LspAction::OutgoingCalls => (
+            "callHierarchy/outgoingCalls",
+            json!({"item": extras.hierarchy_item.clone().unwrap_or(Value::Null)}),
+        ),
     }
 }
 
@@ -592,6 +710,7 @@ fn run_lsp_request(
     line: u32,
     character: u32,
     action: LspAction,
+    extras: &LspRequestExtras,
 ) -> Result<LspResult, String> {
     // File-resolve and read flow through typed `FileError` so the path and
     // `io::ErrorKind` are preserved through the source chain — see #492. We
@@ -684,34 +803,7 @@ fn run_lsp_request(
     })?;
 
     // Send the actual request
-    let (method, params) = match action {
-        LspAction::GoToDefinition => (
-            "textDocument/definition",
-            json!({
-                "textDocument": {"uri": &file_uri},
-                "position": {"line": line.saturating_sub(1), "character": character}
-            }),
-        ),
-        LspAction::FindReferences => (
-            "textDocument/references",
-            json!({
-                "textDocument": {"uri": &file_uri},
-                "position": {"line": line.saturating_sub(1), "character": character},
-                "context": {"includeDeclaration": true}
-            }),
-        ),
-        LspAction::Hover => (
-            "textDocument/hover",
-            json!({
-                "textDocument": {"uri": &file_uri},
-                "position": {"line": line.saturating_sub(1), "character": character}
-            }),
-        ),
-        LspAction::DocumentSymbols => (
-            "textDocument/documentSymbol",
-            json!({"textDocument": {"uri": &file_uri}}),
-        ),
-    };
+    let (method, params) = build_action_request(action, &file_uri, line, character, extras);
 
     send_lsp_message(&mut stdin, method, 2, params)?;
     let response = read_lsp_response(&mut reader, 2).map_err(|e| {
@@ -934,8 +1026,15 @@ fn parse_lsp_response(action: LspAction, file_path: &str, response: &Value) -> L
                 symbols: Vec::new(),
             }
         }
-        LspAction::GoToDefinition | LspAction::FindReferences => {
-            let locations = parse_locations(result_data);
+        LspAction::GoToDefinition
+        | LspAction::FindReferences
+        | LspAction::GoToImplementation => {
+            // crosslink #643: parse_locations now normalises LocationLink →
+            // Location internally, so the three position-pointing actions
+            // share the same parsing path.
+            // crosslink #644: drop hits inside gitignored files (build
+            // artefacts, vendored deps) — they pollute jump-to-def results.
+            let locations = filter_gitignored(parse_locations(result_data));
             LspResult {
                 action: format!("{action:?}"),
                 file_path: file_path.to_string(),
@@ -952,6 +1051,72 @@ fn parse_lsp_response(action: LspAction, file_path: &str, response: &Value) -> L
                 results: Vec::new(),
                 hover_text: None,
                 symbols,
+            }
+        }
+        // crosslink #645: `workspace/symbol` returns `WorkspaceSymbol[]` or
+        // `SymbolInformation[]` — both carry a `location: Location` field, so
+        // we project each entry's location through `parse_locations` to get
+        // the same `LspLocation` shape every other ops returns.
+        LspAction::WorkspaceSymbol => {
+            let locations = match result_data {
+                Some(Value::Array(arr)) => {
+                    let locs: Vec<Value> = arr
+                        .iter()
+                        .filter_map(|s| s.get("location").cloned())
+                        .collect();
+                    parse_locations(Some(&Value::Array(locs)))
+                }
+                _ => Vec::new(),
+            };
+            LspResult {
+                action: "workspaceSymbol".to_string(),
+                file_path: file_path.to_string(),
+                results: locations,
+                hover_text: None,
+                symbols: Vec::new(),
+            }
+        }
+        LspAction::PrepareCallHierarchy => {
+            // `CallHierarchyItem[]` — each item has `uri` + `selectionRange`.
+            // Render via parse_call_hierarchy by wrapping each item under a
+            // synthetic `from` key so it shares the call-edge path.
+            let synthetic = result_data
+                .and_then(Value::as_array)
+                .map(|items| {
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|it| serde_json::json!({"from": it}))
+                            .collect(),
+                    )
+                });
+            let locations = parse_call_hierarchy(synthetic.as_ref(), "from");
+            LspResult {
+                action: "prepareCallHierarchy".to_string(),
+                file_path: file_path.to_string(),
+                results: locations,
+                hover_text: None,
+                symbols: Vec::new(),
+            }
+        }
+        LspAction::IncomingCalls => {
+            let locations = parse_call_hierarchy(result_data, "from");
+            LspResult {
+                action: "incomingCalls".to_string(),
+                file_path: file_path.to_string(),
+                results: locations,
+                hover_text: None,
+                symbols: Vec::new(),
+            }
+        }
+        LspAction::OutgoingCalls => {
+            let locations = parse_call_hierarchy(result_data, "to");
+            LspResult {
+                action: "outgoingCalls".to_string(),
+                file_path: file_path.to_string(),
+                results: locations,
+                hover_text: None,
+                symbols: Vec::new(),
             }
         }
     }
@@ -1009,6 +1174,138 @@ fn extract_hover_array_element(v: &Value) -> Option<&str> {
         .or_else(|| v.get("value").and_then(|x| x.as_str()))
 }
 
+/// Normalise either a `Location` or a `LocationLink` JSON object to the
+/// `(uri, range)` pair we render downstream (crosslink #643).
+///
+/// Per LSP §3.17 the goToDefinition / goToImplementation response is
+/// `Location | Location[] | LocationLink[] | null`. The shapes differ:
+///
+/// * `Location`     — `{uri, range}`
+/// * `LocationLink` — `{targetUri, targetRange, targetSelectionRange,
+///                      originSelectionRange?}`
+///
+/// CC normalises `LocationLink` → `Location` by treating
+/// `targetUri` as `uri` and `targetSelectionRange` (falling back to
+/// `targetRange`) as `range`. We mirror that exactly so a server that
+/// returns `LocationLink`s (e.g. modern `rust-analyzer`, `gopls`) does not
+/// silently produce empty results.
+fn normalise_location(loc: &Value) -> Option<(&str, &Value)> {
+    // `Location` shape: top-level `uri`.
+    if let Some(uri) = loc.get("uri").and_then(Value::as_str) {
+        if let Some(range) = loc.get("range") {
+            return Some((uri, range));
+        }
+    }
+    // `LocationLink` shape: `targetUri` + `targetSelectionRange` (preferred)
+    // or `targetRange` (fallback). `targetSelectionRange` is "the range of
+    // the symbol name itself" which is the more useful jump target — it is
+    // what CC's normaliser picks.
+    if let Some(target_uri) = loc.get("targetUri").and_then(Value::as_str) {
+        if let Some(range) = loc
+            .get("targetSelectionRange")
+            .or_else(|| loc.get("targetRange"))
+        {
+            return Some((target_uri, range));
+        }
+    }
+    None
+}
+
+/// Convert a `file://` URI into an absolute filesystem path, if possible.
+///
+/// Used by [`filter_gitignored`] (crosslink #644) to feed
+/// `git check-ignore` paths it understands. Non-`file://` URIs (e.g. JDT
+/// `jdt://` scheme) are returned as `None` so the caller skips the check
+/// and keeps the location.
+fn uri_to_local_path(uri: &str) -> Option<std::path::PathBuf> {
+    let trimmed = uri.strip_prefix("file://")?;
+    // Strip a leading `/` on Windows-shaped `file:///C:/...` URIs is wrong, but
+    // OC's stored format always begins with `/` on Linux and the LSP servers
+    // we target emit POSIX paths inside `file://` even on Windows because the
+    // language server itself canonicalises. Treat as POSIX path.
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Filter out [`LspLocation`]s pointing at gitignored files (crosslink #644).
+///
+/// Runs `git check-ignore` once per unique path. The check is best-effort:
+/// if `git` is not on PATH, the working tree is not a git repo, or
+/// `check-ignore` errors, the input list passes through unchanged — we
+/// must never silently drop a hit because the gitignore probe failed,
+/// since the model relies on the locations to navigate the codebase.
+fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
+    use std::collections::HashSet;
+    use std::process::Command as ProcCommand;
+
+    if locations.is_empty() {
+        return locations;
+    }
+
+    // Collect the unique local paths to probe; non-file URIs go through.
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut path_strings: Vec<String> = Vec::new();
+    for loc in &locations {
+        if let Some(p) = uri_to_local_path(&loc.uri) {
+            if !paths.contains(&p) {
+                if let Some(s) = p.to_str() {
+                    path_strings.push(s.to_string());
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    if path_strings.is_empty() {
+        return locations;
+    }
+
+    // `git check-ignore --stdin` reads NUL- or newline-separated paths and
+    // prints back only the ones that ARE ignored. Exit status 0 = at least one
+    // ignored; 1 = none ignored; 128 = error (not a repo etc).
+    let out = ProcCommand::new("git")
+        .args(["check-ignore", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let Ok(mut child) = out else {
+        return locations;
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(path_strings.join("\n").as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return locations;
+    };
+
+    // Status 128 means "not a git repo" or other error — keep everything.
+    if output.status.code() == Some(128) {
+        return locations;
+    }
+
+    let ignored: HashSet<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+
+    if ignored.is_empty() {
+        return locations;
+    }
+
+    locations
+        .into_iter()
+        .filter(|loc| {
+            // Per `unnecessary_map_or`: collapse to `.is_none_or` so the
+            // "keep when we couldn't probe" semantics are explicit.
+            uri_to_local_path(&loc.uri)
+                .is_none_or(|p| p.to_str().is_none_or(|s| !ignored.contains(s)))
+        })
+        .collect()
+}
+
 fn parse_locations(data: Option<&Value>) -> Vec<LspLocation> {
     let arr = match data {
         Some(Value::Array(a)) => a.clone(),
@@ -1018,8 +1315,7 @@ fn parse_locations(data: Option<&Value>) -> Vec<LspLocation> {
 
     arr.iter()
         .filter_map(|loc| {
-            let uri = loc.get("uri").and_then(|u| u.as_str())?;
-            let range = loc.get("range")?;
+            let (uri, range) = normalise_location(loc)?;
             let start = range.get("start")?;
             let end = range.get("end");
             Some(LspLocation {
@@ -1042,6 +1338,52 @@ fn parse_locations(data: Option<&Value>) -> Vec<LspLocation> {
                     .and_then(serde_json::Value::as_u64)
                     .map(u64_to_u32_saturating),
                 preview: None,
+            })
+        })
+        .collect()
+}
+
+/// Parse a `callHierarchy/{incoming,outgoing}Calls` response.
+///
+/// Each element is a `CallHierarchyIncomingCall` / `OutgoingCall` that
+/// wraps a `CallHierarchyItem` under `from` (incoming) or `to` (outgoing).
+/// We pull the item's `uri` + `selectionRange` (preferring it over the
+/// full `range`, since `selectionRange` is the symbol-name range) and
+/// emit a [`LspLocation`] per entry, matching how CC surfaces these.
+fn parse_call_hierarchy(data: Option<&Value>, key: &str) -> Vec<LspLocation> {
+    let Some(Value::Array(arr)) = data else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let item = entry.get(key)?;
+            let uri = item.get("uri").and_then(Value::as_str)?;
+            let range = item.get("selectionRange").or_else(|| item.get("range"))?;
+            let start = range.get("start")?;
+            let end = range.get("end");
+            Some(LspLocation {
+                uri: uri.to_string(),
+                line: start
+                    .get("line")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(0, u64_to_u32_saturating)
+                    + 1,
+                character: start
+                    .get("character")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(0, u64_to_u32_saturating),
+                end_line: end
+                    .and_then(|e| e.get("line"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|l| u64_to_u32_saturating(l) + 1),
+                end_character: end
+                    .and_then(|e| e.get("character"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(u64_to_u32_saturating),
+                preview: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
         })
         .collect()
@@ -1402,9 +1744,9 @@ mod tests {
     }
 
     /// B1b — OC stores the raw `file://…` URI, not a workspace-relative path.
-    /// Gap #643: CC normalizes `LocationLink` → Location; OC only handles
-    /// Location objects (requires `uri` field). A `LocationLink` input (with
-    /// `targetUri` but no `uri`) is silently dropped.
+    /// Crosslink #643 (closed): `LocationLink` shapes are now normalised
+    /// to `Location` via `normalise_location`; see the dedicated test
+    /// `location_link_normalised_to_location` below.
     #[test]
     fn spec_b1_raw_uri_stored_not_relative_path() {
         let data = json!([{
@@ -1417,24 +1759,38 @@ mod tests {
         assert_eq!(locs[0].uri, "file:///home/user/project/src/lib.rs");
     }
 
-    /// B1c — `LocationLink` objects (with `targetUri` but no `uri`) are silently
-    /// dropped by OC's `parse_locations` because it requires `uri`. (Gap #643.)
+    /// B1c — `LocationLink` objects are normalised to `Location` (crosslink
+    /// #643, closed). `targetUri` becomes `uri` and `targetSelectionRange`
+    /// (preferred over `targetRange`) becomes `range`. This mirrors CC's
+    /// `LocationLink` → `Location` normaliser.
     #[test]
-    fn spec_b1_location_link_silently_dropped_gap643() {
-        // This is a LocationLink shape, not a Location shape.
+    fn location_link_normalised_to_location() {
         let data = json!([{
             "targetUri": "file:///src/lib.rs",
             "targetRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
-            "targetSelectionRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}},
+            "targetSelectionRange": {"start": {"line": 7, "character": 4}, "end": {"line": 7, "character": 9}},
             "originSelectionRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}
         }]);
-        // OC: filter_map drops entries without `uri`. Result is empty.
-        // CC: would normalise targetUri → Location. (Gap #643.)
         let locs = parse_locations(Some(&data));
-        assert!(
-            locs.is_empty(),
-            "OC drops LocationLink shapes (no `uri` field); gap #643 tracks the fix"
-        );
+        assert_eq!(locs.len(), 1, "LocationLink should normalise to Location");
+        assert_eq!(locs[0].uri, "file:///src/lib.rs");
+        // targetSelectionRange is the symbol name; preferred over targetRange.
+        // Line is 0-based at the wire → 1-based here, so 7 → 8.
+        assert_eq!(locs[0].line, 8);
+        assert_eq!(locs[0].character, 4);
+    }
+
+    /// `LocationLink` without `targetSelectionRange` should fall back to
+    /// `targetRange`.
+    #[test]
+    fn location_link_falls_back_to_target_range() {
+        let data = json!([{
+            "targetUri": "file:///src/lib.rs",
+            "targetRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 10}}
+        }]);
+        let locs = parse_locations(Some(&data));
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].line, 6);
     }
 
     // Spec B2: hover — hover text extraction
@@ -1654,21 +2010,13 @@ mod tests {
     // Spec B5: Unknown action string → explicit error listing valid actions
     // ─────────────────────────────────────────────────────────────────────
 
-    /// B5a — OC returns a specific error message naming exactly the 4 operations
-    /// it supports. CC rejects at Zod validation layer (9 operations).
-    /// Pinning: the exact error text from the `_` match arm.
+    /// B5a — Unknown actions surface a list of every supported action.
+    /// Crosslink #645 (closed) added the five call-hierarchy / workspace
+    /// ops, so the listed-actions set is now 9 (CC parity).
     #[test]
     fn spec_b5_unknown_action_exact_error_message() {
-        // Use an extension for which rust-analyzer might not be installed;
-        // unknown-action check happens AFTER the server-availability check.
-        // We use a non-.rs extension with a known server path that won't
-        // be installed in CI to ensure we hit the unknown-action arm only
-        // when the server IS installed. To isolate the action-parsing logic
-        // we call it through execute_lsp with .md extension (no known server),
-        // which returns a different error. Instead, test via the internal match
-        // by calling execute_lsp with a .rs file and a bad action; the code
-        // checks action BEFORE spawning the server, so we expect "Unknown LSP
-        // action" regardless of server availability.
+        // Pick an unambiguously bogus action; this branch is hit before
+        // the server-availability probe so test environment doesn't matter.
         let mut args: HashMap<String, Value> = HashMap::new();
         args.insert(
             "file_path".to_string(),
@@ -1676,59 +2024,169 @@ mod tests {
         );
         args.insert(
             "action".to_string(),
-            Value::String("workspaceSymbol".to_string()),
+            Value::String("definitely_not_a_real_action".to_string()),
         );
         let (msg, is_err) = execute_lsp(&args);
         assert!(is_err);
-        // Exact pin: OC's error message lists exactly these 4 operations.
-        // Gap #645: CC has 9 operations; OC only implements 4.
         assert!(
-            msg.contains("Unknown LSP action: workspaceSymbol"),
+            msg.contains("Unknown LSP action"),
             "unexpected message: {msg}"
         );
-        assert!(
-            msg.contains("goToDefinition"),
-            "error should list goToDefinition; got: {msg}"
-        );
-        assert!(
-            msg.contains("findReferences"),
-            "error should list findReferences; got: {msg}"
-        );
-        assert!(msg.contains("hover"), "error should list hover; got: {msg}");
-        assert!(
-            msg.contains("documentSymbols"),
-            "error should list documentSymbols; got: {msg}"
-        );
+        // Every supported action must appear in the error listing — pins the
+        // CC-parity surface added by crosslink #645.
+        for op in [
+            "goToDefinition",
+            "findReferences",
+            "hover",
+            "documentSymbols",
+            "workspaceSymbol",
+            "goToImplementation",
+            "prepareCallHierarchy",
+            "incomingCalls",
+            "outgoingCalls",
+        ] {
+            assert!(
+                msg.contains(op),
+                "error should list `{op}`; got: {msg}"
+            );
+        }
     }
 
-    /// B5b — All 5 gap operations are unknown to OC.
-    /// Gap #645: workspaceSymbol, goToImplementation, prepareCallHierarchy,
-    ///           incomingCalls, outgoingCalls are absent from OC's `LspAction` enum.
+    /// B5b — The five new actions are now recognised (crosslink #645 closed).
+    /// They will fail downstream when the language server is not installed,
+    /// but the error must no longer be "Unknown LSP action". The probe is
+    /// driven by file extension; we use `.rs` so the action lookup runs even
+    /// if `rust-analyzer` is not installed — the failure point shifts to
+    /// the server-availability check, which carries different wording.
     #[test]
-    fn spec_b5_five_missing_operations_unknown_gap645() {
-        let missing_ops = [
+    fn five_new_actions_recognised() {
+        let new_ops = [
             "workspaceSymbol",
             "goToImplementation",
             "prepareCallHierarchy",
             "incomingCalls",
             "outgoingCalls",
         ];
-        for op in missing_ops {
+        for op in new_ops {
             let mut args: HashMap<String, Value> = HashMap::new();
             args.insert(
                 "file_path".to_string(),
                 Value::String("test.rs".to_string()),
             );
             args.insert("action".to_string(), Value::String(op.to_string()));
-            let (msg, is_err) = execute_lsp(&args);
-            assert!(is_err, "{op} should produce an error");
-            // Either "Unknown LSP action" (action parsed before server check)
-            // or "not found" (server absent in CI). Both are acceptable pins.
+            let (msg, _is_err) = execute_lsp(&args);
+            // The action MUST be recognised now (crosslink #645). The call
+            // may still fail downstream when rust-analyzer is missing, but
+            // the failure mode MUST NOT be "Unknown LSP action".
             assert!(
-                msg.contains("Unknown LSP action") || msg.contains("not found"),
-                "op={op} unexpected message: {msg}"
+                !msg.contains("Unknown LSP action"),
+                "op={op} should be recognised but got: {msg}"
             );
         }
+    }
+
+    /// `parse_lsp_response` correctly routes each new action through its
+    /// parser without going via the network.
+    #[test]
+    fn parse_response_workspace_symbol() {
+        let resp = json!({
+            "id": 2,
+            "result": [
+                {
+                    "name": "Foo",
+                    "kind": 23,
+                    "location": {
+                        "uri": "file:///a.rs",
+                        "range": {"start": {"line": 0, "character": 0},
+                                  "end":   {"line": 0, "character": 3}}
+                    }
+                }
+            ]
+        });
+        let result = parse_lsp_response(LspAction::WorkspaceSymbol, "test.rs", &resp);
+        assert_eq!(result.action, "workspaceSymbol");
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].uri, "file:///a.rs");
+    }
+
+    #[test]
+    fn parse_response_prepare_call_hierarchy() {
+        let resp = json!({
+            "id": 2,
+            "result": [
+                {
+                    "name": "foo",
+                    "uri": "file:///a.rs",
+                    "selectionRange": {
+                        "start": {"line": 4, "character": 0},
+                        "end":   {"line": 4, "character": 3}
+                    },
+                    "range": {
+                        "start": {"line": 4, "character": 0},
+                        "end":   {"line": 6, "character": 1}
+                    }
+                }
+            ]
+        });
+        let result = parse_lsp_response(LspAction::PrepareCallHierarchy, "test.rs", &resp);
+        assert_eq!(result.action, "prepareCallHierarchy");
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].line, 5); // 4 + 1 (1-based)
+        assert_eq!(result.results[0].preview.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn parse_response_incoming_outgoing_calls() {
+        let resp = json!({
+            "id": 2,
+            "result": [
+                {
+                    "from": {
+                        "name": "caller",
+                        "uri": "file:///caller.rs",
+                        "selectionRange": {
+                            "start": {"line": 2, "character": 0},
+                            "end":   {"line": 2, "character": 6}
+                        },
+                        "range": {
+                            "start": {"line": 2, "character": 0},
+                            "end":   {"line": 5, "character": 1}
+                        }
+                    },
+                    "fromRanges": []
+                }
+            ]
+        });
+        let result = parse_lsp_response(LspAction::IncomingCalls, "test.rs", &resp);
+        assert_eq!(result.action, "incomingCalls");
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].uri, "file:///caller.rs");
+
+        let resp_out = json!({
+            "id": 2,
+            "result": [
+                {
+                    "to": {
+                        "name": "callee",
+                        "uri": "file:///callee.rs",
+                        "selectionRange": {
+                            "start": {"line": 9, "character": 0},
+                            "end":   {"line": 9, "character": 6}
+                        },
+                        "range": {
+                            "start": {"line": 9, "character": 0},
+                            "end":   {"line": 12, "character": 1}
+                        }
+                    },
+                    "fromRanges": []
+                }
+            ]
+        });
+        let result_out =
+            parse_lsp_response(LspAction::OutgoingCalls, "test.rs", &resp_out);
+        assert_eq!(result_out.action, "outgoingCalls");
+        assert_eq!(result_out.results.len(), 1);
+        assert_eq!(result_out.results[0].uri, "file:///callee.rs");
     }
 
     // Spec B6: Server crash mid-call → explicit error, not hang

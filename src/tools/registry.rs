@@ -133,7 +133,10 @@ impl ToolRegistry {
 
 // ─── Handler implementations ──────────────────────────────────────────────────
 
-use super::{ask_user, bash, chainlink, cron, file, lsp, plan_mode, task, todo, web, worktree};
+use super::{
+    ask_user, bash, chainlink, cron, file, lsp, plan_mode, skill, task, todo, tool_search, web,
+    worktree,
+};
 
 // ── bash ─────────────────────────────────────────────────────────────────────
 
@@ -672,13 +675,23 @@ impl ToolHandler for LspHandler {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Perform code intelligence operations via Language Server Protocol. Communicates with external language servers (rust-analyzer, typescript-language-server, pylsp, gopls, clangd, etc.) to provide goToDefinition, findReferences, hover, and documentSymbols. Automatically detects the appropriate language server based on file extension. Line numbers are 1-indexed.",
+                "description": "Perform code intelligence operations via Language Server Protocol. Communicates with external language servers (rust-analyzer, typescript-language-server, pylsp, gopls, clangd, etc.). Automatically detects the appropriate language server based on file extension. Line numbers are 1-indexed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["goToDefinition", "findReferences", "hover", "documentSymbols"],
+                            "enum": [
+                                "goToDefinition",
+                                "findReferences",
+                                "hover",
+                                "documentSymbols",
+                                "workspaceSymbol",
+                                "goToImplementation",
+                                "prepareCallHierarchy",
+                                "incomingCalls",
+                                "outgoingCalls"
+                            ],
                             "description": "The LSP operation to perform"
                         },
                         "file_path": {
@@ -687,11 +700,19 @@ impl ToolHandler for LspHandler {
                         },
                         "line": {
                             "type": "integer",
-                            "description": "1-indexed line number of the symbol (required for goToDefinition, findReferences, hover)"
+                            "description": "1-indexed line number of the symbol (required for position-pointing ops)"
                         },
                         "character": {
                             "type": "integer",
-                            "description": "0-indexed character offset within the line (required for goToDefinition, findReferences, hover)"
+                            "description": "0-indexed character offset within the line (required for position-pointing ops)"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Symbol-name query for workspaceSymbol (empty string lists all)"
+                        },
+                        "hierarchy_item": {
+                            "type": "object",
+                            "description": "Previously-fetched CallHierarchyItem (returned by prepareCallHierarchy); required by incomingCalls / outgoingCalls"
                         }
                     },
                     "required": ["action", "file_path"]
@@ -1380,6 +1401,80 @@ impl ToolHandler for ReadMcpResourceHandler {
     }
 }
 
+// ── skill (crosslink #612) ───────────────────────────────────────────────────
+//
+// Wraps `skills::get_skill` so the model can pull a user-authored skill
+// into context by name. Response is an XML-shaped `<skill>...</skill>`
+// envelope; see `skill::execute_skill` for the contract.
+
+struct SkillHandler;
+impl ToolHandler for SkillHandler {
+    fn name(&self) -> &'static str {
+        "skill"
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "skill",
+                "description": "Load a user-authored skill by name and return its body wrapped in a <skill name=\"...\">...</skill> envelope. Skills live under .openclaudia/skills/ (project) and ~/.openclaudia/skills/ (user). The returned envelope is intended to be spliced into the next turn's system prompt by the orchestrator.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the skill to load (matches the `name:` field in the skill's YAML frontmatter)"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            }
+        })
+    }
+    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+        skill::execute_skill(args)
+    }
+}
+
+// ── tool_search (crosslink #614) ────────────────────────────────────────────
+//
+// Deferred tool-schema lookup. Supports the `select:Name1,Name2` form and
+// keyword search. Returns a `<functions>...</functions>` envelope identical
+// to the bootstrap tool-list encoding.
+
+struct ToolSearchHandler;
+impl ToolHandler for ToolSearchHandler {
+    fn name(&self) -> &'static str {
+        "tool_search"
+    }
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description": "Fetch full schema definitions for deferred tools so they can be called. Two query forms: `select:Read,Edit,Grep` returns those exact tools by name; a keyword query like `notebook jupyter` returns ranked matches. A leading `+term` forces the term to appear in the tool name. Returns `<function>{...}</function>` blocks inside a `<functions>` envelope.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Query to find deferred tools. Use `select:<tool_name>` for direct selection, or keywords to search."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 5, ceiling: 50)"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+    }
+    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+        tool_search::execute_tool_search(args)
+    }
+}
+
 // ─── Registry construction ────────────────────────────────────────────────────
 
 /// All registered handlers as static references, in **JSON-output order** —
@@ -1433,6 +1528,10 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &CronCreateHandler,
     &CronDeleteHandler,
     &CronListHandler,
+    // skill (crosslink #612)
+    &SkillHandler,
+    // tool_search (crosslink #614)
+    &ToolSearchHandler,
 ];
 
 /// Iterate every registered handler in JSON-output order. The public

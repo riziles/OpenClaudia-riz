@@ -525,6 +525,14 @@ impl McpTransport for StdioTransport {
 pub struct HttpTransport {
     base_url: String,
     request_id: AtomicU64,
+    /// MCP Streamable HTTP session id (crosslink #631).
+    ///
+    /// The first response to `initialize` may carry an `Mcp-Session-Id`
+    /// header. Per MCP spec §6.5 every subsequent POST MUST echo that
+    /// value back. We cache it here so callers do not need to thread the
+    /// id through every request. `RwLock` because the value is read on
+    /// every request but written at most once.
+    session_id: std::sync::RwLock<Option<String>>,
 }
 
 impl HttpTransport {
@@ -570,6 +578,7 @@ impl HttpTransport {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             request_id: AtomicU64::new(1),
+            session_id: std::sync::RwLock::new(None),
         })
     }
 
@@ -591,7 +600,21 @@ impl HttpTransport {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             request_id: AtomicU64::new(1),
+            session_id: std::sync::RwLock::new(None),
         }
+    }
+
+    /// MCP Streamable HTTP session id, once captured (crosslink #631).
+    ///
+    /// Returns `None` before the first response carrying an
+    /// `Mcp-Session-Id` header. Visible to tests so they can pin the
+    /// session-id propagation contract end-to-end.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
     }
 
     /// Returns the process-wide shared client. Used so call sites do
@@ -621,10 +644,23 @@ impl McpTransport for HttpTransport {
         // request-level timeout (so it can be reused for other
         // workloads with different deadlines); the cap is set here
         // via `RequestBuilder::timeout`.
-        let response = Self::client()
+        //
+        // Crosslink #631 — MCP Streamable HTTP compliance:
+        // * `Accept: application/json, text/event-stream` per spec §6.5
+        //   (servers MAY respond with either; we must announce we accept
+        //   both even though we currently parse only the JSON branch).
+        // * Echo any captured `Mcp-Session-Id` so the server can route
+        //   subsequent requests to the same logical session.
+        let mut builder = Self::client()
             .post(&self.base_url)
             .timeout(HTTP_REQUEST_TIMEOUT)
-            .json(&request)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&request);
+        if let Some(sid) = self.session_id() {
+            builder = builder.header("Mcp-Session-Id", sid);
+        }
+        let response = builder
             .send()
             .await
             .map_err(|e| {
@@ -647,6 +683,20 @@ impl McpTransport for HttpTransport {
                 "HTTP error: {}",
                 response.status()
             )));
+        }
+
+        // Capture `Mcp-Session-Id` if the server set one. Per spec the
+        // server MAY emit it on the initialize response; once set, all
+        // subsequent POSTs MUST echo it (handled above on the next call).
+        if let Some(sid) = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+        {
+            if let Ok(mut guard) = self.session_id.write() {
+                *guard = Some(sid);
+            }
         }
 
         let response: JsonRpcResponse = response
@@ -1147,6 +1197,65 @@ impl McpServer {
     /// Returns an `McpError` if the transport fails to close.
     pub async fn close(self) -> Result<(), McpError> {
         self.transport.close().await
+    }
+}
+
+/// Stub kinds for not-yet-implemented MCP transports (crosslink #630).
+///
+/// The MCP spec defines several streaming transports that OC does not yet
+/// implement end-to-end:
+///
+/// * **`Sse`** — Server-Sent Events (`text/event-stream`) one-way push from
+///   the server, paired with a separate HTTP POST for the client→server
+///   direction.
+/// * **`WebSocket`** — full-duplex `ws://` / `wss://` channel.
+/// * **`StreamableHttp`** — the current MCP-canonical HTTP transport with
+///   bidirectional streaming over a single endpoint (spec §6.5). The
+///   underlying request path is now compliant ([`HttpTransport`] gained
+///   `Accept`-header and `Mcp-Session-Id` support in crosslink #631), but
+///   the server-push branch (`text/event-stream` responses) is still
+///   parsed as JSON only — when the server elects to stream, we land in
+///   the `not yet implemented` arm here.
+///
+/// This enum exists so callers can name the transport choice today and the
+/// `build_stub_transport` constructor returns a structured error per
+/// variant. When a transport ships, the matching arm flips from
+/// `Err(McpError::NotImplemented)` to `Ok(Box<dyn McpTransport>)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransportKind {
+    /// `text/event-stream` server-push branch — landing under #630-SSE.
+    Sse,
+    /// Full-duplex WebSocket transport — landing under #630-WS.
+    WebSocket,
+    /// MCP Streamable HTTP server-push branch — landing under #630-SH.
+    StreamableHttp,
+}
+
+impl McpTransportKind {
+    /// Human-readable name suitable for error messages.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Sse => "Server-Sent Events",
+            Self::WebSocket => "WebSocket",
+            Self::StreamableHttp => "Streamable HTTP",
+        }
+    }
+
+    /// Construct a transport of this kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Transport`] with a `"not yet implemented"` body
+    /// for every variant — the unifying boundary that lets callers wire
+    /// configuration today and detect at runtime that the chosen transport
+    /// is on the roadmap rather than misspelled.
+    pub fn build_stub_transport(&self, _url: &str) -> Result<Box<dyn McpTransport>, McpError> {
+        Err(McpError::Transport(format!(
+            "{} MCP transport is not yet implemented (crosslink #630); \
+             use `stdio` or `http` for now",
+            self.label()
+        )))
     }
 }
 

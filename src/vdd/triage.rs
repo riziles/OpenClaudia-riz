@@ -668,6 +668,7 @@ mod tests {
             permissions: crate::config::PermissionsConfig::default(),
             memory: crate::config::MemoryConfig::default(),
             web_fetch: crate::config::WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }
     }
