@@ -23,6 +23,24 @@ use crate::memory::MemoryDb;
 use crate::modes::fragments::{BASE_COMMS, BASE_IDENTITY, BASE_PRINCIPLES, BASE_TOOLS};
 use crate::modes::BehaviorMode;
 
+/// Initial allocation for the stable system-prompt prefix
+/// (identity + behavioral axes + tools + principles + comms).
+///
+/// 12 KiB — derived empirically: the assembled prefix is ~10 KiB across the
+/// shipped behavioral presets, leaving headroom for the largest custom mode
+/// and avoiding a reallocation hop into the next slab class (16 KiB).
+/// Documents the magic capacity from crosslink #372.
+const PREFIX_CAPACITY_BYTES: usize = 12 * 1024;
+
+/// Initial allocation for the dynamic system-prompt suffix
+/// (environment + skills + memory + hooks + custom instructions).
+///
+/// 4 KiB — derived empirically: a typical suffix with cwd + a handful of
+/// skills + memory excerpts + custom instructions lands at ~2-3 KiB.
+/// 4 KiB also matches one page on most platforms, reducing allocator churn.
+/// Documents the magic capacity from crosslink #372.
+const SUFFIX_CAPACITY_BYTES: usize = 4 * 1024;
+
 /// Two system prompt blocks optimised for Anthropic prompt caching.
 ///
 /// - `stable_prefix`: identity + axes + tools + principles + comms.
@@ -130,7 +148,7 @@ pub fn build_system_prompt_blocks(
     working_dir: Option<&str>,
 ) -> SystemPromptBlocks {
     // ── Stable prefix ────────────────────────────────────────────────
-    let mut prefix = String::with_capacity(12288);
+    let mut prefix = String::with_capacity(PREFIX_CAPACITY_BYTES);
 
     // 1. Identity
     prefix.push_str(BASE_IDENTITY);
@@ -155,7 +173,7 @@ pub fn build_system_prompt_blocks(
     prefix.push_str(BASE_COMMS);
 
     // ── Dynamic suffix ───────────────────────────────────────────────
-    let mut suffix = String::with_capacity(4096);
+    let mut suffix = String::with_capacity(SUFFIX_CAPACITY_BYTES);
 
     // 6. Environment
     if let Some(cwd) = working_dir {

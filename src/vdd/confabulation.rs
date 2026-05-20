@@ -5,6 +5,31 @@
 //! Also provides string similarity and common false positive pattern matching.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+// ==========================================================================
+// Compiled regex patterns for false-positive detection (crosslink #346)
+//
+// Previously these were `regex::Regex::new(pattern)` calls inside
+// `is_common_false_positive`, executed once per finding per iteration.
+// Promoting to module-level `LazyLock<Vec<Regex>>` makes compilation a
+// one-time cost. Failure to compile is a constant-data bug, so we panic
+// at first access rather than silently treat the match as `false`.
+// ==========================================================================
+
+const FALSE_POSITIVE_REGEX_PATTERNS: &[&str] = &[
+    r"test\s+(code|file|module)\s+(requires|needs|uses)\s+deterministic",
+    r"admin[\-\s]configured\s+(endpoint|url|path)",
+];
+
+static FALSE_POSITIVE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    FALSE_POSITIVE_REGEX_PATTERNS
+        .iter()
+        .map(|p| Regex::new(p).unwrap_or_else(|e| panic!("invalid FP regex {p:?}: {e}")))
+        .collect()
+});
 
 // ==========================================================================
 // ConfabulationTracker
@@ -133,17 +158,11 @@ pub(crate) fn is_common_false_positive(description: &str, reasoning: &str) -> bo
         }
     }
 
-    // Check for regex patterns
-    let regex_patterns = [
-        r"test\s+(code|file|module)\s+(requires|needs|uses)\s+deterministic",
-        r"admin[\-\s]configured\s+(endpoint|url|path)",
-    ];
-
-    for pattern in &regex_patterns {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            if re.is_match(&combined) {
-                return true;
-            }
+    // Pre-compiled regex patterns (crosslink #346); compilation failure is
+    // a startup panic, not a silent miss.
+    for re in FALSE_POSITIVE_REGEXES.iter() {
+        if re.is_match(&combined) {
+            return true;
         }
     }
 

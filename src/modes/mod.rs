@@ -88,10 +88,21 @@ pub enum Preset {
     /// Build from scratch with proper architecture.
     Create,
     /// Extend a fast-built project, improve incrementally.
+    ///
+    /// Differs from [`Preset::Refactor`] by scope: `Extend` operates with
+    /// `Scope::Adjacent` (touch the call site and ±1 hop, e.g. add a tool
+    /// argument and update its single caller). Pick `Extend` when the work
+    /// stays inside one module's blast radius. Crosslink #379.
     Extend,
     /// Surgical precision, minimal risk.
     Safe,
     /// Restructure freely across the codebase.
+    ///
+    /// Differs from [`Preset::Extend`] by scope: `Refactor` operates with
+    /// `Scope::Unrestricted` (cross-module rewrites are expected, e.g.
+    /// extract a trait that touches 12 implementors, split a god module).
+    /// Pick `Refactor` when the change must reshape boundaries.
+    /// Crosslink #379.
     Refactor,
     /// Read-only — understand code without changing it.
     Explore,
@@ -384,9 +395,16 @@ impl BehaviorMode {
             |preset| {
                 let desc = match preset {
                     Preset::Create => "Build from scratch with proper architecture",
-                    Preset::Extend => "Extend and improve incrementally",
+                    // Extend vs Refactor distinguished by scope (crosslink #379):
+                    // Extend = Adjacent scope (touch the call-site + 1 hop);
+                    // Refactor = Unrestricted scope (cross-module reshape OK).
+                    Preset::Extend => {
+                        "Extend incrementally — local changes near the call site (e.g. add a field, wire a new tool)"
+                    }
                     Preset::Safe => "Surgical precision, minimal risk",
-                    Preset::Refactor => "Restructure freely across the codebase",
+                    Preset::Refactor => {
+                        "Restructure freely across the codebase (e.g. extract trait, split module, move types)"
+                    }
                     Preset::Explore => "Read-only — understand code without changing it",
                     Preset::Debug => "Investigation-first debugging",
                     Preset::Methodical => "Step-by-step precision",
