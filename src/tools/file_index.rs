@@ -23,20 +23,31 @@ pub struct SearchResult {
     pub score: i32,
 }
 
+/// One indexed path paired with its precomputed lowercase form.
+///
+/// crosslink #975: `FileIndex` used to store `paths: Vec<String>` and
+/// `lower_paths: Vec<String>` as parallel arrays whose index alignment was
+/// enforced only by the convention that `walk_dir` pushed both. A future
+/// `remove` method (or any partial update) could trivially break the
+/// invariant and produce silently mismatched search scores. The struct
+/// pairs the two strings into a single record so the type system enforces
+/// "one push per file" and the search iterator no longer zips two slices.
+#[derive(Debug, Clone)]
+struct IndexedPath {
+    display: String,
+    lower: String,
+}
+
 /// In-memory file index for fuzzy searching.
 #[derive(Default)]
 pub struct FileIndex {
-    paths: Vec<String>,
-    lower_paths: Vec<String>,
+    paths: Vec<IndexedPath>,
 }
 
 impl FileIndex {
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            paths: Vec::new(),
-            lower_paths: Vec::new(),
-        }
+        Self { paths: Vec::new() }
     }
 
     /// Build index by walking the directory tree, respecting .gitignore.
@@ -71,8 +82,10 @@ impl FileIndex {
                 self.walk_dir(root, &path);
             } else if let Ok(rel) = path.strip_prefix(root) {
                 let rel_str = rel.to_string_lossy().to_string();
-                self.lower_paths.push(rel_str.to_lowercase());
-                self.paths.push(rel_str);
+                self.paths.push(IndexedPath {
+                    lower: rel_str.to_lowercase(),
+                    display: rel_str,
+                });
             }
         }
     }
@@ -89,12 +102,11 @@ impl FileIndex {
         let mut results: Vec<SearchResult> = self
             .paths
             .iter()
-            .zip(self.lower_paths.iter())
-            .filter_map(|(path, lower)| {
-                let score = Self::score_match(&query_chars, lower, path);
+            .filter_map(|p| {
+                let score = Self::score_match(&query_chars, &p.lower, &p.display);
                 if score > 0 {
                     Some(SearchResult {
-                        path: path.clone(),
+                        path: p.display.clone(),
                         score,
                     })
                 } else {
@@ -208,12 +220,24 @@ impl FileIndex {
 mod tests {
     use super::*;
 
+    /// crosslink #975: helper that builds a `FileIndex` from display paths,
+    /// computing the matching lowercase form so tests cannot accidentally
+    /// drift the two halves of what used to be parallel `Vec`s.
+    fn index_from_paths(paths: &[&str]) -> FileIndex {
+        FileIndex {
+            paths: paths
+                .iter()
+                .map(|p| IndexedPath {
+                    display: (*p).to_string(),
+                    lower: p.to_lowercase(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn test_score_basic_match() {
-        let index = FileIndex {
-            paths: vec!["src/main.rs".to_string()],
-            lower_paths: vec!["src/main.rs".to_string()],
-        };
+        let index = index_from_paths(&["src/main.rs"]);
         let results = index.search("main", 10);
         assert_eq!(results.len(), 1);
         assert!(results[0].score > 0);
@@ -221,16 +245,7 @@ mod tests {
 
     #[test]
     fn test_score_boundary_bonus() {
-        let index = FileIndex {
-            paths: vec![
-                "src/main.rs".to_string(),
-                "src/domain/maintain.rs".to_string(),
-            ],
-            lower_paths: vec![
-                "src/main.rs".to_string(),
-                "src/domain/maintain.rs".to_string(),
-            ],
-        };
+        let index = index_from_paths(&["src/main.rs", "src/domain/maintain.rs"]);
         let results = index.search("main", 10);
         // "main.rs" should score higher (boundary match after /)
         assert!(results[0].path == "src/main.rs");
@@ -238,29 +253,20 @@ mod tests {
 
     #[test]
     fn test_no_match() {
-        let index = FileIndex {
-            paths: vec!["src/main.rs".to_string()],
-            lower_paths: vec!["src/main.rs".to_string()],
-        };
+        let index = index_from_paths(&["src/main.rs"]);
         let results = index.search("xyz", 10);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_empty_query() {
-        let index = FileIndex {
-            paths: vec!["src/main.rs".to_string()],
-            lower_paths: vec!["src/main.rs".to_string()],
-        };
+        let index = index_from_paths(&["src/main.rs"]);
         assert!(index.search("", 10).is_empty());
     }
 
     #[test]
     fn test_case_insensitive() {
-        let index = FileIndex {
-            paths: vec!["src/MyComponent.tsx".to_string()],
-            lower_paths: vec!["src/mycomponent.tsx".to_string()],
-        };
+        let index = index_from_paths(&["src/MyComponent.tsx"]);
         let results = index.search("mycomp", 10);
         assert_eq!(results.len(), 1);
     }

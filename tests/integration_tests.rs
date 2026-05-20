@@ -5,7 +5,8 @@
 
 use openclaudia::memory::MemoryDb;
 use openclaudia::tools::{
-    clear_todo_list, execute_tool, get_todo_list, reset_read_tracker, FunctionCall, ToolCall,
+    clear_todo_list, execute_tool, get_todo_list, reset_read_tracker, FunctionCall, TodoStatus,
+    ToolCall,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1933,7 +1934,7 @@ mod todo_tools {
 
         assert_eq!(todos.len(), 1, "Should have 1 todo");
         assert_eq!(todos[0].content, "Persistent task");
-        assert_eq!(todos[0].status, "pending");
+        assert_eq!(todos[0].status, TodoStatus::Pending);
         assert_eq!(todos[0].active_form, "Working on persistent task");
     }
 

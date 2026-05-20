@@ -11,7 +11,7 @@ pub use notebook::{execute_notebook_edit, source_to_line_array};
 #[allow(unused_imports)] // used by tests in tools::mod
 pub use read::{
     detect_file_type, parse_page_range, read_image_file, read_notebook_file, read_text_file,
-    FileType,
+    FileType, ImageKind,
 };
 pub use write::execute_write_file;
 
@@ -20,17 +20,27 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// Maximum number of entries in the read tracker, per session, before
-/// LRU eviction kicks in. Per-session so a noisy session cannot evict
-/// another session's reads. Matches the previous global ceiling.
+/// the oldest write is evicted from the front of the list. Per-session so
+/// a noisy session cannot evict another session's reads. Matches the
+/// previous global ceiling.
 const READ_TRACKER_MAX_ENTRIES: usize = 10_000;
 
 /// Tracks which files have been read, bucketed per session id.
 ///
-/// Each session id (set via `crate::tools::SessionIdGuard`) has its
-/// own LRU list of canonicalized paths. `edit_file` will fail if the
-/// file hasn't been read first **in the same session**. Without an
-/// active guard the bucket falls back to the shared default key so
-/// the chat REPL and legacy tests keep working out of the box.
+/// Each session id (set via `crate::tools::SessionIdGuard`) has its own
+/// write-recency list of canonicalized paths: every `mark_read` removes
+/// any prior occurrence and pushes the path to the end of the list, so the
+/// path with the oldest *write* (not oldest *use*) sits at the front and
+/// is evicted first. `edit_file` will fail if the file hasn't been read
+/// first **in the same session**. Without an active guard the bucket
+/// falls back to the shared default key so the chat REPL and legacy
+/// tests keep working out of the box.
+///
+/// crosslink #986: the previous doc-comment called this an "LRU" list,
+/// which is ambiguous — true LRU bumps the entry on read too. Here, only
+/// `mark_read` touches the order; `has_been_read` is read-only and does
+/// not affect eviction. The naming is now "write-recency" / "insertion-
+/// recency" to match the actual semantics.
 ///
 /// crosslink #440 phase 1: session isolation lives inside this
 /// singleton (keyed by the thread-local session id), not yet threaded
@@ -39,10 +49,11 @@ const READ_TRACKER_MAX_ENTRIES: usize = 10_000;
 pub static READ_TRACKER: LazyLock<ReadFileTracker> = LazyLock::new(ReadFileTracker::new);
 
 pub struct ReadFileTracker {
-    /// Per-session LRU lists. Key is the session id from the
+    /// Per-session write-recency lists. Key is the session id from the
     /// thread-local guard (or the shared default key when no guard is
-    /// active). Most-recently-read paths sit at the end; over
+    /// active). Most-recently-WRITTEN paths sit at the end; over
     /// [`READ_TRACKER_MAX_ENTRIES`] in a bucket evicts from the front.
+    /// `has_been_read` does not promote — see crosslink #986.
     buckets: Mutex<HashMap<String, Vec<PathBuf>>>,
 }
 
@@ -98,18 +109,72 @@ impl ReadFileTracker {
 ///
 /// Pinned at startup so that later `cd`s (via the worktree tool, shell
 /// commands, etc.) cannot move the jail underneath us.
+///
+/// crosslink #981: when `current_dir` or `canonicalize` fail (process started
+/// in a deleted directory, FUSE EIO, etc.) the previous fallback was a bare
+/// `PathBuf::from(".")` — a relative path. Every subsequent
+/// `path_is_within(canonical, &PROJECT_ROOT)` would then compare a fully
+/// canonicalized absolute path against `"."` and reject every file silently,
+/// breaking the entire tool subsystem with no visible error. Surface the
+/// failure: a `warn!` records the underlying cause and we fall back to the
+/// absolute filesystem-root `/` so the jail is conservatively wide-open
+/// rather than uniformly closed — operators see broken behaviour and an
+/// explicit warning instead of a silent dead harness. The follow-up cleanup
+/// (panic-on-startup) is tracked separately; this is the smallest fix that
+/// removes the silent-dead-harness mode.
 static PROJECT_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
-    std::env::current_dir()
-        .and_then(|cwd| cwd.canonicalize())
-        .unwrap_or_else(|_| PathBuf::from("."))
+    match std::env::current_dir().and_then(|cwd| cwd.canonicalize()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "PROJECT_ROOT could not be resolved at startup (current_dir/canonicalize failed); \
+                 file-tool jail will fall back to the filesystem root '/'. crosslink #981",
+            );
+            // Use a path that exists and is a real directory so containment
+            // checks at least return *something* deterministic. `/` matches
+            // every absolute path; the operator will see this in logs and
+            // can correct it. Better than `"."`, which silently broke
+            // every path comparison.
+            #[cfg(unix)]
+            {
+                PathBuf::from("/")
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from("\\")
+            }
+        }
+    }
 });
 
 /// Process temp directory, canonicalized.
 static TEMP_ROOT: LazyLock<Option<PathBuf>> =
     LazyLock::new(|| std::env::temp_dir().canonicalize().ok());
 
+/// Returns `true` when the path jail is in force.
+///
+/// `OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1` opts out of the project-root + temp-dir
+/// containment requirement. crosslink #982: emit a single `tracing::warn!`
+/// the first time we observe the variable in the disabled state so an
+/// operator who set the flag "just for one test" and forgot has a paper
+/// trail in the logs. We deliberately do not warn on every call (the file
+/// tools call `resolve_path` per operation); the once-per-process latch
+/// keeps the log signal-rich without rate-limiting the file subsystem.
 fn strict_mode() -> bool {
-    !matches!(std::env::var("OPENCLAUDIA_ALLOW_OUT_OF_ROOT"), Ok(ref v) if v == "1")
+    let on = !matches!(std::env::var("OPENCLAUDIA_ALLOW_OUT_OF_ROOT"), Ok(ref v) if v == "1");
+    if !on {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                env = "OPENCLAUDIA_ALLOW_OUT_OF_ROOT",
+                "file-path jail DISABLED: OPENCLAUDIA_ALLOW_OUT_OF_ROOT=1 is set; \
+                 file tools may read/write outside the project root. crosslink #982",
+            );
+        }
+    }
+    on
 }
 
 fn path_is_within(canonical: &Path, root: &Path) -> bool {
@@ -170,6 +235,45 @@ fn resolve_path(path: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(canonical)
+}
+
+/// Canonicalise a path that may not yet exist by walking the deepest
+/// canonicalisable ancestor and rejoining the remaining suffix.
+///
+/// crosslink #969: this used to live as inline `match canonicalize(&p) {
+/// Ok(c) => c, Err(_) => match p.parent() { ... } }` blocks in
+/// `write.rs`, `edit.rs::canonicalise_edit_path`, and
+/// `notebook.rs::preflight_and_open` — three near-identical copies with
+/// drifted error messages. Centralised here so every file tool agrees on
+/// the semantics. Returns the resolved [`PathBuf`] or a stringly-typed
+/// error mentioning the original user-supplied path.
+pub(super) fn canonicalize_or_walk_up(p: &Path, user_path: &str) -> Result<PathBuf, String> {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return Ok(c);
+    }
+    // Walk up the ancestor chain until we find a canonicalisable directory,
+    // then rejoin the missing suffix. Supports `write_file` calling
+    // `create_dir_all` later: e.g. `/tmp/X/a/b/c/file.txt` where only
+    // `/tmp/X` exists today.
+    let mut ancestor = p;
+    let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        let file_name = ancestor.file_name().ok_or_else(|| {
+            format!("Cannot resolve any ancestor of '{user_path}' — reached filesystem root")
+        })?;
+        suffix.push(file_name);
+        let Some(parent) = ancestor.parent() else {
+            return Err(format!("Invalid path: '{user_path}'"));
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let mut built = canon_parent;
+            for comp in suffix.iter().rev() {
+                built.push(comp);
+            }
+            return Ok(built);
+        }
+        ancestor = parent;
+    }
 }
 
 pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
@@ -251,7 +355,7 @@ pub fn execute_read_file(
     READ_TRACKER.mark_read(&resolved);
 
     match detect_file_type(&resolved_str) {
-        FileType::Image(mime_type) => read_image_file(&resolved_str, mime_type),
+        FileType::Image(kind) => read_image_file(&resolved_str, kind),
         FileType::Pdf => {
             let pages = args.get("pages").and_then(|v| v.as_str());
             read::read_pdf_file(&resolved_str, pages)

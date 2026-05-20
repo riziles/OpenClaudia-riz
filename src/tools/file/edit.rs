@@ -1,4 +1,4 @@
-use super::{resolve_open_path, resolve_path, READ_TRACKER};
+use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, READ_TRACKER};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -36,28 +36,43 @@ fn rewrite_in_place(file: &mut std::fs::File, new_content: &str) -> std::io::Res
     file.write_all(new_content.as_bytes())
 }
 
-/// Canonicalise the user-supplied edit path. Mirrors the old inline logic in
-/// [`execute_edit_file`]; extracted to keep that function under the clippy
-/// `too_many_lines` budget after the crosslink #687 branch was added.
+/// Count physical lines in `s`. crosslink #988.
 ///
-/// Returns the canonical path string, falling back to the canonical parent +
-/// original leaf when the file does not yet exist.
+/// The unit is "lines that span a `\n`-terminated record OR a non-empty,
+/// non-terminated tail" — that is, `s.matches('\n').count()` plus one when
+/// the input is non-empty and does not end with `\n`.
+///
+/// * `""`     → 0    (empty input adds no lines)
+/// * `"a"`    → 1    (single tail line, no terminator)
+/// * `"a\n"`  → 1    (single terminated record)
+/// * `"a\nb"` → 2    (terminated record + tail)
+/// * `"a\nb\n"` → 2  (two terminated records)
+///
+/// Unlike `str::lines()` this counts every `\n` byte, so files that use
+/// `\r`-only or mixed terminators no longer collapse to count `1`. The
+/// behavior is also consistent with the "physical lines" metric expected by
+/// `guardrails::record_file_modification`: empty inserts contribute 0,
+/// non-empty inserts contribute at least 1.
+///
+/// Note: a strict "trailing newline removed" delta still surfaces as
+/// `(1, 1)` because both sides remain one physical line; that information
+/// is byte-level, not line-level, and is the diff-threshold metric's
+/// territory rather than this counter's.
+fn count_physical_lines(s: &str) -> u32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let newlines = s.bytes().filter(|&b| b == b'\n').count();
+    let trailing = usize::from(!s.ends_with('\n'));
+    u32::try_from(newlines + trailing).unwrap_or(u32::MAX)
+}
+
+/// Canonicalise the user-supplied edit path. Thin wrapper around the
+/// shared [`canonicalize_or_walk_up`] helper (crosslink #969) that
+/// resolves the user-supplied path through `resolve_path` first.
 fn canonicalise_edit_path(path: &str) -> Result<String, String> {
     let p = resolve_path(path)?;
-    let canonical = match std::fs::canonicalize(&p) {
-        Ok(c) => c,
-        Err(_) => match p.parent() {
-            Some(parent) => match std::fs::canonicalize(parent) {
-                Ok(canon_parent) => canon_parent.join(p.file_name().unwrap_or_default()),
-                Err(_) => {
-                    return Err(format!(
-                        "Cannot resolve path '{path}': parent directory does not exist"
-                    ));
-                }
-            },
-            None => return Err(format!("Invalid path: '{path}'")),
-        },
-    };
+    let canonical = canonicalize_or_walk_up(&p, path)?;
     Ok(canonical.to_string_lossy().to_string())
 }
 
@@ -151,6 +166,18 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
         return ("Missing 'new_string' argument".to_string(), true);
     };
 
+    // crosslink #970: a no-op edit (`old_string == new_string`) would otherwise
+    // burn a full read+truncate+write cycle on the file, churn the mtime, and
+    // misleadingly report "Successfully edited". Refuse the call before any
+    // I/O so the model is told the change would be a no-op and can correct
+    // the request in the same turn.
+    if old_string == new_string {
+        return (
+            "old_string and new_string are identical — edit would be a no-op. Either change one or remove the call.".to_string(),
+            true,
+        );
+    }
+
     // crosslink #687: honour the `replace_all` flag. When `true`, all
     // occurrences are replaced; when `false` (or absent) the existing
     // single-occurrence-with-multi-rejection behaviour is preserved.
@@ -202,12 +229,18 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
         many => many.len(),
     };
 
-    let lines_removed = u32::try_from(old_string.lines().count())
-        .unwrap_or(u32::MAX)
-        .saturating_mul(u32::try_from(count).unwrap_or(u32::MAX));
-    let lines_added = u32::try_from(new_string.lines().count())
-        .unwrap_or(u32::MAX)
-        .saturating_mul(u32::try_from(count).unwrap_or(u32::MAX));
+    // crosslink #988: `str::lines()` only recognises `\n` and `\r\n` and
+    // collapses a final trailing newline so e.g. "x\n" → 1 line, "x" → 1
+    // line, "x\n" replaced by "y" reports the same physical-line count on
+    // both sides which silently hides newline-only deltas from the guardrails
+    // diff-threshold check. Count physical `\n` bytes plus an extra line for
+    // a non-empty tail that does NOT end in `\n` so the unit is "physical
+    // lines as the diff sees them," matching what `record_file_modification`
+    // expects.
+    let lines_removed =
+        count_physical_lines(old_string).saturating_mul(u32::try_from(count).unwrap_or(u32::MAX));
+    let lines_added =
+        count_physical_lines(new_string).saturating_mul(u32::try_from(count).unwrap_or(u32::MAX));
 
     let new_content = if replace_all {
         content.replace(old_string, new_string)
@@ -233,6 +266,27 @@ mod tests {
     use std::io::Write as _;
     use std::path::Path;
     use tempfile::NamedTempFile;
+
+    /// crosslink #988: `count_physical_lines` reports physical lines as the
+    /// diff sees them (newline bytes plus a trailing non-newline-terminated
+    /// fragment). The cases below are the exact ones the issue called out as
+    /// silently miscounted under `str::lines()`.
+    #[test]
+    fn count_physical_lines_matches_diff_semantics_988() {
+        use super::count_physical_lines;
+        assert_eq!(count_physical_lines(""), 0, "empty input → 0");
+        assert_eq!(count_physical_lines("a"), 1, "no-newline → 1");
+        assert_eq!(count_physical_lines("a\n"), 1, "single line ending in \\n");
+        assert_eq!(count_physical_lines("a\nb"), 2, "two lines, no trailing");
+        assert_eq!(count_physical_lines("a\nb\n"), 2, "two lines, trailing");
+        assert_eq!(count_physical_lines("\n"), 1, "lone newline");
+        // The "x\n" → "y" delta the issue specifically called out: lines()
+        // would have reported (1, 1) and missed the newline removal; here the
+        // call sites see (1, 1) — both sides are 1 physical line — and the
+        // newline delta shows up downstream in the byte-level diff threshold.
+        assert_eq!(count_physical_lines("x\n"), 1);
+        assert_eq!(count_physical_lines("y"), 1);
+    }
 
     /// Write content to a `NamedTempFile`, mark it as read in `READ_TRACKER`,
     /// and return (file, `canonical_path_string`).
@@ -316,19 +370,42 @@ mod tests {
     }
 
     // =========================================================================
-    // Behavior 4 edge: old_string === new_string
+    // Behavior 4 edge: old_string === new_string  (crosslink #970)
     // =========================================================================
 
+    /// crosslink #970 regression: a no-op edit (`old_string == new_string`)
+    /// must be rejected BEFORE any filesystem I/O, so the call burns no read /
+    /// truncate / write and the mtime is not churned. The matching CC error
+    /// code is 1; we surface a textual error explaining why the call was a
+    /// no-op so the model can correct in the same turn.
     #[test]
-    fn edit_old_equals_new_succeeds_if_present() {
-        // Behavior 4 edge: CC catches old==new before the not-found check (errorCode 1).
-        // OC does NOT special-case this — it succeeds (no-op write) when the string
-        // exists once. Pinned as current OC behavior.
-        let (_f, path) = tmp_readable("foo bar\n");
+    fn edit_old_equals_new_is_rejected_as_noop_970() {
+        let (f, path) = tmp_readable("foo bar\n");
+        let mtime_before = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime before");
+
         let args = make_args(&path, "foo bar", "foo bar");
         let (msg, is_err) = super::execute_edit_file(&args);
-        // OC: succeeds (no special validation for equal strings)
-        assert!(!is_err, "OC does not reject old==new: {msg}");
+
+        assert!(is_err, "old==new must produce is_error=true; got: {msg}");
+        assert!(
+            msg.contains("identical") || msg.contains("no-op"),
+            "error message must explain the no-op: {msg}"
+        );
+
+        // File contents and mtime must be untouched — the call should not have
+        // performed any write (let alone truncate-then-rewrite).
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "foo bar\n", "file contents must be unchanged");
+        let mtime_after = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime after");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "mtime must not advance on a rejected no-op edit"
+        );
+        drop(f);
     }
 
     // =========================================================================

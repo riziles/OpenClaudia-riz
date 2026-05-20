@@ -1,4 +1,4 @@
-use super::{resolve_open_path, resolve_path};
+use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -58,18 +58,13 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    let canonical = match std::fs::canonicalize(&p) {
-        Ok(canon) => canon,
-        Err(_) => {
-            if let Some(parent) = p.parent() {
-                std::fs::canonicalize(parent).map_or_else(
-                    |_| p.clone(),
-                    |canon_parent| canon_parent.join(p.file_name().unwrap_or_default()),
-                )
-            } else {
-                return (format!("Invalid path: '{user_path}'"), true);
-            }
-        }
+    // crosslink #969: single source of truth for "canonicalize the path, or
+    // walk up to the deepest existing ancestor and rejoin." Edit, write, and
+    // (the next refactor) notebook all share this helper instead of carrying
+    // three drifted copies.
+    let canonical = match canonicalize_or_walk_up(&p, user_path) {
+        Ok(c) => c,
+        Err(e) => return (e, true),
     };
     let path = canonical.to_string_lossy().to_string();
     let path = path.as_str();

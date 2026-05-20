@@ -398,11 +398,34 @@ fn validate_exit_request<S: std::hash::BuildHasher>(
         }
     };
 
-    let git_dir = git_in(&worktree_path, &["rev-parse", "--git-dir"])
-        .ok()
-        .map_or_else(String::new, |o| {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        });
+    // crosslink #983: refuse to proceed if `git rev-parse --git-dir` itself
+    // failed. Previously this branch silently fell through to an empty
+    // string, which then *did not equal* the (non-empty) common_dir — so a
+    // corrupted `.git` was misclassified as an isolated worktree and the
+    // function would happily call `git worktree remove --force` on the
+    // user's main repository. Surface the underlying git failure instead.
+    let git_dir = match git_in(&worktree_path, &["rev-parse", "--git-dir"]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            return Err((
+                format!(
+                    "Error: failed to resolve git directory for '{}': {}",
+                    worktree_path.display(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                true,
+            ));
+        }
+        Err(e) => {
+            return Err((
+                format!(
+                    "Error: failed to run git rev-parse --git-dir on '{}': {e}",
+                    worktree_path.display()
+                ),
+                true,
+            ));
+        }
+    };
 
     if git_dir == common_dir || git_dir == ".git" {
         return Err((

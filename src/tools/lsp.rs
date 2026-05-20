@@ -420,7 +420,17 @@ fn run_lsp_request(
 
     // Graceful shutdown; Drop will kill+wait regardless, but we attempt a
     // clean exit first so the server can flush caches.
+    //
+    // crosslink #965: per LSP spec the `shutdown` request requires a response
+    // BEFORE `exit` is sent. Well-behaved servers may buffer further messages
+    // until they have replied to `shutdown`; if we skip reading that response,
+    // the subsequent `exit` notification can land in a buffer that the server
+    // never drains, leaving the child as an orphan. We read (and discard) the
+    // shutdown response between the two sends; the result is intentionally
+    // dropped because we only care about the protocol sequencing, not the
+    // payload, and any read failure is non-fatal (Drop still kills+waits).
     let _ = send_lsp_message(&mut stdin, "shutdown", 3, json!(null));
+    let _ = read_lsp_response(&mut reader, 3);
     let _ = send_lsp_notification(&mut stdin, "exit", json!(null));
     drop(stdin); // EOF signals server to exit
     let _ = guard.child_mut().wait();
@@ -685,11 +695,11 @@ fn parse_symbols_inner(data: Option<&Value>, depth: usize) -> Vec<LspSymbol> {
             let start = range.get("start")?;
             let end = range.get("end");
 
-            let children = sym
-                .get("children")
-                .and_then(|c| c.as_array())
-                .map(|_| parse_symbols_inner(sym.get("children"), depth + 1))
-                .unwrap_or_default();
+            // crosslink #963: `parse_symbols_inner` already returns `Vec::new()`
+            // when the value is not an array, so the previous `.and_then(as_array)
+            // .map(|_| ...)` gate was a redundant double-fetch that discarded the
+            // already-converted array. One call, single fetch.
+            let children = parse_symbols_inner(sym.get("children"), depth + 1);
 
             Some(LspSymbol {
                 name: name.to_string(),

@@ -158,46 +158,71 @@ fn schedules_path() -> PathBuf {
     PathBuf::from(SCHEDULES_FILE)
 }
 
+/// One cron field's display name and accepted value range.
+///
+/// crosslink #978: replaces the previous `FIELD_NAMES: [&str; 5]` /
+/// `FIELD_RANGES: [(u32, u32); 5]` parallel-array pair. A future maintainer
+/// reordering only one of the two arrays would have silently inverted
+/// hour-vs-day validation while still passing the matching-length
+/// compile-time assert. Pairing the two pieces of information into a
+/// single record makes the invariant a structural property of the data.
+struct CronField {
+    name: &'static str,
+    min: u32,
+    max: u32,
+}
+
+const FIELDS: [CronField; 5] = [
+    CronField {
+        name: "minute (0-59)",
+        min: 0,
+        max: 59,
+    },
+    CronField {
+        name: "hour (0-23)",
+        min: 0,
+        max: 23,
+    },
+    CronField {
+        name: "day (1-31)",
+        min: 1,
+        max: 31,
+    },
+    CronField {
+        name: "month (1-12)",
+        min: 1,
+        max: 12,
+    },
+    CronField {
+        name: "weekday (0-6)",
+        min: 0,
+        max: 6,
+    },
+];
+
 /// Validate a cron expression (basic check for 5-field format)
 fn validate_cron(expr: &str) -> Result<(), String> {
-    const FIELD_NAMES: [&str; 5] = [
-        "minute (0-59)",
-        "hour (0-23)",
-        "day (1-31)",
-        "month (1-12)",
-        "weekday (0-6)",
-    ];
-    const FIELD_RANGES: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
-    // Compile-time assertion that both arrays have matching lengths
-    const _: () = assert!(FIELD_NAMES.len() == FIELD_RANGES.len());
     let fields: Vec<&str> = expr.split_whitespace().collect();
-    if fields.len() != 5 {
+    if fields.len() != FIELDS.len() {
         return Err(format!(
             "Cron expression must have 5 fields (minute hour day month weekday), got {}",
             fields.len()
         ));
     }
 
-    let field_names = FIELD_NAMES;
-    let field_ranges = FIELD_RANGES;
-
     for (i, field) in fields.iter().enumerate() {
+        let spec = &FIELDS[i];
         if *field == "*" {
             continue;
         }
         // Handle */N step values
         if let Some(step) = field.strip_prefix("*/") {
             match step.parse::<u32>() {
-                Ok(0) => {
-                    return Err(format!(
-                        "Step value cannot be 0 in {} field",
-                        field_names[i]
-                    ))
-                }
+                Ok(0) => return Err(format!("Step value cannot be 0 in {} field", spec.name)),
                 Err(_) => {
                     return Err(format!(
                         "Invalid step value '{}' in {} field",
-                        step, field_names[i]
+                        step, spec.name
                     ))
                 }
                 _ => {}
@@ -208,19 +233,16 @@ fn validate_cron(expr: &str) -> Result<(), String> {
         if field.contains('-') {
             let parts: Vec<&str> = field.split('-').collect();
             if parts.len() != 2 {
-                return Err(format!(
-                    "Invalid range '{}' in {} field",
-                    field, field_names[i]
-                ));
+                return Err(format!("Invalid range '{}' in {} field", field, spec.name));
             }
             for part in parts {
                 let val: u32 = part
                     .parse()
-                    .map_err(|_| format!("Invalid value '{}' in {} field", part, field_names[i]))?;
-                if val < field_ranges[i].0 || val > field_ranges[i].1 {
+                    .map_err(|_| format!("Invalid value '{}' in {} field", part, spec.name))?;
+                if val < spec.min || val > spec.max {
                     return Err(format!(
                         "Value {} out of range for {} field",
-                        val, field_names[i]
+                        val, spec.name
                     ));
                 }
             }
@@ -230,11 +252,11 @@ fn validate_cron(expr: &str) -> Result<(), String> {
         for val_str in field.split(',') {
             let val: u32 = val_str
                 .parse()
-                .map_err(|_| format!("Invalid value '{}' in {} field", val_str, field_names[i]))?;
-            if val < field_ranges[i].0 || val > field_ranges[i].1 {
+                .map_err(|_| format!("Invalid value '{}' in {} field", val_str, spec.name))?;
+            if val < spec.min || val > spec.max {
                 return Err(format!(
                     "Value {} out of range for {} field",
-                    val, field_names[i]
+                    val, spec.name
                 ));
             }
         }

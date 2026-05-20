@@ -38,7 +38,9 @@ pub use accumulator::{
 /// module (e.g. `hooks::mod` env-scrub logic). Avoids making `bash` public.
 pub(crate) use bash::is_sensitive_env;
 pub use registry::{PermissionTarget, ToolContext, ToolHandler, ToolRegistry};
-pub use todo::{clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem};
+pub use todo::{
+    clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem, TodoStatus,
+};
 
 use crate::config::AppConfig;
 use crate::memory::MemoryDb;
@@ -1015,33 +1017,34 @@ mod tests {
 
     #[test]
     fn test_detect_file_type_images() {
+        use super::file::ImageKind;
         assert!(matches!(
             detect_file_type("photo.png"),
-            FileType::Image("image/png")
+            FileType::Image(ImageKind::Png)
         ));
         assert!(matches!(
             detect_file_type("photo.PNG"),
-            FileType::Image("image/png")
+            FileType::Image(ImageKind::Png)
         ));
         assert!(matches!(
             detect_file_type("photo.jpg"),
-            FileType::Image("image/jpeg")
+            FileType::Image(ImageKind::Jpeg)
         ));
         assert!(matches!(
             detect_file_type("photo.jpeg"),
-            FileType::Image("image/jpeg")
+            FileType::Image(ImageKind::Jpeg)
         ));
         assert!(matches!(
             detect_file_type("photo.JPEG"),
-            FileType::Image("image/jpeg")
+            FileType::Image(ImageKind::Jpeg)
         ));
         assert!(matches!(
             detect_file_type("anim.gif"),
-            FileType::Image("image/gif")
+            FileType::Image(ImageKind::Gif)
         ));
         assert!(matches!(
             detect_file_type("modern.webp"),
-            FileType::Image("image/webp")
+            FileType::Image(ImageKind::Webp)
         ));
     }
 
@@ -1403,7 +1406,8 @@ mod tests {
         let fake_png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         fs::write(&img_path, &fake_png).unwrap();
 
-        let (output, is_error) = read_image_file(img_path.to_str().unwrap(), "image/png");
+        let (output, is_error) =
+            read_image_file(img_path.to_str().unwrap(), super::file::ImageKind::Png);
         assert!(!is_error, "read_image_file should succeed");
         assert!(output.contains("[Image: test.png"));
         assert!(output.contains("image/png"));

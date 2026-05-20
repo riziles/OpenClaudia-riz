@@ -54,10 +54,58 @@ fn check_file_safety(path: &str) -> Option<(String, bool)> {
     None
 }
 
+/// Image formats the harness can hand to vision-capable models.
+///
+/// crosslink #966: this used to live as a raw `&'static str` (the MIME type)
+/// inside `FileType::Image`. Adding a new format had to update three
+/// independent string literals across `detect_file_type`, `read_image_file`,
+/// and any downstream adapter assumption. With a closed enum the type system
+/// enforces exhaustiveness — every match arm sees every supported image kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl ImageKind {
+    /// MIME type the `Anthropic` / `OpenAI` / `Google` adapters expect for
+    /// this image kind. The mapping lives here so that the [`FileType`]
+    /// variant is no longer the carrier of stringly-typed format
+    /// information.
+    #[must_use]
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    /// Map a filename extension (case-insensitive, without the leading dot)
+    /// to an `ImageKind`. Returns `None` for unknown / non-image extensions.
+    #[must_use]
+    pub const fn from_extension(ext: &str) -> Option<Self> {
+        if ext.eq_ignore_ascii_case("png") {
+            Some(Self::Png)
+        } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+            Some(Self::Jpeg)
+        } else if ext.eq_ignore_ascii_case("gif") {
+            Some(Self::Gif)
+        } else if ext.eq_ignore_ascii_case("webp") {
+            Some(Self::Webp)
+        } else {
+            None
+        }
+    }
+}
+
 /// Supported file types for `read_file`
 pub enum FileType {
     Text,
-    Image(&'static str), // mime type
+    Image(ImageKind),
     Pdf,
     Notebook,
 }
@@ -66,25 +114,26 @@ pub enum FileType {
 pub fn detect_file_type(path: &str) -> FileType {
     let p = Path::new(path);
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext.eq_ignore_ascii_case("png") {
-        FileType::Image("image/png")
-    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
-        FileType::Image("image/jpeg")
-    } else if ext.eq_ignore_ascii_case("gif") {
-        FileType::Image("image/gif")
-    } else if ext.eq_ignore_ascii_case("webp") {
-        FileType::Image("image/webp")
-    } else if ext.eq_ignore_ascii_case("pdf") {
-        FileType::Pdf
-    } else if ext.eq_ignore_ascii_case("ipynb") {
-        FileType::Notebook
-    } else {
-        FileType::Text
-    }
+    ImageKind::from_extension(ext).map_or_else(
+        || {
+            if ext.eq_ignore_ascii_case("pdf") {
+                FileType::Pdf
+            } else if ext.eq_ignore_ascii_case("ipynb") {
+                FileType::Notebook
+            } else {
+                FileType::Text
+            }
+        },
+        FileType::Image,
+    )
 }
 
-/// Read an image file, base64-encode it, and return a structured result
-pub fn read_image_file(path: &str, mime_type: &str) -> (String, bool) {
+/// Read an image file, base64-encode it, and return a structured result.
+///
+/// The image kind is carried by the typed [`ImageKind`] enum (crosslink #966)
+/// rather than as a raw MIME-type `&str`, so callers can no longer fabricate a
+/// nonsense MIME like `"image/whatever"` at the call site.
+pub fn read_image_file(path: &str, kind: ImageKind) -> (String, bool) {
     if let Some(err) = check_file_safety(path) {
         return err;
     }
@@ -104,6 +153,7 @@ pub fn read_image_file(path: &str, mime_type: &str) -> (String, bool) {
         .file_name()
         .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
 
+    let mime_type = kind.mime();
     let result = format!(
         "[Image: {filename} ({file_size} bytes, {mime_type}) - base64 data included for vision-capable models]\n{b64}"
     );
@@ -266,6 +316,103 @@ pub fn read_pdf_file(path: &str, pages: Option<&str>) -> (String, bool) {
     }
 }
 
+/// Join the string elements of an nbformat "source"/"text"/"traceback" array,
+/// emitting a `tracing::warn!` for every non-string element instead of
+/// silently dropping it (crosslink #976).
+///
+/// The prior implementation used `filter_map(Value::as_str)`, which made an
+/// `.ipynb` containing a number or object inside a `source` array look
+/// truncated to the model — the rest of the cell vanished with no signal.
+/// The model then made edits based on an incomplete view of the cell.
+///
+/// Returns the joined string. The caller decides whether to embed it into
+/// the output unconditionally; warnings are surfaced as a side effect on
+/// the `tracing` subscriber so test capture and operator logs can both
+/// detect the malformed input.
+fn join_string_array_with_warn(arr: &[Value], context: &str) -> String {
+    let mut out = String::new();
+    for (i, v) in arr.iter().enumerate() {
+        if let Some(s) = v.as_str() {
+            out.push_str(s);
+        } else {
+            tracing::warn!(
+                context = %context,
+                index = i,
+                kind = ?v,
+                "notebook_read: non-string element in array — entry dropped",
+            );
+        }
+    }
+    out
+}
+
+/// Render a single notebook cell's outputs into `output`. Extracted from
+/// `read_notebook_file` to keep that function under the clippy
+/// `too_many_lines` budget after the crosslink #976 warn-on-drop
+/// hardening expanded each output branch. Handles `stream`,
+/// `execute_result`/`display_data`, and `error` cell-output kinds.
+fn render_cell_outputs(output: &mut String, outputs: &[Value]) {
+    for out in outputs {
+        let output_type = out.get("output_type").and_then(|t| t.as_str());
+        match output_type {
+            Some("stream") => {
+                if let Some(text) = out.get("text") {
+                    let text_str = match text {
+                        Value::Array(arr) => join_string_array_with_warn(arr, "stream.text"),
+                        Value::String(s) => s.clone(),
+                        _ => {
+                            tracing::warn!(
+                                kind = ?text,
+                                "notebook_read: stream.text is neither array nor string — output skipped",
+                            );
+                            continue;
+                        }
+                    };
+                    let _ = write!(output, "Output:\n{text_str}\n");
+                }
+            }
+            Some("execute_result" | "display_data") => {
+                if let Some(data) = out.get("data") {
+                    if let Some(text_plain) = data.get("text/plain") {
+                        let text_str = match text_plain {
+                            Value::Array(arr) => {
+                                join_string_array_with_warn(arr, "data.text/plain")
+                            }
+                            Value::String(s) => s.clone(),
+                            _ => {
+                                tracing::warn!(
+                                    kind = ?text_plain,
+                                    "notebook_read: data.text/plain is neither array nor string — output skipped",
+                                );
+                                continue;
+                            }
+                        };
+                        let _ = write!(output, "Output:\n{text_str}\n");
+                    }
+                }
+            }
+            Some("error") => {
+                if let Some(traceback) = out.get("traceback").and_then(|t| t.as_array()) {
+                    let mut frames: Vec<String> = Vec::with_capacity(traceback.len());
+                    for (i, v) in traceback.iter().enumerate() {
+                        if let Some(s) = v.as_str() {
+                            frames.push(s.to_string());
+                        } else {
+                            tracing::warn!(
+                                index = i,
+                                kind = ?v,
+                                "notebook_read: non-string traceback frame — dropped",
+                            );
+                        }
+                    }
+                    let _ = write!(output, "Error:\n{}\n", frames.join("\n"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Read a Jupyter notebook (.ipynb) and format cells for display
 pub fn read_notebook_file(path: &str) -> (String, bool) {
     if let Some(err) = check_file_safety(path) {
@@ -303,67 +450,21 @@ pub fn read_notebook_file(path: &str) -> (String, bool) {
             .and_then(|t| t.as_str())
             .unwrap_or("unknown");
 
-        // Get source - can be a string or array of strings
+        // Get source - can be a string or array of strings. crosslink #976:
+        // warn on non-string array elements instead of silently dropping them.
         let source = match cell.get("source") {
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(""),
+            Some(Value::Array(arr)) => join_string_array_with_warn(arr, "cell.source"),
             Some(Value::String(s)) => s.clone(),
             _ => String::new(),
         };
 
         let _ = write!(output, "Cell {i} ({cell_type}):\n```\n{source}\n```\n");
 
-        // For code cells, include text outputs (skip binary/image outputs)
+        // For code cells, include text outputs (skip binary/image outputs).
+        // crosslink #976: warn-on-drop is implemented inside render_cell_outputs.
         if cell_type == "code" {
             if let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array()) {
-                for out in outputs {
-                    let output_type = out.get("output_type").and_then(|t| t.as_str());
-                    match output_type {
-                        Some("stream") => {
-                            if let Some(text) = out.get("text") {
-                                let text_str = match text {
-                                    Value::Array(arr) => arr
-                                        .iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(""),
-                                    Value::String(s) => s.clone(),
-                                    _ => continue,
-                                };
-                                let _ = write!(output, "Output:\n{text_str}\n");
-                            }
-                        }
-                        Some("execute_result" | "display_data") => {
-                            // Only include text/plain data, skip images and other binary
-                            if let Some(data) = out.get("data") {
-                                if let Some(text_plain) = data.get("text/plain") {
-                                    let text_str = match text_plain {
-                                        Value::Array(arr) => arr
-                                            .iter()
-                                            .filter_map(|v| v.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(""),
-                                        Value::String(s) => s.clone(),
-                                        _ => continue,
-                                    };
-                                    let _ = write!(output, "Output:\n{text_str}\n");
-                                }
-                            }
-                        }
-                        Some("error") => {
-                            if let Some(traceback) = out.get("traceback").and_then(|t| t.as_array())
-                            {
-                                let tb: Vec<&str> =
-                                    traceback.iter().filter_map(|v| v.as_str()).collect();
-                                let _ = write!(output, "Error:\n{}\n", tb.join("\n"));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                render_cell_outputs(&mut output, outputs);
             }
         }
         output.push('\n');
@@ -530,18 +631,27 @@ mod tests {
     fn read_text_offset_zero_treated_as_start_of_file() {
         // Behavior 1 edge: offset=0 — CC treats as "start of file" (no skip).
         // OC: saturating_sub(1) on 0u64 yields 0 → .skip(0) — same behavior.
+        //
+        // crosslink #989: the previous version of this test had a "NOTE"
+        // comment claiming OC emits a suffix when offset=0 because the
+        // suffix gate checked the *pre*-subtraction value. The production
+        // code in `read_text_file` actually checks the POST-subtraction
+        // `offset > 0` (see read.rs `suffix = if offset > 0 || limit.is_some()`),
+        // so with offset=0 and no limit no suffix is emitted. The stale
+        // comment has been removed; we now also pin the absence of a
+        // suffix so a future regression that misreads the gate as
+        // `offset_arg > 0` is caught immediately.
         let (_f, path) = tmp_text("alpha\nbeta\n");
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(0u64));
         let (output, is_err) = read_text_file(&path, &args);
         assert!(!is_err);
-        // offset=0 is treated as "start of file": both lines must appear.
-        // NOTE: OC produces a suffix even when offset=0 because offset_arg>0
-        // check uses the pre-subtraction value — this is an OC quirk. We pin
-        // current behavior: suffix is present because limit=Some(_) is absent
-        // but offset arg was present.
         assert!(output.contains("alpha"), "offset=0 must yield first line");
         assert!(output.contains("beta"));
+        assert!(
+            !output.contains("(showing lines"),
+            "offset=0 + no limit must NOT emit the windowing suffix; got: {output}"
+        );
     }
 
     #[test]
@@ -619,7 +729,7 @@ mod tests {
         ];
         f.write_all(minimal_png).expect("write png");
         let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(&path, "image/png");
+        let (output, is_err) = read_image_file(&path, ImageKind::Png);
         assert!(!is_err);
         assert!(output.contains("[Image:"), "header line present: {output}");
         assert!(output.contains("image/png"), "mime type present");
@@ -635,7 +745,7 @@ mod tests {
         let f = NamedTempFile::new().expect("tempfile");
         // Write nothing — file is 0 bytes
         let path = f.path().to_string_lossy().to_string();
-        let (output, is_err) = read_image_file(&path, "image/png");
+        let (output, is_err) = read_image_file(&path, ImageKind::Png);
         // OC: no error for 0-byte file (CC parity gap — CC throws "Image file is empty").
         // Pinned as current OC behavior.
         assert!(
@@ -651,7 +761,7 @@ mod tests {
         // Behavior 2 error path: file not found.
         // check_file_safety stats first, so the message may be "Cannot stat"
         // rather than "Failed to read image file".
-        let (output, is_err) = read_image_file("/tmp/__oc_no_such_image.png", "image/png");
+        let (output, is_err) = read_image_file("/tmp/__oc_no_such_image.png", ImageKind::Png);
         assert!(is_err);
         assert!(
             output.contains("Cannot stat") || output.contains("Failed to read image file"),

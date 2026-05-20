@@ -64,6 +64,70 @@ fn find_cell_by_id(cells: &[Value], cell_id: &str) -> Option<usize> {
 /// its body linear (validate → resolve → dispatch → persist).
 type ToolFailure = (String, bool);
 
+/// Edit operation on a notebook cell. crosslink #974.
+///
+/// Was a `String` validated against `["replace", "insert", "delete"]` then
+/// re-matched in three downstream sites (one of them ending in
+/// `_ => unreachable!()`). A closed enum lets the type system prove the
+/// dispatch is total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    Replace,
+    Insert,
+    Delete,
+}
+
+impl EditMode {
+    fn parse(s: &str) -> Result<Self, ToolFailure> {
+        match s {
+            "replace" => Ok(Self::Replace),
+            "insert" => Ok(Self::Insert),
+            "delete" => Ok(Self::Delete),
+            other => Err((
+                format!("Invalid edit_mode '{other}'. Must be 'replace', 'insert', or 'delete'."),
+                true,
+            )),
+        }
+    }
+}
+
+/// Cell kind in a Jupyter notebook (matches the nbformat `cell_type` field).
+/// crosslink #985: the prior code accepted any string verbatim for
+/// `cell_type`, so a model could persist a cell with `cell_type: "garbage"`
+/// (or `"raw"` with no `outputs`/`execution_count` cleanup) and corrupt the
+/// notebook for downstream Jupyter clients. Validate against a closed
+/// allowlist of nbformat-defined cell types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellType {
+    Code,
+    Markdown,
+    Raw,
+}
+
+impl CellType {
+    fn parse(s: &str) -> Result<Self, ToolFailure> {
+        match s {
+            "code" => Ok(Self::Code),
+            "markdown" => Ok(Self::Markdown),
+            "raw" => Ok(Self::Raw),
+            other => Err((
+                format!(
+                    "Invalid cell_type '{other}'. Must be 'code', 'markdown', or 'raw' (nbformat)."
+                ),
+                true,
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Markdown => "markdown",
+            Self::Raw => "raw",
+        }
+    }
+}
+
 /// Parsed-and-validated arguments. Owning `String`s avoids tying the lifetime
 /// of the helper chain to the borrowed `HashMap` arg map.
 struct ParsedArgs {
@@ -71,8 +135,8 @@ struct ParsedArgs {
     cell_id: Option<String>,
     cell_number: Option<usize>,
     new_source: String,
-    cell_type: Option<String>,
-    edit_mode: String,
+    cell_type: Option<CellType>,
+    edit_mode: EditMode,
 }
 
 /// Path/preflight context: paths and open handle shared across read+write.
@@ -118,18 +182,11 @@ fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> 
         .ok_or_else(|| ("Missing 'new_source' argument".to_string(), true))?
         .to_string();
 
-    let edit_mode = args
-        .get("edit_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("replace")
-        .to_string();
-
-    if !["replace", "insert", "delete"].contains(&edit_mode.as_str()) {
-        return Err((
-            format!("Invalid edit_mode '{edit_mode}'. Must be 'replace', 'insert', or 'delete'."),
-            true,
-        ));
-    }
+    let edit_mode = EditMode::parse(
+        args.get("edit_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("replace"),
+    )?;
 
     let cell_id = args
         .get("cell_id")
@@ -151,10 +208,12 @@ fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> 
             )
         })?),
     };
-    let cell_type = args
-        .get("cell_type")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // crosslink #985: validate `cell_type` against the nbformat allowlist —
+    // `code`, `markdown`, `raw` — instead of accepting any string verbatim.
+    let cell_type = match args.get("cell_type").and_then(|v| v.as_str()) {
+        Some(s) => Some(CellType::parse(s)?),
+        None => None,
+    };
 
     Ok(ParsedArgs {
         raw_path,
@@ -287,8 +346,32 @@ fn apply_replace(
         ));
     }
     cells[index]["source"] = source_to_line_array(&parsed.new_source);
-    if let Some(ct) = parsed.cell_type.as_deref() {
-        cells[index]["cell_type"] = json!(ct);
+    if let Some(ct) = parsed.cell_type {
+        // crosslink #985: when the caller switches a cell's type, normalise
+        // the type-specific fields so the resulting notebook satisfies
+        // nbformat. Markdown / raw cells must NOT carry code-only fields
+        // (`outputs`, `execution_count`); code cells MUST carry both, even
+        // when empty. Without this, switching a code cell to markdown
+        // leaves stale `outputs: [...]` data in the JSON — which Jupyter
+        // either rejects or renders incorrectly.
+        cells[index]["cell_type"] = json!(ct.as_str());
+        let cell_obj = &mut cells[index];
+        match ct {
+            CellType::Code => {
+                if !cell_obj.get("outputs").is_some_and(Value::is_array) {
+                    cell_obj["outputs"] = json!([]);
+                }
+                if cell_obj.get("execution_count").is_none() {
+                    cell_obj["execution_count"] = Value::Null;
+                }
+            }
+            CellType::Markdown | CellType::Raw => {
+                if let Some(obj) = cell_obj.as_object_mut() {
+                    obj.remove("outputs");
+                    obj.remove("execution_count");
+                }
+            }
+        }
     }
     Ok(EditOutcome {
         summary_index: Some(index),
@@ -304,7 +387,7 @@ fn apply_insert(
     locator: &Locator,
     parsed: &ParsedArgs,
 ) -> Result<EditOutcome, ToolFailure> {
-    let ct = parsed.cell_type.as_deref().ok_or_else(|| {
+    let ct = parsed.cell_type.ok_or_else(|| {
         (
             "cell_type is required when inserting a new cell. Use 'code' or 'markdown'."
                 .to_string(),
@@ -331,11 +414,14 @@ fn apply_insert(
     }
 
     let mut new_cell = json!({
-        "cell_type": ct,
+        "cell_type": ct.as_str(),
         "metadata": {},
         "source": source_to_line_array(&parsed.new_source)
     });
-    if ct == "code" {
+    // crosslink #985: only code cells carry `outputs` / `execution_count` in
+    // nbformat. The typed `CellType` lets us decide once at the dispatch
+    // site instead of comparing strings.
+    if ct == CellType::Code {
         new_cell["outputs"] = json!([]);
         new_cell["execution_count"] = Value::Null;
     }
@@ -370,18 +456,18 @@ fn apply_delete(cells: &mut Vec<Value>, locator: &Locator) -> Result<EditOutcome
     })
 }
 
-/// Step 5: dispatch on `edit_mode`. `parse_args` already validated the
-/// string is one of the three known modes, so the wildcard is unreachable.
+/// Step 5: dispatch on `edit_mode`. crosslink #974: the typed `EditMode`
+/// enum makes this match exhaustive without a wildcard — adding a new mode
+/// is a compile error here, not a runtime `unreachable!()`.
 fn dispatch_edit(
     cells: &mut Vec<Value>,
     locator: &Locator,
     parsed: &ParsedArgs,
 ) -> Result<EditOutcome, ToolFailure> {
-    match parsed.edit_mode.as_str() {
-        "replace" => apply_replace(cells, locator, parsed),
-        "insert" => apply_insert(cells, locator, parsed),
-        "delete" => apply_delete(cells, locator),
-        _ => unreachable!("edit_mode validated in parse_args"),
+    match parsed.edit_mode {
+        EditMode::Replace => apply_replace(cells, locator, parsed),
+        EditMode::Insert => apply_insert(cells, locator, parsed),
+        EditMode::Delete => apply_delete(cells, locator),
     }
 }
 
@@ -428,15 +514,14 @@ fn format_success(
     let where_str = outcome
         .summary_index
         .map_or_else(|| locator.target_desc.clone(), |idx| format!("{idx}"));
-    let action = match parsed.edit_mode.as_str() {
-        "replace" => format!("Replaced cell {where_str} contents"),
-        "insert" => format!(
+    let action = match parsed.edit_mode {
+        EditMode::Replace => format!("Replaced cell {where_str} contents"),
+        EditMode::Insert => format!(
             "Inserted new {} cell at position {}",
-            parsed.cell_type.as_deref().unwrap_or("unknown"),
+            parsed.cell_type.map_or("unknown", CellType::as_str),
             where_str
         ),
-        "delete" => format!("Deleted cell {where_str}"),
-        _ => unreachable!("edit_mode validated in parse_args"),
+        EditMode::Delete => format!("Deleted cell {where_str}"),
     };
     let mut result = format!(
         "Successfully edited '{}'. {}. Notebook now has {} cells.",

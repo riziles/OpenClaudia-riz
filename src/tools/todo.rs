@@ -5,11 +5,55 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
+/// Hard cap on a single todo's `content` field, in *bytes* (matches the
+/// Claude Code parity limit).
+///
+/// crosslink #979: this used to be a bare `2000` literal duplicated across
+/// the length check and the error message; promoting to a `const` lets
+/// future tuning happen in one place and lets the error message read the
+/// same value the validator does.
+///
+/// Note on units: `String::len` returns the UTF-8 byte length, not the
+/// grapheme count. The validator error string says "bytes" so the model
+/// is not misled by the "characters" mis-naming the prior message used.
+pub const TODO_CONTENT_MAX_BYTES: usize = 2000;
+
+/// Lifecycle state of a single todo item. crosslink #973.
+///
+/// Was previously a `String` validated against the literal slice
+/// `["pending", "in_progress", "completed"]` at write time, with every
+/// downstream consumer re-comparing the same hardcoded strings. The
+/// `#[serde(rename_all = "snake_case")]` attribute keeps the on-wire form
+/// identical to the previous string-based representation
+/// (`"pending"` / `"in_progress"` / `"completed"`), so existing callers
+/// and serialized session state continue to round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    /// Short single-character icon used by `execute_todo_read` to render
+    /// the status alongside the content. Moved here from a stringly-typed
+    /// `match` over the underlying `&str` so adding a new state is a
+    /// single-file edit guarded by the type system.
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Completed => "[x]",
+            Self::InProgress => "[>]",
+            Self::Pending => "[ ]",
+        }
+    }
+}
+
 /// Todo item for task tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
-    pub status: String,
+    pub status: TodoStatus,
     #[serde(rename = "activeForm")]
     pub active_form: String,
 }
@@ -76,6 +120,50 @@ static TODO_LISTS: std::sync::LazyLock<Mutex<HashMap<String, Vec<TodoItem>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Write/update the todo list
+/// Parse and validate a single `todos[i]` JSON object into a [`TodoItem`].
+///
+/// Surfaces every per-item validation failure as a `(message, true)`
+/// tuple matching the entry-point return shape so the caller can bubble
+/// it back to the model without restringing. crosslink #973 / #979.
+fn parse_todo_item(i: usize, item: &Value) -> Result<TodoItem, (String, bool)> {
+    let content = match item.get("content").and_then(|v| v.as_str()) {
+        Some(c) if c.len() > TODO_CONTENT_MAX_BYTES => {
+            return Err((
+                format!(
+                    "Todo {i} content exceeds maximum length of {TODO_CONTENT_MAX_BYTES} bytes"
+                ),
+                true,
+            ));
+        }
+        Some(c) => c.to_string(),
+        None => return Err((format!("Todo {i} missing 'content' field"), true)),
+    };
+
+    let Some(raw) = item.get("status") else {
+        return Err((format!("Todo {i} missing 'status' field"), true));
+    };
+    let status: TodoStatus = serde_json::from_value(raw.clone()).map_err(|_| {
+        let displayed = raw.as_str().unwrap_or("<non-string>");
+        (
+            format!(
+                "Todo {i} has invalid status '{displayed}'. Must be: pending, in_progress, completed"
+            ),
+            true,
+        )
+    })?;
+
+    let active_form = match item.get("activeForm").and_then(|v| v.as_str()) {
+        Some(a) => a.to_string(),
+        None => return Err((format!("Todo {i} missing 'activeForm' field"), true)),
+    };
+
+    Ok(TodoItem {
+        content,
+        status,
+        active_form,
+    })
+}
+
 pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
     let Some(todos_value) = args.get("todos") else {
         return ("Missing 'todos' argument".to_string(), true);
@@ -85,49 +173,17 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
         return ("'todos' must be an array".to_string(), true);
     };
 
-    let mut new_todos: Vec<TodoItem> = Vec::new();
+    let mut new_todos: Vec<TodoItem> = Vec::with_capacity(todos_array.len());
     let mut in_progress_count = 0;
-
     for (i, item) in todos_array.iter().enumerate() {
-        let content = match item.get("content").and_then(|v| v.as_str()) {
-            Some(c) if c.len() > 2000 => {
-                return (
-                    format!("Todo {i} content exceeds maximum length of 2000 characters"),
-                    true,
-                );
-            }
-            Some(c) => c.to_string(),
-            None => return (format!("Todo {i} missing 'content' field"), true),
+        let todo_item = match parse_todo_item(i, item) {
+            Ok(t) => t,
+            Err(err) => return err,
         };
-
-        let status = match item.get("status").and_then(|v| v.as_str()) {
-            Some(s) => {
-                if !["pending", "in_progress", "completed"].contains(&s) {
-                    return (
-                        format!(
-                            "Todo {i} has invalid status '{s}'. Must be: pending, in_progress, completed"
-                        ),
-                        true,
-                    );
-                }
-                if s == "in_progress" {
-                    in_progress_count += 1;
-                }
-                s.to_string()
-            }
-            None => return (format!("Todo {i} missing 'status' field"), true),
-        };
-
-        let active_form = match item.get("activeForm").and_then(|v| v.as_str()) {
-            Some(a) => a.to_string(),
-            None => return (format!("Todo {i} missing 'activeForm' field"), true),
-        };
-
-        new_todos.push(TodoItem {
-            content,
-            status,
-            active_form,
-        });
+        if todo_item.status == TodoStatus::InProgress {
+            in_progress_count += 1;
+        }
+        new_todos.push(todo_item);
     }
 
     // Warn if more than one task is in_progress
@@ -143,7 +199,8 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
     // instead of keeping a list of done items. Keeps the session cleanup
     // clean and signals the agent to stop referring back to finished work.
     // See claude-code/tools/TodoWriteTool/TodoWriteTool.ts (`allDone` branch).
-    let all_done = !new_todos.is_empty() && new_todos.iter().all(|t| t.status == "completed");
+    let all_done =
+        !new_todos.is_empty() && new_todos.iter().all(|t| t.status == TodoStatus::Completed);
     let stored_todos = if all_done {
         Vec::new()
     } else {
@@ -175,12 +232,18 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
     }
 
     // Format output for the non-all-done case.
-    let completed = new_todos.iter().filter(|t| t.status == "completed").count();
+    let completed = new_todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
     let in_progress = new_todos
         .iter()
-        .filter(|t| t.status == "in_progress")
+        .filter(|t| t.status == TodoStatus::InProgress)
         .count();
-    let pending = new_todos.iter().filter(|t| t.status == "pending").count();
+    let pending = new_todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Pending)
+        .count();
 
     let mut output = format!(
         "Todo list updated: {} total ({} completed, {} in progress, {} pending){}",
@@ -192,7 +255,10 @@ pub fn execute_todo_write(args: &HashMap<String, Value>) -> (String, bool) {
     );
 
     // Show current in-progress task if any
-    if let Some(current) = new_todos.iter().find(|t| t.status == "in_progress") {
+    if let Some(current) = new_todos
+        .iter()
+        .find(|t| t.status == TodoStatus::InProgress)
+    {
         let _ = write!(output, "\n\nCurrently: {}", current.active_form);
     }
 
@@ -212,20 +278,23 @@ pub fn execute_todo_read() -> (String, bool) {
     }
 
     let mut output = String::new();
-    for (i, todo) in todos.iter().enumerate() {
-        let status_icon = match todo.status.as_str() {
-            "completed" => "[x]",
-            "in_progress" => "[>]",
-            "pending" => "[ ]",
-            _ => "[?]",
-        };
-        let _ = writeln!(output, "{}. {} {}", i + 1, status_icon, todo.content);
+    for (i, item) in todos.iter().enumerate() {
+        let _ = writeln!(output, "{}. {} {}", i + 1, item.status.icon(), item.content);
     }
 
     // Summary
-    let completed = todos.iter().filter(|t| t.status == "completed").count();
-    let in_progress = todos.iter().filter(|t| t.status == "in_progress").count();
-    let pending = todos.iter().filter(|t| t.status == "pending").count();
+    let completed = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let in_progress = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::InProgress)
+        .count();
+    let pending = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Pending)
+        .count();
 
     let _ = write!(
         output,
