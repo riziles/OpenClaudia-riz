@@ -1088,8 +1088,18 @@ pub async fn run_subagent(
             "max_tokens": SUBAGENT_MAX_TOKENS
         });
 
-        // Make the API call
-        let response = match make_api_call(client, &base_url, api_key.as_ref(), &request_body).await
+        // Make the API call — provider is plumbed through so the
+        // ProviderAdapter trait (canonical implementation in
+        // `src/providers/`) handles request/response transformation for
+        // every supported provider. See crosslink #407.
+        let response = match make_api_call(
+            client,
+            &app_config.proxy.target,
+            &base_url,
+            api_key.as_ref(),
+            &request_body,
+        )
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -1235,52 +1245,133 @@ pub async fn run_subagent(
     }
 }
 
+/// Canonical provider names accepted by the subagent dispatcher.
+///
+/// This list mirrors the explicit (non-fallback) arms of
+/// [`crate::providers::get_adapter`]. The crate-level `get_adapter`
+/// deliberately falls back to the OpenAI-compatible adapter for
+/// unknown names (typo-tolerant proxy use case); subagent dispatch has
+/// the opposite preference — an unknown provider is an operator
+/// configuration error that must surface as a clean error rather than
+/// silently translating Anthropic-targeted prompts through an
+/// OpenAI-shape body. See crosslink #407.
+const SUBAGENT_KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "gemini",
+    "deepseek",
+    "qwen",
+    "alibaba",
+    "zai",
+    "glm",
+    "zhipu",
+    "ollama",
+    "local",
+    "lmstudio",
+    "localai",
+    "text-generation-webui",
+];
+
+/// Validate a provider name and return its canonical
+/// [`crate::providers::ProviderAdapter`].
+///
+/// Returns a typed error string instead of silently falling back so
+/// that misconfigured subagents fail fast at the dispatch boundary
+/// instead of issuing wrong-shape HTTP requests upstream.
+fn resolve_subagent_adapter(
+    provider: &str,
+) -> Result<Box<dyn crate::providers::ProviderAdapter>, String> {
+    let normalized = provider.to_ascii_lowercase();
+    if !SUBAGENT_KNOWN_PROVIDERS.contains(&normalized.as_str()) {
+        return Err(format!(
+            "Unknown subagent provider '{provider}'. Configure one of: {}",
+            SUBAGENT_KNOWN_PROVIDERS.join(", ")
+        ));
+    }
+    Ok(crate::providers::get_adapter(&normalized))
+}
+
+/// Decode the in-flight subagent `request_body` JSON into the typed
+/// [`crate::proxy::ChatCompletionRequest`] that every adapter consumes.
+///
+/// The subagent loop builds its working state as untyped `serde_json`
+/// to keep the message-append path cheap; the typed struct is the
+/// canonical input expected by every provider adapter and is the
+/// reason this refactor is type-safe rather than yet another bag of
+/// `Value::get(...)` calls. Errors are surfaced verbatim so a
+/// malformed request body produces a debuggable agent-error message.
+fn build_chat_completion_request(
+    request_body: &Value,
+) -> Result<crate::proxy::ChatCompletionRequest, String> {
+    serde_json::from_value::<crate::proxy::ChatCompletionRequest>(request_body.clone())
+        .map_err(|e| format!("Failed to materialize ChatCompletionRequest: {e}"))
+}
+
 /// Make an API call to the LLM provider.
 ///
-/// `api_key` is an optional [`crate::providers::ApiKey`]; when `None` the
-/// auth header is omitted rather than sent empty. See crosslink #256.
+/// Provider transformation is delegated to the canonical
+/// [`crate::providers::ProviderAdapter`] trait so subagent dispatch
+/// supports every provider the proxy supports (Anthropic, OpenAI,
+/// Google/Gemini, DeepSeek, Qwen, Z.AI/GLM, Ollama,
+/// OpenAI-compatible) instead of a hardcoded Anthropic-vs-OpenAI
+/// branch. The previous implementation duplicated provider
+/// transformation logic from `src/providers/` and only handled two
+/// out of seven formats — see crosslink #407.
+///
+/// `api_key` is an optional [`crate::providers::ApiKey`]; when `None`
+/// the auth header is omitted rather than sent empty. See crosslink
+/// #256.
 async fn make_api_call(
     client: &Client,
+    provider: &str,
     base_url: &str,
     api_key: Option<&crate::providers::ApiKey>,
     request_body: &Value,
 ) -> Result<Value, String> {
-    // Determine if this is Anthropic or OpenAI format
-    let is_anthropic = base_url.contains("anthropic.com");
+    // Resolve the typed adapter for this provider — strict validation
+    // so an unknown provider name fails fast at the dispatch boundary
+    // (see `resolve_subagent_adapter`).
+    let adapter = resolve_subagent_adapter(provider)?;
 
-    let (endpoint, mut headers) = if is_anthropic {
-        (
-            format!("{}/messages", base_url.trim_end_matches('/')),
-            vec![
-                ("anthropic-version".to_string(), "2023-06-01".to_string()),
-                ("content-type".to_string(), "application/json".to_string()),
-            ],
-        )
-    } else {
-        (
-            format!("{}/chat/completions", base_url.trim_end_matches('/')),
-            vec![("Content-type".to_string(), "application/json".to_string())],
-        )
-    };
+    // Materialize the typed request the adapter trait consumes.
+    let typed_request = build_chat_completion_request(request_body)?;
 
-    // Auth header — unredacted access is confined to `.as_str()`.
-    if let Some(key) = api_key {
-        if is_anthropic {
-            headers.push(("x-api-key".to_string(), key.as_str().to_string()));
-        } else {
-            headers.push((
-                "Authorization".to_string(),
-                format!("Bearer {}", key.as_str()),
-            ));
-        }
+    // Transform via the canonical adapter — handles every provider's
+    // wire format, including Anthropic prompt-cache `cache_control`
+    // headers, Google `generationConfig`, Ollama `options`, etc.
+    let body = adapter
+        .transform_request(&typed_request)
+        .map_err(|e| format!("Adapter transform_request failed: {e}"))?;
+
+    // Endpoint path is adapter-owned (Google's path embeds the model
+    // name, Ollama uses /api/chat, Anthropic uses /v1/messages, etc.).
+    // We strip the `/v1` suffix from the configured base_url because
+    // every adapter's endpoint already encodes its own version
+    // segment — matching the URL composition rule in
+    // `src/vdd/transport.rs::forward_request`.
+    let normalized_base = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let endpoint = format!("{normalized_base}{}", adapter.chat_endpoint(&typed_request.model));
+
+    // Headers come from the adapter when an api_key is present. We
+    // ensure a content-type header is set in all cases so providers
+    // without an explicit content-type contribution still receive
+    // valid JSON.
+    let mut headers: Vec<(String, String)> = api_key
+        .map(|k| adapter.get_headers(k))
+        .unwrap_or_default();
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        headers.push((
+            "content-type".to_string(),
+            "application/json".to_string(),
+        ));
     }
-
-    // Transform request for Anthropic if needed
-    let body = if is_anthropic {
-        transform_to_anthropic(request_body)
-    } else {
-        request_body.clone()
-    };
 
     let mut req = client.post(&endpoint);
     for (key, value) in headers {
@@ -1307,192 +1398,12 @@ async fn make_api_call(
         .await
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    // Transform Anthropic response to OpenAI format if needed
-    if is_anthropic {
-        Ok(transform_from_anthropic(&json))
-    } else {
-        Ok(json)
-    }
-}
-
-/// Transform `OpenAI`-format request to Anthropic format
-#[allow(clippy::too_many_lines)]
-fn transform_to_anthropic(request: &Value) -> Value {
-    let messages = request.get("messages").and_then(|m| m.as_array());
-    let tools = request.get("tools").and_then(|t| t.as_array());
-
-    // Extract system message
-    let system: Option<String> = messages.and_then(|msgs| {
-        msgs.iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .map(String::from)
-    });
-
-    // Convert messages (excluding system)
-    let converted_messages: Vec<Value> = messages
-        .map(|msgs| {
-            msgs.iter()
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-                .map(|m| {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content = m.get("content").cloned().unwrap_or_else(|| json!(""));
-
-                    // Handle tool role -> user with tool_result
-                    if role == "tool" {
-                        let tool_call_id = m
-                            .get("tool_call_id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("");
-                        return json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "tool_result",
-                                "tool_use_id": tool_call_id,
-                                "content": content
-                            }]
-                        });
-                    }
-
-                    // Handle assistant with tool_calls
-                    if role == "assistant" {
-                        if let Some(tool_calls) = m.get("tool_calls").and_then(|tc| tc.as_array()) {
-                            let mut content_parts: Vec<Value> = Vec::new();
-
-                            // Add text content if present
-                            if let Some(text) = m.get("content").and_then(|c| c.as_str()) {
-                                if !text.is_empty() {
-                                    content_parts.push(json!({
-                                        "type": "text",
-                                        "text": text
-                                    }));
-                                }
-                            }
-
-                            // Convert tool calls to tool_use
-                            let empty_func = json!({});
-                            for tc in tool_calls {
-                                let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                                let func = tc.get("function").unwrap_or(&empty_func);
-                                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                                let args_str = func
-                                    .get("arguments")
-                                    .and_then(|a| a.as_str())
-                                    .unwrap_or("{}");
-                                let input: Value =
-                                    serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
-
-                                content_parts.push(json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": input
-                                }));
-                            }
-
-                            return json!({
-                                "role": "assistant",
-                                "content": content_parts
-                            });
-                        }
-                    }
-
-                    // Standard message
-                    let content_array = content.as_str().map_or_else(
-                        || content.clone(),
-                        |text| json!([{"type": "text", "text": text}]),
-                    );
-
-                    json!({
-                        "role": if role == "assistant" { "assistant" } else { "user" },
-                        "content": content_array
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Convert tools
-    let converted_tools: Vec<Value> = tools
-        .map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    let func = t.get("function")?;
-                    let default_desc = json!("");
-                    let default_params = json!({});
-                    Some(json!({
-                        "name": func.get("name")?,
-                        "description": func.get("description").unwrap_or(&default_desc),
-                        "input_schema": func.get("parameters").unwrap_or(&default_params)
-                    }))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut body = json!({
-        "model": request.get("model").and_then(|m| m.as_str()).unwrap_or("claude-sonnet-4-6"),
-        "messages": converted_messages,
-        "max_tokens": request.get("max_tokens").and_then(serde_json::Value::as_u64).unwrap_or_else(|| u64::from(SUBAGENT_MAX_TOKENS))
-    });
-
-    if let Some(sys) = system {
-        body["system"] = json!(sys);
-    }
-
-    if !converted_tools.is_empty() {
-        body["tools"] = json!(converted_tools);
-    }
-
-    body
-}
-
-/// Transform Anthropic response to `OpenAI` format
-fn transform_from_anthropic(response: &Value) -> Value {
-    let content = response.get("content").and_then(|c| c.as_array());
-
-    let mut text_content = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-
-    if let Some(parts) = content {
-        for part in parts {
-            match part.get("type").and_then(|t| t.as_str()) {
-                Some("text") => {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        text_content.push_str(text);
-                    }
-                }
-                Some("tool_use") => {
-                    let id = part.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let name = part.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let empty_input = json!({});
-                    let input = part.get("input").unwrap_or(&empty_input);
-
-                    tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
-                        }
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut message = json!({
-        "role": "assistant",
-        "content": text_content
-    });
-
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = json!(tool_calls);
-    }
-
-    message
+    // Translate provider-native response back to OpenAI chat shape so
+    // `parse_response` (which expects `choices[0].message`) keeps
+    // working unchanged for every provider.
+    adapter
+        .transform_response(json, false)
+        .map_err(|e| format!("Adapter transform_response failed: {e}"))
 }
 
 /// Parse the response to extract the assistant message
@@ -1856,24 +1767,201 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_transform_to_anthropic() {
-        let request = json!({
-            "model": "test-model",
+    // ── Crosslink #407: ProviderAdapter dispatch in subagent ────────────────
+    //
+    // The previous `transform_to_anthropic` / `transform_from_anthropic`
+    // functions were a stovepiped reimplementation of
+    // `providers::AnthropicAdapter`, with branches that only handled
+    // Anthropic + OpenAI. The four tests below pin the new behaviour:
+    //
+    //   1. Anthropic produces the canonical adapter shape (system array
+    //      with cache_control, not the bare string the duplicate emitted).
+    //   2. OpenAI passthrough produces a well-formed OpenAI-shape body.
+    //   3. Google produces Gemini-shape contents (was broken: the old
+    //      Anthropic-vs-OpenAI branch routed Gemini calls through OpenAI
+    //      wire format, which Gemini's REST API does not accept).
+    //   4. Unknown provider returns a clean typed error rather than
+    //      silently falling back to the OpenAI shape.
+
+    fn anthropic_request_body() -> Value {
+        json!({
+            "model": "claude-sonnet-4-6",
             "messages": [
                 {"role": "system", "content": "System prompt"},
                 {"role": "user", "content": "Hello"}
             ],
             "max_tokens": 1000
-        });
+        })
+    }
 
-        let anthropic = transform_to_anthropic(&request);
-        assert_eq!(anthropic.get("model").unwrap().as_str(), Some("test-model"));
+    /// Snapshot the adapter-produced Anthropic body so it matches the
+    /// canonical AnthropicAdapter contract: `system` is an array of
+    /// content blocks with `cache_control`, messages exclude system,
+    /// `max_tokens` and `model` round-trip verbatim.
+    #[test]
+    fn crosslink407_anthropic_request_uses_adapter_shape() {
+        let body = anthropic_request_body();
+        let typed = build_chat_completion_request(&body).expect("decodable");
+        let adapter = resolve_subagent_adapter("anthropic").expect("anthropic is known");
+
+        let out = adapter.transform_request(&typed).expect("transform ok");
+
+        assert_eq!(out.get("model").and_then(|v| v.as_str()), Some("claude-sonnet-4-6"));
+        assert_eq!(out.get("max_tokens").and_then(Value::as_u64), Some(1000));
+
+        // System is now the canonical Anthropic array shape with
+        // cache_control — the old duplicate emitted a bare string and
+        // dropped prompt-cache hits, which #407 fixes by construction.
+        let system_arr = out
+            .get("system")
+            .and_then(|v| v.as_array())
+            .expect("system must be array, not a bare string");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0].get("type").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(
-            anthropic.get("system").unwrap().as_str(),
+            system_arr[0].get("text").and_then(|v| v.as_str()),
             Some("System prompt")
         );
-        assert!(anthropic.get("messages").unwrap().as_array().unwrap().len() == 1);
+        assert_eq!(
+            system_arr[0]
+                .get("cache_control")
+                .and_then(|c| c.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("ephemeral")
+        );
+
+        // Messages exclude the system entry (handled separately at top
+        // level by Anthropic) — only the user turn remains.
+        let messages = out
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get("role").and_then(|v| v.as_str()), Some("user"));
+    }
+
+    /// OpenAI subagent dispatch: produces a well-formed OpenAI-shape
+    /// body via the canonical adapter. The duplicate code path used to
+    /// rely on the literal `request_body.clone()` (no transformation);
+    /// going through the adapter is now uniform with every other
+    /// provider and ensures the request validates against the typed
+    /// `ChatCompletionRequest` contract.
+    #[test]
+    fn crosslink407_openai_request_passes_through_adapter() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "ping"}
+            ],
+            "max_tokens": 256
+        });
+        let typed = build_chat_completion_request(&body).expect("decodable");
+        let adapter = resolve_subagent_adapter("openai").expect("openai is known");
+
+        let out = adapter.transform_request(&typed).expect("transform ok");
+
+        assert_eq!(out.get("model").and_then(|v| v.as_str()), Some("gpt-4o"));
+        let messages = out
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get("role").and_then(|v| v.as_str()), Some("user"));
+
+        // Endpoint is the OpenAI-shape chat completions path — the
+        // adapter owns this string, not subagent.rs.
+        assert_eq!(adapter.chat_endpoint("gpt-4o"), "/v1/chat/completions");
+    }
+
+    /// Google subagent dispatch — previously broken because the old
+    /// `transform_to_anthropic`/`OpenAI`-only branch sent the body as
+    /// `{model, messages, ...}` which Gemini's REST API rejects.
+    /// Going through `GoogleAdapter` emits the Gemini-native shape
+    /// (`contents`, `systemInstruction`, `generationConfig`) and the
+    /// model-aware endpoint path.
+    #[test]
+    fn crosslink407_google_request_uses_gemini_shape() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hi"}
+            ],
+            "temperature": 0.5,
+            "max_tokens": 512
+        });
+        let typed = build_chat_completion_request(&body).expect("decodable");
+        let adapter = resolve_subagent_adapter("google").expect("google is known");
+
+        let out = adapter.transform_request(&typed).expect("transform ok");
+
+        // Gemini native shape: `contents`, not OpenAI `messages`.
+        assert!(
+            out.get("contents").and_then(|v| v.as_array()).is_some(),
+            "Google adapter must emit `contents`, got {out:?}"
+        );
+        assert!(
+            out.get("systemInstruction").is_some(),
+            "Google adapter must emit `systemInstruction` for system prompt"
+        );
+        assert_eq!(
+            out["generationConfig"]["maxOutputTokens"]
+                .as_u64()
+                .expect("maxOutputTokens"),
+            512
+        );
+
+        // Endpoint embeds the model name — proof the adapter (not a
+        // hardcoded subagent string) owns URL composition.
+        assert!(
+            adapter
+                .chat_endpoint("gemini-2.5-pro")
+                .contains("gemini-2.5-pro"),
+            "Gemini endpoint must embed the model name"
+        );
+
+        // `gemini` alias also resolves to the Google adapter.
+        let alias = resolve_subagent_adapter("gemini").expect("gemini alias is known");
+        assert_eq!(alias.name(), "google");
+    }
+
+    /// Negative test — an unknown provider name must surface as a
+    /// clean typed error at the dispatch boundary, NOT silently fall
+    /// back to OpenAI. The crate-level `get_adapter` is typo-tolerant
+    /// by design (the proxy treats unknown providers as
+    /// OpenAI-compatible local servers); subagent dispatch has the
+    /// opposite preference because a wrongly-routed Anthropic agent
+    /// would issue malformed HTTP requests upstream. See crosslink
+    /// #407.
+    #[test]
+    fn crosslink407_unknown_provider_returns_clean_error() {
+        let err = match resolve_subagent_adapter("not-a-real-provider") {
+            Ok(_) => panic!("unknown provider must error, not silently fall back"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("Unknown subagent provider"),
+            "error must name the misconfigured provider, got: {err}"
+        );
+        assert!(
+            err.contains("not-a-real-provider"),
+            "error must echo the bad provider name, got: {err}"
+        );
+        // Empty string is also rejected (operator left the field blank).
+        assert!(resolve_subagent_adapter("").is_err());
+
+        // Every name in the allow-list resolves successfully.
+        for known in SUBAGENT_KNOWN_PROVIDERS {
+            assert!(
+                resolve_subagent_adapter(known).is_ok(),
+                "{known} must resolve"
+            );
+        }
+        // Case-insensitive: operators sometimes capitalise provider
+        // names in config (e.g. "Anthropic"). The strict gate must
+        // still accept them.
+        assert!(resolve_subagent_adapter("Anthropic").is_ok());
+        assert!(resolve_subagent_adapter("OPENAI").is_ok());
     }
 
     // ── Spec #527 behavior 1: run_in_background returns agent_id immediately ──
