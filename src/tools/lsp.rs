@@ -752,10 +752,15 @@ fn run_lsp_request(
         "workspaceFolders": [{"uri": root_uri, "name": "workspace"}]
     });
     send_lsp_message(&mut stdin, "initialize", 1, init_params)?;
-    let _init_response = read_lsp_response(&mut reader, 1).map_err(|e| {
-        let snip = stderr_snippet(&stderr_buf);
-        format!("initialize failed: {e}{snip}")
-    })?;
+    // #651: answer server→client reverse-requests (e.g.
+    // `workspace/configuration`) inline during init — several servers stall
+    // until they receive a response. The legacy `read_lsp_response` silently
+    // skipped these.
+    let _init_response = read_lsp_response_with_reverse(&mut reader, 1, Some(&mut stdin))
+        .map_err(|e| {
+            let snip = stderr_snippet(&stderr_buf);
+            format!("initialize failed: {e}{snip}")
+        })?;
 
     // Send initialized notification
     send_lsp_notification(&mut stdin, "initialized", json!({}))?;
@@ -926,6 +931,37 @@ fn read_lsp_response(
     reader: &mut BufReader<impl std::io::Read>,
     expected_id: u32,
 ) -> Result<Value, String> {
+    read_lsp_response_with_reverse(reader, expected_id, None::<&mut std::io::Sink>)
+}
+
+/// Like [`read_lsp_response`] but, when `reverse_writer` is supplied,
+/// answers server→client reverse-requests inline so the server can
+/// finish initialization.
+///
+/// Reverse-requests are the underbelly of LSP: a server may, mid-stream,
+/// send a JSON-RPC request *to the client* (e.g. `workspace/configuration`
+/// during init) and stall until it sees a matching response. The legacy
+/// loop silently skipped these messages — which is why several servers
+/// (clangd, gopls, jdtls) appear to hang under OC today. CC parity here
+/// is `LSPServerManager.ts:123-135` (crosslink #651).
+///
+/// We currently support the bare-minimum response that satisfies the
+/// most common reverse-requests:
+///
+/// | method                       | response shape   | notes                       |
+/// |------------------------------|------------------|-----------------------------|
+/// | `workspace/configuration`    | `[null, ...]`    | one `null` per requested scope |
+/// | `client/registerCapability`  | `null`           | no-op accept                  |
+/// | `client/unregisterCapability`| `null`           | no-op accept                  |
+/// | `window/workDoneProgress/create` | `null`       | no-op accept                  |
+///
+/// Anything else gets a JSON-RPC `MethodNotFound` (`-32601`) so the server
+/// can fail fast instead of stalling.
+pub(crate) fn read_lsp_response_with_reverse<W: std::io::Write>(
+    reader: &mut BufReader<impl std::io::Read>,
+    expected_id: u32,
+    mut reverse_writer: Option<&mut W>,
+) -> Result<Value, String> {
     let max_messages = lsp_max_messages();
     for _attempt in 0..max_messages {
         // Read headers
@@ -961,6 +997,23 @@ fn read_lsp_response(
             if id == u64::from(expected_id) {
                 return Ok(msg);
             }
+            // Server→client reverse-request: has an id AND a method. The
+            // server is waiting for a response from us. Answer it inline so
+            // initialization can progress.
+            if let (Some(method), Some(writer)) = (
+                msg.get("method").and_then(|v| v.as_str()),
+                reverse_writer.as_deref_mut(),
+            ) {
+                let reply = build_reverse_response(id, method, msg.get("params"));
+                if let Err(err) = write_lsp_raw(writer, &reply) {
+                    tracing::warn!(
+                        method,
+                        id,
+                        error = %err,
+                        "failed to answer LSP reverse-request — server may stall",
+                    );
+                }
+            }
         }
 
         // Otherwise it's a notification (no id) or a response to a different request;
@@ -970,6 +1023,66 @@ fn read_lsp_response(
         "LSP scan budget exhausted: did not see response id={expected_id} after \
          {max_messages} messages (raise OPENCLAUDIA_LSP_MAX_MESSAGES to relax)"
     ))
+}
+
+/// JSON-RPC error code: `MethodNotFound`. Returned to the server for any
+/// reverse-request method we don't explicitly handle.
+const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+
+/// Build a JSON-RPC response to a server→client reverse-request.
+///
+/// Public-via-`pub(crate)` only so the unit tests can exercise the
+/// method-dispatch matrix without spinning up a child process.
+pub(crate) fn build_reverse_response(id: u64, method: &str, params: Option<&Value>) -> Value {
+    match method {
+        // CC parity: every scope receives `null` (i.e. "use server defaults").
+        // The number of nulls must match `params.items.len()` or the spec
+        // says servers may treat the response as malformed.
+        "workspace/configuration" => {
+            let n = params
+                .and_then(|p| p.get("items"))
+                .and_then(|v| v.as_array())
+                .map_or(1, Vec::len);
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": vec![Value::Null; n],
+            })
+        }
+        // Capability registration / progress creation: accept silently so
+        // the server can move on. CC does the same.
+        "client/registerCapability"
+        | "client/unregisterCapability"
+        | "window/workDoneProgress/create" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": Value::Null,
+        }),
+        other => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": JSONRPC_METHOD_NOT_FOUND,
+                "message": format!("OpenClaudia LSP shim does not handle reverse-request: {other}"),
+            },
+        }),
+    }
+}
+
+/// Serialize `msg` with the LSP Content-Length framing and write to
+/// `writer`. Mirrors [`send_lsp_message`] minus the `id` synthesis (the
+/// caller already chose an id for a reply).
+fn write_lsp_raw(writer: &mut impl Write, msg: &Value) -> Result<(), String> {
+    let body = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    writer
+        .write_all(header.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(body.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn find_project_root(file_path: &Path) -> String {
@@ -2783,5 +2896,73 @@ mod tests {
         unsafe {
             std::env::remove_var(SENTINEL_KEY);
         }
+    }
+
+    // ── #651: workspace/configuration + reverse-request handler ────────────
+
+    /// `build_reverse_response` for `workspace/configuration` returns one
+    /// `null` per requested scope item — server treats any mismatch as
+    /// malformed.
+    #[test]
+    fn reverse_workspace_configuration_returns_per_item_nulls() {
+        let params = json!({
+            "items": [
+                {"section": "rust-analyzer"},
+                {"section": "rust-analyzer.cargo"},
+                {"section": "rust-analyzer.checkOnSave"}
+            ]
+        });
+        let reply = build_reverse_response(7, "workspace/configuration", Some(&params));
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["jsonrpc"], "2.0");
+        let result = reply["result"].as_array().expect("result must be array");
+        assert_eq!(result.len(), 3, "one null per requested scope");
+        assert!(result.iter().all(serde_json::Value::is_null));
+    }
+
+    /// Missing / empty `items` is degenerate but must not panic — we return
+    /// a single-element null array as a conservative default.
+    #[test]
+    fn reverse_workspace_configuration_handles_missing_items() {
+        let reply = build_reverse_response(1, "workspace/configuration", None);
+        assert_eq!(reply["result"].as_array().map(Vec::len), Some(1));
+        let reply2 =
+            build_reverse_response(2, "workspace/configuration", Some(&json!({"items": []})));
+        assert_eq!(reply2["result"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Capability registration / progress create are accepted with a bare
+    /// `null` result (the spec's "no-op acknowledgement").
+    #[test]
+    fn reverse_capability_methods_accept_silently() {
+        for method in [
+            "client/registerCapability",
+            "client/unregisterCapability",
+            "window/workDoneProgress/create",
+        ] {
+            let reply = build_reverse_response(42, method, None);
+            assert_eq!(reply["id"], 42);
+            assert!(
+                reply["result"].is_null(),
+                "{method} must reply with null result, got {reply}"
+            );
+            assert!(
+                reply.get("error").is_none(),
+                "{method} must not return error",
+            );
+        }
+    }
+
+    /// Unknown reverse-request methods get a JSON-RPC `MethodNotFound` so the
+    /// server can fail fast instead of stalling.
+    #[test]
+    fn reverse_unknown_method_returns_method_not_found() {
+        let reply = build_reverse_response(99, "telemetry/queryUserAgent", None);
+        assert_eq!(reply["id"], 99);
+        assert_eq!(reply["error"]["code"], -32601);
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("telemetry/queryUserAgent"));
     }
 }

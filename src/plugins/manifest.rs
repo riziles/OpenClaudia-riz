@@ -314,6 +314,32 @@ fn default_transport() -> String {
     "stdio".to_string()
 }
 
+/// LSP server configuration declared by a plugin manifest (CC parity
+/// with `lspPluginIntegration.ts`, crosslink #655).
+///
+/// A plugin can ship its own language server (e.g. a custom DSL the
+/// plugin author owns); on enable the host registers it with the LSP
+/// pool so the standard `lsp` tool dispatches against it transparently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspServerConfig {
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments passed to the executable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Extra environment variables injected into the spawned process.
+    /// The standard LSP env-scrub allowlist (see `tools::lsp`) still
+    /// applies — credentials that fail the allowlist are dropped with a
+    /// `warn!` log.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// File extensions the server claims (e.g. `["rs"]`). Empty means
+    /// the server is invocation-only — it does not auto-register against
+    /// any extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+}
+
 /// Agents field - can be path string or array of paths
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -379,6 +405,20 @@ pub struct PluginManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub mcp_servers: Option<McpServersSpec>,
+    /// LSP server registrations declared by the plugin (CC parity with
+    /// `lspPluginIntegration.ts`, crosslink #655).
+    ///
+    /// Each entry maps a language identifier (e.g. `"rust"`) to an
+    /// [`LspServerConfig`] describing how to spawn the server binary.
+    /// On plugin load the host wires every entry into the LSP pool so
+    /// `is_lsp_connected("rust")` returns true once the plugin is enabled.
+    /// `None` ⇒ plugin contributes no LSP servers (overwhelmingly common).
+    #[serde(
+        default,
+        rename = "lspServers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lsp_servers: Option<HashMap<String, LspServerConfig>>,
     /// Optional detached ed25519 signature over the manifest bytes.
     ///
     /// When present, the signature is verified by
@@ -556,6 +596,29 @@ mod tests {
             serde_json::from_str(r#"{"name":"p","commands":{"build":{"source":"./build.md"}}}"#)
                 .unwrap();
         assert!(matches!(m.commands, Some(CommandsSpec::Map(_))));
+    }
+
+    /// #655: a manifest with `lspServers` parses each entry into a typed
+    /// [`LspServerConfig`].
+    #[test]
+    fn plugin_manifest_lsp_servers_parse() {
+        let json = r#"{
+            "name": "rust-tools",
+            "lspServers": {
+                "rust": {
+                    "command": "rust-analyzer",
+                    "args": ["--no-cargo-watch"],
+                    "extensions": ["rs"]
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let servers = m.lsp_servers.expect("lspServers must parse");
+        let rust = servers.get("rust").expect("rust server present");
+        assert_eq!(rust.command, "rust-analyzer");
+        assert_eq!(rust.args, vec!["--no-cargo-watch"]);
+        assert_eq!(rust.extensions, vec!["rs"]);
+        assert!(rust.env.is_empty());
     }
 
     /// A manifest with an inline hooks block with valid hook keys parses correctly.

@@ -1,47 +1,158 @@
-//! Web-fetch tool configuration — preapproved domain list.
+//! Web-fetch configuration (crosslink #608, CC parity with
+//! `web_fetch` + `applyPromptToMarkdown`).
 //!
-//! See crosslink #603. Claude Code ships a built-in list of ~30 domains
-//! whose fetches do not require an interactive permission prompt
-//! (documentation hosts, package indexes, well-known reference sites).
-//! `OpenClaudia` previously had no equivalent — every fetch fell through
-//! to the same prompt path regardless of destination, including obvious
-//! documentation lookups that no user would object to.
+//! CC's `web_fetch` accepts a `prompt` field alongside `url`; the fetched
+//! markdown is fed to a small distillation model (Haiku by default) and
+//! the model's answer becomes the returned `result`. This module owns
+//! the schema half of that contract; the runtime hook lives in
+//! `tools/web.rs` and is wired in once the secondary-model dispatch
+//! lands (tracked in the issue body for #608).
 //!
-//! This module exposes [`WebFetchConfig`] holding the user-facing
-//! `preapproved_domains` list (with a sensible default that mirrors CC's
-//! shipped list), and [`is_preapproved`] which subdomain-matches a URL
-//! against that list. The permission layer consults `is_preapproved`
-//! before opening a prompt so allowlisted hosts skip the round-trip.
+//! Schema fields:
+//! * `distillation_enabled` — opt-in; when `false` the tool returns raw
+//!   reader markdown the way it does today (back-compat).
+//! * `max_distillation_bytes` — hard cap on the raw markdown sent to the
+//!   distillation model. CC uses 100 000 chars (`MAX_MARKDOWN_LENGTH`);
+//!   we mirror that exactly so a prompt that distils correctly under CC
+//!   distils identically here.
+//! * `distillation_provider` / `distillation_model` — explicit selection
+//!   of the secondary model. Both optional: `None` lets the runtime pick
+//!   the active provider's "small / fast" tier (matches CC's
+//!   Haiku-default behaviour on Anthropic-first-party).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// Web-fetch tool configuration.
+/// Hard cap CC enforces on the markdown blob handed to the distillation model.
 ///
-/// `preapproved_domains` is a host allowlist — a URL whose host is equal
-/// to, or a subdomain of, any entry is treated as preapproved and bypasses
-/// the interactive permission prompt. Match semantics are identical to
-/// the [`crate::tools`] web-search `allowed_domains` filter
-/// (`docs.python.org` matches both the exact host and `foo.docs.python.org`).
-///
-/// Defaults to [`default_preapproved_domains`] — roughly 30 well-known
-/// documentation / package / reference sites. Users can override with an
-/// empty list to disable the preapproval shortcut entirely, or extend it
-/// with additional hosts.
-///
-/// See crosslink #603.
-#[derive(Debug, Deserialize, Clone)]
+/// Mirrors `MAX_MARKDOWN_LENGTH` in `applyPromptToMarkdown.ts` — diverging
+/// here would silently change the rendered answer for the same input.
+pub const CC_MAX_MARKDOWN_LENGTH: usize = 100_000;
+
+/// Configuration for the optional secondary-model distillation step
+/// applied to `web_fetch` output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebFetchConfig {
+    /// When `true`, `web_fetch` accepts a `prompt` field and routes the
+    /// fetched markdown through the distillation model. When `false`
+    /// (default), the tool returns raw markdown — preserving today's
+    /// behaviour for users who haven't opted in.
+    #[serde(default)]
+    pub distillation_enabled: bool,
+    /// Max byte length of the raw markdown sent to the secondary model.
+    /// Defaults to [`CC_MAX_MARKDOWN_LENGTH`] for CC parity.
+    #[serde(default = "default_max_distillation_bytes")]
+    pub max_distillation_bytes: usize,
+    /// Override the provider used for distillation. `None` ⇒ session's
+    /// active provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distillation_provider: Option<String>,
+    /// Override the model used for distillation. `None` ⇒ the provider's
+    /// "small / fast" tier (Haiku on Anthropic, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distillation_model: Option<String>,
+    /// Hosts that bypass the SSRF prompt for fetches (#603).
     #[serde(default = "default_preapproved_domains")]
     pub preapproved_domains: Vec<String>,
+}
+
+const fn default_max_distillation_bytes() -> usize {
+    CC_MAX_MARKDOWN_LENGTH
 }
 
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
+            distillation_enabled: false,
+            max_distillation_bytes: CC_MAX_MARKDOWN_LENGTH,
+            distillation_provider: None,
+            distillation_model: None,
             preapproved_domains: default_preapproved_domains(),
         }
     }
 }
+
+impl WebFetchConfig {
+    /// Truncate `markdown` to `max_distillation_bytes` along a char
+    /// boundary so the slice is always valid UTF-8.
+    ///
+    /// This is the host-side mirror of CC's pre-distillation truncate
+    /// step; isolating it here keeps the cap and the truncate in lock
+    /// step (modifying the cap in serde without touching the truncate
+    /// would silently over-spend on the secondary model).
+    #[must_use]
+    pub fn truncate_for_distillation<'a>(&self, markdown: &'a str) -> &'a str {
+        let max = self.max_distillation_bytes;
+        if markdown.len() <= max {
+            return markdown;
+        }
+        let mut end = max;
+        while end > 0 && !markdown.is_char_boundary(end) {
+            end -= 1;
+        }
+        &markdown[..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_cc_back_compat_posture() {
+        let cfg = WebFetchConfig::default();
+        assert!(
+            !cfg.distillation_enabled,
+            "distillation must default off so existing /web_fetch behaviour is preserved"
+        );
+        assert_eq!(cfg.max_distillation_bytes, CC_MAX_MARKDOWN_LENGTH);
+        assert!(cfg.distillation_provider.is_none());
+        assert!(cfg.distillation_model.is_none());
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_does_not_split_multibyte() {
+        let cfg = WebFetchConfig {
+            // 5 bytes — splits inside the 3-byte `é` if we naively cut.
+            max_distillation_bytes: 4,
+            ..Default::default()
+        };
+        let s = "ab\u{e9}cd"; // 'a', 'b', 'é' (2 bytes), 'c', 'd' → 6 bytes
+        let out = cfg.truncate_for_distillation(s);
+        // out must be valid UTF-8 and ≤ 4 bytes.
+        assert!(out.len() <= 4);
+        // and prefix-of-s.
+        assert!(s.starts_with(out));
+    }
+
+    #[test]
+    fn truncate_returns_input_when_under_cap() {
+        let cfg = WebFetchConfig::default();
+        let s = "short";
+        assert_eq!(cfg.truncate_for_distillation(s), s);
+    }
+
+    #[test]
+    fn yaml_round_trip_preserves_overrides() {
+        let cfg = WebFetchConfig {
+            distillation_enabled: true,
+            max_distillation_bytes: 5_000,
+            distillation_provider: Some("anthropic".into()),
+            distillation_model: Some("claude-haiku-4".into()),
+            preapproved_domains: default_preapproved_domains(),
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let back: WebFetchConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn cc_max_markdown_length_is_one_hundred_k() {
+        // Pin the constant — a drift from CC would silently change the
+        // rendered answer for the same input.
+        assert_eq!(CC_MAX_MARKDOWN_LENGTH, 100_000);
+    }
+}
+
 
 /// Default preapproved-domain list shipped with `OpenClaudia`.
 ///
@@ -145,7 +256,7 @@ fn domain_matches(host: &str, needle: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod preapproved_tests {
     use super::*;
 
     #[test]

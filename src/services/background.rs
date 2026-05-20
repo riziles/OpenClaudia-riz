@@ -125,6 +125,102 @@ impl BackgroundJob for MemoryConsolidationJob {
     }
 }
 
+// ── Plugin auto-update job (#652) + delisting auto-uninstall (#658) ─────────
+
+/// Background poll for plugin updates (CC parity, crosslink #652).
+///
+/// Walks the snapshot of installed plugins on every tick and emits a
+/// structured `plugin_autoupdate_check` event per plugin. Mirrors
+/// `pluginAutoupdate.ts` from CC.
+///
+/// Phase 1 scope: scheduling slot only — the actual version-check +
+/// signed-update download lands alongside the marketplace transport
+/// layer (tracked in #652's runtime follow-up). Until then, `run`
+/// emits one event per plugin so operators can observe the polling
+/// cadence without yet downloading anything.
+pub struct PluginAutoupdateJob {
+    /// Discovery snapshot supplied by the caller — a list of
+    /// `(plugin_id, current_version)` pairs. Cloned out of the live
+    /// [`PluginManager`][crate::plugins::manager::PluginManager] at job
+    /// construction time so the scheduler stays free of plugin-layer
+    /// borrow lifetimes.
+    plugins: Vec<(String, Option<String>)>,
+}
+
+impl PluginAutoupdateJob {
+    /// Build a job that will check `plugins` on every tick.
+    #[must_use]
+    pub const fn new(plugins: Vec<(String, Option<String>)>) -> Self {
+        Self { plugins }
+    }
+}
+
+impl BackgroundJob for PluginAutoupdateJob {
+    fn name(&self) -> &'static str {
+        "plugin_autoupdate"
+    }
+
+    fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
+        for (plugin_id, version) in &self.plugins {
+            tracing::info!(
+                event = "plugin_autoupdate_check",
+                plugin_id,
+                current_version = version.as_deref().unwrap_or("unknown"),
+                "polled plugin source for available update"
+            );
+        }
+        Ok(JobOutcome {
+            job_name: "plugin_autoupdate",
+            records_pruned: 0,
+            records_deduped: 0,
+        })
+    }
+}
+
+/// Background poll for plugin delisting (CC parity, crosslink #658).
+///
+/// Detects plugins delisted from their source marketplace and emits an
+/// actionable event so the operator can decide on uninstall. Mirrors
+/// `pluginBlocklist.ts::detectAndUninstallDelistedPlugins`.
+///
+/// Phase 1 scope mirrors [`PluginAutoupdateJob`]: scheduling slot now,
+/// marketplace transport later. The job is parameterised with the same
+/// `(plugin_id, source)` snapshot the auto-update job consumes so the
+/// caller wires a single discovery pass through both.
+pub struct PluginDelistingJob {
+    plugins: Vec<(String, String)>,
+}
+
+impl PluginDelistingJob {
+    /// Construct from `(plugin_id, source_url_or_marketplace_name)` pairs.
+    #[must_use]
+    pub const fn new(plugins: Vec<(String, String)>) -> Self {
+        Self { plugins }
+    }
+}
+
+impl BackgroundJob for PluginDelistingJob {
+    fn name(&self) -> &'static str {
+        "plugin_delisting_check"
+    }
+
+    fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
+        for (plugin_id, source) in &self.plugins {
+            tracing::info!(
+                event = "plugin_delisting_check",
+                plugin_id,
+                source,
+                "polled marketplace for delisting status"
+            );
+        }
+        Ok(JobOutcome {
+            job_name: "plugin_delisting_check",
+            records_pruned: 0,
+            records_deduped: 0,
+        })
+    }
+}
+
 /// Remove duplicate archival memory entries that share identical content.
 /// Keeps the entry with the latest `updated_at` timestamp; deletes the rest.
 /// Returns the count of deleted rows.
@@ -738,5 +834,53 @@ mod tests {
             second.records_deduped, 0,
             "AgentSummaryJob must be idempotent across passes"
         );
+    }
+
+    // ── #652 / #658: plugin auto-update + delisting jobs ───────────────────
+
+    /// `PluginAutoupdateJob::run` is a no-op for an empty plugin list and
+    /// produces an outcome that the scheduler can ingest.
+    #[test]
+    fn plugin_autoupdate_job_runs_on_empty_list() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db(&tmp);
+        let job = PluginAutoupdateJob::new(vec![]);
+        let outcome = job.run(&db).expect("empty list run must succeed");
+        assert_eq!(outcome.job_name, "plugin_autoupdate");
+        assert_eq!(outcome.records_pruned, 0);
+        assert_eq!(outcome.records_deduped, 0);
+        assert_eq!(job.name(), "plugin_autoupdate");
+    }
+
+    /// `PluginDelistingJob::run` is a no-op for an empty plugin list.
+    #[test]
+    fn plugin_delisting_job_runs_on_empty_list() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db(&tmp);
+        let job = PluginDelistingJob::new(vec![]);
+        let outcome = job.run(&db).expect("empty list run must succeed");
+        assert_eq!(outcome.job_name, "plugin_delisting_check");
+        assert_eq!(job.name(), "plugin_delisting_check");
+    }
+
+    /// Both jobs satisfy the `BackgroundJob` object-safety contract so the
+    /// scheduler can hold them behind `Arc<dyn BackgroundJob>`.
+    #[test]
+    fn plugin_jobs_are_object_safe() {
+        let _: Arc<dyn BackgroundJob> = Arc::new(PluginAutoupdateJob::new(vec![]));
+        let _: Arc<dyn BackgroundJob> = Arc::new(PluginDelistingJob::new(vec![]));
+    }
+
+    /// Carrying a small plugin list through the run path doesn't panic and
+    /// returns the same outcome shape (only the log volume changes).
+    #[test]
+    fn plugin_autoupdate_job_runs_with_populated_list() {
+        let tmp = TempDir::new().unwrap();
+        let db = make_db(&tmp);
+        let job = PluginAutoupdateJob::new(vec![
+            ("p1".into(), Some("1.0.0".into())),
+            ("p2".into(), None),
+        ]);
+        assert!(job.run(&db).is_ok());
     }
 }

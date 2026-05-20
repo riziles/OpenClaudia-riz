@@ -140,6 +140,51 @@ const SKILLS: &[SlashCommand] = &[
     ),
 ];
 
+/// Time-travel and session-shape commands tracked as CC-parity stubs
+/// (crosslink #653, #657, #659, #662). Implementations may begin as
+/// surface-only "tracked but not implemented" responses while the
+/// underlying overlays / checkpoint storage land; see each issue.
+const TIME_TRAVEL: &[SlashCommand] = &[
+    cmd(
+        "/rewind",
+        "Restore an earlier conversation/code state (interactive selector)",
+    ),
+    cmd(
+        "/teleport",
+        "Jump to a named checkpoint (stub; CC parity tracking)",
+    ),
+    cmd(
+        "/thinkback",
+        "Replay the last assistant turn's thinking blocks",
+    ),
+    cmd(
+        "/fast",
+        "Toggle fast mode (auto-switches model + remembers preference)",
+    ),
+];
+
+/// Interactive management overlays (crosslink #663, #666). The slash
+/// entries are registered here so users can discover them via /help;
+/// the actual TUI overlay implementations are tracked in #520 and the
+/// per-command issues.
+const MANAGEMENT: &[SlashCommand] = &[
+    cmd("/mcp", "Open the MCP server settings overlay"),
+    cmd(
+        "/mcp enable <name|all>",
+        "Enable a registered MCP server (or all of them)",
+    ),
+    cmd(
+        "/mcp disable <name|all>",
+        "Disable a registered MCP server (or all of them)",
+    ),
+    cmd(
+        "/mcp reconnect <name>",
+        "Force-reconnect a stalled MCP server",
+    ),
+    cmd("/permissions", "Open the permission rules overlay"),
+    cmd("/hooks", "Open the lifecycle hooks overlay"),
+];
+
 /// All sections in the order they should render.
 ///
 /// Iterated by both `slash_help()` (CLI printer) and `HelpOverlay`
@@ -165,6 +210,14 @@ pub const SLASH_SECTIONS: &[SlashSection] = &[
     SlashSection {
         title: "Skill Commands",
         commands: SKILLS,
+    },
+    SlashSection {
+        title: "Time Travel & Session Shape",
+        commands: TIME_TRAVEL,
+    },
+    SlashSection {
+        title: "Management Overlays",
+        commands: MANAGEMENT,
     },
 ];
 
@@ -213,6 +266,28 @@ mod tests {
             assert!(
                 invocations.contains(&canonical),
                 "canonical command {canonical} missing from SLASH_SECTIONS"
+            );
+        }
+    }
+
+    /// CC-parity time-travel + management commands (#653, #657, #659,
+    /// #662, #663, #666). Each entry must appear at least once in the
+    /// flat iterator so /help and the TUI cheatsheet surface it.
+    #[test]
+    fn time_travel_and_management_commands_present() {
+        let invocations: Vec<&str> = all_commands().map(|c| c.invocation).collect();
+        for canonical in [
+            "/rewind",
+            "/teleport",
+            "/thinkback",
+            "/fast",
+            "/mcp",
+            "/permissions",
+            "/hooks",
+        ] {
+            assert!(
+                invocations.contains(&canonical),
+                "CC-parity command {canonical} missing from SLASH_SECTIONS"
             );
         }
     }

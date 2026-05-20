@@ -74,12 +74,129 @@ pub struct SkillDefinition {
     pub description: String,
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// CC parity: longer-form "when to use" hint surfaced to the agent
+    /// alongside `description`. Optional; falls back to `description` when
+    /// absent. Mirrors CC `loadSkillsDir.ts:whenToUse`.
+    #[serde(default, rename = "when_to_use", alias = "whenToUse")]
+    pub when_to_use: Option<String>,
+    /// CC parity: short hint shown in autocomplete UIs (e.g. `<file>`).
+    /// Mirrors CC `argument-hint` frontmatter key.
+    #[serde(default, rename = "argument-hint", alias = "argument_hint")]
+    pub argument_hint: Option<String>,
+    /// CC parity: preferred model id for this skill (e.g. `claude-opus-4`).
+    /// `None` keeps the session's currently selected model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// CC parity: reasoning-effort tier (`low` / `medium` / `high`).
+    /// String for forward-compat; runtime treats unknown values as
+    /// "use session default" so a new tier doesn't break old binaries.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// CC parity: glob patterns whose matches activate the skill
+    /// automatically. See [`skill_matches_path`] for the matcher.
+    /// Empty / absent = manual-invocation only.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// CC parity: lifecycle hooks declared by the skill itself.
+    /// Inline JSON object; the host wires them into [`crate::hooks`] when
+    /// the skill activates. Schema deliberately loose to mirror CC.
+    #[serde(default)]
+    pub hooks: Option<serde_json::Value>,
+    /// CC parity: when `false`, the skill is library-only — the host UI
+    /// must not surface it via `/skill <name>` invocation. Defaults to
+    /// `true` so existing skills keep working.
+    #[serde(default = "default_user_invocable", rename = "user-invocable", alias = "user_invocable")]
+    pub user_invocable: bool,
     /// The prompt content (markdown body after frontmatter)
     #[serde(skip)]
     pub prompt: String,
     /// Path to the skill file
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+const fn default_user_invocable() -> bool {
+    true
+}
+
+/// True iff at least one entry in `paths` matches `touched` as a glob.
+///
+/// Used by conditional-skill activation (CC parity, crosslink #665):
+/// a touched-file event picks up any skill whose `paths:` glob list matches.
+///
+/// Glob semantics: `*` matches a single path segment (never `/`), `**`
+/// matches across segments, `?` matches one non-slash character. An
+/// invalid pattern is logged at `warn` and skipped — we never panic on
+/// user input. An empty / `None` `paths` field yields `false` so callers
+/// can iterate skills uniformly.
+#[must_use]
+pub fn skill_matches_path(skill: &SkillDefinition, touched: &Path) -> bool {
+    let Some(patterns) = skill.paths.as_ref() else {
+        return false;
+    };
+    if patterns.is_empty() {
+        return false;
+    }
+    let touched_str = touched.to_string_lossy();
+    patterns
+        .iter()
+        .any(|pat| match glob_to_regex(pat) {
+            Ok(re) => re.is_match(&touched_str),
+            Err(err) => {
+                tracing::warn!(
+                    skill = %skill.name,
+                    pattern = %pat,
+                    error = %err,
+                    "invalid glob in skill `paths` — entry ignored"
+                );
+                false
+            }
+        })
+}
+
+/// Translate a shell-style glob into an anchored regex.
+///
+/// Recognised constructs (subset of POSIX fnmatch + git-style globs):
+/// * `*`  — any run of non-`/` characters.
+/// * `**` — any characters including `/`.
+/// * `?`  — exactly one non-`/` character.
+/// * literal chars are regex-escaped.
+///
+/// This is a deliberately minimal helper rather than a full `globset`
+/// pull-in (workspace currently has no glob crate). Good enough for the
+/// `paths:` frontmatter activation matcher.
+fn glob_to_regex(glob: &str) -> Result<regex::Regex, regex::Error> {
+    let mut out = String::with_capacity(glob.len() * 2 + 4);
+    out.push('^');
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    // `**/` (globstar followed by a separator) matches zero
+                    // or more intermediate path segments — `src/**/*.rs`
+                    // must match both `src/a.rs` and `src/foo/bar.rs`.
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        out.push_str("(?:.*/)?");
+                    } else {
+                        out.push_str(".*");
+                    }
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('$');
+    regex::Regex::new(&out)
 }
 
 /// Cache key: the mtime of each scanned directory, in scan order.
@@ -109,34 +226,99 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Return the candidate skill directories in priority order.
+/// Env var that turns off the managed / policy skill layer (#664).
 ///
-/// Project directory comes first so its skills win on name collision. The
-/// project directory is resolved against an explicit project root (the
-/// nearest ancestor containing `.openclaudia/config.yaml`) and an absolute
-/// `PathBuf` is pushed. If no project root can be located the project-skills
-/// entry is omitted entirely (crosslink #823): the previous relative
-/// `PathBuf::from(".openclaudia/skills")` would otherwise silently pick up
-/// whatever directory the process happened to be in at scan time, and the
-/// loaded skills are injected straight into the model context.
-fn skill_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(2);
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(root) = find_project_root(&cwd) {
-            let project_skills = root.join(".openclaudia").join("skills");
-            tracing::info!(
-                path = %project_skills.display(),
-                "Project skills dir resolved (absolute)"
-            );
-            dirs.push(project_skills);
-        } else {
-            tracing::debug!(
-                cwd = %cwd.display(),
-                "No .openclaudia/config.yaml ancestor found; skipping project skills dir"
-            );
+/// When set to a non-empty value, [`skill_dirs`] skips the
+/// `<OPENCLAUDIA_MANAGED_PATH>/skills` directory entirely. Mirrors CC's
+/// `CLAUDE_CODE_DISABLE_POLICY_SKILLS` behaviour.
+pub const DISABLE_POLICY_SKILLS_ENV: &str = "OPENCLAUDIA_DISABLE_POLICY_SKILLS";
+
+/// Env var pointing at an admin-managed config root whose
+/// `skills/` subdirectory contributes policy-layer skills. Optional —
+/// when absent, the policy layer is empty.
+pub const MANAGED_PATH_ENV: &str = "OPENCLAUDIA_MANAGED_PATH";
+
+/// Walk from `start` upward to `home` (inclusive) and collect every
+/// `.openclaudia/skills/` directory along the way (CC parity with
+/// `getProjectDirsUpToHome`, crosslink #661).
+///
+/// Order: deepest (closest to `start`) first, so child-project skills
+/// win on name collision against parent-monorepo skills.
+fn walk_project_skill_dirs(start: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(".openclaudia").join("skills");
+        if candidate.exists() {
+            out.push(candidate);
+        }
+        if let Some(h) = home {
+            if ancestor == h {
+                break;
+            }
         }
     }
-    if let Some(home) = dirs::home_dir() {
+    out
+}
+
+/// Return the candidate skill directories in priority order.
+///
+/// Order: managed/policy → project → user. Policy skills take precedence
+/// because they encode admin-imposed behaviour the user is not allowed to
+/// override silently.
+///
+/// Project directories are discovered by walking every ancestor up to the
+/// user's home (CC parity, crosslink #661). The legacy
+/// `find_project_root` lookup is kept as a fall-back so an explicit
+/// `.openclaudia/config.yaml` still anchors discovery when no skills
+/// directory exists at any ancestor.
+fn skill_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let home = dirs::home_dir();
+
+    // 1. Managed / policy layer (#664). Off by default; opt in by setting
+    //    OPENCLAUDIA_MANAGED_PATH. Disable with OPENCLAUDIA_DISABLE_POLICY_SKILLS.
+    if std::env::var(DISABLE_POLICY_SKILLS_ENV).map_or(true, |v| v.is_empty()) {
+        if let Ok(managed) = std::env::var(MANAGED_PATH_ENV) {
+            let dir = PathBuf::from(managed).join("skills");
+            tracing::info!(
+                path = %dir.display(),
+                "Managed/policy skills dir registered"
+            );
+            dirs.push(dir);
+        }
+    }
+
+    // 2. Project layer (#661): every `.openclaudia/skills/` from cwd up to
+    //    HOME, deepest first.
+    if let Ok(cwd) = std::env::current_dir() {
+        let walked = walk_project_skill_dirs(&cwd, home.as_deref());
+        if walked.is_empty() {
+            // Legacy fall-back: anchor on the nearest config.yaml so the
+            // pre-#661 behaviour still works when none of the walked
+            // ancestors actually has a skills dir created yet.
+            if let Some(root) = find_project_root(&cwd) {
+                let project_skills = root.join(".openclaudia").join("skills");
+                tracing::info!(
+                    path = %project_skills.display(),
+                    "Project skills dir resolved via config.yaml anchor"
+                );
+                dirs.push(project_skills);
+            } else {
+                tracing::debug!(
+                    cwd = %cwd.display(),
+                    "No ancestor .openclaudia/skills/ or config.yaml found; skipping project skills dirs"
+                );
+            }
+        } else {
+            for d in walked {
+                tracing::info!(path = %d.display(), "Project skills dir registered");
+                dirs.push(d);
+            }
+        }
+    }
+
+    // 3. User layer.
+    if let Some(home) = home {
         dirs.push(home.join(".openclaudia/skills"));
     }
     dirs
@@ -620,6 +802,138 @@ mod tests {
             matches!(err, SkillParseError::ReadFailed(_)),
             "expected ReadFailed, got {err:?}"
         );
+    }
+
+    // ── #660 / #665 / #664 / #661 — expanded frontmatter + matchers ──────────
+
+    /// #660: extended frontmatter fields round-trip through the parser.
+    #[test]
+    fn parse_skill_file_round_trips_extended_frontmatter() {
+        let content = "---\nname: ext\ndescription: d\nwhen_to_use: long form hint\nargument-hint: <file>\nmodel: claude-opus-4\neffort: high\npaths: [\"src/**/*.rs\"]\nuser-invocable: false\nhooks: {PreToolUse: \"echo pre\"}\n---\n\nbody";
+        let tmp = std::env::temp_dir().join("openclaudia_ext_skill.md");
+        std::fs::write(&tmp, content).unwrap();
+        let s = parse_skill_file(&tmp).expect("extended frontmatter must parse");
+        assert_eq!(s.when_to_use.as_deref(), Some("long form hint"));
+        assert_eq!(s.argument_hint.as_deref(), Some("<file>"));
+        assert_eq!(s.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(s.paths.as_deref(), Some(&["src/**/*.rs".to_string()][..]));
+        assert!(!s.user_invocable);
+        assert!(s.hooks.is_some(), "hooks must be retained as Value");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// #660: user-invocable defaults to true for older skills that omit it.
+    #[test]
+    fn user_invocable_defaults_true_when_absent() {
+        let content = "---\nname: legacy\ndescription: legacy skill\n---\nbody";
+        let tmp = std::env::temp_dir().join("openclaudia_legacy_skill.md");
+        std::fs::write(&tmp, content).unwrap();
+        let s = parse_skill_file(&tmp).unwrap();
+        assert!(s.user_invocable, "absent user-invocable must default true");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// #665: glob match against `paths:` returns true for matching files,
+    /// false for non-matches, false for absent / empty `paths:`.
+    #[test]
+    fn skill_matches_path_glob_semantics() {
+        let mut s = SkillDefinition {
+            name: "x".into(),
+            description: String::new(),
+            allowed_tools: None,
+            when_to_use: None,
+            argument_hint: None,
+            model: None,
+            effort: None,
+            paths: Some(vec!["src/**/*.rs".to_string(), "*.toml".to_string()]),
+            hooks: None,
+            user_invocable: true,
+            prompt: String::new(),
+            path: PathBuf::new(),
+        };
+        assert!(skill_matches_path(&s, Path::new("src/lib.rs")));
+        assert!(skill_matches_path(&s, Path::new("src/foo/bar.rs")));
+        assert!(skill_matches_path(&s, Path::new("Cargo.toml")));
+        assert!(!skill_matches_path(&s, Path::new("README.md")));
+        assert!(
+            !skill_matches_path(&s, Path::new("nested/Cargo.toml")),
+            "single-star pattern must not cross / boundary"
+        );
+        s.paths = None;
+        assert!(!skill_matches_path(&s, Path::new("anything.rs")));
+        s.paths = Some(vec![]);
+        assert!(!skill_matches_path(&s, Path::new("anything.rs")));
+    }
+
+    /// #665: invalid glob is logged and ignored without panicking.
+    #[test]
+    fn skill_matches_path_ignores_invalid_glob() {
+        let s = SkillDefinition {
+            name: "bad".into(),
+            description: String::new(),
+            allowed_tools: None,
+            when_to_use: None,
+            argument_hint: None,
+            model: None,
+            effort: None,
+            // `[` opens a char class but never closes — invalid regex after
+            // translation. Must not blow up.
+            paths: Some(vec!["[unterminated".to_string()]),
+            hooks: None,
+            user_invocable: true,
+            prompt: String::new(),
+            path: PathBuf::new(),
+        };
+        assert!(!skill_matches_path(&s, Path::new("foo")));
+    }
+
+    /// #661: walking up to `home` collects every `.openclaudia/skills/` it
+    /// passes, in deepest-first order, and stops at `home` itself.
+    #[test]
+    fn walk_project_skill_dirs_returns_deepest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_path_buf();
+        let mid = home.join("project");
+        let leaf = mid.join("sub");
+        std::fs::create_dir_all(leaf.join(".openclaudia").join("skills")).unwrap();
+        std::fs::create_dir_all(mid.join(".openclaudia").join("skills")).unwrap();
+
+        let walked = walk_project_skill_dirs(&leaf, Some(&home));
+        assert_eq!(walked.len(), 2);
+        assert!(walked[0].starts_with(&leaf));
+        assert!(walked[1].starts_with(&mid));
+    }
+
+    /// #664: when `OPENCLAUDIA_DISABLE_POLICY_SKILLS=1` is set, the managed
+    /// dir contributes zero skills even if `OPENCLAUDIA_MANAGED_PATH` is set.
+    #[test]
+    fn policy_skills_disable_env_suppresses_managed_dir() {
+        // Use a fresh temp managed path; the dir does not have to exist for
+        // the assertion (we only verify `skill_dirs` doesn't include it).
+        let root = tempfile::tempdir().unwrap();
+        // SAFETY: tests run sequentially in this module via cargo's default
+        // single-thread per binary integration, but env mutation is still a
+        // process-global side effect — restore on exit so a sibling test
+        // doesn't observe the override.
+        let prev_disable = std::env::var(DISABLE_POLICY_SKILLS_ENV).ok();
+        let prev_path = std::env::var(MANAGED_PATH_ENV).ok();
+        std::env::set_var(MANAGED_PATH_ENV, root.path());
+        std::env::set_var(DISABLE_POLICY_SKILLS_ENV, "1");
+        let dirs = skill_dirs();
+        assert!(
+            !dirs.iter().any(|d| d.starts_with(root.path())),
+            "disable env must suppress managed dir; got {dirs:?}"
+        );
+        // Restore.
+        match prev_disable {
+            Some(v) => std::env::set_var(DISABLE_POLICY_SKILLS_ENV, v),
+            None => std::env::remove_var(DISABLE_POLICY_SKILLS_ENV),
+        }
+        match prev_path {
+            Some(v) => std::env::set_var(MANAGED_PATH_ENV, v),
+            None => std::env::remove_var(MANAGED_PATH_ENV),
+        }
     }
 
     /// End-to-end: two back-to-back [`load_skills`] calls return equal data,

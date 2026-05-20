@@ -16,8 +16,9 @@ mod permissions;
 mod provider;
 mod proxy;
 mod session;
+pub mod stop_conditions;
 mod vdd;
-mod web;
+pub mod webfetch;
 
 pub use acp::AcpConfig;
 pub use guardrails::{
@@ -38,10 +39,13 @@ pub use permissions::PermissionsConfig;
 pub use provider::{adaptive_budget_for, ProviderConfig, ThinkingConfig};
 pub use proxy::ProxyConfig;
 pub use session::{SessionConfig, TokenTrackingConfig};
+pub use stop_conditions::{StopConditionsConfig, StopReason, TokenTotals};
 pub use vdd::{
     VddAdversaryConfig, VddConfig, VddMode, VddStaticAnalysis, VddThresholds, VddTracking,
 };
-pub use web::{default_preapproved_domains, is_preapproved, WebFetchConfig};
+pub use webfetch::{
+    default_preapproved_domains, is_preapproved, WebFetchConfig, CC_MAX_MARKDOWN_LENGTH,
+};
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;

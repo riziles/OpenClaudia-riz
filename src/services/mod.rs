@@ -24,11 +24,13 @@ pub mod lsp_diagnostics;
 pub mod lsp_pool;
 pub mod policy;
 pub mod rate_limit_mock;
+pub mod mcp_registry;
 
 pub use analytics::{AnalyticsEvent, AnalyticsSink, NoopAnalytics, TracingAnalytics};
 pub use auto_compactor::{AutoCompactPolicy, AutoCompactor};
 pub use background::{
     AgentSummaryJob, BackgroundJob, JobOutcome, JobScheduler, MemoryConsolidationJob,
+    PluginAutoupdateJob, PluginDelistingJob,
 };
 pub use feature_flags::{FeatureFlagSource, StaticFlags};
 pub use lsp_diagnostics::{
@@ -38,8 +40,9 @@ pub use lsp_diagnostics::{
 pub use lsp_pool::{ChildHandle, LspServerManager, LspSpawner};
 pub use policy::{EnterprisePolicy, PolicyDecision, PolicyError};
 pub use rate_limit_mock::{MockRateLimit, RateLimitMock};
+pub use mcp_registry::{McpRegistration, McpServerSpec, PluginMcpRegistry};
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Central service registry. Clone-cheap (`Arc` fields) so it can be
 /// passed down the call tree without worrying about lifetime plumbing.
@@ -47,6 +50,11 @@ use std::sync::Arc;
 pub struct ServiceRegistry {
     analytics: Arc<dyn AnalyticsSink>,
     flags: Arc<dyn FeatureFlagSource>,
+    /// Plugin-declared MCP servers wired on plugin load (CC parity with
+    /// `mcpPluginIntegration.ts`, crosslink #654). Mutated under
+    /// [`PluginMcpRegistry`]'s internal `RwLock`; cloning the `Arc` keeps
+    /// every observer on the same view.
+    mcp_servers: Arc<RwLock<PluginMcpRegistry>>,
 }
 
 impl ServiceRegistry {
@@ -58,6 +66,48 @@ impl ServiceRegistry {
         Self {
             analytics: Arc::new(NoopAnalytics),
             flags: Arc::new(StaticFlags::default()),
+            mcp_servers: Arc::new(RwLock::new(PluginMcpRegistry::default())),
+        }
+    }
+
+    /// Register every MCP server declared by the given plugins (CC
+    /// parity with `mcpPluginIntegration.ts`, crosslink #654).
+    ///
+    /// Iterates each [`crate::plugins::Plugin`] passed in and copies its
+    /// `mcp_configs` map into the registry under the plugin's `id` as
+    /// the namespace. Subsequent calls with the same plugin id replace
+    /// the prior set so reload-and-re-wire works in-place. Lock
+    /// poisoning is recovered (`PoisonError::into_inner`) so a panicked
+    /// reader cannot brick the registry for the rest of the process.
+    pub fn wire_plugin_mcp_servers<'p, I>(&self, plugins: I)
+    where
+        I: IntoIterator<Item = &'p crate::plugins::Plugin>,
+    {
+        let mut guard = match self.mcp_servers.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for plugin in plugins {
+            let registrations: Vec<McpRegistration> = plugin
+                .mcp_configs
+                .iter()
+                .map(|(name, cfg)| McpRegistration {
+                    plugin_id: plugin.id.clone(),
+                    server_name: name.clone(),
+                    spec: McpServerSpec::from_plugin_config(cfg),
+                })
+                .collect();
+            guard.replace_plugin(&plugin.id, registrations);
+        }
+    }
+
+    /// Iterate every currently registered (plugin, server) pair. Useful
+    /// for `/mcp list` and the doctor command.
+    #[must_use]
+    pub fn plugin_mcp_registrations(&self) -> Vec<McpRegistration> {
+        match self.mcp_servers.read() {
+            Ok(g) => g.all(),
+            Err(poisoned) => poisoned.into_inner().all(),
         }
     }
 

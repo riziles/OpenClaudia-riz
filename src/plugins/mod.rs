@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod policy;
 pub mod validate;
+pub mod zip_cache;
 
 // Re-export all public types for backward compatibility
 pub use git::copy_dir_recursive;
@@ -422,6 +423,10 @@ pub struct Plugin {
     pub hook_definitions: Vec<HooksDefinition>,
     /// Resolved MCP server configs
     pub mcp_configs: HashMap<String, McpServerConfig>,
+    /// Resolved LSP server configs (CC parity, crosslink #655). One entry
+    /// per `lspServers` map entry in the manifest. Empty when the plugin
+    /// declares no language servers — the common case.
+    pub lsp_configs: HashMap<String, crate::plugins::manifest::LspServerConfig>,
     /// Resolved agent paths
     pub agent_paths: Vec<PathBuf>,
     /// Resolved skill paths
@@ -475,6 +480,7 @@ impl Plugin {
             command_metadata: HashMap::new(),
             hook_definitions: Vec::new(),
             mcp_configs: HashMap::new(),
+            lsp_configs: HashMap::new(),
             agent_paths: Vec::new(),
             skill_paths: Vec::new(),
         };
@@ -483,6 +489,7 @@ impl Plugin {
         plugin.resolve_commands();
         plugin.resolve_hooks();
         plugin.resolve_mcp_servers();
+        plugin.resolve_lsp_servers();
         plugin.resolve_agents();
         plugin.resolve_skills();
 
@@ -574,6 +581,7 @@ impl Plugin {
             agents: None,
             skills: None,
             mcp_servers,
+            lsp_servers: None,
             signature: None,
         })
     }
@@ -925,6 +933,23 @@ impl Plugin {
                     error = %e,
                     "Plugin manifest mcp_servers file unreadable"
                 );
+            }
+        }
+    }
+
+    /// Resolve plugin-declared LSP server registrations (CC parity with
+    /// `lspPluginIntegration.ts`, crosslink #655).
+    ///
+    /// Copies `manifest.lsp_servers` into `self.lsp_configs`. We don't
+    /// validate the binary on `PATH` here — that's runtime concern owned
+    /// by [`crate::tools::lsp::is_lsp_connected`]. Validating ahead of
+    /// time would force the plugin to fail-load when the user's `PATH`
+    /// happens not to contain the server yet (e.g. it's installed by a
+    /// post-install hook), which is too strict.
+    fn resolve_lsp_servers(&mut self) {
+        if let Some(servers) = &self.manifest.lsp_servers {
+            for (lang, cfg) in servers {
+                self.lsp_configs.insert(lang.clone(), cfg.clone());
             }
         }
     }
