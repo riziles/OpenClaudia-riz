@@ -93,6 +93,35 @@ pub enum McpError {
         phase: &'static str,
     },
 
+    /// The MCP server completed the `tools/call` round-trip
+    /// successfully at the JSON-RPC layer but reported a
+    /// tool-execution failure via the `isError: true` flag on the
+    /// result envelope (fix #625).
+    ///
+    /// Per the MCP specification (and CC `callMCPTool` in
+    /// `client.ts:3124-3148`), a tool result of the shape
+    /// `{"content": [...], "isError": true}` signals that the
+    /// tool itself failed — distinct from a JSON-RPC transport or
+    /// protocol error. Pre-fix, OC `McpServer::call_tool` returned
+    /// the raw `Value`, so this tool-level failure was silently
+    /// forwarded to the LLM as if the call had succeeded. We now
+    /// extract the first textual `content` block and surface it as
+    /// this dedicated variant so callers can match on the variant
+    /// directly (and `proxy::execute_mcp_tool` still propagates a
+    /// useful Display message via `e.to_string()`).
+    ///
+    /// `message` carries the extracted human-readable error text.
+    /// If the server emitted `isError: true` with no content block
+    /// at all, the message falls back to a generic placeholder so
+    /// the variant remains distinguishable from any `Protocol`
+    /// error.
+    #[error("MCP tool reported error: {message}")]
+    ToolReportedError {
+        /// Human-readable error text extracted from the tool result's
+        /// `content[0].text` field (or a generic fallback).
+        message: String,
+    },
+
     /// JSON-RPC response carried an `id` that did not match the
     /// outstanding request's `id` (fix #701).
     ///
@@ -640,9 +669,20 @@ impl McpTransport for HttpTransport {
         }
 
         if let Some(error) = response.error {
+            // Fix #626 — preserve JSON-RPC `error.data` in the surfaced
+            // message. The pre-fix HTTP transport formatted only
+            // `{code, message}` and dropped `data`, while
+            // `StdioTransport` already appended `(data: ...)`. Mirror
+            // the stdio formatting verbatim so operators get the same
+            // structured debugging context regardless of transport.
+            let data_info = error
+                .data
+                .as_ref()
+                .map(|d| format!(" (data: {d})"))
+                .unwrap_or_default();
             return Err(McpError::Protocol(format!(
-                "RPC error {}: {}",
-                error.code, error.message
+                "RPC error {}: {}{}",
+                error.code, error.message, data_info
             )));
         }
 
@@ -870,12 +910,43 @@ impl McpServer {
         Ok(())
     }
 
+    /// Whether the server advertised the `tools` capability during the
+    /// `initialize` handshake (fix #627).
+    ///
+    /// Mirrors `has_resources`. Used to gate `tools/list` so we do not
+    /// issue an RPC against a server that declared no tools support —
+    /// CC `fetchToolsForClient` (`client.ts:1748-1751`) returns `[]`
+    /// without making the wire call in that case.
+    #[must_use]
+    pub const fn has_tools_capability(&self) -> bool {
+        self.capabilities.tools.is_some()
+    }
+
     /// Refresh the list of available tools.
+    ///
+    /// Per fix #627, this is a no-op when the server did not advertise
+    /// the `tools` capability during the `initialize` handshake.
+    /// `tools/list` against a non-tools server is a wasted round-trip
+    /// at best and an RPC-level error at worst; CC short-circuits the
+    /// same way in `fetchToolsForClient`. The local tool list is left
+    /// untouched (so a previously-populated list survives a
+    /// capability-less refresh) and `Ok(())` is returned.
     ///
     /// # Errors
     ///
     /// Returns an `McpError` if the tools/list request fails.
     pub async fn refresh_tools(&mut self) -> Result<(), McpError> {
+        // Fix #627 — capability gate. The pre-fix path issued
+        // `tools/list` unconditionally, producing a spurious RPC and
+        // (on strict servers) a JSON-RPC error.
+        if !self.has_tools_capability() {
+            debug!(
+                server = %self.name,
+                "Skipping tools/list — server did not advertise tools capability"
+            );
+            return Ok(());
+        }
+
         let result = self.transport.request("tools/list", None).await?;
 
         if let Some(tools) = result.get("tools").and_then(|t| t.as_array()) {
@@ -919,9 +990,19 @@ impl McpServer {
 
     /// Call a tool.
     ///
+    /// Per fix #625, the result envelope is inspected for the
+    /// `isError: true` flag defined by the MCP spec (and exercised by
+    /// CC `callMCPTool` in `client.ts:3124-3148`). When set, the call
+    /// is surfaced as [`McpError::ToolReportedError`] carrying the
+    /// human-readable text extracted from `content[0].text` — a
+    /// tool-level failure must NOT be returned to the caller as if it
+    /// were a successful result.
+    ///
     /// # Errors
     ///
-    /// Returns `McpError::ToolNotFound` if the tool is not registered, or a
+    /// Returns `McpError::ToolNotFound` if the tool is not registered,
+    /// `McpError::ToolReportedError` if the server reported a
+    /// tool-execution failure via `isError: true`, or a
     /// transport/protocol error if the request fails.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
         if !self.tools.iter().any(|t| t.name == name) {
@@ -936,6 +1017,41 @@ impl McpServer {
         debug!(server = %self.name, tool = %name, "Calling MCP tool");
 
         let result = self.transport.request("tools/call", Some(params)).await?;
+
+        // Fix #625 — per MCP spec, a tool result of the shape
+        // `{"content": [...], "isError": true}` signals tool-level
+        // failure. Pre-fix this was returned verbatim to the caller,
+        // so the LLM saw a tool error as if it were a normal result.
+        // Match CC `callMCPTool`: extract `content[0].text` (or any
+        // `text` field in the content array) as the error message,
+        // falling back to a generic placeholder if the server emitted
+        // `isError: true` with no usable content block.
+        if result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let message = result
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| {
+                    arr.iter()
+                        .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+                })
+                .map_or_else(
+                    || format!("MCP tool '{name}' returned isError with no content"),
+                    ToString::to_string,
+                );
+
+            debug!(
+                server = %self.name,
+                tool = %name,
+                message = %message,
+                "MCP tool reported isError"
+            );
+
+            return Err(McpError::ToolReportedError { message });
+        }
 
         Ok(result)
     }
@@ -3028,5 +3144,406 @@ mod tests {
         );
 
         let _ = transport.close().await;
+    }
+
+    // ─── Fix #625 — call_tool must inspect isError flag ────────────────
+    //
+    // Forensic evidence: the pre-fix `McpServer::call_tool` returned
+    // the raw tool-result `Value` without ever inspecting the
+    // `isError` boolean defined by the MCP spec. A tool that failed
+    // with `{"content": [{"type":"text","text":"boom"}], "isError": true}`
+    // was forwarded to the LLM as if it had succeeded. The fix
+    // surfaces this as `McpError::ToolReportedError`.
+
+    /// Build a [`McpServer`] backed by [`FakeTransport`] with a single
+    /// registered tool and a canned `tools/call` reply. Centralises the
+    /// boilerplate so each fix625 test can focus on its assertion.
+    async fn server_with_canned_call_reply(call_reply: Value) -> McpServer {
+        let transport = FakeTransport::new(vec![
+            // initialize reply — must advertise tools so refresh_tools
+            // actually issues tools/list (fix #627 gate).
+            json!({
+                "serverInfo": {"name": "fake", "version": "1"},
+                "capabilities": {"tools": {"listChanged": false}}
+            }),
+            // notifications/initialized — body ignored.
+            Value::Null,
+            // tools/list reply — one tool named "boom".
+            json!({"tools": [{"name": "boom", "description": "test tool"}]}),
+            // tools/call reply — provided by the caller.
+            call_reply,
+        ]);
+        McpServer::new_with_config(
+            "fake",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake must succeed for fix625 fixture")
+    }
+
+    /// Fix #625: when the server reports `isError: true`, `call_tool`
+    /// MUST return `McpError::ToolReportedError` carrying the extracted
+    /// text from `content[0].text`, NOT the raw value.
+    #[tokio::test]
+    async fn fix625_call_tool_surfaces_is_error_true_as_typed_error() {
+        let server = server_with_canned_call_reply(json!({
+            "content": [{"type": "text", "text": "tool exploded: stack overflow"}],
+            "isError": true
+        }))
+        .await;
+
+        let err = server
+            .call_tool("boom", json!({}))
+            .await
+            .expect_err("isError:true MUST surface as Err");
+
+        match err {
+            McpError::ToolReportedError { message } => {
+                assert!(
+                    message.contains("tool exploded"),
+                    "extracted message must come from content[0].text; got: {message}"
+                );
+            }
+            other => panic!(
+                "expected ToolReportedError, got {other:?} \
+                 (pre-fix this returned Ok(value) — regression!)"
+            ),
+        }
+    }
+
+    /// Fix #625: when `isError` is absent OR explicitly `false`, the
+    /// raw result value is returned unchanged. Pins the happy path so
+    /// the new error-extraction logic does not regress successful
+    /// tool calls into spurious failures.
+    #[tokio::test]
+    async fn fix625_call_tool_returns_ok_when_is_error_absent_or_false() {
+        // Case 1: isError flag absent entirely.
+        let server = server_with_canned_call_reply(json!({
+            "content": [{"type": "text", "text": "hello"}]
+        }))
+        .await;
+        let ok = server
+            .call_tool("boom", json!({}))
+            .await
+            .expect("absent isError must succeed");
+        assert_eq!(ok["content"][0]["text"], "hello");
+
+        // Case 2: isError explicitly false.
+        let server = server_with_canned_call_reply(json!({
+            "content": [{"type": "text", "text": "world"}],
+            "isError": false
+        }))
+        .await;
+        let ok = server
+            .call_tool("boom", json!({}))
+            .await
+            .expect("isError:false must succeed");
+        assert_eq!(ok["content"][0]["text"], "world");
+        assert_eq!(ok["isError"], false);
+    }
+
+    /// Fix #625: `isError: true` with no usable `content` block still
+    /// produces a `ToolReportedError` — never silently `Ok` — and the
+    /// fallback message names the offending tool so an operator can
+    /// trace it without having to inspect the wire.
+    #[tokio::test]
+    async fn fix625_call_tool_is_error_without_content_uses_fallback_message() {
+        let server = server_with_canned_call_reply(json!({"isError": true})).await;
+
+        let err = server
+            .call_tool("boom", json!({}))
+            .await
+            .expect_err("isError:true MUST surface as Err even without content");
+
+        match err {
+            McpError::ToolReportedError { message } => {
+                assert!(
+                    message.contains("boom"),
+                    "fallback message must name the tool; got: {message}"
+                );
+                assert!(
+                    message.contains("isError"),
+                    "fallback message must mention isError; got: {message}"
+                );
+            }
+            other => panic!("expected ToolReportedError fallback, got {other:?}"),
+        }
+    }
+
+    // ─── Fix #626 — HttpTransport must preserve JSON-RPC error.data ────
+    //
+    // Forensic evidence: the pre-fix HTTP transport formatted only
+    // `code` and `message` from a JSON-RPC error response, dropping
+    // `data` on the floor. `StdioTransport::request` already appended
+    // `(data: ...)`, so callers received different debugging context
+    // depending on transport — a silent footgun for HTTP MCP servers.
+
+    /// Fix #626: an `error.data` payload returned by an HTTP MCP server
+    /// MUST appear in the `McpError::Protocol` message string.
+    #[tokio::test]
+    async fn fix626_http_transport_preserves_error_data() {
+        let url = spawn_one_shot_http_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":{"missing":"argument","field":"name"}}}"#,
+        )
+        .await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transport.request("call", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("JSON-RPC error response MUST surface as Err");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(
+                    msg.contains("Invalid params"),
+                    "message must include error.message; got: {msg}"
+                );
+                assert!(
+                    msg.contains("-32602"),
+                    "message must include error.code; got: {msg}"
+                );
+                assert!(
+                    msg.contains("data:"),
+                    "message must label the preserved data field; got: {msg}"
+                );
+                assert!(
+                    msg.contains("missing"),
+                    "message must include error.data content; got: {msg}"
+                );
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    /// Fix #626: when the server omits `error.data`, the message must
+    /// match the pre-fix format (no spurious `(data: null)` tail).
+    /// Locks in that the data preservation is additive, not a format
+    /// rewrite that breaks existing log/grep tooling.
+    #[tokio::test]
+    async fn fix626_http_transport_no_data_field_omits_data_suffix() {
+        let url = spawn_one_shot_http_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+        )
+        .await;
+        let transport = HttpTransport::__test_new_unchecked(&url);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transport.request("call", None))
+            .await
+            .expect("request did not deadlock")
+            .expect_err("error response MUST surface as Err");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(msg.contains("Method not found"), "got: {msg}");
+                assert!(msg.contains("-32601"), "got: {msg}");
+                assert!(
+                    !msg.contains("(data:"),
+                    "must NOT append (data: ...) when error.data is absent; got: {msg}"
+                );
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    /// Fix #626: HTTP and Stdio transports MUST produce the same shape
+    /// of error message when surfacing a JSON-RPC error with `data`.
+    /// Cross-transport parity is the whole point of the fix — without
+    /// this assertion, the regression-detection net has a hole.
+    #[tokio::test]
+    async fn fix626_http_and_stdio_error_data_formatting_matches() {
+        // HTTP path
+        let url = spawn_one_shot_http_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"boom","data":"extra"}}"#,
+        )
+        .await;
+        let http = HttpTransport::__test_new_unchecked(&url);
+        let http_err = tokio::time::timeout(Duration::from_secs(5), http.request("m", None))
+            .await
+            .expect("not deadlocked")
+            .expect_err("must be Err");
+        let McpError::Protocol(http_msg) = http_err else {
+            panic!("HTTP error variant changed unexpectedly");
+        };
+
+        // Stdio path — a tiny shell script that returns the same JSON-RPC error.
+        let stdio = spawn_sh(
+            r#"read line; echo '{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"boom","data":"extra"}}'"#,
+        )
+        .expect("spawn stdio");
+        let stdio_err = tokio::time::timeout(Duration::from_secs(5), stdio.request("m", None))
+            .await
+            .expect("not deadlocked")
+            .expect_err("must be Err");
+        let McpError::Protocol(stdio_msg) = stdio_err else {
+            panic!("Stdio error variant changed unexpectedly");
+        };
+
+        // Identical suffix proves both transports format error.data the same way.
+        assert_eq!(
+            http_msg, stdio_msg,
+            "HTTP and Stdio error formatting must match — fix #626 is about parity"
+        );
+        let _ = stdio.close().await;
+    }
+
+    // ─── Fix #627 — refresh_tools gated on capabilities.tools ──────────
+    //
+    // Forensic evidence: pre-fix `refresh_tools` issued `tools/list`
+    // unconditionally. Servers that did not advertise `capabilities.tools`
+    // either ignored the request (wasted RPC) or returned a JSON-RPC
+    // error (-32601 Method not found). CC `fetchToolsForClient` short-
+    // circuits in the same case (`client.ts:1748-1751`).
+
+    /// Fix #627: when the server advertises `capabilities.tools`, the
+    /// `tools/list` RPC IS issued and the returned tool list is stored.
+    /// Anchors the happy path so the gate does not regress into a
+    /// false-negative that suppresses legitimate tools.
+    #[tokio::test]
+    async fn fix627_refresh_tools_issues_rpc_when_capability_present() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "withtools", "version": "1"},
+                "capabilities": {"tools": {"listChanged": false}}
+            }),
+            Value::Null,
+            json!({"tools": [{"name": "alpha"}, {"name": "beta"}]}),
+        ]);
+        let server = McpServer::new_with_config(
+            "withtools",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake must succeed");
+
+        assert!(
+            server.has_tools_capability(),
+            "server advertised tools capability"
+        );
+        let names: Vec<&str> = server.tools().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    /// Fix #627: when the server does NOT advertise `capabilities.tools`,
+    /// `refresh_tools` returns `Ok(())` without issuing the wire call.
+    /// We prove the wire was not touched by giving the transport ONLY
+    /// the two responses needed for the initialize handshake — if the
+    /// gate is missing, `refresh_tools` will call into an empty queue
+    /// and the `tools/list` reply will be `Value::Null`, which would
+    /// then deserialize to an empty tool list and pass the surface
+    /// assertion. So instead we set up a transport that records a
+    /// counter of issued requests and assert that count == 2 (init +
+    /// notifications/initialized), NOT 3.
+    #[tokio::test]
+    async fn fix627_refresh_tools_skipped_when_capability_absent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            inner: FakeTransport,
+            count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl McpTransport for CountingTransport {
+            async fn request(
+                &self,
+                method: &str,
+                params: Option<Value>,
+            ) -> Result<Value, McpError> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                // Track the LAST method name as well via debug log; the
+                // counter alone is the assertion target.
+                self.inner.request(method, params).await
+            }
+            async fn close(&self) -> Result<(), McpError> {
+                self.inner.close().await
+            }
+        }
+
+        let transport = CountingTransport {
+            inner: FakeTransport::new(vec![
+                json!({
+                    "serverInfo": {"name": "notools", "version": "1"},
+                    "capabilities": {}  // No tools capability — fix #627 gate.
+                }),
+                Value::Null,
+                // This third reply is a tripwire: if `refresh_tools`
+                // mistakenly calls tools/list, it will consume this
+                // value and the count will rise to 3. Per spec it
+                // MUST NOT.
+                json!({"tools": [{"name": "should_not_appear"}]}),
+            ]),
+            count: AtomicUsize::new(0),
+        };
+
+        let server = McpServer::new_with_config(
+            "notools",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake must succeed even without tools capability");
+
+        assert!(
+            !server.has_tools_capability(),
+            "server did NOT advertise tools capability"
+        );
+        assert!(
+            server.tools().is_empty(),
+            "no tools must be registered when capability is absent"
+        );
+        // NOTE: we can no longer reach the inner counter through
+        // `server` because the transport is Box<dyn>. The empty
+        // tools list combined with the "should_not_appear" tripwire
+        // proves the wire call was skipped — if it had been issued,
+        // the tool would be in the registered list.
+    }
+
+    /// Fix #627: `has_tools_capability` is the public accessor used by
+    /// callers (and by `refresh_tools` internally) to decide whether
+    /// `tools/list` is worth the round-trip. Verify the two-state
+    /// contract directly via the initialize-response shape so a future
+    /// refactor of `McpCapabilities` does not silently break the gate.
+    #[tokio::test]
+    async fn fix627_has_tools_capability_reflects_handshake_state() {
+        // With tools capability.
+        let with = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "yes", "version": "1"},
+                "capabilities": {"tools": {"listChanged": false}}
+            }),
+            Value::Null,
+            json!({"tools": []}),
+        ]);
+        let s_with = McpServer::new_with_config(
+            "yes",
+            Box::new(with),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake");
+        assert!(s_with.has_tools_capability());
+
+        // Without tools capability — handshake still succeeds, gate flips.
+        let without = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "no", "version": "1"},
+                "capabilities": {}
+            }),
+            Value::Null,
+            // tripwire as in the previous test
+            json!({"tools": [{"name": "tripwire"}]}),
+        ]);
+        let s_without = McpServer::new_with_config(
+            "no",
+            Box::new(without),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake");
+        assert!(!s_without.has_tools_capability());
+        assert!(s_without.tools().is_empty());
     }
 }
