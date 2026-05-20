@@ -1346,6 +1346,92 @@ mod tests {
         assert_eq!(normalize_path("src/main.rs"), "src/main.rs");
     }
 
+    // ── #576 regression battery ────────────────────────────────────────────
+    //
+    // Lock in shell-glob semantics for `*` and `**` so the translation stays
+    // consistent with how every other path-glob system (POSIX `fnmatch`,
+    // `.gitignore`, `globset`) treats the path separator:
+    //
+    //   `*`  → `[^/]*`   (single path segment, never crosses `/`)
+    //   `**` → `.*`      (multi-segment, freely crosses `/`)
+    //
+    // CC's `matchWildcardPattern` (shellRuleMatching.ts) collapses `*` to
+    // `.*` because it operates on bash command strings, not paths — there
+    // are no path segments to respect. OC's glob runs against real
+    // filesystem paths (write_file, edit_file, blast radius), so the
+    // single-star rule MUST stop at `/` or `Bash(rm -rf *)` accidentally
+    // matches `rm -rf /etc/passwd`. The tests below pin that down.
+
+    /// #576-1: bare `*` matches a single path-segment filename.
+    #[test]
+    fn issue_576_star_matches_single_segment_filename() {
+        let re = glob_to_regex("*").unwrap();
+        assert!(
+            re.is_match("foo.rs"),
+            "#576: `*` must match single-segment `foo.rs`"
+        );
+    }
+
+    /// #576-2: bare `*` does NOT cross a path separator (shell semantics).
+    /// This is the load-bearing case — without it, `Bash(rm -rf *)`-style
+    /// rules silently match absolute paths like `/etc/passwd`.
+    #[test]
+    fn issue_576_star_does_not_match_multi_segment_path() {
+        let re = glob_to_regex("*").unwrap();
+        assert!(
+            !re.is_match("dir/foo.rs"),
+            "#576: `*` must NOT match multi-segment `dir/foo.rs` (would cross `/`)"
+        );
+    }
+
+    /// #576-3: `**` is the explicit opt-in to multi-segment matching.
+    #[test]
+    fn issue_576_double_star_matches_multi_segment_path() {
+        let re = glob_to_regex("**").unwrap();
+        assert!(
+            re.is_match("dir/foo.rs"),
+            "#576: `**` must match multi-segment `dir/foo.rs`"
+        );
+    }
+
+    /// #576-4: `**` also matches a zero-directory (single-segment) path.
+    #[test]
+    fn issue_576_double_star_matches_zero_segment_path() {
+        let re = glob_to_regex("**").unwrap();
+        assert!(
+            re.is_match("foo.rs"),
+            "#576: `**` must match zero-directory `foo.rs`"
+        );
+    }
+
+    /// #576-5: `dir/*` matches one level deep but stops at the next `/`.
+    #[test]
+    fn issue_576_dir_star_matches_one_level_only() {
+        let re = glob_to_regex("dir/*").unwrap();
+        assert!(
+            re.is_match("dir/foo.rs"),
+            "#576: `dir/*` must match `dir/foo.rs`"
+        );
+        assert!(
+            !re.is_match("dir/sub/foo.rs"),
+            "#576: `dir/*` must NOT match nested `dir/sub/foo.rs`"
+        );
+    }
+
+    /// #576-6: `dir/**` matches arbitrarily deep paths under `dir/`.
+    #[test]
+    fn issue_576_dir_double_star_matches_any_depth() {
+        let re = glob_to_regex("dir/**").unwrap();
+        assert!(
+            re.is_match("dir/foo.rs"),
+            "#576: `dir/**` must match shallow `dir/foo.rs`"
+        );
+        assert!(
+            re.is_match("dir/sub/foo.rs"),
+            "#576: `dir/**` must match nested `dir/sub/foo.rs`"
+        );
+    }
+
     // ====== Blast radius tests ======
 
     #[test]
