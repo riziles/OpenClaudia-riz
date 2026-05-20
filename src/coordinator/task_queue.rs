@@ -32,6 +32,15 @@ impl TaskId {
     }
 }
 
+impl std::fmt::Display for TaskId {
+    /// Render a `TaskId` as its bare numeric id, without the `TaskId(...)`
+    /// wrapper Debug prints. This is what the `TaskQueueError` variants use
+    /// when interpolating ids into user-facing error messages (crosslink #817).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Where a task sits in its lifecycle. The coordinator reads this
 /// to decide which tasks are ready to start, which need retrying,
 /// etc.
@@ -98,9 +107,9 @@ impl Task {
 /// Queue errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TaskQueueError {
-    #[error("task {missing:?} is not in the queue")]
+    #[error("task {missing} is not in the queue")]
     UnknownTask { missing: TaskId },
-    #[error("adding dependency {from:?} → {to:?} would form a cycle")]
+    #[error("adding dependency {from} → {to} would form a cycle")]
     CycleDetected { from: TaskId, to: TaskId },
 }
 
@@ -169,9 +178,15 @@ impl TaskQueue {
     /// `UnknownTask` if either id is missing; `CycleDetected` if
     /// the edge would close a loop.
     pub fn add_dependency(&mut self, from: TaskId, to: TaskId) -> Result<(), TaskQueueError> {
-        if !self.tasks.iter().any(|t| t.id == from) {
-            return Err(TaskQueueError::UnknownTask { missing: from });
-        }
+        // Cache the row positions up front so we don't re-scan the vec
+        // three times per call (crosslink #826). The `from` index also
+        // doubles as the insertion site for the new edge, eliminating the
+        // post-cycle `iter_mut().find(...)` and its silent-no-op fallback.
+        let from_idx = self
+            .tasks
+            .iter()
+            .position(|t| t.id == from)
+            .ok_or(TaskQueueError::UnknownTask { missing: from })?;
         if !self.tasks.iter().any(|t| t.id == to) {
             return Err(TaskQueueError::UnknownTask { missing: to });
         }
@@ -184,9 +199,7 @@ impl TaskQueue {
         if self.path_exists(to, from) {
             return Err(TaskQueueError::CycleDetected { from, to });
         }
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == from) {
-            task.depends_on.push(to);
-        }
+        self.tasks[from_idx].depends_on.push(to);
         Ok(())
     }
 

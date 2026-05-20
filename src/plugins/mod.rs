@@ -594,17 +594,33 @@ impl Plugin {
         Ok(())
     }
 
-    /// Resolve command paths and metadata from manifest + convention
+    /// Resolve command paths and metadata from manifest + convention.
+    ///
+    /// Failures to read the convention directory or any individual command
+    /// file now surface via `tracing::warn!` with the plugin name, path, and
+    /// underlying error (crosslink #799). The previous implementation buried
+    /// the read in `if let Ok(...)` chains with no `else`, so an unreadable
+    /// `commands/` directory was indistinguishable from one with no commands.
     fn resolve_commands(&mut self) {
         // Convention: commands/ directory
         let commands_dir = self.path.join("commands");
         if commands_dir.exists() && self.manifest.commands.is_none() {
-            if let Ok(entries) = fs::read_dir(&commands_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().is_some_and(|e| e == "md") {
-                        self.command_paths.push(p);
+            match fs::read_dir(&commands_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().is_some_and(|e| e == "md") {
+                            self.command_paths.push(p);
+                        }
                     }
+                }
+                Err(e) => {
+                    warn!(
+                        path = ?commands_dir,
+                        plugin = %self.manifest.name,
+                        error = %e,
+                        "Plugin commands/ directory unreadable; skipping convention-discovered commands"
+                    );
                 }
             }
         }
@@ -757,33 +773,29 @@ impl Plugin {
         Ok(def)
     }
 
-    /// Resolve MCP server configurations from manifest + convention
+    /// Resolve MCP server configurations from manifest + convention.
+    ///
+    /// Every read / parse failure is surfaced as a `tracing::warn!` line tagged
+    /// with the plugin name, file path, and underlying error (crosslink #799).
+    /// The previous implementation buried every fallible step in nested
+    /// `if let Ok(...)` chains with no `else`, which meant a plugin author who
+    /// shipped a broken `.mcp.json` got zero diagnostic — the plugin loaded
+    /// with the broken server silently absent.
     fn resolve_mcp_servers(&mut self) {
         // Convention: .mcp.json at plugin root. Use the symlink-rejecting
         // reader so an attacker cannot swap .mcp.json for a symlink to
         // a sensitive file. See crosslink #347.
         let mcp_json = self.path.join(".mcp.json");
         if mcp_json.exists() {
-            if let Ok(content) = read_plugin_file(&mcp_json) {
-                // .mcp.json can be { "mcpServers": { ... } } or just { "server-name": { ... } }
-                if let Ok(wrapper) =
-                    serde_json::from_str::<HashMap<String, serde_json::Value>>(&content)
-                {
-                    if let Some(servers_val) = wrapper.get("mcpServers") {
-                        if let Ok(servers) = serde_json::from_value::<
-                            HashMap<String, McpServerConfig>,
-                        >(servers_val.clone())
-                        {
-                            self.mcp_configs.extend(servers);
-                        }
-                    } else {
-                        // Try as direct map
-                        if let Ok(servers) =
-                            serde_json::from_str::<HashMap<String, McpServerConfig>>(&content)
-                        {
-                            self.mcp_configs.extend(servers);
-                        }
-                    }
+            match read_plugin_file(&mcp_json) {
+                Ok(content) => self.parse_mcp_json_file(&mcp_json, &content),
+                Err(e) => {
+                    warn!(
+                        path = ?mcp_json,
+                        plugin = %self.manifest.name,
+                        error = %e,
+                        "Plugin .mcp.json unreadable; skipping MCP servers from this file"
+                    );
                 }
             }
         }
@@ -791,54 +803,139 @@ impl Plugin {
         // Manifest-specified MCP servers — paths go through
         // `validate_plugin_path` and `read_plugin_file` so neither path
         // traversal nor symlink swapping is possible.
-        if let Some(ref mcp_spec) = self.manifest.mcp_servers {
+        //
+        // The manifest is cloned out of `self.manifest.mcp_servers` so the
+        // subsequent `&mut self.mcp_configs` writes don't conflict with the
+        // shared borrow of the manifest field. McpServersSpec is plain data
+        // and the clone is one-shot per plugin load, so the cost is trivial.
+        let mcp_spec = self.manifest.mcp_servers.clone();
+        if let Some(mcp_spec) = mcp_spec {
             match mcp_spec {
-                McpServersSpec::Path(p) => match validate_plugin_path(&self.path, p) {
+                McpServersSpec::Path(p) => match validate_plugin_path(&self.path, &p) {
                     Ok(resolved) if resolved.exists() => {
-                        if let Ok(content) = read_plugin_file(&resolved) {
-                            if let Ok(servers) =
-                                serde_json::from_str::<HashMap<String, McpServerConfig>>(&content)
-                            {
-                                self.mcp_configs.extend(servers);
-                            }
-                        }
+                        self.load_mcp_servers_from_path(&p, &resolved);
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        warn!(
+                            path = %p,
+                            plugin = %self.manifest.name,
+                            "Plugin manifest mcp_servers path does not exist"
+                        );
+                    }
                     Err(e) => {
                         warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
                     }
                 },
                 McpServersSpec::Map(map) => {
-                    self.mcp_configs.extend(map.clone());
+                    self.mcp_configs.extend(map);
                 }
                 McpServersSpec::Array(entries) => {
                     for entry in entries {
                         match entry {
                             McpServersSpecEntry::Path(p) => {
-                                match validate_plugin_path(&self.path, p) {
+                                match validate_plugin_path(&self.path, &p) {
                                     Ok(resolved) if resolved.exists() => {
-                                        if let Ok(content) = read_plugin_file(&resolved) {
-                                            if let Ok(servers) = serde_json::from_str::<
-                                                HashMap<String, McpServerConfig>,
-                                            >(
-                                                &content
-                                            ) {
-                                                self.mcp_configs.extend(servers);
-                                            }
-                                        }
+                                        self.load_mcp_servers_from_path(&p, &resolved);
                                     }
-                                    Ok(_) => {}
+                                    Ok(_) => {
+                                        warn!(
+                                            path = %p,
+                                            plugin = %self.manifest.name,
+                                            "Plugin manifest mcp_servers path does not exist"
+                                        );
+                                    }
                                     Err(e) => {
                                         warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
                                     }
                                 }
                             }
                             McpServersSpecEntry::Map(map) => {
-                                self.mcp_configs.extend(map.clone());
+                                self.mcp_configs.extend(map);
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Parse a `.mcp.json` body (the convention file at the plugin root) and
+    /// extend `self.mcp_configs`. Every parse failure logs a `warn!` with the
+    /// plugin name and path so operators can spot a broken file (crosslink #799).
+    fn parse_mcp_json_file(&mut self, path: &Path, content: &str) {
+        // .mcp.json can be `{ "mcpServers": { ... } }` or a direct map.
+        match serde_json::from_str::<HashMap<String, serde_json::Value>>(content) {
+            Ok(wrapper) => {
+                if let Some(servers_val) = wrapper.get("mcpServers") {
+                    match serde_json::from_value::<HashMap<String, McpServerConfig>>(
+                        servers_val.clone(),
+                    ) {
+                        Ok(servers) => {
+                            self.mcp_configs.extend(servers);
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = ?path,
+                                plugin = %self.manifest.name,
+                                error = %e,
+                                "Plugin .mcp.json `mcpServers` block could not be decoded as McpServerConfig map"
+                            );
+                        }
+                    }
+                } else {
+                    match serde_json::from_str::<HashMap<String, McpServerConfig>>(content) {
+                        Ok(servers) => {
+                            self.mcp_configs.extend(servers);
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = ?path,
+                                plugin = %self.manifest.name,
+                                error = %e,
+                                "Plugin .mcp.json (direct-map form) could not be decoded as McpServerConfig map"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    path = ?path,
+                    plugin = %self.manifest.name,
+                    error = %e,
+                    "Plugin .mcp.json is not valid JSON; skipping MCP servers from this file"
+                );
+            }
+        }
+    }
+
+    /// Read and parse a manifest-referenced MCP servers file. Logs every
+    /// failure with full context (crosslink #799).
+    fn load_mcp_servers_from_path(&mut self, declared: &str, resolved: &Path) {
+        match read_plugin_file(resolved) {
+            Ok(content) => match serde_json::from_str::<HashMap<String, McpServerConfig>>(&content)
+            {
+                Ok(servers) => {
+                    self.mcp_configs.extend(servers);
+                }
+                Err(e) => {
+                    warn!(
+                        declared = %declared,
+                        resolved = ?resolved,
+                        plugin = %self.manifest.name,
+                        error = %e,
+                        "Plugin manifest mcp_servers file failed to decode as McpServerConfig map"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    declared = %declared,
+                    resolved = ?resolved,
+                    plugin = %self.manifest.name,
+                    error = %e,
+                    "Plugin manifest mcp_servers file unreadable"
+                );
             }
         }
     }
@@ -1029,7 +1126,24 @@ impl Plugin {
                 .unwrap_or("unknown")
                 .to_string();
 
-            let raw_content = fs::read_to_string(path).unwrap_or_default();
+            // Crosslink #799: read failures used to silently fall back to
+            // an empty string via `unwrap_or_default()`, which then yielded
+            // a "command" with no description, no body, and no flags — the
+            // plugin author who shipped an unreadable file got zero signal.
+            // Log and skip the entry so operators can grep for the warning.
+            let raw_content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        path = ?path,
+                        plugin = %self.manifest.name,
+                        command = %cmd_name,
+                        error = %e,
+                        "Plugin command file unreadable; skipping this command"
+                    );
+                    continue;
+                }
+            };
             let front_matter = parse_command_front_matter(&raw_content);
 
             let meta = self.command_metadata.get(&cmd_name);

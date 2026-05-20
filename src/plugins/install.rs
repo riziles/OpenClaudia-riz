@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::PluginError;
 
@@ -188,13 +188,66 @@ impl InstalledPlugins {
                     }
                 }
                 Err(e) => {
-                    warn!(path = ?path, error = %e, "Failed to parse installed_plugins.json, skipping file");
+                    // Data-loss-on-corruption defense (crosslink #804): a
+                    // parse failure used to silently degrade to "treat this
+                    // file as empty", which the next `save()` would then
+                    // happily overwrite with the empty in-memory view —
+                    // erasing every prior install record.
+                    //
+                    // Preserve the bytes-on-disk as
+                    // `<file>.corrupt-<unix_ts>.bak` BEFORE returning so the
+                    // operator can inspect / restore them. We still degrade
+                    // to "empty for this file" so the install command stays
+                    // usable, but the surfaced `error!` line tells operators
+                    // there's a backup to look at.
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let backup = Self::corrupt_backup_path_resolve(path, ts);
+                    match std::fs::rename(path, &backup) {
+                        Ok(()) => {
+                            error!(
+                                path = ?path,
+                                backup = ?backup,
+                                error = %e,
+                                "installed_plugins.json failed to parse; preserved corrupt copy as backup and starting with an empty view for this file"
+                            );
+                        }
+                        Err(rename_err) => {
+                            error!(
+                                path = ?path,
+                                backup = ?backup,
+                                parse_error = %e,
+                                rename_error = %rename_err,
+                                "installed_plugins.json failed to parse; could not move corrupt copy aside — leaving original in place to avoid data loss and skipping this file"
+                            );
+                        }
+                    }
                 }
             },
             Err(e) => {
                 warn!(path = ?path, error = %e, "Failed to read installed_plugins.json");
             }
         }
+    }
+
+    /// Build the backup path used when [`Self::merge_file_into`] finds a
+    /// corrupt tracking file. The backup lives next to the original file as
+    /// `<filename>.corrupt-<unix_seconds>.bak`. We never overwrite an
+    /// existing backup — collisions just append `.dup` so the operator can
+    /// see multiple corruption events without losing earlier evidence.
+    fn corrupt_backup_path_resolve(path: &Path, ts: u64) -> PathBuf {
+        let file_name = path.file_name().map_or_else(
+            || "installed_plugins.json".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut candidate = parent.join(format!("{file_name}.corrupt-{ts}.bak"));
+        while candidate.exists() {
+            let next = format!("{}.dup", candidate.display());
+            candidate = PathBuf::from(next);
+        }
+        candidate
     }
 
     /// Persist this in-memory view back to disk by dispatching each entry to
@@ -531,7 +584,9 @@ mod save_tests {
     // -----------------------------------------------------------------
     #[test]
     fn save_user_scope_writes_only_to_global_file() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -567,7 +622,9 @@ mod save_tests {
     // -----------------------------------------------------------------
     #[test]
     fn save_project_scope_writes_only_to_project_file() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -609,7 +666,9 @@ mod save_tests {
     // -----------------------------------------------------------------
     #[test]
     fn save_mixed_scopes_writes_to_correct_files() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -646,8 +705,7 @@ mod save_tests {
         assert_eq!(global_ids, vec!["mgr@m", "u@m"]);
 
         // Project owns Project + Local only.
-        let mut project_ids: Vec<&str> =
-            project_file.plugins.keys().map(String::as_str).collect();
+        let mut project_ids: Vec<&str> = project_file.plugins.keys().map(String::as_str).collect();
         project_ids.sort_unstable();
         assert_eq!(project_ids, vec!["l@m", "p@m"]);
 
@@ -664,7 +722,9 @@ mod save_tests {
     // -----------------------------------------------------------------
     #[test]
     fn load_merges_global_and_project_files() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -783,7 +843,9 @@ mod save_tests {
     // -----------------------------------------------------------------
     #[test]
     fn save_errors_when_home_missing_and_user_entry_present() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::unset();
 
@@ -838,7 +900,9 @@ mod save_tests {
     fn save_creates_file_with_mode_0o600() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -866,7 +930,9 @@ mod save_tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let _guard = HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -909,7 +975,8 @@ mod save_tests {
                     &format!("/proj/plugin-{i}"),
                 ),
             );
-            ip.save(project.path()).expect("concurrent save must succeed");
+            ip.save(project.path())
+                .expect("concurrent save must succeed");
         }
 
         done.store(true, Ordering::Relaxed);

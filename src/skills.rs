@@ -95,11 +95,47 @@ struct SkillsCache {
 
 static SKILLS_CACHE: LazyLock<RwLock<Option<SkillsCache>>> = LazyLock::new(|| RwLock::new(None));
 
+/// Walk upward from `start` looking for the project root — the nearest
+/// ancestor that contains `.openclaudia/config.yaml`. Returns `None` when no
+/// such ancestor exists, in which case the project-skills dir is skipped
+/// entirely rather than silently picking up `.openclaudia/skills/` from
+/// whatever directory the process happens to be running in (crosslink #823).
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if ancestor.join(".openclaudia").join("config.yaml").exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
 /// Return the candidate skill directories in priority order.
 ///
-/// Project directory comes first so its skills win on name collision.
+/// Project directory comes first so its skills win on name collision. The
+/// project directory is resolved against an explicit project root (the
+/// nearest ancestor containing `.openclaudia/config.yaml`) and an absolute
+/// `PathBuf` is pushed. If no project root can be located the project-skills
+/// entry is omitted entirely (crosslink #823): the previous relative
+/// `PathBuf::from(".openclaudia/skills")` would otherwise silently pick up
+/// whatever directory the process happened to be in at scan time, and the
+/// loaded skills are injected straight into the model context.
 fn skill_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from(".openclaudia/skills")];
+    let mut dirs = Vec::with_capacity(2);
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(root) = find_project_root(&cwd) {
+            let project_skills = root.join(".openclaudia").join("skills");
+            tracing::info!(
+                path = %project_skills.display(),
+                "Project skills dir resolved (absolute)"
+            );
+            dirs.push(project_skills);
+        } else {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                "No .openclaudia/config.yaml ancestor found; skipping project skills dir"
+            );
+        }
+    }
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".openclaudia/skills"));
     }
@@ -161,7 +197,9 @@ pub fn parse_skill_file(path: &Path) -> Result<SkillDefinition, SkillParseError>
     }
 
     let rest = &content[3..];
-    let end = rest.find("---").ok_or(SkillParseError::FrontmatterMissing)?;
+    let end = rest
+        .find("---")
+        .ok_or(SkillParseError::FrontmatterMissing)?;
     let frontmatter = rest[..end].trim();
     let body = rest[end + 3..].trim();
 

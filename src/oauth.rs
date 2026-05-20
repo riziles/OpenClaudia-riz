@@ -474,33 +474,81 @@ impl OAuthStore {
             return;
         };
 
-        // Read file and check for symlinks atomically — open the file first,
-        // then verify the opened handle isn't a symlink. This prevents TOCTOU
-        // where a symlink is created between the check and the read.
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open OAuth session file {}: {}",
-                    path.display(),
-                    e
-                );
-                return;
+        // Open the session file refusing to follow symlinks (crosslink #814).
+        // The previous implementation called `fs::File::open` (which follows
+        // symlinks) and then inspected `symlink_metadata` AFTER the fact —
+        // by that point a hostile symlink had already been opened, defeating
+        // the check the doc comment claimed it provided. With `O_NOFOLLOW`
+        // the open itself fails with ELOOP on a symlink, so there is no
+        // post-open race window.
+        //
+        // On non-Unix targets there is no O_NOFOLLOW equivalent here; fall
+        // back to the prior open-then-check pattern (still better than
+        // nothing — see #814 for follow-up).
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!("No persisted OAuth sessions found");
+                        return;
+                    }
+                    Err(e) => {
+                        // ELOOP surfaces here when the path is a symlink.
+                        // Log it as a security-relevant event rather than a
+                        // generic open failure so operators can spot it.
+                        if e.raw_os_error() == Some(libc::ELOOP) {
+                            error!(
+                                "OAuth session file {} is a symlink — refusing to read for security",
+                                path.display()
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Failed to open OAuth session file {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let f = match fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!("No persisted OAuth sessions found");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to open OAuth session file {}: {}",
+                            path.display(),
+                            e
+                        );
+                        return;
+                    }
+                };
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|sm| sm.file_type().is_symlink())
+                {
+                    error!(
+                        "OAuth session file {} is a symlink — refusing to read for security",
+                        path.display()
+                    );
+                    return;
+                }
+                f
             }
         };
-        // Check the path's symlink status AFTER opening the file.
-        // If someone replaces the file with a symlink after we open it,
-        // we already have the real file's handle — this just warns us.
-        if path
-            .symlink_metadata()
-            .is_ok_and(|sm| sm.file_type().is_symlink())
-        {
-            error!(
-                "OAuth session file {} is a symlink — refusing to read for security",
-                path.display()
-            );
-            return;
-        }
 
         match std::io::read_to_string(file) {
             Ok(data) => {

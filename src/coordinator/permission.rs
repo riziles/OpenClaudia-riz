@@ -12,7 +12,7 @@
 //! the bridge into the event loop as the sole receiver of teammate
 //! `PermissionRequest` events.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::teammate::TeammateId;
 
@@ -57,10 +57,16 @@ impl std::fmt::Debug for QueuedPermission {
 pub struct LeaderPermissionBridge {
     /// FIFO of pending prompts.
     pending: VecDeque<QueuedPermission>,
-    /// Pairs of (teammate, tool) the user has always-allowed for
-    /// this run. Keyed pair → matches CC's "per-teammate `a`
-    /// doesn't leak across teammates" behavior.
-    always_allowed: HashSet<(TeammateId, String)>,
+    /// Per-teammate cache of always-allowed tool names. The outer
+    /// `HashMap<TeammateId, _>` and inner `HashSet<String>` give O(1)
+    /// expected lookup in `is_always_allowed` (crosslink #808) — the
+    /// previous flat `HashSet<(TeammateId, String)>` had to fall back
+    /// to a linear `iter().any()` to dodge an owned-key allocation,
+    /// turning the hot dispatch-path check into O(K·Q).
+    ///
+    /// Keyed per teammate → matches CC's "per-teammate `a` doesn't
+    /// leak across teammates" behavior.
+    always_allowed: HashMap<TeammateId, HashSet<String>>,
 }
 
 impl LeaderPermissionBridge {
@@ -97,18 +103,23 @@ impl LeaderPermissionBridge {
     /// `(teammate_id, tool_name)` is marked so future requests
     /// from that teammate for that tool bypass the queue entirely.
     pub fn always_allow(&mut self, teammate: TeammateId, tool_name: impl Into<String>) {
-        self.always_allowed.insert((teammate, tool_name.into()));
+        self.always_allowed
+            .entry(teammate)
+            .or_default()
+            .insert(tool_name.into());
     }
 
     /// Check the always-allow cache. True → the request should
     /// skip enqueuing and resolve immediately as `Allow`.
+    ///
+    /// O(1) expected — the per-teammate `HashSet<String>` lookup goes
+    /// through `HashSet::contains(&str)`, so the borrowed `tool_name`
+    /// never has to be cloned (crosslink #808).
     #[must_use]
     pub fn is_always_allowed(&self, teammate: &TeammateId, tool_name: &str) -> bool {
-        // The HashSet requires owned-key lookup; we keep the
-        // lookup allocation-free by comparing inside a `iter().any`.
         self.always_allowed
-            .iter()
-            .any(|(t, tool)| t == teammate && tool == tool_name)
+            .get(teammate)
+            .is_some_and(|tools| tools.contains(tool_name))
     }
 }
 

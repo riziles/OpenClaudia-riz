@@ -419,31 +419,82 @@ async fn run_pre_tool_use_hooks(
 }
 
 /// Lazily-compiled regex for extracting file extensions from message text.
+///
+/// The path prefix is bounded to `{1,256}` and the extension to `{1,10}` so
+/// no single match can scan an unbounded run of dotted characters — closes
+/// the ReDoS-shaped concern in crosslink #819 alongside the per-request
+/// byte cap enforced by [`extract_extensions_from_messages`].
 static EXTENSION_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b")
+    regex::Regex::new(r"[\w/\\.-]{1,256}\.([a-zA-Z0-9]{1,10})\b")
         .expect("EXTENSION_PATTERN is a valid static regex")
 });
 
-/// Extract file extensions from message content (looks for file paths)
+/// Max bytes of message text the extension scanner is allowed to look at per
+/// request. A 1 MiB user message previously made the regex sweep the whole
+/// payload; 64 KiB is enough to catch path mentions in any realistic prompt
+/// while keeping the per-request cost bounded (crosslink #819).
+const EXTENSION_SCAN_BUDGET_BYTES: usize = 64 * 1024;
+
+/// Cap on distinct extensions returned per request. The downstream rules
+/// engine looks up a handful of extensions at most; an attacker who packs a
+/// message with thousands of `.foo`-style tokens should not be able to
+/// inflate the lookup set unboundedly (crosslink #819).
+const EXTENSION_UNIQUE_CAP: usize = 32;
+
+/// Extract file extensions from message content (looks for file paths).
+///
+/// Borrows message text instead of cloning it, caps total scanned bytes per
+/// request, and caps the number of distinct extensions returned. See
+/// [`EXTENSION_SCAN_BUDGET_BYTES`] / [`EXTENSION_UNIQUE_CAP`].
 fn extract_extensions_from_messages(messages: &[ChatMessage]) -> Vec<String> {
     use std::collections::HashSet;
 
-    let mut extensions = HashSet::new();
+    let mut extensions: HashSet<String> = HashSet::new();
     let extension_pattern = &*EXTENSION_PATTERN;
+    let mut remaining = EXTENSION_SCAN_BUDGET_BYTES;
 
-    for msg in messages {
-        let text = match &msg.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| p.text.clone())
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
+    // Helper closure: scan a single borrowed text slice into `extensions`,
+    // honouring the scan-byte and unique-extension caps. Returns once either
+    // cap is hit so we don't keep iterating captures for nothing.
+    let scan_slice = |text: &str, remaining: &mut usize, extensions: &mut HashSet<String>| {
+        if *remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
+            return;
+        }
+        let take = text.len().min(*remaining);
+        // Trim to a UTF-8 boundary so the &str slice is always valid even
+        // when `take` lands mid-codepoint.
+        let mut end = take;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let slice = &text[..end];
+        *remaining = remaining.saturating_sub(end);
 
-        for cap in extension_pattern.captures_iter(&text) {
+        for cap in extension_pattern.captures_iter(slice) {
             if let Some(ext) = cap.get(1) {
                 extensions.insert(ext.as_str().to_lowercase());
+                if extensions.len() >= EXTENSION_UNIQUE_CAP {
+                    return;
+                }
+            }
+        }
+    };
+
+    for msg in messages {
+        if remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
+            break;
+        }
+        match &msg.content {
+            MessageContent::Text(t) => scan_slice(t, &mut remaining, &mut extensions),
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    if remaining == 0 || extensions.len() >= EXTENSION_UNIQUE_CAP {
+                        break;
+                    }
+                    if let Some(ref part_text) = p.text {
+                        scan_slice(part_text, &mut remaining, &mut extensions);
+                    }
+                }
             }
         }
     }
