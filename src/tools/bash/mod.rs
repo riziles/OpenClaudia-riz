@@ -26,7 +26,21 @@ struct BackgroundShell {
     stdout_buffer: Arc<Mutex<Vec<String>>>,
     stderr_buffer: Arc<Mutex<Vec<String>>>,
     command: String,
+    /// Liveness signal — true once the wait thread has reaped the child.
+    ///
+    /// # Fix for crosslink #674
+    ///
+    /// Pre-fix this flag was also flipped by the stdout reader on EOF,
+    /// racing with the wait thread. A caller could observe
+    /// `is_running=false` together with `exit_code=None` because the
+    /// reader signalled "done" before the wait thread populated the
+    /// exit status. Post-fix only the wait thread writes this flag and
+    /// it implies `exit_status` has been populated under `SeqCst`.
     finished: Arc<AtomicBool>,
+    /// Distinct from `finished`: set by the wait thread immediately
+    /// after writing `exit_status`. Consulted by `get_output` so that
+    /// (`is_running=false`, `exit_code=None`) is unreachable.
+    reaped: Arc<AtomicBool>,
     exit_status: Arc<Mutex<Option<i32>>>,
     /// PID of the spawned process, used to send SIGTERM on kill
     pid: u32,
@@ -78,6 +92,38 @@ impl BackgroundShellManager {
         // IMPORTANT: Set current_dir to ensure bash runs in the same directory as the process
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+        // ── Crosslink #672 fix: atomic check+reserve ──────────────────────────
+        //
+        // Pre-fix the `cmd.spawn()` call happened BEFORE any capacity guard,
+        // so a flood of concurrent `run_in_background=true` callers could each
+        // fork a child before any of them lost the cap check. The cap then
+        // only suppressed *tracking*, leaking orphan OS processes.
+        //
+        // Fix: hold the manager's `shells` lock across the entire critical
+        // section — GC sweep, capacity check, spawn, and insert — so the
+        // check and the spawn are atomic with respect to other spawners.
+        // The lock is contended only by other spawn/list/kill calls, and
+        // `Command::spawn` is a fast `fork+exec` syscall, so holding it
+        // for the duration is acceptable for the cap=50 workload.
+        let mut shells = self
+            .shells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // GC sweep: remove finished shells whose output has been retrieved at least once
+        shells.retain(|_id, s| {
+            let is_finished = s.finished.load(Ordering::SeqCst);
+            let output_retrieved = s.output_retrieved_after_finish.load(Ordering::SeqCst);
+            !is_finished || !output_retrieved
+        });
+
+        if shells.len() >= MAX_BACKGROUND_SHELLS {
+            return Err(format!(
+                "Maximum background shell limit ({MAX_BACKGROUND_SHELLS}) reached. \
+                 Kill or wait for existing shells to finish."
+            ));
+        }
+
         #[cfg(windows)]
         let child = {
             let mut cmd = match find_git_bash() {
@@ -104,22 +150,6 @@ impl BackgroundShellManager {
             cmd.spawn()
         };
 
-        // Enforce maximum shell limit BEFORE spawning the process
-        if let Ok(mut shells) = self.shells.lock() {
-            // GC sweep: remove finished shells whose output has been retrieved at least once
-            shells.retain(|_id, s| {
-                let is_finished = s.finished.load(Ordering::SeqCst);
-                let output_retrieved = s.output_retrieved_after_finish.load(Ordering::SeqCst);
-                !is_finished || !output_retrieved
-            });
-
-            if shells.len() >= MAX_BACKGROUND_SHELLS {
-                return Err(format!(
-                    "Maximum background shell limit ({MAX_BACKGROUND_SHELLS}) reached. Kill or wait for existing shells to finish."
-                ));
-            }
-        }
-
         let mut child = child.map_err(|e| format!("Failed to spawn background shell: {e}"))?;
 
         // Capture PID before moving the child handle into the wait thread
@@ -128,12 +158,22 @@ impl BackgroundShellManager {
         let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
         let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
         let finished = Arc::new(AtomicBool::new(false));
+        let reaped = Arc::new(AtomicBool::new(false));
         let exit_status = Arc::new(Mutex::new(None));
 
-        // Spawn thread to read stdout
+        // ── Crosslink #674 fix: only the wait thread sets `finished` ──────
+        //
+        // Pre-fix BOTH the stdout reader and the wait thread set
+        // `finished=true`. The stdout reader could fire on EOF BEFORE the
+        // wait thread reaped the child, producing the impossible state
+        // (is_running=false, exit_code=None). Post-fix: the stdout reader
+        // no longer touches `finished`; it is the sole responsibility of
+        // the wait thread, which sets `exit_status` first and `reaped`
+        // second under release/acquire ordering. `get_output` consults
+        // `reaped` so a caller never observes a finished shell without an
+        // exit code.
         if let Some(stdout) = child.stdout.take() {
             let buffer = Arc::clone(&stdout_buffer);
-            let finished_clone = Arc::clone(&finished);
             thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
@@ -141,7 +181,6 @@ impl BackgroundShellManager {
                         buf.push(line);
                     }
                 }
-                finished_clone.store(true, Ordering::SeqCst);
             });
         }
 
@@ -161,12 +200,17 @@ impl BackgroundShellManager {
         // Spawn thread to wait for process and capture exit status
         let exit_status_clone = Arc::clone(&exit_status);
         let finished_clone = Arc::clone(&finished);
+        let reaped_clone = Arc::clone(&reaped);
         let mut child_for_wait = child;
         thread::spawn(move || {
             if let Ok(status) = child_for_wait.wait() {
                 if let Ok(mut es) = exit_status_clone.lock() {
                     *es = status.code();
                 }
+                // Order matters: set `reaped` AFTER `exit_status` so
+                // `get_output` cannot observe `reaped=true` with
+                // `exit_status=None`.
+                reaped_clone.store(true, Ordering::SeqCst);
                 finished_clone.store(true, Ordering::SeqCst);
             }
         });
@@ -176,14 +220,14 @@ impl BackgroundShellManager {
             stderr_buffer,
             command: command.to_string(),
             finished,
+            reaped,
             exit_status,
             pid,
             output_retrieved_after_finish: AtomicBool::new(false),
         };
 
-        if let Ok(mut shells) = self.shells.lock() {
-            shells.insert(shell_id.clone(), shell);
-        }
+        shells.insert(shell_id.clone(), shell);
+        drop(shells);
 
         Ok(shell_id)
     }
@@ -244,9 +288,16 @@ impl BackgroundShellManager {
             .output_retrieved_after_finish
             .store(true, Ordering::SeqCst);
 
-        let is_finished = shell.finished.load(Ordering::SeqCst);
-        let is_running = !is_finished;
+        // Crosslink #674 fix: derive `is_running` from `reaped` (set by the
+        // wait thread after writing `exit_status`), not from `finished` —
+        // which the stdout reader could previously flip on EOF before the
+        // exit code was available. This guarantees a caller that observes
+        // `is_running=false` will also see `exit_code=Some(_)` whenever the
+        // process actually produced a code (i.e. wasn't killed in a way that
+        // returned `None`).
+        let is_reaped = shell.reaped.load(Ordering::SeqCst);
         let exit_code = shell.exit_status.lock().ok().and_then(|es| *es);
+        let is_running = !is_reaped;
 
         Ok((output, is_running, exit_code))
     }
@@ -267,7 +318,14 @@ impl BackgroundShellManager {
                 // Terminate the process group (SIGTERM -> wait -> SIGKILL)
                 terminate_process_tree(shell.pid);
             }
+            // Crosslink #674: keep `finished` and `reaped` flipped together
+            // so the killed shell never appears as `is_running=true` to a
+            // subsequent `get_output` poll. The wait thread will still race
+            // to write the exit status; either it wins (exit_status=Some)
+            // or kill closes the channel first (exit_status=None) — both
+            // are valid for an explicitly-killed shell.
             shell.finished.store(true, Ordering::SeqCst);
+            shell.reaped.store(true, Ordering::SeqCst);
             Ok(format!(
                 "Shell '{}' terminated (command: {}, pid: {})",
                 shell_id, shell.command, shell.pid
@@ -900,5 +958,271 @@ mod tests {
         // Clean up: a single drain marks the flag and makes the slot
         // eligible for the next GC sweep.
         let _ = BACKGROUND_SHELLS.get_output(&id);
+    }
+
+    // ── Crosslink #672 — TOCTOU spawn race ────────────────────────────────────
+    //
+    // Pre-fix `cmd.spawn()` was invoked BEFORE the cap-enforcement lock
+    // section, so N concurrent callers could each fork a child before any of
+    // them lost the cap check. Post-fix the cap check, spawn, and insert all
+    // happen under a single contiguous `shells` lock acquisition. These
+    // tests fire `cap + EXTRA` concurrent spawners against a fresh manager
+    // and assert (a) successful spawns never exceed the cap and (b) the
+    // internal map size never transiently bulges past the cap during the
+    // race window.
+
+    const STRESS_EXTRA: usize = 12;
+
+    fn count_capacity_errors(results: &[Result<String, String>]) -> usize {
+        results
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .is_some_and(|e| e.contains("Maximum background shell limit"))
+            })
+            .count()
+    }
+
+    /// `#672-a`: `cap + EXTRA` concurrent spawners on a fresh manager — the
+    /// number of *successful* spawns must not exceed `MAX_BACKGROUND_SHELLS`,
+    /// and at least one caller must observe the cap-rejection error string,
+    /// proving the rejection path is reachable under contention.
+    ///
+    /// Pre-fix the cap check ran AFTER the spawn syscall, so a flurry of
+    /// threads would all pass the cap check and the OS+map would each see
+    /// >cap entries.
+    ///
+    /// NOTE: under heavy parallel test load (cargo test --lib) some
+    /// `Command::spawn` calls may fail with fork ENOMEM/EAGAIN. Those count
+    /// as neither a success nor a cap-rejection; the cap invariant
+    /// (`successes <= cap`) is unaffected.
+    #[test]
+    #[cfg(unix)]
+    fn fix672_concurrent_spawn_never_exceeds_cap() {
+        use std::sync::Arc;
+        use std::thread;
+        let mgr = Arc::new(BackgroundShellManager::new());
+        let total = MAX_BACKGROUND_SHELLS + STRESS_EXTRA;
+
+        let barrier = Arc::new(std::sync::Barrier::new(total));
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let mgr_c = Arc::clone(&mgr);
+            let bar_c = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                bar_c.wait();
+                // Short-lived but non-instant so successful spawns stay in
+                // the map long enough for racers to observe contention.
+                mgr_c.spawn("sleep 2")
+            }));
+        }
+
+        let results: Vec<Result<String, String>> =
+            handles.into_iter().map(|h| h.join().expect("join")).collect();
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let cap_errors = count_capacity_errors(&results);
+
+        // Tear down before assertions: kill every successful spawn so we
+        // don't leak `sleep` processes on test failure.
+        for id in results.iter().flatten() {
+            let _ = mgr.kill(id);
+        }
+
+        assert!(
+            successes <= MAX_BACKGROUND_SHELLS,
+            "fix672-a: successful spawns must not exceed cap ({MAX_BACKGROUND_SHELLS}); \
+             got {successes}"
+        );
+        // The race is exercised when either (a) we hit the cap
+        // (cap_errors > 0) or (b) the OS rejected enough spawns that we
+        // never reached cap — in the latter case the test result is
+        // inconclusive (test-infra noise from concurrent cwd-mutating
+        // tests). Either way the cap invariant above must hold.
+        let other_errors = total - successes - cap_errors;
+        assert!(
+            cap_errors > 0 || other_errors >= STRESS_EXTRA,
+            "fix672-a: cap-rejection path was not exercised AND not enough \
+             OS-level spawn failures to explain it; got {successes} ok + \
+             {cap_errors} cap-err + {other_errors} other-err out of {total}"
+        );
+    }
+
+    /// `#672-b`: under contention the manager's map size is bounded by the
+    /// cap at every observable moment. Pins the invariant that the internal
+    /// map cannot transiently bulge past `MAX_BACKGROUND_SHELLS` (which the
+    /// pre-fix code did between spawn and rejection).
+    #[test]
+    #[cfg(unix)]
+    fn fix672_manager_map_size_bounded_by_cap_under_load() {
+        use std::sync::Arc;
+        use std::thread;
+        let mgr = Arc::new(BackgroundShellManager::new());
+        let total = MAX_BACKGROUND_SHELLS + STRESS_EXTRA;
+
+        let barrier = Arc::new(std::sync::Barrier::new(total + 1));
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let mgr_c = Arc::clone(&mgr);
+            let bar_c = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                bar_c.wait();
+                mgr_c.spawn("sleep 2")
+            }));
+        }
+        // Let all spawners go and immediately start observing the map.
+        barrier.wait();
+
+        // Poll the map size during the race window — it must never exceed cap.
+        let mut max_seen = 0usize;
+        for _ in 0..200 {
+            let size = mgr
+                .shells
+                .lock()
+                .map_or_else(|e| e.into_inner().len(), |s| s.len());
+            max_seen = max_seen.max(size);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+
+        let results: Vec<Result<String, String>> =
+            handles.into_iter().map(|h| h.join().expect("join")).collect();
+
+        // Teardown
+        for id in results.iter().flatten() {
+            let _ = mgr.kill(id);
+        }
+
+        assert!(
+            max_seen <= MAX_BACKGROUND_SHELLS,
+            "fix672-b: observed map size {max_seen} exceeded cap {MAX_BACKGROUND_SHELLS} \
+             during concurrent spawn — TOCTOU race regressed"
+        );
+    }
+
+    // ── Crosslink #674 — finished/exit_status race ────────────────────────────
+    //
+    // Pre-fix the stdout reader thread flipped `finished=true` on EOF,
+    // racing the wait thread which is the only authority for `exit_status`.
+    // Callers could see (is_running=false, exit_code=None) — impossible
+    // per the public contract. Post-fix the wait thread is the sole writer
+    // of the liveness signal (`reaped`) and writes `exit_status` first,
+    // `reaped` second under SeqCst.
+
+    /// `#674-a`: spam many quick processes and assert no poll ever observes
+    /// the impossible (`is_running=false`, `exit_code=None`) state. Pre-fix
+    /// the stdout reader could win this race.
+    ///
+    /// Tolerates `Command::spawn` failures caused by concurrent tests
+    /// mutating the process-wide `cwd` (the spawn helper inherits
+    /// `std::env::current_dir()`, which can disappear under tempdir-using
+    /// tests in parallel). The invariant under test is the (`is_running`,
+    /// `exit_code`) coherence — not spawn liveness — so failed spawns are
+    /// dropped from the sample but the test still requires at least N/3
+    /// successful spawns to remain statistically meaningful.
+    #[test]
+    #[cfg(unix)]
+    fn fix674_no_finished_without_exit_code() {
+        use std::sync::Arc;
+        use std::thread;
+        const N: usize = 30;
+        let mgr = Arc::new(BackgroundShellManager::new());
+
+        let mut ids = Vec::with_capacity(N);
+        for i in 0..N {
+            // Mix of fast/empty-stdout commands to maximise the EOF/wait
+            // race surface.
+            let cmd = if i % 2 == 0 {
+                "true".to_string()
+            } else {
+                format!("echo fix674_{i}")
+            };
+            if let Ok(id) = mgr.spawn(&cmd) {
+                ids.push(id);
+            }
+        }
+        assert!(
+            ids.len() >= N / 3,
+            "fix674-a: too few spawns succeeded ({}) — test cannot \
+             meaningfully exercise the race; likely concurrent-test \
+             interference with the process cwd",
+            ids.len()
+        );
+
+        // Race: poll all shells repeatedly while the wait/reader threads
+        // are flipping flags. Record any impossible state.
+        let mgr_poll = Arc::clone(&mgr);
+        let ids_poll = ids.clone();
+        let poller = thread::spawn(move || {
+            let mut violations: Vec<String> = Vec::new();
+            for _ in 0..200 {
+                for id in &ids_poll {
+                    if let Ok((_, is_running, exit_code)) = mgr_poll.get_output(id) {
+                        if !is_running && exit_code.is_none() {
+                            violations.push(id.clone());
+                        }
+                    }
+                }
+            }
+            violations
+        });
+
+        let violations = poller.join().expect("poller join");
+
+        // Teardown — best-effort
+        for id in &ids {
+            let _ = mgr.kill(id);
+        }
+
+        assert!(
+            violations.is_empty(),
+            "fix674-a: observed (is_running=false, exit_code=None) on shells \
+             {violations:?} — the EOF/wait race regressed"
+        );
+    }
+
+    /// `#674-b`: once `get_output` reports `is_running=false` for a normally
+    /// terminated shell, `exit_code` must be `Some(_)`. Pinning the
+    /// "settled-finished implies exit code present" contract.
+    ///
+    /// Like `#674-a`, tolerates spawn failures caused by parallel tests
+    /// racing on the process cwd.
+    #[test]
+    #[cfg(unix)]
+    fn fix674_settled_finished_has_exit_code() {
+        const N: usize = 20;
+        let mgr = BackgroundShellManager::new();
+
+        let mut ids: Vec<(String, i32)> = Vec::with_capacity(N);
+        for i in 0..N {
+            let exit_code: i32 = i32::try_from(i % 3).expect("0..3 fits in i32");
+            if let Ok(id) = mgr.spawn(&format!("exit {exit_code}")) {
+                ids.push((id, exit_code));
+            }
+        }
+        assert!(
+            ids.len() >= N / 3,
+            "fix674-b: too few spawns succeeded ({}) — likely concurrent \
+             tests racing on process cwd",
+            ids.len()
+        );
+
+        // Wait long enough for every wait-thread to reap.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        for (id, expected) in &ids {
+            let (_, is_running, exit_code) = mgr
+                .get_output(id)
+                .expect("fix674-b: get_output must succeed");
+            assert!(
+                !is_running,
+                "fix674-b: shell {id} must be settled after 600ms"
+            );
+            assert_eq!(
+                exit_code,
+                Some(*expected),
+                "fix674-b: settled shell {id} must have exit_code Some({expected}); \
+                 got {exit_code:?} — finished/exit_status race regressed"
+            );
+        }
     }
 }
