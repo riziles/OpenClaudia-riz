@@ -828,7 +828,17 @@ pub fn format_tool_results_xml_with_names(results: &[(&str, Option<&str>, &str, 
             xml.push_str(&xml_escape(content));
             xml.push_str("</output>\n");
 
-            // Add explicit completion hint for file operations
+            // Add explicit completion hint for file operations.
+            //
+            // Crosslink #486: bash success used to be detected with a
+            // substring search for "error"/"Error"/"failed" in the captured
+            // output, which misclassified perfectly successful commands like
+            // `echo "no errors found"` as failures and silently dropped the
+            // completion hint. We are already inside the `!is_error` branch
+            // here (the outer `if *is_error` handled the failure path), so
+            // the exit-code-based truth is in scope: the only reason to skip
+            // a hint is the tool's own structured success/failure signal,
+            // not a textual heuristic on stdout.
             if let Some(name) = tool_name {
                 let completion_hint = match *name {
                     "write_file" | "Write" | "write" => {
@@ -838,11 +848,11 @@ pub fn format_tool_results_xml_with_names(results: &[(&str, Option<&str>, &str, 
                         Some("Edit applied successfully. The operation is COMPLETE - do NOT call edit_file again with the same change.")
                     }
                     "bash" | "Bash" => {
-                        if content.contains("error") || content.contains("Error") || content.contains("failed") {
-                            None // Don't add completion hint for errors
-                        } else {
-                            Some("Command executed successfully.")
-                        }
+                        // Reached this arm ⇒ `is_error == false` ⇒ the tool
+                        // result reported success (exit code 0). Emit the
+                        // hint unconditionally; do NOT re-derive failure
+                        // from stdout content.
+                        Some("Command executed successfully.")
                     }
                     _ => None,
                 };
@@ -1462,5 +1472,92 @@ this never closes"#;
         assert!(buf.contains("<invoke name=\"Bash\">"));
         assert!(!buf.contains("<function_results>"));
         assert!(!buf.contains("this never closes"));
+    }
+
+    // ── crosslink #486: bash completion_note uses exit-code, not content ────
+    //
+    // Regression tests for the substring heuristic that previously inspected
+    // bash stdout for the literal strings "error" / "Error" / "failed" and
+    // suppressed the completion hint on false positives.
+
+    #[test]
+    fn completion_note_bash_success_emitted_even_when_content_says_error() {
+        // Exit code 0 (is_error = false) but stdout contains the word
+        // "error" — historically suppressed the hint; now the structured
+        // success signal wins.
+        let xml = format_tool_results_xml_with_names(&[(
+            "id-1",
+            Some("Bash"),
+            "no errors found in build output\nfailed: 0",
+            false,
+        )]);
+        assert!(
+            xml.contains("<status>success</status>"),
+            "exit-code success must surface as success status"
+        );
+        assert!(
+            xml.contains("<completion_note>Command executed successfully.</completion_note>"),
+            "bash success ⇒ completion_note must be emitted regardless of stdout content; got:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn completion_note_bash_failure_has_no_completion_note() {
+        // Exit code != 0 (is_error = true) takes the error branch and
+        // intentionally omits the completion_note. The content here is the
+        // mirror of the success test — plain ASCII that does NOT mention
+        // "error" anywhere — to prove the routing is exit-code-driven, not
+        // content-driven.
+        let xml = format_tool_results_xml_with_names(&[(
+            "id-2",
+            Some("Bash"),
+            "foo",
+            true,
+        )]);
+        assert!(
+            xml.contains("<status>error</status>"),
+            "exit-code failure must surface as error status"
+        );
+        assert!(
+            !xml.contains("<completion_note>"),
+            "bash failure path must not emit a completion_note; got:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn completion_note_bash_success_with_benign_content_still_emitted() {
+        // Plain success with neutral stdout — sanity check that the happy
+        // path keeps emitting the hint after the heuristic was removed.
+        let xml = format_tool_results_xml_with_names(&[(
+            "id-3",
+            Some("Bash"),
+            "hello world",
+            false,
+        )]);
+        assert!(xml.contains("<status>success</status>"));
+        assert!(xml
+            .contains("<completion_note>Command executed successfully.</completion_note>"));
+    }
+
+    #[test]
+    fn completion_note_non_bash_tools_unaffected() {
+        // The write_file / edit_file branches were not part of #486 — verify
+        // they still emit their own hints on success and stay quiet on
+        // error, so the refactor didn't collapse them by accident.
+        let write_ok = format_tool_results_xml_with_names(&[(
+            "id-w",
+            Some("Write"),
+            "ok",
+            false,
+        )]);
+        assert!(write_ok.contains("File created successfully"));
+
+        let edit_err = format_tool_results_xml_with_names(&[(
+            "id-e",
+            Some("Edit"),
+            "boom",
+            true,
+        )]);
+        assert!(!edit_err.contains("<completion_note>"));
     }
 }
