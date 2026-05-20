@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::compaction::{CompactionConfig, ContextCompactor};
+use crate::compaction::{CompactionOverrides, ContextCompactor};
 use crate::config::{AppConfig, ProviderConfig};
 use crate::context::ContextInjector;
 use crate::hooks::{
@@ -52,7 +52,15 @@ pub struct ProxyState {
     pub client: Client,
     pub hook_engine: HookEngine,
     pub rules_engine: RulesEngine,
-    pub compactor: ContextCompactor,
+    /// Operator-supplied overrides for compaction behavior.
+    ///
+    /// Stored as overrides — *not* a fully realized [`ContextCompactor`] —
+    /// because the actual compactor is model-specific and must be built
+    /// per request from `request.model`. Storing the overrides separately
+    /// lets `compact_request_context` build the per-request compactor in
+    /// one call (`ContextCompactor::for_model_with_overrides`) with zero
+    /// clones (crosslink #489).
+    pub compactor_overrides: CompactionOverrides,
     pub session_manager: Arc<RwLock<SessionManager>>,
     pub plugin_manager: Arc<PluginManager>,
     pub mcp_manager: Arc<RwLock<McpManager>>,
@@ -790,13 +798,11 @@ async fn apply_vdd_review(
 /// request context if needed. Logs results and fires hooks. Non-fatal: errors
 /// are logged at warn and do not abort the request.
 async fn compact_request_context(request: &mut ChatCompletionRequest, state: &ProxyState) {
-    let mut compactor = crate::compaction::ContextCompactor::for_model(&request.model);
-    let base_config = state.compactor.config().clone();
-    let mut model_config = compactor.config().clone();
-    model_config.preserve_recent = base_config.preserve_recent;
-    model_config.preserve_system = base_config.preserve_system;
-    model_config.preserve_tool_calls = base_config.preserve_tool_calls;
-    compactor.set_config(model_config);
+    // Single-pass construction — no temporary clones of CompactionConfig.
+    // Adding a new override field is enforced at compile time via the
+    // destructuring in `CompactionConfig::apply_overrides` (crosslink #489).
+    let compactor =
+        ContextCompactor::for_model_with_overrides(&request.model, &state.compactor_overrides);
 
     let actual_token_hint: Option<usize> = {
         let sm = state.session_manager.read().await;
@@ -1766,8 +1772,10 @@ async fn build_proxy_state(config: AppConfig) -> anyhow::Result<ProxyState> {
 
     let rules_engine = RulesEngine::new(".openclaudia/rules");
 
-    // Initialize compactor with default model context
-    let compactor = ContextCompactor::new(CompactionConfig::default());
+    // Compaction overrides default to "no overrides" — the per-request
+    // model-specific compactor is built in `compact_request_context` using
+    // these as a delta on top of the model defaults (crosslink #489).
+    let compactor_overrides = CompactionOverrides::default();
 
     // Initialize session manager
     let session_manager = Arc::new(RwLock::new(SessionManager::new(
@@ -1816,7 +1824,7 @@ async fn build_proxy_state(config: AppConfig) -> anyhow::Result<ProxyState> {
         client,
         hook_engine,
         rules_engine,
-        compactor,
+        compactor_overrides,
         session_manager,
         plugin_manager,
         mcp_manager,

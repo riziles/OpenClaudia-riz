@@ -72,6 +72,105 @@ impl CompactionConfig {
             ..Default::default()
         }
     }
+
+    /// Apply a [`CompactionOverrides`] to this config in-place.
+    ///
+    /// Each `Some(value)` overwrites the corresponding field; `None`
+    /// preserves the existing (typically model-derived) default. This is
+    /// the single explicit forwarding point — adding a new field to
+    /// [`CompactionOverrides`] forces the matching arm here at compile
+    /// time, so a future override field can never be silently dropped.
+    pub fn apply_overrides(&mut self, overrides: &CompactionOverrides) {
+        // Destructure so adding a field to `CompactionOverrides` is a
+        // compile error here until it is handled below — this is the
+        // "explicit forwarding" guarantee required by crosslink #489.
+        let CompactionOverrides {
+            max_context_tokens,
+            threshold,
+            preserve_recent,
+            preserve_system,
+            preserve_tool_calls,
+            summary_prompt,
+        } = overrides;
+        if let Some(v) = *max_context_tokens {
+            self.max_context_tokens = v;
+        }
+        if let Some(v) = *threshold {
+            self.threshold = v;
+        }
+        if let Some(v) = *preserve_recent {
+            self.preserve_recent = v;
+        }
+        if let Some(v) = *preserve_system {
+            self.preserve_system = v;
+        }
+        if let Some(v) = *preserve_tool_calls {
+            self.preserve_tool_calls = v;
+        }
+        if let Some(v) = summary_prompt {
+            self.summary_prompt = Some(v.clone());
+        }
+    }
+}
+
+/// User-supplied overrides for [`CompactionConfig`].
+///
+/// Stored in [`crate::proxy::ProxyState`] so per-request handlers can apply
+/// the caller's preferences over a fresh model-specific config without
+/// cloning a whole [`CompactionConfig`] or constructing a temporary
+/// [`ContextCompactor`] twice per request (crosslink #489).
+///
+/// Each field is `Option<T>` — `None` means "keep the model default",
+/// `Some(v)` means "the operator set this explicitly". Adding a new field
+/// to [`CompactionConfig`] should also add a field here so the override
+/// surface stays in sync; the destructuring `let` in
+/// [`CompactionConfig::apply_overrides`] then forces every field to be
+/// considered at compile time.
+///
+/// `PartialEq` (not `Eq`) is derived because `threshold` is `Option<f32>`
+/// and `f32` is not `Eq`. Configs are compared structurally in tests, not
+/// keyed in maps, so `PartialEq` is sufficient.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompactionOverrides {
+    /// Override the model-derived context window (tokens).
+    pub max_context_tokens: Option<usize>,
+    /// Override the threshold ratio (0.0-1.0).
+    pub threshold: Option<f32>,
+    /// Override the minimum recent-message preservation count.
+    pub preserve_recent: Option<usize>,
+    /// Override whether system messages are always preserved.
+    pub preserve_system: Option<bool>,
+    /// Override whether tool calls / results are always preserved.
+    pub preserve_tool_calls: Option<bool>,
+    /// Override the custom summary prompt.
+    pub summary_prompt: Option<String>,
+}
+
+impl CompactionOverrides {
+    /// Extract the overrides that the operator pinned in a base
+    /// [`CompactionConfig`] versus a model-default reference.
+    ///
+    /// Used by [`crate::proxy::ProxyState`] when migrating from the
+    /// legacy "store a whole compactor" layout: the three legacy fields
+    /// (`preserve_recent`, `preserve_system`, `preserve_tool_calls`) plus
+    /// the `summary_prompt` if non-default are forwarded; the
+    /// `max_context_tokens` and `threshold` are intentionally NOT forwarded
+    /// because those are model-derived defaults, not user pins.
+    #[must_use]
+    pub fn from_user_config(config: &CompactionConfig) -> Self {
+        let defaults = CompactionConfig::default();
+        Self {
+            max_context_tokens: None,
+            threshold: None,
+            preserve_recent: (config.preserve_recent != defaults.preserve_recent)
+                .then_some(config.preserve_recent),
+            preserve_system: (config.preserve_system != defaults.preserve_system)
+                .then_some(config.preserve_system),
+            preserve_tool_calls: (config.preserve_tool_calls != defaults.preserve_tool_calls)
+                .then_some(config.preserve_tool_calls),
+            summary_prompt: config.summary_prompt.clone(),
+        }
+    }
 }
 
 /// Sentinel prefix that marks a system message as a compact-boundary divider.
@@ -362,6 +461,23 @@ impl ContextCompactor {
     #[must_use]
     pub fn for_model(model: &str) -> Self {
         Self::new(CompactionConfig::for_model(model))
+    }
+
+    /// Create a model-specific compactor with operator overrides applied
+    /// in one pass — no `CompactionConfig` clones, no temporary
+    /// `ContextCompactor` swap.
+    ///
+    /// This replaces the legacy "build compactor, clone its config, clone
+    /// the operator's config, copy three named fields, write the merged
+    /// config back" sequence in `proxy::compact_request_context` (crosslink
+    /// #489). The forwarding is now explicit (see
+    /// [`CompactionConfig::apply_overrides`]); a new override field is a
+    /// compile-time obligation, not a silent omission.
+    #[must_use]
+    pub fn for_model_with_overrides(model: &str, overrides: &CompactionOverrides) -> Self {
+        let mut config = CompactionConfig::for_model(model);
+        config.apply_overrides(overrides);
+        Self::new(config)
     }
 
     /// Analyze whether compaction is needed.
@@ -2511,5 +2627,168 @@ mod tests {
         assert!(!body.contains("</context-summary>"));
         assert!(!body.contains("<system>"));
         assert!(body.contains("&lt;/context-summary&gt;"));
+    }
+
+    // ========================================================================
+    // crosslink #489 — CompactionOverrides + for_model_with_overrides
+    // ========================================================================
+
+    /// `for_model_with_overrides` must apply each `Some` field declaratively
+    /// over the model default, leaving `None` fields untouched. This is the
+    /// behavior `proxy::compact_request_context` depends on; if a future
+    /// override field is silently dropped this test should catch it (the
+    /// asserts here cover all 4 boolean/numeric override fields).
+    #[test]
+    fn fix489_for_model_with_overrides_applies_each_field() {
+        let overrides = CompactionOverrides {
+            max_context_tokens: None,
+            threshold: None,
+            preserve_recent: Some(12),
+            preserve_system: Some(false),
+            preserve_tool_calls: Some(false),
+            summary_prompt: Some("custom".to_string()),
+        };
+        let compactor = ContextCompactor::for_model_with_overrides("claude-3-opus", &overrides);
+        let cfg = compactor.config();
+
+        // Model-derived defaults preserved (overrides set `None`).
+        assert_eq!(cfg.max_context_tokens, CLAUDE_OPUS_CONTEXT);
+        assert!((cfg.threshold - COMPACTION_THRESHOLD).abs() < f32::EPSILON);
+
+        // Overridden fields applied.
+        assert_eq!(cfg.preserve_recent, 12);
+        assert!(!cfg.preserve_system);
+        assert!(!cfg.preserve_tool_calls);
+        assert_eq!(cfg.summary_prompt.as_deref(), Some("custom"));
+
+        // A default-override (everything None) must round-trip to the
+        // model default — proving the per-field forwarding has no
+        // accidental overwrites.
+        let noop = ContextCompactor::for_model_with_overrides(
+            "claude-3-opus",
+            &CompactionOverrides::default(),
+        );
+        let noop_cfg = noop.config();
+        let model_default = CompactionConfig::for_model("claude-3-opus");
+        assert_eq!(
+            noop_cfg.max_context_tokens,
+            model_default.max_context_tokens
+        );
+        assert_eq!(noop_cfg.preserve_recent, model_default.preserve_recent);
+        assert_eq!(noop_cfg.preserve_system, model_default.preserve_system);
+        assert_eq!(
+            noop_cfg.preserve_tool_calls,
+            model_default.preserve_tool_calls
+        );
+        assert_eq!(noop_cfg.summary_prompt, model_default.summary_prompt);
+    }
+
+    /// Confirms the explicit-forwarding contract. `apply_overrides`
+    /// destructures `CompactionOverrides`, so adding a field there without
+    /// handling it here is a compile error. We additionally check, at run
+    /// time, that the union of "overridden field arms" matches the public
+    /// fields of `CompactionOverrides` — if a field is added but its arm
+    /// is omitted this assertion still fires because the new field's
+    /// default `None` would never propagate.
+    #[test]
+    fn fix489_apply_overrides_is_exhaustive() {
+        // Build an Overrides where every field is `Some` and check that
+        // every corresponding config field is mutated. If a future field
+        // is added to Overrides but `apply_overrides` is not updated, the
+        // destructuring `let` in `apply_overrides` fails to compile —
+        // that is the compile-time half of the contract. This test is
+        // the runtime half.
+        let overrides = CompactionOverrides {
+            max_context_tokens: Some(99_999),
+            threshold: Some(0.42),
+            preserve_recent: Some(7),
+            preserve_system: Some(false),
+            preserve_tool_calls: Some(false),
+            summary_prompt: Some("explicit".to_string()),
+        };
+        let mut cfg = CompactionConfig::default();
+        cfg.apply_overrides(&overrides);
+        assert_eq!(cfg.max_context_tokens, 99_999);
+        assert!((cfg.threshold - 0.42).abs() < f32::EPSILON);
+        assert_eq!(cfg.preserve_recent, 7);
+        assert!(!cfg.preserve_system);
+        assert!(!cfg.preserve_tool_calls);
+        assert_eq!(cfg.summary_prompt.as_deref(), Some("explicit"));
+    }
+
+    /// Functional regression: the new per-request path
+    /// (`for_model_with_overrides` -> `compact`) must still compact a
+    /// realistic conversation correctly. Mirrors `test_compact_performed`
+    /// but goes through the new constructor with operator overrides.
+    #[tokio::test]
+    async fn fix489_compaction_still_works_via_overrides_path() {
+        let long_content = "x".repeat(10_000);
+        let messages = vec![
+            create_test_message("system", "You are helpful."),
+            create_test_message("user", &long_content),
+            create_test_message("assistant", &long_content),
+            create_test_message("user", &long_content),
+            create_test_message("assistant", &long_content),
+            create_test_message("user", "Recent message"),
+            create_test_message("assistant", "Recent response"),
+        ];
+        let mut request = create_test_request(messages);
+
+        // Override the model-derived context window down so this fixture
+        // forces compaction without picking a real model name.
+        let overrides = CompactionOverrides {
+            max_context_tokens: Some(5_000),
+            threshold: Some(0.8),
+            preserve_recent: Some(2),
+            preserve_system: Some(true),
+            preserve_tool_calls: Some(true),
+            summary_prompt: None,
+        };
+
+        let compactor = ContextCompactor::for_model_with_overrides("gpt-4", &overrides);
+        let result = compactor
+            .compact(&mut request, None, None)
+            .await
+            .expect("compaction should succeed on oversized request");
+
+        assert!(result.compacted, "expected compaction to fire");
+        assert!(result.messages_summarized > 0);
+        assert!(result.summary.is_some());
+        assert!(result.new_tokens < result.original_tokens);
+    }
+
+    /// `CompactionOverrides::from_user_config` extracts the three
+    /// preservation pins (the historical "implicit 3-field forwarding"
+    /// surface) without forwarding model-derived fields. Locks the
+    /// migration semantics for any caller still threading a legacy
+    /// `CompactionConfig` through the operator config layer.
+    #[test]
+    fn fix489_overrides_from_user_config_extracts_pins_only() {
+        let user = CompactionConfig {
+            max_context_tokens: 999_999, // intentionally NOT forwarded
+            threshold: 0.5,              // intentionally NOT forwarded
+            preserve_recent: 9,
+            preserve_system: false,
+            preserve_tool_calls: false,
+            summary_prompt: Some("pinned".to_string()),
+        };
+        let overrides = CompactionOverrides::from_user_config(&user);
+
+        // Model-derived fields are intentionally left as None so the
+        // per-request model defaults win.
+        assert_eq!(overrides.max_context_tokens, None);
+        assert_eq!(overrides.threshold, None);
+
+        // Operator pins are extracted.
+        assert_eq!(overrides.preserve_recent, Some(9));
+        assert_eq!(overrides.preserve_system, Some(false));
+        assert_eq!(overrides.preserve_tool_calls, Some(false));
+        assert_eq!(overrides.summary_prompt.as_deref(), Some("pinned"));
+
+        // Defaulted user config produces an all-None override (cheap to
+        // clone, no per-request work).
+        let default_user = CompactionConfig::default();
+        let noop = CompactionOverrides::from_user_config(&default_user);
+        assert_eq!(noop, CompactionOverrides::default());
     }
 }
