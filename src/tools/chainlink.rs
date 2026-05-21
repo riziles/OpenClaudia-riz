@@ -1,6 +1,7 @@
 use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -52,7 +53,8 @@ fn token_has_metachar(tok: &str) -> bool {
 /// with POSIX rules via `shlex`, validate the first token against
 /// [`ALLOWED_SUBCOMMANDS`], and exec the binary directly. **No shell is
 /// invoked**, closing the injection vector described in crosslink #265.
-pub fn execute_chainlink(args: &HashMap<String, Value>) -> (String, bool) {
+#[must_use]
+pub fn execute_chainlink<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
     // crosslink #675: typed accessor.
     let cmd_args = match args.arg_str("args") {
         Ok(c) => c,
