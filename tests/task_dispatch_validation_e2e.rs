@@ -1,0 +1,329 @@
+//! End-to-end tests for the 4 `task_*` tools dispatched
+//! through the registry — no-session error path + happy-path
+//! validation with a real `TaskManager` in `ToolContext`.
+//!
+//! Sprint 151 of the verification effort. Sprint 103
+//! covered the format functions; this file pins the
+//! registry-dispatched path including the "no session"
+//! fallback when `ctx.task_mgr` is None.
+
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
+use openclaudia::session::TaskManager;
+use openclaudia::tools::registry::{registry, ToolContext};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+const NO_SESSION_MARKER: &str = "Task management not available (no session)";
+
+fn dispatch_without_session(name: &str, args: &HashMap<String, Value>) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+    };
+    registry()
+        .dispatch(name, args, &mut ctx)
+        .expect("tool must be registered")
+}
+
+fn dispatch_with_session(
+    name: &str,
+    args: &HashMap<String, Value>,
+    tm: &mut TaskManager,
+) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: Some(tm),
+    };
+    registry()
+        .dispatch(name, args, &mut ctx)
+        .expect("tool must be registered")
+}
+
+fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    for (k, v) in entries {
+        m.insert((*k).to_string(), v.clone());
+    }
+    m
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section A — No-session fallback for all 4 task tools
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_create_without_session_returns_no_session_error() {
+    let args = args_with(&[("subject", json!("Test")), ("description", json!("desc"))]);
+    let (msg, is_err) = dispatch_without_session("task_create", &args);
+    assert!(is_err);
+    assert_eq!(
+        msg, NO_SESSION_MARKER,
+        "PINS NO_SESSION: documented message MUST match exactly"
+    );
+}
+
+#[test]
+fn task_update_without_session_returns_no_session_error() {
+    let args = args_with(&[("task_id", json!("task-1"))]);
+    let (msg, is_err) = dispatch_without_session("task_update", &args);
+    assert!(is_err);
+    assert_eq!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_get_without_session_returns_no_session_error() {
+    let args = args_with(&[("task_id", json!("task-1"))]);
+    let (msg, is_err) = dispatch_without_session("task_get", &args);
+    assert!(is_err);
+    assert_eq!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_list_without_session_returns_no_session_error() {
+    let (msg, is_err) = dispatch_without_session("task_list", &HashMap::new());
+    assert!(is_err);
+    assert_eq!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn no_session_path_is_consistent_across_all_4_tools() {
+    // PINS NO_SESSION uniformity: all 4 task tools fall back
+    // to the same message — model never has to remember
+    // different no-session strings per tool.
+    let tools_and_args: &[(&str, Value)] = &[
+        ("task_create", json!({"subject": "x"})),
+        ("task_update", json!({"task_id": "task-1"})),
+        ("task_get", json!({"task_id": "task-1"})),
+        ("task_list", json!({})),
+    ];
+    for (name, args_value) in tools_and_args {
+        let args: HashMap<String, Value> = args_value
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let (msg, is_err) = dispatch_without_session(name, &args);
+        assert!(is_err, "{name} MUST error without session");
+        assert_eq!(msg, NO_SESSION_MARKER, "{name} MUST surface NO_SESSION");
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section B — task_create with session
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_create_with_session_succeeds_and_returns_task_id() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[
+        ("subject", json!("Implement feature X")),
+        ("description", json!("desc")),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+    assert!(!is_err);
+    // task_create returns a message that includes the new task id.
+    assert!(
+        msg.contains("task-1") || msg.contains("Created"),
+        "MUST surface created-task confirmation; got {msg:?}"
+    );
+}
+
+#[test]
+fn task_create_missing_subject_errors_with_session() {
+    let mut tm = TaskManager::new();
+    let (msg, is_err) = dispatch_with_session("task_create", &HashMap::new(), &mut tm);
+    assert!(is_err);
+    assert_ne!(
+        msg, NO_SESSION_MARKER,
+        "session present → MUST NOT be no_session error"
+    );
+}
+
+#[test]
+fn task_create_subject_as_number_errors_with_session() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[("subject", json!(42))]);
+    let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section C — task_list with session
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_list_empty_manager_returns_documented_empty_message() {
+    let mut tm = TaskManager::new();
+    let (msg, is_err) = dispatch_with_session("task_list", &HashMap::new(), &mut tm);
+    assert!(!is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_list_after_create_shows_created_task() {
+    let mut tm = TaskManager::new();
+
+    let create_args = args_with(&[
+        ("subject", json!("unique_task_subject_marker_151")),
+        ("description", json!("desc")),
+    ]);
+    let (_c_msg, c_err) = dispatch_with_session("task_create", &create_args, &mut tm);
+    assert!(!c_err);
+
+    let (l_msg, l_err) = dispatch_with_session("task_list", &HashMap::new(), &mut tm);
+    assert!(!l_err);
+    assert!(
+        l_msg.contains("unique_task_subject_marker_151"),
+        "task_list MUST show created task subject; got {l_msg:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section D — task_get with session
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_get_unknown_task_id_returns_null_not_error() {
+    // AUTHORING DISCOVERY: task_get for an unknown id returns
+    // ("null", is_err=false) — pins the JSON-null sentinel
+    // shape rather than raising an error. Documented contract:
+    // `task_mgr.get_task(task_id).map_or_else(|| Value::Null.to_string(), ...)`.
+    let mut tm = TaskManager::new();
+    let args = args_with(&[("task_id", json!("nonexistent-task-marker"))]);
+    let (msg, is_err) = dispatch_with_session("task_get", &args, &mut tm);
+    assert!(!is_err, "PINS CONTRACT: get on unknown is null, not error");
+    assert_eq!(msg, "null", "MUST return JSON Value::Null literal");
+}
+
+#[test]
+fn task_get_missing_task_id_arg_errors() {
+    let mut tm = TaskManager::new();
+    let (msg, is_err) = dispatch_with_session("task_get", &HashMap::new(), &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_get_after_create_returns_created_task_details() {
+    let mut tm = TaskManager::new();
+    let create_args = args_with(&[
+        ("subject", json!("get-test-marker-xyz")),
+        ("description", json!("desc")),
+    ]);
+    let (_, c_err) = dispatch_with_session("task_create", &create_args, &mut tm);
+    assert!(!c_err);
+
+    let get_args = args_with(&[("task_id", json!("task-1"))]);
+    let (g_msg, g_err) = dispatch_with_session("task_get", &get_args, &mut tm);
+    assert!(!g_err, "task_get on existing id MUST succeed");
+    assert!(
+        g_msg.contains("get-test-marker-xyz"),
+        "task_get MUST include subject; got {g_msg:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section E — task_update with session
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_update_missing_task_id_errors() {
+    let mut tm = TaskManager::new();
+    let (msg, is_err) = dispatch_with_session("task_update", &HashMap::new(), &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_update_unknown_task_id_errors() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[
+        ("task_id", json!("nonexistent")),
+        ("status", json!("in_progress")),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_update", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_update_existing_task_status_succeeds() {
+    let mut tm = TaskManager::new();
+    let create_args = args_with(&[
+        ("subject", json!("update test")),
+        ("description", json!("desc")),
+    ]);
+    let (_, _) = dispatch_with_session("task_create", &create_args, &mut tm);
+
+    let update_args = args_with(&[
+        ("task_id", json!("task-1")),
+        ("status", json!("in_progress")),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_update", &update_args, &mut tm);
+    assert!(!is_err, "valid update MUST succeed; got {msg:?}");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section F — Cross-tool: TaskManager state persists across dispatches
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn task_manager_state_persists_across_3_dispatches() {
+    // PINS LIFECYCLE: create → update → list shows update.
+    let mut tm = TaskManager::new();
+
+    let create_args = args_with(&[
+        ("subject", json!("persistence-test")),
+        ("description", json!("desc")),
+    ]);
+    let (_, _) = dispatch_with_session("task_create", &create_args, &mut tm);
+
+    let update_args = args_with(&[("task_id", json!("task-1")), ("status", json!("completed"))]);
+    let (_, u_err) = dispatch_with_session("task_update", &update_args, &mut tm);
+    assert!(!u_err);
+
+    let (l_msg, l_err) = dispatch_with_session("task_list", &HashMap::new(), &mut tm);
+    assert!(!l_err);
+    // Updated status MUST be visible in list output.
+    assert!(
+        l_msg.contains("completed") || l_msg.contains("Completed") || l_msg.contains("DONE"),
+        "list MUST reflect completed status; got {l_msg:?}"
+    );
+}
+
+#[test]
+fn distinct_task_managers_have_independent_state() {
+    // PINS ISOLATION: separate TaskManager instances → separate
+    // task lists; no shared global state via the registry.
+    let mut tm_a = TaskManager::new();
+    let mut tm_b = TaskManager::new();
+
+    let create_args_a = args_with(&[
+        ("subject", json!("ONLY_IN_A_xyz")),
+        ("description", json!("desc")),
+    ]);
+    let (_, _) = dispatch_with_session("task_create", &create_args_a, &mut tm_a);
+
+    let (alpha_list, _) = dispatch_with_session("task_list", &HashMap::new(), &mut tm_a);
+    let (other_list, _) = dispatch_with_session("task_list", &HashMap::new(), &mut tm_b);
+    assert!(alpha_list.contains("ONLY_IN_A_xyz"));
+    assert!(!other_list.contains("ONLY_IN_A_xyz"));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section G — Registration
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn all_4_task_tools_registered_in_registry() {
+    for name in &["task_create", "task_update", "task_get", "task_list"] {
+        assert!(registry().get(name).is_some(), "{name} MUST be registered");
+    }
+}
