@@ -35,7 +35,7 @@ pub use anthropic::{
     build_system_blocks, build_system_blocks_from_string, convert_messages_to_anthropic,
     convert_tools_to_anthropic, AnthropicAdapter,
 };
-pub use api_key::{ApiKey, ApiKeyError};
+pub use api_key::{ApiKey, ApiKeyError, MAX_API_KEY_LEN, REDACTED_PLACEHOLDER};
 pub use deepseek::DeepSeekAdapter;
 pub use google::GoogleAdapter;
 pub use ollama::OllamaAdapter;
