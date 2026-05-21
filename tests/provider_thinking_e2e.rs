@@ -1,0 +1,323 @@
+//! End-to-end tests for the provider-specific thinking-config
+//! injection matrix.
+//!
+//! Sprint 29 of the verification effort. The 4 OpenAI-compatible
+//! adapters (`OpenAI`, `DeepSeek`, `Qwen`, `Z.AI`/GLM) each inject
+//! `thinking` mode into the request body via a different shape:
+//!
+//!   - **`OpenAI`**: `reasoning_effort: "low|medium|high"`,
+//!     ONLY for o1/o3/o4 models.
+//!   - **`DeepSeek`**: `enable_thinking: true` when enabled;
+//!     ABSENT when disabled (silent no-op).
+//!   - **`Qwen`**: `enable_thinking` ALWAYS written (true OR false).
+//!   - **`Z.AI`/GLM**: `thinking: {type: "enabled"|"disabled"}`,
+//!     plus `clear_thinking: false` when
+//!     `preserve_across_turns=true`.
+//!
+//! This file pins each branch of the dispatch with positive +
+//! negative cases.
+
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
+use openclaudia::config::ThinkingConfig;
+use openclaudia::providers::get_adapter;
+use openclaudia::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+use serde_json::json;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+fn minimal_request(model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text("hi".to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+        extra: std::collections::HashMap::default(),
+    }
+}
+
+fn enabled_thinking(reasoning_effort: Option<&str>) -> ThinkingConfig {
+    ThinkingConfig {
+        enabled: true,
+        budget_tokens: None,
+        preserve_across_turns: false,
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        adaptive: true,
+    }
+}
+
+const fn disabled_thinking() -> ThinkingConfig {
+    ThinkingConfig {
+        enabled: false,
+        budget_tokens: None,
+        preserve_across_turns: false,
+        reasoning_effort: None,
+        adaptive: true,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section A — OpenAI: reasoning_effort gated by o1/o3/o4 model family
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn openai_thinking_injects_reasoning_effort_for_o1_model() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("o1-preview");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
+        .expect("transform");
+    assert_eq!(
+        body["reasoning_effort"], "high",
+        "o1 model with thinking enabled MUST set reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn openai_thinking_defaults_reasoning_effort_to_medium() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("o3-mini");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(None))
+        .expect("transform");
+    assert_eq!(
+        body["reasoning_effort"], "medium",
+        "o3 model with no effort set MUST default to 'medium'; got {body}"
+    );
+}
+
+#[test]
+fn openai_thinking_ignored_for_non_reasoning_model() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("gpt-4o");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
+        .expect("transform");
+    // gpt-4o is NOT in o1/o3/o4 — reasoning_effort MUST NOT be set.
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "non-reasoning model MUST NOT receive reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn openai_thinking_disabled_writes_no_reasoning_field() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("o1-preview");
+    let body = adapter
+        .transform_request_with_thinking(&req, &disabled_thinking())
+        .expect("transform");
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "disabled thinking MUST NOT set reasoning_effort; got {body}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section B — DeepSeek: enable_thinking present-or-absent
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn deepseek_thinking_enabled_sets_enable_thinking_true() {
+    let adapter = get_adapter("deepseek").expect("deepseek adapter");
+    let req = minimal_request("deepseek-reasoner");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(None))
+        .expect("transform");
+    assert_eq!(
+        body["enable_thinking"], true,
+        "DeepSeek with thinking enabled MUST set enable_thinking=true; got {body}"
+    );
+}
+
+#[test]
+fn deepseek_thinking_disabled_omits_enable_thinking() {
+    let adapter = get_adapter("deepseek").expect("deepseek adapter");
+    let req = minimal_request("deepseek-reasoner");
+    let body = adapter
+        .transform_request_with_thinking(&req, &disabled_thinking())
+        .expect("transform");
+    // DeepSeek convention: silent no-op when disabled.
+    assert!(
+        body.get("enable_thinking").is_none(),
+        "DeepSeek disabled MUST omit enable_thinking; got {body}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section C — Qwen: enable_thinking always written
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn qwen_thinking_enabled_writes_enable_thinking_true() {
+    let adapter = get_adapter("qwen").expect("qwen adapter");
+    let req = minimal_request("qwq-32b");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(None))
+        .expect("transform");
+    assert_eq!(
+        body["enable_thinking"], true,
+        "Qwen enabled MUST set enable_thinking=true; got {body}"
+    );
+}
+
+#[test]
+fn qwen_thinking_disabled_writes_enable_thinking_false() {
+    let adapter = get_adapter("qwen").expect("qwen adapter");
+    let req = minimal_request("qwq-32b");
+    let body = adapter
+        .transform_request_with_thinking(&req, &disabled_thinking())
+        .expect("transform");
+    // Qwen convention: writes false explicitly (NOT omit).
+    assert_eq!(
+        body["enable_thinking"], false,
+        "Qwen disabled MUST explicitly write enable_thinking=false; got {body}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section D — Z.AI / GLM: thinking object + clear_thinking
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn zai_thinking_enabled_writes_thinking_object_enabled() {
+    let adapter = get_adapter("zai").expect("zai adapter");
+    let req = minimal_request("glm-4-32b");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(None))
+        .expect("transform");
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "enabled"}),
+        "Z.AI enabled MUST set thinking={{type:enabled}}; got {body}"
+    );
+    // preserve_across_turns=false (the default) means
+    // clear_thinking is NOT emitted.
+    assert!(
+        body.get("clear_thinking").is_none(),
+        "Z.AI without preserve_across_turns MUST omit clear_thinking; got {body}"
+    );
+}
+
+#[test]
+fn zai_thinking_disabled_writes_thinking_object_disabled() {
+    let adapter = get_adapter("zai").expect("zai adapter");
+    let req = minimal_request("glm-4-32b");
+    let body = adapter
+        .transform_request_with_thinking(&req, &disabled_thinking())
+        .expect("transform");
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "disabled"}),
+        "Z.AI disabled MUST set thinking={{type:disabled}}; got {body}"
+    );
+}
+
+#[test]
+fn zai_preserve_across_turns_emits_clear_thinking_false() {
+    let adapter = get_adapter("zai").expect("zai adapter");
+    let req = minimal_request("glm-4-32b");
+    let thinking = ThinkingConfig {
+        enabled: true,
+        budget_tokens: None,
+        preserve_across_turns: true,
+        reasoning_effort: None,
+        adaptive: true,
+    };
+    let body = adapter
+        .transform_request_with_thinking(&req, &thinking)
+        .expect("transform");
+    assert_eq!(
+        body["clear_thinking"], false,
+        "Z.AI with preserve_across_turns MUST emit clear_thinking=false; got {body}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section E — Anthropic: budget_tokens injection
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn anthropic_thinking_injects_budget_tokens() {
+    let adapter = get_adapter("anthropic").expect("anthropic adapter");
+    let req = minimal_request("claude-3-5-sonnet-20241022");
+    let thinking = ThinkingConfig {
+        enabled: true,
+        budget_tokens: Some(8000),
+        preserve_across_turns: false,
+        reasoning_effort: None,
+        adaptive: true,
+    };
+    let body = adapter
+        .transform_request_with_thinking(&req, &thinking)
+        .expect("transform");
+    // Anthropic uses `thinking: {type, budget_tokens}` shape.
+    let thinking_obj = &body["thinking"];
+    assert!(
+        thinking_obj.is_object(),
+        "anthropic thinking field must be an object; got {body}"
+    );
+    assert_eq!(
+        thinking_obj["budget_tokens"], 8000,
+        "anthropic budget_tokens MUST be threaded through; got {body}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section F — Adapter dispatch matrix sanity (each provider produces
+// distinct output for the SAME enabled thinking config)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn each_provider_uses_a_distinct_thinking_field() {
+    // Drive all 4 OpenAI-compat providers with the same enabled
+    // thinking config + a generic model name. Each must produce
+    // a body with a provider-specific signature.
+    let thinking = enabled_thinking(Some("low"));
+    let req = minimal_request("a-model");
+
+    let openai = get_adapter("openai")
+        .unwrap()
+        .transform_request_with_thinking(&req, &thinking)
+        .unwrap();
+    // a-model is NOT o1/o3/o4 so openai injects nothing — that's
+    // the documented behaviour pinned in Section A.
+    assert!(openai.get("reasoning_effort").is_none());
+
+    let deepseek = get_adapter("deepseek")
+        .unwrap()
+        .transform_request_with_thinking(&req, &thinking)
+        .unwrap();
+    assert_eq!(deepseek["enable_thinking"], true);
+
+    let qwen = get_adapter("qwen")
+        .unwrap()
+        .transform_request_with_thinking(&req, &thinking)
+        .unwrap();
+    assert_eq!(qwen["enable_thinking"], true);
+
+    let zai = get_adapter("zai")
+        .unwrap()
+        .transform_request_with_thinking(&req, &thinking)
+        .unwrap();
+    assert_eq!(zai["thinking"]["type"], "enabled");
+
+    // The deepseek + qwen bodies happen to look the same shape
+    // for THIS config (both emit `enable_thinking: true`), but
+    // the disabled variant separates them — Section B/C pin that.
+    // No cross-provider equality assertion here because it would
+    // be tautological for the enabled case.
+}
