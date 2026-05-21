@@ -1,0 +1,366 @@
+//! End-to-end tests for the `edit_file` tool dispatched
+//! through the registry — pre-write validation arms,
+//! the must-read-before-edit gate, the no-op refusal
+//! (#970), and the multi-occurrence refusal (#687).
+//!
+//! Sprint 143 of the verification effort. This file pins
+//! the registry-dispatched validation paths for `edit_file`:
+//! missing `path` / `old_string` / `new_string`, must-read
+//! gate, no-op identical-strings refusal, and `replace_all`
+//! flag.
+
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
+use openclaudia::tools::registry::{registry, ToolContext};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+    };
+    registry()
+        .dispatch("edit_file", args, &mut ctx)
+        .expect("edit_file must be registered")
+}
+
+fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+    };
+    registry()
+        .dispatch("read_file", args, &mut ctx)
+        .expect("read_file must be registered")
+}
+
+fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    for (k, v) in entries {
+        m.insert((*k).to_string(), v.clone());
+    }
+    m
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section A — Missing path arg
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn missing_path_arg_errors() {
+    let args = args_with(&[("old_string", json!("foo")), ("new_string", json!("bar"))]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("path") || msg.contains("Missing"),
+        "MUST surface missing-path; got {msg:?}"
+    );
+}
+
+#[test]
+fn path_arg_as_number_treated_as_missing() {
+    let args = args_with(&[
+        ("path", json!(42)),
+        ("old_string", json!("foo")),
+        ("new_string", json!("bar")),
+    ]);
+    let (_msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section B — Must-read-before-edit gate
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn edit_existing_file_without_prior_read_errors_with_documented_message() {
+    // Create a file that has NOT been read via read_file.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("never_read_unique.txt");
+    std::fs::write(&path, "original body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("original")),
+        ("new_string", json!("modified")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err, "edit without prior read MUST be refused");
+    assert!(
+        msg.contains("must read") && msg.contains("before editing"),
+        "MUST surface must-read-before-edit gate; got {msg:?}"
+    );
+    // Suggests corrective action.
+    assert!(
+        msg.contains("read_file"),
+        "MUST suggest read_file; got {msg:?}"
+    );
+    // Original content preserved when gate fires.
+    let preserved = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        preserved, "original body",
+        "gate failure MUST preserve file content"
+    );
+}
+
+#[test]
+fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("read_then_edited_unique.txt");
+    std::fs::write(&path, "before").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    // Read first via dispatched read_file (populates READ_TRACKER).
+    let read_args = args_with(&[("path", json!(path_str))]);
+    let (_msg, read_err) = dispatch_read(&read_args);
+    assert!(!read_err, "read_file MUST succeed");
+
+    // Now edit succeeds.
+    let edit_args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("before")),
+        ("new_string", json!("after")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&edit_args);
+    assert!(!is_err, "edit after read MUST succeed; got error {msg:?}");
+
+    // Content actually changed on disk.
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(after, "after");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section C — Missing old_string / new_string
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn missing_old_string_after_read_errors() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("missing_old.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    // Read first.
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[("path", json!(path_str)), ("new_string", json!("bar"))]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("old_string"),
+        "MUST mention missing old_string; got {msg:?}"
+    );
+}
+
+#[test]
+fn missing_new_string_after_read_errors() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("missing_new.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[("path", json!(path_str)), ("old_string", json!("foo"))]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("new_string"),
+        "MUST mention missing new_string; got {msg:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section D — No-op refusal (#970)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_op_edit_with_identical_old_and_new_strings_refused() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("noop.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("identical_marker")),
+        ("new_string", json!("identical_marker")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err, "no-op edit MUST be refused");
+    assert!(
+        msg.contains("no-op") || msg.contains("identical"),
+        "MUST surface no-op message; got {msg:?}"
+    );
+}
+
+#[test]
+fn no_op_edit_with_empty_strings_refused() {
+    // PINS #970: empty == empty is also a no-op.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("noop_empty.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("")),
+        ("new_string", json!("")),
+    ]);
+    let (_msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+}
+
+#[test]
+fn no_op_does_not_modify_file_mtime() {
+    // PINS #970 DOC: no-op fails BEFORE any I/O.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("noop_mtime.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("body")),
+        ("new_string", json!("body")),
+    ]);
+    let (_msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(mtime_before, mtime_after, "no-op edit MUST NOT touch mtime");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section E — replace_all flag (#687)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn multi_occurrence_without_replace_all_refused() {
+    // PINS #687: when replace_all=false (default), multiple
+    // occurrences MUST be rejected so callers provide
+    // uniquely-matching context.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("multi_occur.txt");
+    std::fs::write(&path, "x\nx\nx\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("x")),
+        ("new_string", json!("y")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err, "multi-occurrence default-mode edit MUST be refused");
+    // File content preserved.
+    let preserved = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(preserved, "x\nx\nx\n");
+    let _ = msg;
+}
+
+#[test]
+fn multi_occurrence_with_replace_all_true_succeeds() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("multi_replace_all.txt");
+    std::fs::write(&path, "x\nx\nx\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("x")),
+        ("new_string", json!("y")),
+        ("replace_all", json!(true)),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(!is_err, "replace_all=true MUST succeed; got {msg:?}");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(after, "y\ny\ny\n", "every occurrence MUST be replaced");
+}
+
+#[test]
+fn replace_all_false_explicit_matches_default_behavior() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("replace_explicit_false.txt");
+    std::fs::write(&path, "a\na\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("a")),
+        ("new_string", json!("b")),
+        ("replace_all", json!(false)),
+    ]);
+    let (_msg, is_err) = dispatch_edit(&args);
+    // Multi-occurrence + replace_all=false → still refused.
+    assert!(is_err);
+    let preserved = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(preserved, "a\na\n");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Section F — Single-occurrence happy path
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn single_occurrence_edit_replaces_byte_exact() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("single_occur.txt");
+    std::fs::write(&path, "before content\nafter\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("before content")),
+        ("new_string", json!("REPLACED")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(!is_err, "single-occurrence edit MUST succeed; got {msg:?}");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(after, "REPLACED\nafter\n");
+}
+
+#[test]
+fn unicode_old_and_new_strings_round_trip() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("unicode_edit.txt");
+    std::fs::write(&path, "before 日本語 content\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("日本語")),
+        ("new_string", json!("にほんご 🎉")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(!is_err, "unicode edit MUST succeed; got {msg:?}");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(after.contains("にほんご 🎉"));
+    assert!(!after.contains("日本語"));
+}
