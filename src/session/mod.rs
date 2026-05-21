@@ -12,7 +12,7 @@ mod state;
 mod task;
 
 // Re-export all public types
-pub use audit::AuditLogger;
+pub use audit::{AuditError, AuditLogger};
 pub use pricing::{
     calculate_cost, calculate_cost_fast_mode, calculate_cost_full, calculate_cost_with_extras,
     calculate_cost_with_ttl, clear_unknown_model_cost, get_pricing, has_unknown_model_cost,
