@@ -36,7 +36,7 @@ pub use crate::keybindings::{
 pub use memory::MemoryConfig;
 pub use path_validation::{validate_persist_path, PathValidationError, ALLOW_OUT_OF_ROOT_ENV};
 pub use permissions::PermissionsConfig;
-pub use provider::{adaptive_budget_for, ProviderConfig, ThinkingConfig};
+pub use provider::{adaptive_budget_for, validate_base_url, ProviderConfig, ThinkingConfig};
 pub use proxy::ProxyConfig;
 pub use session::{SessionConfig, TokenTrackingConfig};
 pub use stop_conditions::{StopConditionsConfig, StopReason, TokenTotals};
