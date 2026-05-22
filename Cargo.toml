@@ -96,8 +96,11 @@ ratatui = "0.30"
 # SQLite for stateful memory
 rusqlite = { version = "0.39", features = ["bundled"] }
 
-# Headless browser for web scraping (optional, heavy dependency)
-headless_chrome = { version = "1", optional = true }
+# Headless browser for web scraping (optional, heavy dependency).
+# `fetch` enables auto-download of a vendored Chromium revision when no
+# system Chrome is present — used by the web_search / web_browser tool
+# fallback in src/web.rs::launch_browser_for_scraping.
+headless_chrome = { version = "1", optional = true, features = ["fetch"] }
 scraper = { version = "0.27", optional = true }
 syntect = "5"
 similar = { version = "3", features = ["inline"] }

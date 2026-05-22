@@ -1904,7 +1904,12 @@ async fn build_proxy_state(config: AppConfig) -> anyhow::Result<ProxyState> {
 }
 
 /// Connect to all MCP servers discovered through plugins.
-async fn connect_mcp_servers(
+///
+/// `pub` so the full-screen TUI can call it at startup (the proxy is
+/// not the only consumer of MCP — wiring it on `cmd_tui` lets the
+/// `list_mcp_resources` / `read_mcp_resource` tools dispatch into a
+/// real manager instead of returning the "not wired" stub).
+pub async fn connect_mcp_servers(
     mcp_manager: &Arc<RwLock<McpManager>>,
     plugin_manager: &Arc<PluginManager>,
 ) {

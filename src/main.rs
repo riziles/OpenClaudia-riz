@@ -364,6 +364,17 @@ async fn tui_launch(
     let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
     let hook_engine = std::sync::Arc::new(HookEngine::new(merged_hooks));
 
+    // Install a process-wide MCP manager so `list_mcp_resources` /
+    // `read_mcp_resource` can dispatch into real servers instead of
+    // returning the "not wired" stub. Plugin-discovered servers are
+    // connected best-effort — failures are logged by
+    // `connect_mcp_servers` and do not block TUI startup.
+    let plugin_manager = std::sync::Arc::new(init_plugin_manager());
+    let mcp_manager =
+        std::sync::Arc::new(tokio::sync::RwLock::new(openclaudia::mcp::McpManager::new()));
+    openclaudia::proxy::connect_mcp_servers(&mcp_manager, &plugin_manager).await;
+    let _ = openclaudia::mcp::install_manager(mcp_manager);
+
     let rules_engine = RulesEngine::new(".openclaudia/rules");
     let rules_content = {
         let extensions: Vec<&str> = vec!["rs", "py", "ts", "js", "go", "java", "rb", "md"];

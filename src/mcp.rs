@@ -1333,6 +1333,41 @@ pub struct McpManager {
     servers: Mutex<HashMap<String, ServerEntry>>,
 }
 
+/// Process-wide registry slot for the active MCP manager.
+///
+/// The full-screen TUI / proxy / acp entry points install a shared
+/// `Arc<RwLock<McpManager>>` here at startup; synchronous tool
+/// handlers (`list_mcp_resources`, `read_mcp_resource`, …) consult
+/// the slot via [`registered_manager`] and dispatch into the async
+/// manager by `Handle::current().block_on(...)`. That `block_on`
+/// only fires from inside a `spawn_blocking` thread (the runtime's
+/// dedicated blocking pool), so it does not deadlock the
+/// `flavor = "current_thread"` runtime.
+///
+/// Stored as `Option` so non-MCP entry points (CLI subcommands that
+/// never load MCP servers) can leave it unset; handlers report
+/// "no MCP servers connected" rather than panicking.
+static REGISTERED_MANAGER: std::sync::OnceLock<std::sync::Arc<tokio::sync::RwLock<McpManager>>> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide MCP manager.
+///
+/// Idempotent — the first installer wins, subsequent calls are
+/// silently ignored. Returns `true` on the install-this-call path,
+/// `false` otherwise, so callers can log a one-time warning if they
+/// are racing for the slot.
+pub fn install_manager(mgr: std::sync::Arc<tokio::sync::RwLock<McpManager>>) -> bool {
+    REGISTERED_MANAGER.set(mgr).is_ok()
+}
+
+/// Fetch the process-wide MCP manager, if one has been installed via
+/// [`install_manager`]. Returns `None` from contexts that never
+/// initialised MCP (the docs / config / chainlink subcommands).
+#[must_use]
+pub fn registered_manager() -> Option<&'static std::sync::Arc<tokio::sync::RwLock<McpManager>>> {
+    REGISTERED_MANAGER.get()
+}
+
 impl McpManager {
     /// Create a new MCP manager
     #[must_use]

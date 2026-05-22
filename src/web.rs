@@ -738,18 +738,50 @@ async fn search_brave(
 /// # Errors
 ///
 /// Returns an error string if the browser cannot be launched or no results are found.
+/// Launch a headless Chromium for scraping.
+///
+/// `LaunchOptions::path = None` plus the `fetch` feature on
+/// `headless_chrome` lets the upstream `Process::new` resolve the
+/// browser binary in two stages: first it consults the standard
+/// install dirs (`/usr/bin/chromium`, `/Applications/Google Chrome`,
+/// etc) via `FetcherOptions::with_allow_standard_dirs(true)`; if no
+/// system browser is present it auto-downloads a known-good Chromium
+/// revision into the user's data dir and caches it for future runs.
+///
+/// The combined behaviour matches user expectation — the tool just
+/// works on a fresh machine without manual Chromium installation —
+/// and the error path stays actionable when both fail (e.g. no
+/// network during first-run auto-download).
+#[cfg(feature = "browser")]
+fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
+    use headless_chrome::{Browser, LaunchOptions};
+
+    let opts = LaunchOptions::default_builder()
+        .headless(true)
+        .build()
+        .map_err(|e| format!("Failed to configure browser: {e}"))?;
+    Browser::new(opts).map_err(|e| {
+        format!(
+            "Failed to launch Chromium: {e}. Install chromium/google-chrome \
+             on PATH, or ensure network access for the first-run auto-download."
+        )
+    })
+}
+
+/// Search `DuckDuckGo` via a headless Chromium and parse the rendered
+/// HTML for the top `limit` results.
+///
+/// # Errors
+///
+/// Returns a descriptive message if Chromium cannot be launched
+/// (no system Chrome and the first-run auto-download failed), if
+/// navigation times out, if the response exceeds the rendered-HTML
+/// cap, or if the DOM does not contain the expected selectors.
 #[cfg(feature = "browser")]
 pub fn search_duckduckgo(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    use headless_chrome::{Browser, LaunchOptions};
     use scraper::{Html, Selector};
 
-    let browser = Browser::new(
-        LaunchOptions::default_builder()
-            .headless(true)
-            .build()
-            .map_err(|e| format!("Failed to configure browser: {e}"))?,
-    )
-    .map_err(|e| format!("Failed to launch browser: {e}"))?;
+    let browser = launch_browser_for_scraping()?;
 
     let tab = browser
         .new_tab()
@@ -886,17 +918,9 @@ pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult
 /// Returns an error string if the URL is invalid or browser automation fails.
 #[cfg(feature = "browser")]
 pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
-    use headless_chrome::{Browser, LaunchOptions};
-
     validate_url(url)?;
 
-    let browser = Browser::new(
-        LaunchOptions::default_builder()
-            .headless(true)
-            .build()
-            .map_err(|e| format!("Failed to configure browser: {e}"))?,
-    )
-    .map_err(|e| format!("Failed to launch browser: {e}"))?;
+    let browser = launch_browser_for_scraping()?;
 
     let tab = browser
         .new_tab()

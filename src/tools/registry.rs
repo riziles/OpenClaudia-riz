@@ -1345,17 +1345,67 @@ impl ToolHandler for ListMcpResourcesHandler {
             }
         })
     }
-    fn execute(
-        &self,
-        _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        (
-            "list_mcp_resources is not wired into the tool dispatch system yet. \
-             The schema is published to the model but dispatch is unimplemented."
-                .to_string(),
-            true,
-        )
+    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+        let Some(mgr) = crate::mcp::registered_manager() else {
+            return (
+                "No MCP manager has been installed for this session. \
+                 Configure MCP servers under `mcp.servers` in \
+                 `.openclaudia/config.yaml` and re-launch."
+                    .to_string(),
+                true,
+            );
+        };
+        let server_filter = args
+            .get("server")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // We're already inside `pipeline::execute_single_tool`'s
+        // `spawn_blocking` thread, so blocking on the runtime here
+        // does NOT pin the current_thread executor. See the docstring
+        // on `REGISTERED_MANAGER` in `src/mcp.rs` for the architecture.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return (
+                "list_mcp_resources requires an active tokio runtime to \
+                 dispatch into the async MCP manager."
+                    .to_string(),
+                true,
+            );
+        };
+        let mgr = mgr.clone();
+        let result = handle.block_on(async move {
+            let guard = mgr.read().await;
+            guard.list_resources(server_filter.as_deref()).await
+        });
+        match result {
+            Ok(entries) if entries.is_empty() => (
+                "No MCP resources are exposed by the connected servers.".to_string(),
+                false,
+            ),
+            Ok(entries) => {
+                let body = entries
+                    .iter()
+                    .map(|(server, res)| {
+                        format!(
+                            "{server}\t{uri}\t{name}{desc}",
+                            uri = res.uri,
+                            name = res.name,
+                            desc = res
+                                .description
+                                .as_deref()
+                                .map(|d| format!("\t{d}"))
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let header = format!(
+                    "{count} resource(s) across MCP servers:\nserver\turi\tname[\tdescription]\n",
+                    count = entries.len()
+                );
+                (format!("{header}{body}"), false)
+            }
+            Err(e) => (format!("list_mcp_resources failed: {e}"), true),
+        }
     }
 }
 
@@ -1387,17 +1437,47 @@ impl ToolHandler for ReadMcpResourceHandler {
             }
         })
     }
-    fn execute(
-        &self,
-        _args: &HashMap<String, Value>,
-        _ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        (
-            "read_mcp_resource is not wired into the tool dispatch system yet. \
-             The schema is published to the model but dispatch is unimplemented."
-                .to_string(),
-            true,
-        )
+    fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+        let Some(server) = args.get("server").and_then(Value::as_str) else {
+            return (
+                "read_mcp_resource: missing required argument `server`".to_string(),
+                true,
+            );
+        };
+        let Some(uri) = args.get("uri").and_then(Value::as_str) else {
+            return (
+                "read_mcp_resource: missing required argument `uri`".to_string(),
+                true,
+            );
+        };
+        let Some(mgr) = crate::mcp::registered_manager() else {
+            return (
+                "No MCP manager has been installed for this session. \
+                 Configure MCP servers under `mcp.servers` in \
+                 `.openclaudia/config.yaml` and re-launch."
+                    .to_string(),
+                true,
+            );
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return (
+                "read_mcp_resource requires an active tokio runtime to \
+                 dispatch into the async MCP manager."
+                    .to_string(),
+                true,
+            );
+        };
+        let server_owned = server.to_string();
+        let uri_owned = uri.to_string();
+        let mgr = mgr.clone();
+        let result = handle.block_on(async move {
+            let guard = mgr.read().await;
+            guard.read_resource(&server_owned, &uri_owned).await
+        });
+        match result {
+            Ok(content) => (content, false),
+            Err(e) => (format!("read_mcp_resource failed: {e}"), true),
+        }
     }
 }
 
