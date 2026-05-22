@@ -850,36 +850,52 @@ impl App {
             if TUI_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            terminal.draw(|frame| self.draw(frame))?;
 
-            // Non-blocking event drain with an `.await` between empty polls.
-            //
-            // The previous `events.next()` was a synchronous
-            // `std::sync::mpsc::recv()` that pinned the main thread.
-            // Under `#[tokio::main(flavor = "current_thread")]` that
-            // starved every spawned task (including `run_api_turn_async`),
-            // so the API call fired from a user's keystroke never made
-            // progress and the agent never replied. Yielding via
-            // `tokio::time::sleep(...).await` hands the runtime back so
-            // spawned tasks can drive their futures.
-            match events.try_next() {
-                Ok(event) => {
-                    if !self.handle_app_event(Ok(event)) {
+            // Drain ALL pending events before drawing so the next
+            // frame reflects the most recent state. The previous
+            // "draw → handle one event → loop" order painted the
+            // OLD state on every iteration that received an event,
+            // and the NEW state only appeared on the iteration
+            // after — producing the "responses one turn behind"
+            // symptom users reported when streaming events arrived
+            // back-to-back. Draining the channel first eliminates
+            // that one-frame lag without changing per-event
+            // dispatch semantics.
+            let mut channel_dead = false;
+            loop {
+                match events.try_next() {
+                    Ok(event) => {
+                        if !self.handle_app_event(Ok(event)) {
+                            channel_dead = true;
+                            break;
+                        }
+                        if self.should_quit {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let _ = self.handle_app_event(Err(std::sync::mpsc::RecvError));
+                        channel_dead = true;
                         break;
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(16)).await;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let _ = self.handle_app_event(Err(std::sync::mpsc::RecvError));
-                    break;
-                }
             }
-
-            if self.should_quit {
+            if channel_dead || self.should_quit {
                 break;
             }
+
+            // Render once per loop iteration with the post-drain state.
+            terminal.draw(|frame| self.draw(frame))?;
+
+            // Yield to the runtime so spawned tasks
+            // (`run_api_turn_async`, tool calls, hook execution)
+            // can drive their futures. Under
+            // `flavor = "current_thread"` this `.await` is the only
+            // place the executor regains control between events.
+            // 16 ms ≈ 60 fps — keypress echo feels instant without
+            // burning CPU between events.
+            tokio::time::sleep(Duration::from_millis(16)).await;
         }
 
         disable_raw_mode()?;
