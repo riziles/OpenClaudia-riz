@@ -810,9 +810,32 @@ impl App {
                 break;
             }
             terminal.draw(|frame| self.draw(frame))?;
-            if !self.handle_app_event(events.next()) {
-                break;
+
+            // Non-blocking event drain with an `.await` between empty polls.
+            //
+            // The previous `events.next()` was a synchronous
+            // `std::sync::mpsc::recv()` that pinned the main thread.
+            // Under `#[tokio::main(flavor = "current_thread")]` that
+            // starved every spawned task (including `run_api_turn_async`),
+            // so the API call fired from a user's keystroke never made
+            // progress and the agent never replied. Yielding via
+            // `tokio::time::sleep(...).await` hands the runtime back so
+            // spawned tasks can drive their futures.
+            match events.try_next() {
+                Ok(event) => {
+                    if !self.handle_app_event(Ok(event)) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = self.handle_app_event(Err(std::sync::mpsc::RecvError));
+                    break;
+                }
             }
+
             if self.should_quit {
                 break;
             }
@@ -822,7 +845,9 @@ impl App {
         execute!(io::stdout(), LeaveAlternateScreen)?;
 
         // Save session on exit
-        self.chat_session.messages = self.session_messages.clone();
+        self.chat_session
+            .messages
+            .clone_from(&self.session_messages);
         self.chat_session.touch();
         let _ = save_session(&self.chat_session);
 

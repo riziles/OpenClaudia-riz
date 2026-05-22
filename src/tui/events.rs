@@ -148,6 +148,23 @@ impl EventHandler {
     pub fn next(&self) -> Result<AppEvent, mpsc::RecvError> {
         self.rx.recv()
     }
+
+    /// Non-blocking poll. Returns immediately whether an event is ready or not.
+    ///
+    /// Used by the async TUI loop so it can `.await tokio::time::sleep`
+    /// between empty polls — that `.await` is what lets the
+    /// current-thread tokio runtime drive spawned tasks (e.g.
+    /// `run_api_turn_async`). A purely blocking `recv()` would pin
+    /// the runtime thread and starve every spawned task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TryRecvError::Empty` when no event is ready yet, or
+    /// `TryRecvError::Disconnected` when both producer halves
+    /// (terminal-reader thread + API senders) have hung up.
+    pub fn try_next(&self) -> Result<AppEvent, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 
 /// Translate a raw crossterm terminal event into an [`AppEvent`], filtering
