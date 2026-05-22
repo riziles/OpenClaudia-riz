@@ -762,10 +762,19 @@ impl App {
 
     /// Run the interactive TUI event loop.
     ///
+    /// `async` so the `SessionEnd` cleanup at the end can `.await` the
+    /// hook engine directly instead of `Handle::block_on`-ing the same
+    /// current-thread runtime that's already driving it (which panics
+    /// with "Cannot start a runtime from within a runtime"). The event
+    /// loop body itself is still synchronous — `events.next()` blocks
+    /// the main task — so no concurrent async work runs until the loop
+    /// exits, but that matches the pre-fix behaviour and is necessary
+    /// for the terminal-render loop.
+    ///
     /// # Errors
     ///
     /// Returns an error if terminal initialization or rendering fails.
-    pub fn run(&mut self) -> io::Result<()> {
+    pub async fn run(&mut self) -> io::Result<()> {
         // Capture the tokio runtime handle (must be called inside an async context).
         self.runtime_handle = tokio::runtime::Handle::try_current().ok();
 
@@ -821,18 +830,18 @@ impl App {
         // so we can't recover from a failure, and we must not spam the
         // terminal (already restored from alt-screen). The hook engine
         // owns its own error logging via tracing.
-        if let (Some(engine), Some(handle)) =
-            (self.hook_engine.as_ref(), self.runtime_handle.as_ref())
-        {
+        //
+        // Awaiting directly (rather than `Handle::block_on`-ing inside the
+        // current-thread runtime) avoids the "Cannot start a runtime from
+        // within a runtime" panic that surfaced when the TUI was launched
+        // via `#[tokio::main(flavor = "current_thread")]`.
+        if let Some(engine) = self.hook_engine.as_ref() {
             let session_id = self.chat_session.id.clone();
-            let engine = engine.clone();
-            handle.block_on(async move {
-                let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::SessionEnd)
-                    .with_session_id(session_id);
-                let _ = engine
-                    .run(crate::hooks::HookEvent::SessionEnd, &input)
-                    .await;
-            });
+            let input = crate::hooks::HookInput::new(crate::hooks::HookEvent::SessionEnd)
+                .with_session_id(session_id);
+            let _ = engine
+                .run(crate::hooks::HookEvent::SessionEnd, &input)
+                .await;
         }
 
         Ok(())

@@ -331,13 +331,13 @@ async fn cmd_tui(model_override: Option<String>) -> anyhow::Result<()> {
     )?;
 
     guardrails::configure(&config.guardrails);
-    tui_launch(&config, &model, endpoint, headers, claude_code_token)
+    tui_launch(&config, &model, endpoint, headers, claude_code_token).await
 }
 
 /// Build TUI system resources (memory, prompt, hooks, rules) and launch the app.
 ///
 /// Extracted from `cmd_tui` to keep that function under the line limit.
-fn tui_launch(
+async fn tui_launch(
     config: &config::AppConfig,
     model: &str,
     endpoint: String,
@@ -386,7 +386,9 @@ fn tui_launch(
     app.hook_engine = Some(hook_engine);
     app.memory_db = memory_db.map(std::sync::Arc::new);
     app.rules_content = rules_content;
-    app.run().map_err(|e| anyhow::anyhow!("TUI error: {e}"))
+    app.run()
+        .await
+        .map_err(|e| anyhow::anyhow!("TUI error: {e}"))
 }
 
 /// Result of an interactive permission prompt for a tool call.
