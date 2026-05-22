@@ -1089,9 +1089,17 @@ impl App {
     /// The permission prompt is a sub-state of Normal mode (it overlays
     /// the input line but does not block scrolling), so it stays inside
     /// the Normal-mode dispatcher.
+    ///
+    /// Important: a pending permission prompt always wins over the
+    /// streaming check. The pipeline emits `PermissionRequest` mid-turn
+    /// while `is_waiting == true`; if we routed to Streaming we'd drop
+    /// the y/n/a/d keystrokes the user needs to unblock the prompt
+    /// (and through it, the entire agent turn).
     const fn current_key_mode(&self) -> KeyMode {
         if self.overlay.is_some() {
             KeyMode::Modal
+        } else if self.pending_permission.is_some() {
+            KeyMode::Normal
         } else if self.is_waiting {
             KeyMode::Streaming
         } else {
