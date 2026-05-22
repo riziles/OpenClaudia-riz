@@ -1186,9 +1186,14 @@ enum PermissionOutcome {
 /// Consults `always_allowed`/`always_denied` session caches (batch-scoped),
 /// then the `PermissionManager`'s session-scoped TUI always-allow/deny cache
 /// (crosslink #724 — persists across batches for the lifetime of the
-/// manager), then sends a `PermissionRequest` event and blocks for the
-/// user's decision if neither cache matches.
-fn check_tool_permission(
+/// manager), then sends a `PermissionRequest` event and `.await`s the
+/// user's decision via a tokio `oneshot` if neither cache matches.
+///
+/// `async` so the reply wait yields the runtime — under
+/// `flavor = "current_thread"` a synchronous `mpsc::recv` here would
+/// pin the only thread and deadlock the main TUI loop (which is the
+/// one that has to deliver the user's response).
+async fn check_tool_permission(
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
@@ -1232,7 +1237,7 @@ fn check_tool_permission(
     } else {
         arguments.to_string()
     };
-    let (reply_tx, reply_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(AppEvent::PermissionRequest {
             tool_name: tool_name.to_string(),
@@ -1243,7 +1248,7 @@ fn check_tool_permission(
     {
         return PermissionOutcome::ChannelBroken;
     }
-    match reply_rx.recv() {
+    match reply_rx.await {
         Ok(PermissionResponse::Allow) => PermissionOutcome::Allowed,
         Ok(PermissionResponse::AlwaysAllow) => {
             always_allowed.insert(tool_name.to_string());
@@ -1443,7 +1448,9 @@ async fn execute_tool_calls_for_tui(
                 &mut always_denied,
                 permission_mgr.as_deref(),
                 tx,
-            ) {
+            )
+            .await
+            {
                 PermissionOutcome::Allowed => {}
                 PermissionOutcome::DeniedWithResult(result_json) => {
                     results.push(result_json);
@@ -1883,8 +1890,8 @@ mod tests {
     /// `Allowed` without sending a `PermissionRequest` event. This is the
     /// integration test that proves the cache survives across batches: a
     /// fresh `execute_tool_calls_for_tui` invocation would see this state.
-    #[test]
-    fn issue_724_check_tool_permission_uses_session_always_allowed() {
+    #[tokio::test]
+    async fn issue_724_check_tool_permission_uses_session_always_allowed() {
         use std::sync::mpsc as std_mpsc;
 
         let mgr = PermissionManager::unrestricted();
@@ -1905,7 +1912,8 @@ mod tests {
             &mut always_denied,
             Some(&mgr),
             &tx,
-        );
+        )
+        .await;
         assert!(
             matches!(outcome, PermissionOutcome::Allowed),
             "#724: a prior 'always allow' must short-circuit to Allowed without a prompt"
@@ -1919,8 +1927,8 @@ mod tests {
 
     /// crosslink #724 — symmetric to the above: a session-scoped "always deny"
     /// short-circuits to `DeniedWithResult` without prompting the user again.
-    #[test]
-    fn issue_724_check_tool_permission_uses_session_always_denied() {
+    #[tokio::test]
+    async fn issue_724_check_tool_permission_uses_session_always_denied() {
         use std::sync::mpsc as std_mpsc;
 
         let mgr = PermissionManager::unrestricted();
@@ -1939,7 +1947,8 @@ mod tests {
             &mut always_denied,
             Some(&mgr),
             &tx,
-        );
+        )
+        .await;
         assert!(
             matches!(outcome, PermissionOutcome::DeniedWithResult(_)),
             "#724: a prior 'always deny' must short-circuit to Denied without a prompt"

@@ -352,7 +352,7 @@ fn list_sessions() -> Vec<TuiSession> {
 struct PendingPermission {
     tool_name: String,
     tool_args: String,
-    reply: std::sync::mpsc::Sender<super::events::PermissionResponse>,
+    reply: tokio::sync::oneshot::Sender<super::events::PermissionResponse>,
 }
 
 /// Dispatch table for the TUI's no-argument slash commands (crosslink #259).

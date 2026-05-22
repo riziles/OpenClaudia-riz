@@ -70,11 +70,18 @@ pub enum AppEvent {
     /// Sync updated session messages back to the App after an agentic loop.
     SyncMessages(Vec<serde_json::Value>),
     /// Pipeline requesting permission to run a tool.
-    /// Includes a oneshot sender to reply with the user's decision.
+    ///
+    /// Includes a tokio `oneshot::Sender` to reply with the user's
+    /// decision. Tokio oneshot (vs `std::sync::mpsc`) is essential
+    /// here: under `flavor = "current_thread"` the pipeline task
+    /// must `.await` the user's response, and `std::sync::mpsc::recv`
+    /// would pin the single runtime thread (deadlocking the main TUI
+    /// loop that has to deliver the response). `oneshot::Receiver::await`
+    /// yields to the runtime so events keep flowing.
     PermissionRequest {
         tool_name: String,
         tool_args: String,
-        reply: std::sync::mpsc::Sender<PermissionResponse>,
+        reply: tokio::sync::oneshot::Sender<PermissionResponse>,
     },
     /// A subprocess dispatched via `App::spawn_shell` has finished.
     /// The UI thread renders this according to [`SpawnTarget`].
