@@ -1570,7 +1570,15 @@ async fn execute_tool_calls_for_tui(
         .await;
         match tool_result {
             None => break, // channel broken
-            Some(result_json) => results.push(result_json),
+            Some(mut result_json) => {
+                // ask_user_question bridge — see `intercept_user_question`.
+                // Returns `Err(())` only when the AppEvent channel is dead,
+                // matching the existing break-on-broken-channel semantics.
+                if intercept_user_question(&mut result_json, tx).await.is_err() {
+                    break;
+                }
+                results.push(result_json);
+            }
         }
     }
 
@@ -1590,6 +1598,61 @@ async fn execute_tool_calls_for_tui(
     }
 
     (results, true)
+}
+
+/// Bridge the sync `ask_user_question` tool's `USER_QUESTION_MARKER`
+/// payload onto the full-screen TUI's modal flow.
+///
+/// The sync tool returns a JSON object of shape `{"type":
+/// "user_question", "questions": [...]}` as the tool-result content.
+/// The REPL intercepts that via `process_tool_result_marker` and
+/// blocks on stdin (`handle_user_questions`). Under the full-screen
+/// TUI we route the question set to a modal via `AppEvent::
+/// UserQuestion`, park on a oneshot for the answer JSON, and
+/// rewrite `result_json["content"]` so the model only ever sees
+/// the user's answers — never the raw marker.
+///
+/// Returns `Err(())` only when the `AppEvent` channel is dead
+/// (TUI shut down mid-turn). Tool-result payloads that aren't a
+/// `user_question` marker are returned unchanged and `Ok(())`.
+async fn intercept_user_question(
+    result_json: &mut Value,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<(), ()> {
+    let Some(content) = result_json.get("content").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    if !matches!(
+        crate::tools::parse_tool_control_signal(content),
+        Some(crate::tools::ToolControlSignal::UserQuestion)
+    ) {
+        return Ok(());
+    }
+    let Some(questions) = crate::tools::parse_user_questions(content) else {
+        return Ok(());
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(AppEvent::UserQuestion {
+            questions,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Err(());
+    }
+
+    // Modal dropped the sender (e.g. user cancelled with Ctrl+C) →
+    // surface a structured `_cancelled: true` payload to the agent
+    // instead of hanging.
+    let answers = reply_rx
+        .await
+        .unwrap_or_else(|_| "{\"_cancelled\": true}".to_string());
+    if let Some(obj) = result_json.as_object_mut() {
+        obj.insert("content".to_string(), Value::String(answers));
+    }
+    Ok(())
 }
 
 /// Build the assistant message with tool calls for appending to conversation history.

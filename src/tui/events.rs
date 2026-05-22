@@ -83,6 +83,19 @@ pub enum AppEvent {
         tool_args: String,
         reply: tokio::sync::oneshot::Sender<PermissionResponse>,
     },
+    /// The `ask_user_question` tool returned its `USER_QUESTION_MARKER`
+    /// payload. The TUI should display a modal that walks the user
+    /// through each question, collect answers, and send back a JSON
+    /// object mapping `question_text → answer(s)` via the oneshot.
+    ///
+    /// The pipeline thread parks on the receiver until the modal sends
+    /// (same yielding contract as `PermissionRequest`). Mirrors the
+    /// REPL flow in `cli::repl::input::handle_user_questions` so the
+    /// agent-facing contract is identical across both front-ends.
+    UserQuestion {
+        questions: Vec<serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
     /// A subprocess dispatched via `App::spawn_shell` has finished.
     /// The UI thread renders this according to [`SpawnTarget`].
     ShellDone {

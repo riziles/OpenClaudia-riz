@@ -355,6 +355,32 @@ struct PendingPermission {
     reply: tokio::sync::oneshot::Sender<super::events::PermissionResponse>,
 }
 
+/// A pending `ask_user_question` modal waiting for the user to walk
+/// through the question set. Mirrors the REPL flow in
+/// `cli::repl::input::handle_user_questions` so the agent-facing
+/// answer JSON is byte-identical.
+struct PendingUserQuestion {
+    /// Full question set as supplied by the tool call. Each entry has
+    /// `question`, `header`, `options[]`, and an optional `multiSelect`.
+    questions: Vec<serde_json::Value>,
+    /// Index of the question currently shown (0-based).
+    current_index: usize,
+    /// Text the user is typing for the active question. Numeric
+    /// (single-select), comma-separated numeric (multi-select), or
+    /// free-form (when "Other" is picked).
+    input_buffer: String,
+    /// Accumulated answers — flushed back to the pipeline as JSON
+    /// when the last question is answered.
+    answers: serde_json::Map<String, serde_json::Value>,
+    /// `true` once the user picked the synthetic "Other" option for
+    /// the current question and is now typing their free-form answer.
+    other_mode: bool,
+    /// Reply channel back to the pipeline. Dropping it (e.g. on
+    /// Ctrl+C) surfaces a structured "cancelled" payload to the
+    /// model rather than hanging the agent indefinitely.
+    reply: tokio::sync::oneshot::Sender<String>,
+}
+
 /// Dispatch table for the TUI's no-argument slash commands (crosslink #259).
 ///
 /// Each entry maps a canonical command spelling (`/quit`, `/help`, …) to
@@ -519,6 +545,11 @@ pub struct App {
     pub chat_session: TuiSession,
     /// Active permission prompt (if any). Tool execution blocks until resolved.
     pending_permission: Option<PendingPermission>,
+    /// Active `ask_user_question` modal (if any). The pipeline's
+    /// post-tool-execution interceptor parks on a oneshot until the
+    /// modal completes the question set and sends back the answers
+    /// JSON. While `Some`, key dispatch routes to the modal walker.
+    pending_user_question: Option<PendingUserQuestion>,
     /// Hook engine for running lifecycle hooks.
     pub hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     /// Session-scoped task tracker for the `task_create` / `task_update` /
@@ -578,6 +609,7 @@ impl App {
             runtime_handle: None,
             chat_session: TuiSession::new(model, provider),
             pending_permission: None,
+            pending_user_question: None,
             hook_engine: None,
             task_mgr: std::sync::Arc::new(
                 std::sync::Mutex::new(crate::session::TaskManager::new()),
@@ -922,18 +954,7 @@ impl App {
                     content: preview,
                 });
             }
-            Ok(AppEvent::ResponseDone) => {
-                self.messages.finish_thinking();
-                self.messages.finish_streaming();
-                self.is_waiting = false;
-                self.chat_session.messages = self.session_messages.clone();
-                self.chat_session.update_title();
-                self.chat_session.touch();
-                let _ = save_session(&self.chat_session);
-                self.persist_transcript_tail();
-                self.tokens = self.chat_session.estimate_tokens();
-                self.fire_stop_hook();
-            }
+            Ok(AppEvent::ResponseDone) => self.handle_response_done(),
             Ok(AppEvent::ApiError(msg)) => {
                 self.messages.finish_streaming();
                 self.messages
@@ -956,6 +977,21 @@ impl App {
                 self.pending_permission = Some(PendingPermission {
                     tool_name,
                     tool_args,
+                    reply,
+                });
+            }
+            Ok(AppEvent::UserQuestion { questions, reply }) => {
+                // Surface the modal. The pipeline interceptor parks on
+                // the reply oneshot and resumes once the user walks
+                // every question; on Escape the modal drops `reply`
+                // and the interceptor surfaces `_cancelled: true` to
+                // the agent.
+                self.pending_user_question = Some(PendingUserQuestion {
+                    questions,
+                    current_index: 0,
+                    input_buffer: String::new(),
+                    answers: serde_json::Map::new(),
+                    other_mode: false,
                     reply,
                 });
             }
@@ -989,6 +1025,28 @@ impl App {
             Err(_) => return false,
         }
         true
+    }
+
+    /// Finalise the turn when the pipeline emits `ResponseDone`.
+    ///
+    /// Extracted from `handle_app_event` to keep that dispatcher under
+    /// the clippy `too_many_lines` threshold. Responsible for finishing
+    /// any in-flight stream/thinking widgets, flushing the persisted
+    /// chat session, refreshing the token estimate, and firing the
+    /// Stop hook so external orchestrators get the round-trip signal.
+    fn handle_response_done(&mut self) {
+        self.messages.finish_thinking();
+        self.messages.finish_streaming();
+        self.is_waiting = false;
+        self.chat_session
+            .messages
+            .clone_from(&self.session_messages);
+        self.chat_session.update_title();
+        self.chat_session.touch();
+        let _ = save_session(&self.chat_session);
+        self.persist_transcript_tail();
+        self.tokens = self.chat_session.estimate_tokens();
+        self.fire_stop_hook();
     }
 
     /// Render the result of a backgrounded shell call dispatched via
@@ -1107,7 +1165,14 @@ impl App {
     const fn current_key_mode(&self) -> KeyMode {
         if self.overlay.is_some() {
             KeyMode::Modal
-        } else if self.pending_permission.is_some() {
+        } else if self.pending_permission.is_some() || self.pending_user_question.is_some() {
+            // Permission prompt + ask_user_question modal both win over
+            // the streaming check — they arrive mid-turn while
+            // `is_waiting == true`, and the user MUST be able to type
+            // y/n/a/d (permission) or numeric option indices
+            // (ask_user_question) to unblock the pipeline. Without this
+            // routing the streaming dispatcher would silently drop
+            // every key.
             KeyMode::Normal
         } else if self.is_waiting {
             KeyMode::Streaming
@@ -1145,6 +1210,16 @@ impl App {
         // If permission prompt is active, deny and dismiss without quitting.
         if let Some(perm) = self.pending_permission.take() {
             let _ = perm.reply.send(super::events::PermissionResponse::Deny);
+            return;
+        }
+        // If an ask_user_question modal is active, cancel it (drop the
+        // reply sender; the pipeline interceptor surfaces a structured
+        // `_cancelled: true` to the agent instead of hanging).
+        if let Some(pq) = self.pending_user_question.take() {
+            drop(pq.reply);
+            self.messages.add(DisplayMessage::system(
+                "ask_user_question cancelled".to_string(),
+            ));
             return;
         }
         // If an overlay is open, close it instead of quitting — matches
@@ -1200,11 +1275,16 @@ impl App {
     }
 
     /// Normal-mode keystrokes: interactive editing. Permission-prompt
-    /// handling is the one sub-state because the prompt overlays the
-    /// input line without taking the App into modal-overlay state.
+    /// and `ask_user_question` walking are sub-states because the
+    /// prompt / modal overlays the input line without taking the App
+    /// into modal-overlay state.
     fn handle_key_normal(&mut self, key: crossterm::event::KeyEvent) {
         if self.pending_permission.is_some() {
             self.handle_permission_key(key);
+            return;
+        }
+        if self.pending_user_question.is_some() {
+            self.handle_user_question_key(key);
             return;
         }
         self.handle_editing_key(key);
@@ -1239,6 +1319,182 @@ impl App {
                     DisplayMessage::system(content)
                 });
                 let _ = perm.reply.send(resp);
+            }
+        }
+    }
+
+    /// Dispatch keystrokes when an `ask_user_question` modal is active.
+    ///
+    /// The modal walks the question set one entry at a time:
+    /// * Character keys / Backspace edit the `input_buffer`.
+    /// * Enter finalises the current question:
+    ///   - Single-select: parse the buffer as `usize`, look up the
+    ///     matching option (or the synthetic "Other" sentinel that's
+    ///     always one past `options.len()`).
+    ///   - Multi-select: split the buffer on commas and resolve each
+    ///     token the same way.
+    /// * Picking "Other" flips into `other_mode`, where the next Enter
+    ///   commits the free-form text instead of resolving an option
+    ///   index.
+    /// * Escape cancels the entire modal — drops the reply sender so
+    ///   the parked pipeline task receives a structured `_cancelled`
+    ///   payload rather than hanging.
+    ///
+    /// When the last question is answered the accumulated `answers`
+    /// map is serialised to JSON and sent on the reply oneshot,
+    /// `pending_user_question` is cleared, and a one-line system
+    /// message is added to the visible transcript so the user can see
+    /// the modal completed.
+    fn handle_user_question_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Escape cancels the whole modal.
+        if key.code == KeyCode::Esc {
+            if let Some(pq) = self.pending_user_question.take() {
+                // Drop the reply sender — pipeline interceptor surfaces
+                // the cancellation as `_cancelled: true` to the agent.
+                drop(pq.reply);
+                self.messages.add(DisplayMessage::system(
+                    "ask_user_question cancelled".to_string(),
+                ));
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(c) => {
+                if let Some(pq) = self.pending_user_question.as_mut() {
+                    pq.input_buffer.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(pq) = self.pending_user_question.as_mut() {
+                    pq.input_buffer.pop();
+                }
+            }
+            KeyCode::Enter => self.finalise_current_question(),
+            _ => {}
+        }
+    }
+
+    /// Finalise the active question. Extracted from
+    /// [`handle_user_question_key`] to keep the key-dispatch path
+    /// readable; encapsulates the single/multi-select + "Other"
+    /// resolution logic, advances `current_index`, and on completion
+    /// flushes the accumulated answers JSON back through the reply
+    /// channel.
+    fn finalise_current_question(&mut self) {
+        let Some(pq) = self.pending_user_question.as_mut() else {
+            return;
+        };
+        let Some(q) = pq.questions.get(pq.current_index).cloned() else {
+            return;
+        };
+        let question_text = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let options = q
+            .get("options")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Canonicalised key — `ask_user::normalize_question` already
+        // rewrites the legacy `multi_select` to `multiSelect`.
+        let multi_select = q
+            .get("multiSelect")
+            .or_else(|| q.get("multi_select"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let other_num = options.len() + 1;
+
+        let input = std::mem::take(&mut pq.input_buffer);
+        let was_other_mode = pq.other_mode;
+
+        // "Other" follow-up commit: take whatever the user typed
+        // verbatim (single-select) or append to the in-progress
+        // multi-select list (multi-select).
+        if was_other_mode {
+            pq.other_mode = false;
+            let trimmed = input.trim().to_string();
+            if multi_select {
+                let existing = pq
+                    .answers
+                    .entry(question_text)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(arr) = existing {
+                    arr.push(serde_json::Value::String(trimmed));
+                }
+            } else {
+                pq.answers
+                    .insert(question_text, serde_json::Value::String(trimmed));
+            }
+            self.advance_or_finish_question();
+            return;
+        }
+
+        if multi_select {
+            let mut selected: Vec<serde_json::Value> = Vec::new();
+            let mut other_pending = false;
+            for part in input.split(',') {
+                let part = part.trim();
+                if let Ok(num) = part.parse::<usize>() {
+                    if num >= 1 && num <= options.len() {
+                        if let Some(opt) = options.get(num - 1) {
+                            let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                            selected.push(serde_json::Value::String(label.to_string()));
+                        }
+                    } else if num == other_num {
+                        other_pending = true;
+                    }
+                }
+            }
+            pq.answers
+                .insert(question_text, serde_json::Value::Array(selected));
+            if other_pending {
+                pq.other_mode = true;
+                return; // wait for free-form follow-up
+            }
+        } else if let Ok(num) = input.trim().parse::<usize>() {
+            if num >= 1 && num <= options.len() {
+                if let Some(opt) = options.get(num - 1) {
+                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                    pq.answers
+                        .insert(question_text, serde_json::Value::String(label.to_string()));
+                }
+            } else if num == other_num {
+                pq.other_mode = true;
+                return; // wait for free-form follow-up
+            } else {
+                // Out-of-range numeric input — treat the raw text as the
+                // answer (parity with the REPL `else` branch).
+                pq.answers
+                    .insert(question_text, serde_json::Value::String(input));
+            }
+        } else {
+            // Non-numeric input → treat as free-form answer (REPL parity).
+            pq.answers
+                .insert(question_text, serde_json::Value::String(input));
+        }
+
+        self.advance_or_finish_question();
+    }
+
+    /// Advance to the next question, or — if every question has been
+    /// answered — serialise the accumulated answer map and ship it
+    /// back through the reply oneshot.
+    fn advance_or_finish_question(&mut self) {
+        let Some(pq) = self.pending_user_question.as_mut() else {
+            return;
+        };
+        pq.current_index += 1;
+        if pq.current_index >= pq.questions.len() {
+            // Take ownership so we can move `reply` out of the struct.
+            if let Some(done) = self.pending_user_question.take() {
+                let payload = serde_json::Value::Object(done.answers).to_string();
+                let _ = done.reply.send(payload);
+                self.messages.add(DisplayMessage::system(
+                    "ask_user_question answered".to_string(),
+                ));
             }
         }
     }
@@ -2136,6 +2392,9 @@ impl App {
         // ── Permission prompt overlay ──
         self.draw_permission_overlay(frame);
 
+        // ── ask_user_question modal ──
+        self.draw_user_question_overlay(frame);
+
         // ── Modal overlay (rendered last so it floats above everything) ──
         // Use `Clear` to blank the underlying region; both overlays paint
         // their own background via the border-block's default bg.
@@ -2195,6 +2454,66 @@ impl App {
             .block(
                 Block::default()
                     .title(" Permission Required ")
+                    .title_style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GOLD)),
+            )
+            .style(Style::default().bg(Color::Black));
+        frame.render_widget(dialog, dialog_area);
+    }
+
+    /// Render the `ask_user_question` modal when one is active.
+    ///
+    /// Centred box overlaying the bottom of the screen, sized to fit
+    /// the option list. Shows the question header, the question text,
+    /// each option prefixed by `[N]`, a synthetic `[N+1] Other` row
+    /// that triggers free-form follow-up, and the current input
+    /// buffer with a `>` prompt.
+    ///
+    /// All rendering reads from `&self` only — state mutation lives
+    /// in [`handle_user_question_key`] / [`finalise_current_question`].
+    fn draw_user_question_overlay(&self, frame: &mut Frame) {
+        let Some(ref pq) = self.pending_user_question else {
+            return;
+        };
+        let Some(q) = pq.questions.get(pq.current_index) else {
+            return;
+        };
+        let options = q
+            .get("options")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let multi_select = q
+            .get("multiSelect")
+            .or_else(|| q.get("multi_select"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let area = frame.area();
+        // Reserve room for header + question + each option + Other + blank
+        // + prompt + status footer (8 + N lines).
+        let dialog_width = area.width.min(78);
+        let dialog_height = u16::try_from(options.len() + 8)
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_sub(2));
+        let x = (area.width.saturating_sub(dialog_width)) / 2;
+        let y = (area.height.saturating_sub(dialog_height)) / 2;
+        let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+        // Blank the underlying region.
+        frame.render_widget(ratatui::widgets::Clear, dialog_area);
+
+        let lines = build_user_question_lines(pq, q, &options, multi_select);
+
+        let title = if multi_select {
+            " Ask User (multi-select) "
+        } else {
+            " Ask User "
+        };
+        let dialog = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(title)
                     .title_style(Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(GOLD)),
@@ -2404,6 +2723,106 @@ fn send_or_warn(
     }
 }
 
+/// Build the line list for the `ask_user_question` modal overlay.
+///
+/// Pure render — no `&self` access, no state mutation. Extracted from
+/// `App::draw_user_question_overlay` to keep that method under the
+/// clippy `too_many_lines` threshold while still rendering the full
+/// REPL-parity option list (question header + numbered options +
+/// synthetic "Other" row + prompt buffer + footer hint).
+fn build_user_question_lines<'a>(
+    pq: &'a PendingUserQuestion,
+    q: &'a serde_json::Value,
+    options: &'a [serde_json::Value],
+    multi_select: bool,
+) -> Vec<Line<'a>> {
+    let question_text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
+    let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("");
+    let other_num = options.len() + 1;
+
+    let mut lines: Vec<Line<'a>> = Vec::with_capacity(options.len() + 8);
+
+    // Question header line.
+    let header_span = if header.is_empty() {
+        String::new()
+    } else {
+        format!("[{header}] ")
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Question {}/{}: {header_span}{question_text}",
+            pq.current_index + 1,
+            pq.questions.len()
+        ),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Numbered options.
+    for (i, opt) in options.iter().enumerate() {
+        let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+        let desc = opt
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  [{}] ", i + 1),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{label}  ")),
+            Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    // Synthetic "Other" row.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  [{other_num}] "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Other "),
+        Span::styled(
+            "(type your answer)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // Prompt line — show what the user is typing right now.
+    let prompt_label = if pq.other_mode {
+        "  Your answer: "
+    } else if multi_select {
+        "  > (comma-separated numbers) "
+    } else {
+        "  > "
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            prompt_label,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(pq.input_buffer.clone()),
+        Span::styled("_", Style::default().fg(Color::Green)),
+    ]));
+
+    // Footer hint.
+    lines.push(Line::from(Span::styled(
+        "  Enter = submit   Esc = cancel".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines
+}
+
 /// One-line human-readable description of an `AppEvent` for the
 /// channel-closed warning. We avoid `Debug` since `AppEvent` doesn't derive
 /// it and adding the derive would ripple through the rest of the file.
@@ -2426,6 +2845,9 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::FollowUp => "FollowUp".to_string(),
         super::events::AppEvent::PermissionRequest { tool_name, .. } => {
             format!("PermissionRequest({tool_name})")
+        }
+        super::events::AppEvent::UserQuestion { questions, .. } => {
+            format!("UserQuestion(n={})", questions.len())
         }
         super::events::AppEvent::Key(_) => "Key".to_string(),
         super::events::AppEvent::Resize(w, h) => format!("Resize({w},{h})"),
