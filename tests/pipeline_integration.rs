@@ -144,6 +144,9 @@ async fn b1_retry_max_is_3_pin_gap_592() {
         memory_db: None,
         permission_mgr: None,
         hook_engine: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
         session_id: None,
         tx,
     })
@@ -205,6 +208,9 @@ async fn b1_503_is_retried() {
         memory_db: None,
         permission_mgr: None,
         hook_engine: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
         session_id: None,
         tx,
     })
@@ -265,6 +271,9 @@ async fn b1_retry_after_header_used_verbatim_no_jitter_gap_596() {
         memory_db: None,
         permission_mgr: None,
         hook_engine: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
         session_id: None,
         tx,
     })
@@ -314,6 +323,9 @@ async fn b1_408_not_retried_pin_gap_597() {
         memory_db: None,
         permission_mgr: None,
         hook_engine: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
         session_id: None,
         tx,
     })

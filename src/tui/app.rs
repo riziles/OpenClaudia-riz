@@ -521,6 +521,12 @@ pub struct App {
     pending_permission: Option<PendingPermission>,
     /// Hook engine for running lifecycle hooks.
     pub hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    /// Session-scoped task tracker for the `task_create` / `task_update` /
+    /// `task_list` / `task_get` tools. Always populated for the full-screen
+    /// TUI so those tools have a place to write — previously the TUI passed
+    /// `None` for `task_mgr` and the dispatcher returned
+    /// "Task management not available (no session)".
+    pub task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     /// Rules content injected as system message (loaded once at startup).
     pub rules_content: Option<String>,
     /// Whether rules have been injected into session messages.
@@ -573,6 +579,9 @@ impl App {
             chat_session: TuiSession::new(model, provider),
             pending_permission: None,
             hook_engine: None,
+            task_mgr: std::sync::Arc::new(
+                std::sync::Mutex::new(crate::session::TaskManager::new()),
+            ),
             rules_content: None,
             rules_injected: false,
             transcript_watermark: 0,
@@ -2042,6 +2051,7 @@ impl App {
         let session_id_for_task = self.chat_session.id.clone();
         let memory_db = self.memory_db.clone();
         let permission_mgr = self.permission_mgr.clone();
+        let task_mgr = self.task_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
         let session_messages = self.session_messages.clone();
 
@@ -2058,6 +2068,7 @@ impl App {
             memory_db,
             permission_mgr,
             hook_engine,
+            task_mgr,
             session_id: session_id_for_task,
             tx,
         }));
@@ -2298,6 +2309,7 @@ struct ApiTurnParams {
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: String,
     tx: std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -2315,6 +2327,7 @@ struct AgenticCtx<'a> {
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -2512,6 +2525,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             memory_db: ctx.memory_db.clone(),
             permission_mgr: ctx.permission_mgr.clone(),
             hook_engine: ctx.hook_engine.clone(),
+            task_mgr: ctx.task_mgr.clone(),
             session_id: Some(ctx.session_id.to_string()),
             tx: ctx.tx.clone(),
         })
@@ -2569,6 +2583,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         memory_db,
         permission_mgr,
         hook_engine,
+        task_mgr,
         session_id,
         tx,
     } = p;
@@ -2594,6 +2609,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         memory_db: memory_db.clone(),
         permission_mgr: permission_mgr.clone(),
         hook_engine: hook_engine.clone(),
+        task_mgr: task_mgr.clone(),
         session_id: Some(session_id.clone()),
         tx: tx.clone(),
     })
@@ -2615,6 +2631,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     memory_db,
                     permission_mgr,
                     hook_engine,
+                    task_mgr,
                     session_id: &session_id,
                     tx: &tx,
                 },
@@ -2642,6 +2659,7 @@ struct TurnContext<'a> {
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
 }
@@ -2687,6 +2705,7 @@ async fn handle_turn_result(
             memory_db: ctx.memory_db,
             permission_mgr: ctx.permission_mgr,
             hook_engine: ctx.hook_engine,
+            task_mgr: ctx.task_mgr,
             session_id: ctx.session_id,
             tx: ctx.tx,
         };

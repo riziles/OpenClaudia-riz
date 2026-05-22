@@ -13,7 +13,7 @@ use crate::tui::events::{AppEvent, PermissionResponse};
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Send an event to the TUI, logging and returning early if the channel is closed.
 macro_rules! send_event {
@@ -320,6 +320,12 @@ pub struct RunTurnParams<'a> {
     pub memory_db: Option<Arc<MemoryDb>>,
     pub permission_mgr: Option<Arc<PermissionManager>>,
     pub hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    /// Session-scoped `TaskManager` used by `task_create` / `task_update`
+    /// / `task_list` / `task_get`. The TUI keeps a single
+    /// `Arc<Mutex<TaskManager>>` and clones the `Arc` into every turn so
+    /// the task tools have a place to read/write — without this they
+    /// returned "Task management not available (no session)".
+    pub task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     pub session_id: Option<String>,
     pub tx: mpsc::Sender<AppEvent>,
 }
@@ -565,6 +571,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         memory_db,
         permission_mgr,
         hook_engine,
+        task_mgr,
         session_id,
         tx,
     } = p;
@@ -600,6 +607,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             memory_db,
             permission_mgr,
             hook_engine.clone(),
+            task_mgr.clone(),
             session_id.clone(),
             &tx,
         )
@@ -607,15 +615,16 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     }
 
     // Stream SSE response (Anthropic / OpenAI format)
-    stream_sse_response(
+    stream_sse_response(SseStreamParams {
         response,
         provider,
         memory_db,
         permission_mgr,
         hook_engine,
+        task_mgr,
         session_id,
-        &tx,
-    )
+        tx: &tx,
+    })
     .await
 }
 
@@ -757,6 +766,7 @@ async fn handle_google_response(
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
@@ -814,6 +824,7 @@ async fn handle_google_response(
         memory_db,
         permission_mgr,
         hook_engine,
+        task_mgr,
         session_id.as_deref(),
         tx,
     )
@@ -927,15 +938,35 @@ fn handle_sse_timeout(elapsed_secs: u64, full_content: &mut String) {
     }
 }
 
-async fn stream_sse_response(
+/// Borrowed inputs threaded through the SSE-streaming code path.
+///
+/// Bundled because the inner function previously took 8 positional
+/// arguments, which trips `clippy::too_many_arguments` (threshold 7).
+/// All fields are owned / `Arc`-shared resources the inner pipeline
+/// stages need; the param struct mirrors the established
+/// [`RunTurnParams`] pattern.
+struct SseStreamParams<'a> {
     response: reqwest::Response,
-    provider: &str,
+    provider: &'a str,
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
-    tx: &mpsc::Sender<AppEvent>,
-) -> Result<TurnResult, String> {
+    tx: &'a mpsc::Sender<AppEvent>,
+}
+
+async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
+    let SseStreamParams {
+        response,
+        provider,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        task_mgr,
+        session_id,
+        tx,
+    } = p;
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut full_content = String::new();
@@ -1017,11 +1048,51 @@ async fn stream_sse_response(
         }
     }
 
+    finalize_sse_stream(SseFinalize {
+        provider,
+        full_content,
+        tool_accumulator,
+        anthropic_accumulator,
+        stream_usage,
+        memory_db,
+        permission_mgr,
+        hook_engine,
+        task_mgr,
+        session_id,
+        tx,
+    })
+    .await
+}
+
+/// Owned + borrowed state handed to [`finalize_sse_stream`].
+///
+/// Extracted from `stream_sse_response` (which otherwise tipped over
+/// the `clippy::too_many_lines` threshold once `task_mgr` was threaded
+/// through). The struct lets the finalize helper take ownership of the
+/// accumulators and the per-turn channels in a single move.
+struct SseFinalize<'a> {
+    provider: &'a str,
+    full_content: String,
+    tool_accumulator: ToolCallAccumulator,
+    anthropic_accumulator: AnthropicToolAccumulator,
+    stream_usage: TokenUsage,
+    memory_db: Option<Arc<MemoryDb>>,
+    permission_mgr: Option<Arc<PermissionManager>>,
+    hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+    session_id: Option<String>,
+    tx: &'a mpsc::Sender<AppEvent>,
+}
+
+/// Drain the streaming accumulators into a `TurnResult`, dispatching
+/// any captured tool calls. Sends `ResponseDone` when no follow-up
+/// turn is needed — the agentic loop handles the follow-up case.
+async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     // Determine tool calls from the appropriate accumulator
-    let tool_calls = if provider == "anthropic" && anthropic_accumulator.has_tool_use() {
-        anthropic_accumulator.finalize_tool_calls()
-    } else if tool_accumulator.has_tool_calls() {
-        tool_accumulator.finalize()
+    let tool_calls = if f.provider == "anthropic" && f.anthropic_accumulator.has_tool_use() {
+        f.anthropic_accumulator.finalize_tool_calls()
+    } else if f.tool_accumulator.has_tool_calls() {
+        f.tool_accumulator.finalize()
     } else {
         vec![]
     };
@@ -1029,11 +1100,12 @@ async fn stream_sse_response(
     // Execute tool calls if any
     let (tool_results, has_tools) = execute_tool_calls_for_tui(
         &tool_calls,
-        memory_db,
-        permission_mgr,
-        hook_engine,
-        session_id.as_deref(),
-        tx,
+        f.memory_db,
+        f.permission_mgr,
+        f.hook_engine,
+        f.task_mgr,
+        f.session_id.as_deref(),
+        f.tx,
     )
     .await;
 
@@ -1041,14 +1113,14 @@ async fn stream_sse_response(
     // When there are tool calls, the caller (app.rs agentic loop) handles
     // the followup requests and sends ResponseDone when truly finished.
     if !has_tools {
-        send_event!(tx, AppEvent::ResponseDone);
+        send_event!(f.tx, AppEvent::ResponseDone);
     }
 
     Ok(TurnResult {
-        content: full_content,
+        content: f.full_content,
         tool_calls,
         tool_results,
-        usage: stream_usage,
+        usage: f.stream_usage,
         needs_followup: has_tools,
         // The SSE accumulators expose stop_reason internally but this
         // layer does not currently surface it. Anthropic / OpenAI
@@ -1293,6 +1365,7 @@ async fn execute_single_tool(
     tool_call: &ToolCall,
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
     hook_engine: Option<&crate::hooks::HookEngine>,
     tx: &mpsc::Sender<AppEvent>,
@@ -1302,9 +1375,24 @@ async fn execute_single_tool(
     let mem_db = memory_db;
     let perm_mgr = permission_mgr;
     let session_for_task = session_id.map(str::to_string);
+    let task_mgr_for_blocking = task_mgr;
     let result = tokio::task::spawn_blocking(move || {
         let _session_guard = session_for_task.map(tools::SessionIdGuard::set);
-        tools::execute_tool_with_memory(&tool_call_clone, mem_db.as_deref(), perm_mgr.as_deref())
+        // Lock the TaskManager only inside the blocking thread so we
+        // don't hold the mutex across `.await`. Failure-mode parity with
+        // the legacy "no session" branch: poisoned mutex → recover the
+        // inner data rather than panicking, so a single panicking task
+        // tool doesn't take down the entire TUI session.
+        let mut task_guard = task_mgr_for_blocking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tools::execute_tool_with_tasks(
+            &tool_call_clone,
+            mem_db.as_deref(),
+            None,
+            Some(&mut *task_guard),
+            perm_mgr.as_deref(),
+        )
     })
     .await
     .unwrap_or_else(|e| tools::ToolResult {
@@ -1404,6 +1492,7 @@ async fn execute_tool_calls_for_tui(
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> (Vec<Value>, bool) {
@@ -1473,6 +1562,7 @@ async fn execute_tool_calls_for_tui(
             tool_call,
             memory_db.clone(),
             permission_mgr.clone(),
+            task_mgr.clone(),
             session_id,
             hook_engine.as_ref().map(Arc::as_ref),
             tx,
