@@ -1,9 +1,13 @@
 //! Web tools for `OpenClaudia`
 //!
 //! Provides web access capabilities for agents:
-//! - `web_fetch`: Fetch URL content via Jina Reader (free, handles JS/Cloudflare)
-//! - `web_search`: Search the web via Tavily, Brave API, or `DuckDuckGo` (headless browser)
-//! - `web_browser`: Full browser automation via headless Chrome (optional feature)
+//! - `web_fetch`: Fetch URL content via a two-tier fallback —
+//!   direct HTTP first, then headless Chromium for JS-heavy or
+//!   Cloudflare-fronted pages. HTML responses are converted to
+//!   Markdown locally via `htmd` (no third-party render service).
+//! - `web_search`: Search the web via Tavily, Brave API, or
+//!   `DuckDuckGo` (headless browser).
+//! - `web_browser`: Full browser automation via headless Chromium.
 
 use futures::StreamExt;
 use reqwest::redirect;
@@ -25,10 +29,11 @@ pub(crate) const SSRF_REDIRECT_LIMIT: usize = 10;
 
 /// Maximum bytes accepted from any remote HTTP response body (crosslink #745).
 ///
-/// Without this cap, a malicious or compromised upstream — Jina Reader,
-/// Tavily, Brave, or a redirected target — can stream gigabytes into a
-/// `String` before the per-tool truncate (`src/tools/web.rs`) ever runs.
-/// 10 MiB is generous for markdown-converted articles and JSON search
+/// Without this cap, a malicious or compromised upstream — the direct
+/// HTTP target, the headless-browser DOM, Tavily, Brave, or a
+/// redirected target — can stream gigabytes into a `String` before
+/// the per-tool truncate (`src/tools/web.rs`) ever runs. 10 MiB is
+/// generous for markdown-converted articles and JSON search
 /// responses while keeping per-call memory bounded.
 pub(crate) const MAX_WEB_FETCH_BYTES: usize = 10 * 1024 * 1024;
 
@@ -466,8 +471,25 @@ pub(crate) async fn validate_url_async(url_str: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Jina Reader base URL - converts any URL to clean markdown
-const JINA_READER_URL: &str = "https://r.jina.ai/";
+/// Render an HTML document to clean Markdown using the `htmd` crate
+/// (turndown.js-inspired).
+///
+/// Pure transform — no I/O, no panics. On parse failure returns the
+/// input HTML unchanged so the caller always sees *something*.
+///
+/// Local conversion keeps `web_fetch` self-contained: no third-party
+/// render service in the loop, no per-host policy rejections, and no
+/// external logger seeing every URL the agent visits.
+#[must_use]
+pub fn html_to_markdown(html: &str) -> String {
+    match htmd::convert(html) {
+        Ok(md) => md,
+        Err(e) => {
+            tracing::warn!("htmd HTML→Markdown conversion failed ({e}); falling back to raw HTML");
+            html.to_string()
+        }
+    }
+}
 
 /// Tavily API endpoint
 const TAVILY_API_URL: &str = "https://api.tavily.com/search";
@@ -513,16 +535,28 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-/// Fetch a URL using Jina Reader
+/// Fetch a URL and render its body to Markdown for LLM consumption.
 ///
-/// Jina Reader handles:
-/// - JavaScript rendering
-/// - Cloudflare bypass
-/// - Clean markdown output
+/// Two-tier fallback:
+///
+/// 1. **Direct HTTP** via `SHARED_HTTP_CLIENT`. Fast, free, no
+///    third-party. Plain text / JSON bodies are returned verbatim;
+///    HTML bodies are converted to Markdown via [`html_to_markdown`].
+/// 2. **Headless Chrome** via [`fetch_with_browser`]. Used when the
+///    direct fetch returned a non-2xx status, a network error, OR
+///    response markers that look like a Cloudflare bot challenge or
+///    an SPA shell (empty `<body>` / a single `<div id="root">`).
+///    Chrome runs the page's JavaScript, then we re-render to
+///    Markdown the same way.
+///
+/// Returns an error only if **both** tiers fail; the error message
+/// carries both diagnostic strings so the agent can see the full
+/// chain.
 ///
 /// # Errors
 ///
-/// Returns an error string if the URL is invalid or the fetch fails.
+/// Returns an error string if URL validation fails, both fetch tiers
+/// fail, or the response exceeds [`MAX_WEB_FETCH_BYTES`].
 pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     // crosslink #673 — async DNS via tokio::net::lookup_host. The legacy
     // sync `validate_url` invoked the blocking std-library resolver from
@@ -530,38 +564,103 @@ pub async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     // full DNS RTT and starved every other task on the same worker.
     validate_url_async(url).await?;
 
-    // Use Jina Reader to fetch and convert to markdown.
-    // Reuses the process-wide `SHARED_HTTP_CLIENT` (crosslink #368) so the
-    // connection pool and DNS cache survive across calls.
-    let jina_url = format!("{JINA_READER_URL}{url}");
+    let direct_err = match fetch_url_direct(url).await {
+        Ok(result) => return Ok(result),
+        Err(e) => {
+            tracing::info!("direct fetch failed for {url}: {e}; falling back to headless browser");
+            e
+        }
+    };
 
+    // Tier 2: headless Chrome. The browser path is sync (`headless_chrome`
+    // is blocking I/O), so hop onto the blocking pool. Without the
+    // `browser` feature we surface a single combined error.
+    #[cfg(feature = "browser")]
+    {
+        let url_owned = url.to_string();
+        match tokio::task::spawn_blocking(move || fetch_with_browser(&url_owned)).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(browser_err)) => Err(format!(
+                "Both fetch tiers failed. Direct: {direct_err}. Browser: {browser_err}."
+            )),
+            Err(join_err) => Err(format!(
+                "Direct fetch failed ({direct_err}); browser fallback task panicked: {join_err}"
+            )),
+        }
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        Err(format!(
+            "Direct fetch failed: {direct_err} (no browser fallback compiled in — \
+             rebuild with `--features browser` to enable headless-Chrome fallback)"
+        ))
+    }
+}
+
+/// Tier-1 direct HTTP fetch. HTML response bodies are converted to
+/// Markdown via [`html_to_markdown`]; non-HTML bodies (JSON, plain
+/// text, RSS, robots.txt, …) are returned verbatim so the agent sees
+/// what the server actually sent.
+async fn fetch_url_direct(url: &str) -> Result<FetchResult, String> {
     let response = SHARED_HTTP_CLIENT
-        .get(&jina_url)
+        .get(url)
         .timeout(Duration::from_secs(30))
-        .header("Accept", "text/markdown")
+        // A real browser-shaped UA reduces the rate at which sites
+        // block us at the WAF / Cloudflare edge. We still fall back
+        // to headless Chrome if even this is refused.
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; OpenClaudia/0.1; +https://github.com/dollspace-gay/OpenClaudia)",
+        )
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch URL: {e}"))?;
+        .map_err(|e| format!("Network error: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {} - {}", response.status(), url));
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status} from upstream"));
     }
 
-    // Size-cap the body (crosslink #745): without this, a malicious target can
-    // stream gigabytes through Jina Reader before the tool-layer truncate runs.
-    let content = read_bounded_text(response, MAX_WEB_FETCH_BYTES, url).await?;
+    let is_html = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/html") || ct.contains("application/xhtml"));
 
-    // Extract title from markdown if present (first # heading)
-    let title = content
-        .lines()
-        .find(|line| line.starts_with("# "))
-        .map(|line| line.trim_start_matches("# ").to_string());
+    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, url).await?;
+
+    let (content, title) = if is_html {
+        let title = extract_html_title(&body);
+        (html_to_markdown(&body), title)
+    } else {
+        (body, None)
+    };
 
     Ok(FetchResult {
         content,
         title,
         url: url.to_string(),
     })
+}
+
+/// Extract a `<title>...</title>` from raw HTML. Returns the trimmed
+/// title text or `None` if no title tag is present. Operates on the
+/// raw HTML byte stream so it works even for documents `htmd` can't
+/// fully parse.
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    // Skip past the opening tag's `>` — handles `<title>` and
+    // `<title lang="en">` alike.
+    let body_start = lower[start..].find('>')? + start + 1;
+    let body_end_rel = lower[body_start..].find("</title>")?;
+    let title = html[body_start..body_start + body_end_rel].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
 }
 
 /// Tavily API response structure
@@ -909,13 +1008,21 @@ pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult
     Err("DuckDuckGo search requires the browser feature. Rebuild with `cargo build --features browser` or set TAVILY_API_KEY/BRAVE_API_KEY.".to_string())
 }
 
-/// Fetch URL using headless Chrome browser
+/// Fetch a URL using a headless Chromium browser, JS-rendered, then
+/// convert the result DOM to Markdown via [`html_to_markdown`].
 ///
-/// Use this when Jina Reader fails (e.g., complex authentication, specific Cloudflare challenges)
+/// Used by [`fetch_url`] as the tier-2 fallback when the direct HTTP
+/// path returns a non-2xx or a JS-shell page. Also the engine the
+/// `web_browser` tool dispatches against. Browsers can be expensive
+/// (Chrome process startup, 2s JS-render settle), so callers should
+/// prefer [`fetch_url`] and let it decide which tier to use.
 ///
 /// # Errors
 ///
-/// Returns an error string if the URL is invalid or browser automation fails.
+/// Returns an error string if the URL is invalid, the browser fails
+/// to launch (system Chromium missing AND auto-download blocked),
+/// navigation times out, or the rendered DOM exceeds
+/// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
 pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
     validate_url(url)?;
@@ -932,28 +1039,33 @@ pub fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
     tab.wait_until_navigated()
         .map_err(|e| format!("Navigation timeout: {e}"))?;
 
-    // Wait a bit for JavaScript to render
+    // Wait a bit for JavaScript to render. Two seconds covers most
+    // SPAs without making the fast common case unreasonably slow.
     std::thread::sleep(Duration::from_secs(2));
 
-    // Get page content
-    let content = tab
+    // Page title — captured before content extraction because a
+    // tab.get_title() failure shouldn't kill the fetch.
+    let title = tab.get_title().ok();
+
+    // Rendered DOM HTML.
+    let html = tab
         .get_content()
         .map_err(|e| format!("Failed to get page content: {e}"))?;
 
     // Size-cap the rendered HTML (crosslink #745). Same threat model as the
     // DuckDuckGo path: a hostile site can materialize an arbitrarily large
     // DOM through headless Chrome, so refuse anything past the configured cap.
-    if content.len() > MAX_WEB_FETCH_BYTES {
+    if html.len() > MAX_WEB_FETCH_BYTES {
         return Err(format!(
             "Response too large: {} bytes exceeds cap {} at URL {}",
-            content.len(),
+            html.len(),
             MAX_WEB_FETCH_BYTES,
             url
         ));
     }
 
-    // Get title
-    let title = tab.get_title().ok();
+    // Render DOM → Markdown locally via `htmd`.
+    let content = html_to_markdown(&html);
 
     Ok(FetchResult {
         content,
@@ -1429,8 +1541,7 @@ mod tests {
     // ── Body-size cap tests (crosslink #745) ─────────────────────────────────
     //
     // These pin the `read_bounded_text` contract and exercise it against a
-    // real `wiremock` HTTP server (not Jina Reader — those go through
-    // `fetch_url` which prepends the live proxy URL). The four scenarios cover:
+    // real `wiremock` HTTP server. The four scenarios cover:
     //   1. small body under the cap → bytes returned verbatim
     //   2. body that exceeds the cap mid-stream → error names the cap and URL
     //   3. multi-chunk delivery summed across N chunks → total tracked correctly

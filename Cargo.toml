@@ -102,6 +102,12 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # fallback in src/web.rs::launch_browser_for_scraping.
 headless_chrome = { version = "1", optional = true, features = ["fetch"] }
 scraper = { version = "0.27", optional = true }
+
+# HTML → Markdown conversion (turndown.js-inspired). Used by `web_fetch`
+# to render fetched pages into LLM-friendly markdown instead of routing
+# them through Jina Reader's hosted converter — eliminates the
+# third-party single-point-of-failure that caused HTTP 451 rejections.
+htmd = "0.5"
 syntect = "5"
 similar = { version = "3", features = ["inline"] }
 

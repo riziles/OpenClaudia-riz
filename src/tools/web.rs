@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::LazyLock;
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 
 /// Process-wide shared tokio runtime used to drive the async web tools
 /// from sync caller contexts (crosslink #368).
@@ -33,25 +33,50 @@ static SHARED_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .expect("shared web-tools tokio runtime builds with default settings")
 });
 
-/// Drive `fut` to completion regardless of whether the caller is inside
-/// a tokio runtime or not.
+/// Drive `fut` to completion from a synchronous tool handler.
 ///
-/// * Inside a runtime → `block_in_place` + `Handle::block_on` so we don't
-///   panic on nested runtimes and stay on the caller's runtime.
-/// * Outside a runtime → `SHARED_RUNTIME.block_on` so we don't construct
-///   (or destruct) a runtime per call.
+/// Spawns `fut` onto the multi-threaded `SHARED_RUNTIME` and parks
+/// the calling thread on a `std::sync::mpsc` receive until the
+/// spawned task delivers its result. This is the only pattern that
+/// works under `flavor = "current_thread"`:
 ///
-/// Centralising the dispatch makes it impossible for a future web tool
-/// to regress and `Runtime::new()` again.
+/// * `Handle::current().block_on(fut)` panics with "Cannot start a
+///   runtime from within a runtime" when called from the
+///   current-thread runtime's executor thread (where
+///   `chat_repl::run_tool_with_audit` invokes us from).
+/// * `SHARED_RUNTIME.block_on(fut)` panics with the same message —
+///   tokio rejects ALL nested `block_on` calls regardless of which
+///   runtime owns the inner one.
+/// * `tokio::task::block_in_place` panics with "can call blocking
+///   only when running on the multi-threaded runtime" under
+///   `current_thread`.
+///
+/// `Runtime::spawn` is fine because spawning does not enter a
+/// runtime; it just hands the future to an existing one's worker.
+/// The std `recv()` then parks the caller using OS primitives,
+/// independent of any tokio executor.
+///
+/// `fut` must be `Send + 'static` because the spawned task crosses
+/// thread boundaries to `SHARED_RUNTIME`'s worker pool.
+///
+/// Centralising the dispatch makes it impossible for a future web
+/// tool to regress and `Runtime::new()` again.
 fn run_blocking<F>(fut: F) -> F::Output
 where
-    F: Future,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
 {
-    if let Ok(handle) = Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        SHARED_RUNTIME.block_on(fut)
-    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    SHARED_RUNTIME.spawn(async move {
+        // Best-effort: if the receiver disappears (caller's thread
+        // was cancelled), drop the result silently rather than
+        // panicking from inside the runtime.
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().expect(
+        "SHARED_RUNTIME web-tool task panicked or the runtime was \
+         shut down before delivering a result",
+    )
 }
 
 /// Hard cap on the agent-facing fetched-page output string, in bytes.
@@ -100,7 +125,13 @@ pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> Str
     }
 }
 
-/// Fetch a URL using Jina Reader
+/// Fetch a URL and return its body rendered as Markdown.
+///
+/// Delegates to [`web::fetch_url`], which runs a two-tier fallback:
+/// direct HTTP via the shared client first, then headless Chromium
+/// for pages that need JavaScript or get blocked at the WAF edge.
+/// HTML responses are converted to Markdown locally via `htmd`;
+/// non-HTML bodies (JSON, plain text, RSS, …) are returned verbatim.
 pub fn execute_web_fetch(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessor.
     let url = match args.arg_str("url") {
@@ -116,10 +147,11 @@ pub fn execute_web_fetch(args: &HashMap<String, Value>) -> (String, bool) {
         );
     }
 
-    // Drive the async fetch on either the caller's runtime (async
-    // context) or the shared `SHARED_RUNTIME` (sync context). Never
-    // build a fresh runtime per call — see crosslink #368.
-    let result = run_blocking(web::fetch_url(url));
+    // Drive the async fetch on `SHARED_RUNTIME` via `run_blocking`.
+    // The spawned future is `'static` — capture an owned `String` so
+    // the future doesn't borrow `url` across thread boundaries.
+    let url_owned = url.to_string();
+    let result = run_blocking(async move { web::fetch_url(&url_owned).await });
 
     match result {
         Ok(fetch_result) => (
@@ -205,7 +237,10 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
     let config = WebConfig::from_env();
 
     // Shared runtime; never construct a fresh one per call (crosslink #368).
-    let result = run_blocking(web::search_web(query, &config, limit));
+    // The spawned future is `'static` — own all captured inputs so the
+    // future doesn't borrow `query` / `config` across thread boundaries.
+    let query_owned = query.to_string();
+    let result = run_blocking(async move { web::search_web(&query_owned, &config, limit).await });
 
     match result {
         Ok(mut results) => {
@@ -232,8 +267,13 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
     }
 }
 
-/// Fetch a URL using headless Chrome browser
-/// Fallback for when Jina Reader fails on complex sites
+/// Fetch a URL using a headless Chromium browser and return the
+/// rendered DOM as Markdown.
+///
+/// Used directly when the agent explicitly requests browser rendering
+/// (e.g. for JS-heavy SPAs or Cloudflare-fronted sites). For everyday
+/// fetches prefer `web_fetch`, which uses the browser only as a
+/// fallback after the cheaper direct HTTP path.
 pub fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessor.
     let url = match args.arg_str("url") {
@@ -265,6 +305,9 @@ pub fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Handle` is only needed by the runtime-reuse test below; the
+    // module-level `run_blocking` no longer touches it.
+    use tokio::runtime::Handle;
 
     #[test]
     fn host_of_handles_common_shapes() {
@@ -325,14 +368,22 @@ mod tests {
         }
     }
 
-    /// Forensic test for crosslink #368.
+    /// Successor to the original crosslink #368 test.
     ///
-    /// When the caller is already inside a tokio runtime, the dispatcher
-    /// MUST execute on the caller's runtime (via `Handle::current()` +
-    /// `block_in_place`), NOT on the shared one. Verifies the
-    /// async-context branch of `run_blocking` does not jump runtimes.
+    /// The pre-fix invariant ("stay on the caller's runtime via
+    /// `block_in_place`") cannot be honored under
+    /// `flavor = "current_thread"` — `block_in_place` panics outside
+    /// the multi-thread runtime, and a bare `Handle::current().
+    /// block_on(...)` panics with "Cannot start a runtime from
+    /// within a runtime" if called on the executor thread itself.
+    ///
+    /// The new invariant is weaker but actionable: dispatching from
+    /// inside another runtime must not panic, must not construct a
+    /// fresh runtime per call, and must produce the awaited value.
+    /// The runtime ID will now differ from the caller's because we
+    /// always route to `SHARED_RUNTIME` — that's the point.
     #[test]
-    fn run_blocking_uses_caller_runtime_in_async_context() {
+    fn run_blocking_dispatches_from_inside_another_runtime_without_panicking() {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -340,18 +391,14 @@ mod tests {
             .unwrap();
         let caller_id = rt.handle().id();
         let inside_id: tokio::runtime::Id = rt.block_on(async {
-            // spawn_blocking puts the closure on the caller runtime's
-            // blocking pool; `run_blocking` inside it sees an async
-            // context and must stay on the caller's runtime rather than
-            // hop to SHARED_RUNTIME.
             tokio::task::spawn_blocking(move || run_blocking(async { Handle::current().id() }))
                 .await
                 .unwrap()
         });
-        assert_eq!(
+        assert_ne!(
             inside_id, caller_id,
-            "run_blocking left the caller's runtime in an async context \
-             (regression of crosslink #368)"
+            "run_blocking now always uses SHARED_RUNTIME; expected the inside \
+             runtime id to differ from the caller's"
         );
     }
 
