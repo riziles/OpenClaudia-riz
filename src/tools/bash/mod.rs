@@ -612,6 +612,34 @@ pub fn execute_bash(args: &HashMap<String, Value>) -> (String, bool) {
     into_legacy(try_execute_bash(args))
 }
 
+/// Process-wide test lock for `BACKGROUND_SHELLS`-touching tests.
+///
+/// The bash test modules (`mod.rs::tests` + `output.rs::tests`) share the
+/// global `BACKGROUND_SHELLS` registry, so when cargo runs the lib test
+/// binary with default thread-pool parallelism, tests can race: one test
+/// spawns a shell while another asserts an empty `list()`, etc. Earlier
+/// runs were lucky; under load (`cargo test --tests --no-fail-fast`
+/// alongside integration binaries) ~12 of the B1/B2/B3 tests became flaky.
+///
+/// `bg_lock()` returns a `MutexGuard` that serializes those tests without
+/// `--test-threads=1` global serialization. Every test that reads or
+/// mutates `BACKGROUND_SHELLS` MUST hold this lock for its entire body.
+/// Tests that only inspect derived constants (`MAX_BACKGROUND_SHELLS`, the
+/// error-message format-string layout) do NOT need the lock.
+///
+/// Lives at the module root (not inside any single `mod tests`) so both
+/// `mod.rs::tests` and `output.rs::tests` can reach it via
+/// `super::bg_lock()` / `super::super::bg_lock()`. Gated on `cfg(test)`
+/// so it's compiled out of the shipping binary.
+#[cfg(test)]
+pub(super) fn bg_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +667,7 @@ mod tests {
     /// B1-mod-a: spawn returns an 8-char `shell_id` (UUID prefix, mod.rs:57).
     #[test]
     fn b1_spawn_returns_8_char_shell_id() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("echo b1_mod_a")
             .expect("b1_spawn_8char: spawn must succeed");
@@ -647,6 +676,7 @@ mod tests {
             8,
             "b1_spawn_8char: shell_id must be 8 chars; got '{id}'"
         );
+        let _ = BACKGROUND_SHELLS.kill(&id);
     }
 
     /// B1-mod-b: `execute_bash` with `run_in_background=true` returns `is_error=false`
@@ -655,6 +685,7 @@ mod tests {
     /// OC source: mod.rs:334-339.
     #[test]
     fn b1_execute_bash_background_response_format() {
+        let _l = bg_lock();
         let (msg, is_error) = execute_bash(&bg_bash_args("echo b1_mod_b"));
         assert!(!is_error, "b1_bg_format: must not be is_error; got: {msg}");
         assert!(
@@ -670,12 +701,14 @@ mod tests {
     /// B1-mod-c: spawned shell appears in `BACKGROUND_SHELLS.list()`.
     #[test]
     fn b1_spawned_shell_appears_in_list() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("sleep 2")
             .expect("b1_list: spawn must succeed");
         let shells = BACKGROUND_SHELLS.list();
         let found = shells.iter().any(|(listed_id, _, _)| listed_id == &id);
         assert!(found, "b1_list: spawned shell must appear in list; id={id}");
+        let _ = BACKGROUND_SHELLS.kill(&id);
     }
 
     /// B1-mod-d: shell limit — when the shell map is at capacity, spawn returns
@@ -717,6 +750,7 @@ mod tests {
     /// OC source: mod.rs:246-248.
     #[test]
     fn b2_kill_unknown_id_returns_err() {
+        let _l = bg_lock();
         let result = BACKGROUND_SHELLS.kill("deadbeef");
         assert!(result.is_err(), "b2_kill_unknown: must return Err");
         let msg = result.unwrap_err();
@@ -736,6 +770,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b2_kill_running_shell_removes_entry() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("sleep 30")
             .expect("b2_kill_running: spawn must succeed");
@@ -779,6 +814,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b2_kill_success_message_format() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("sleep 30")
             .expect("b2_kill_msg: spawn must succeed");
@@ -810,6 +846,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b2_kill_finished_shell_skips_sigterm_returns_ok() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("echo b2_mod_d_done")
             .expect("b2_kill_finished: spawn must succeed");
@@ -834,6 +871,7 @@ mod tests {
     /// OC source: mod.rs:179-181 — `ok_or_else`.
     #[test]
     fn b3_get_output_unknown_id_returns_err_no_panic() {
+        let _l = bg_lock();
         let result = BACKGROUND_SHELLS.get_output("ffffffff");
         assert!(result.is_err(), "b3_get_output_unknown: must return Err");
         let msg = result.unwrap_err();
@@ -849,6 +887,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b3_get_output_running_shell_is_running_true() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("sleep 5")
             .expect("b3_get_output_running: spawn must succeed");
@@ -873,6 +912,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b3_get_output_finished_shell_is_running_false() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("exit 0")
             .expect("b3_get_output_finished: spawn must succeed");
@@ -981,6 +1021,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fix351_drain_before_finish_marks_retrieved() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("sleep 5")
             .expect("fix351-a: spawn must succeed");
@@ -1020,6 +1061,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fix351_drain_after_finish_marks_retrieved() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("echo fix351_b_done")
             .expect("fix351-b: spawn must succeed");
@@ -1051,6 +1093,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fix351_never_drained_stays_unretrieved() {
+        let _l = bg_lock();
         let id = BACKGROUND_SHELLS
             .spawn("echo fix351_c_done")
             .expect("fix351-c: spawn must succeed");

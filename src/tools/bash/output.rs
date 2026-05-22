@@ -63,6 +63,7 @@ mod tests {
     /// CC has no `bash_output` RPC; this path is OC-specific.
     #[test]
     fn b3_output_unknown_shell_id_is_error() {
+        let _l = super::super::bg_lock();
         let mut args = HashMap::new();
         args.insert(
             "shell_id".to_string(),
@@ -84,6 +85,7 @@ mod tests {
     /// OC source: mod.rs:180 — format!("Shell '{{`shell_id`}}' not found").
     #[test]
     fn b3_output_error_echoes_shell_id() {
+        let _l = super::super::bg_lock();
         let bogus = "cafebabe";
         let mut args = HashMap::new();
         args.insert(
@@ -104,6 +106,7 @@ mod tests {
     /// Result is either "No background shells running." or "Background shells (N):...".
     #[test]
     fn b1_output_no_arg_returns_listing_not_error() {
+        let _l = super::super::bg_lock();
         let args: HashMap<String, serde_json::Value> = HashMap::new();
         let (msg, is_error) = execute_bash_output(&args);
         assert!(
@@ -123,6 +126,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b1_output_status_line_format() {
+        let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
             .spawn("sleep 5")
             .expect("b1_output_status: spawn must succeed");
@@ -130,19 +134,26 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let mut args = HashMap::new();
-        args.insert("shell_id".to_string(), serde_json::Value::String(shell_id));
+        args.insert(
+            "shell_id".to_string(),
+            serde_json::Value::String(shell_id.clone()),
+        );
         let (msg, is_error) = execute_bash_output(&args);
         assert!(!is_error, "b1_output_status: poll must succeed; got: {msg}");
         assert!(
             msg.starts_with("Status:"),
             "b1_output_status: response must begin with 'Status:'; got: {msg}"
         );
+        // Clean up so the next mutex holder doesn't see leftover sleep
+        // processes from this test.
+        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
     }
 
     /// B1-output-c: running shell reports "running" in the status line.
     #[test]
     #[cfg(unix)]
     fn b1_output_running_shell_status_is_running() {
+        let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
             .spawn("sleep 5")
             .expect("b1_output_running: spawn must succeed");
@@ -150,12 +161,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let mut args = HashMap::new();
-        args.insert("shell_id".to_string(), serde_json::Value::String(shell_id));
+        args.insert(
+            "shell_id".to_string(),
+            serde_json::Value::String(shell_id.clone()),
+        );
         let (msg, _) = execute_bash_output(&args);
         assert!(
             msg.contains("running"),
             "b1_output_running: running shell must report 'running'; got: {msg}"
         );
+        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
     }
 
     /// B1-output-d: incremental drain — second poll does not re-emit first poll's output.
@@ -165,6 +180,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b1_output_buffers_drained_on_each_poll() {
+        let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
             .spawn("echo sentinel_b1d; sleep 3")
             .expect("b1_output_drain: spawn must succeed");
@@ -172,7 +188,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let mut args = HashMap::new();
-        args.insert("shell_id".to_string(), serde_json::Value::String(shell_id));
+        args.insert(
+            "shell_id".to_string(),
+            serde_json::Value::String(shell_id.clone()),
+        );
 
         // First poll: should contain the echoed line
         let (first, _) = execute_bash_output(&args.clone());
@@ -187,6 +206,7 @@ mod tests {
             !second.contains("sentinel_b1d"),
             "b1_output_drain: second poll must NOT re-emit drained output; got: {second}"
         );
+        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
     }
 
     /// B1-output-e: finished shell shows "finished" in status, not "running".
@@ -195,6 +215,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn b1_output_finished_shell_status_says_finished() {
+        let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
             .spawn("echo done_b1e")
             .expect("b1_output_finished: spawn must succeed");
