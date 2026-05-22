@@ -15,7 +15,9 @@ pub fn render_color_diff(path: &str, old_text: &str, new_text: &str) {
     let _ = stdout.execute(ResetColor);
     let _ = stdout.execute(Print("\n"));
 
-    let diff = TextDiff::from_lines::<str>(old_text, new_text);
+    // similar 3.x changed `from_lines` from `<T>` to `<Old, New, T>`. Let
+    // inference resolve all three (str slices for old/new, char-level T).
+    let diff = TextDiff::from_lines(old_text, new_text);
 
     for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
         if idx > 0 {

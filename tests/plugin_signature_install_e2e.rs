@@ -11,7 +11,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use openclaudia::plugins::install::{InstallScope, InstalledPlugins, PluginInstallEntry};
 use openclaudia::plugins::validate::{verify_signature, PluginSignature};
 use openclaudia::plugins::{PublicKey, SignatureError};
-use rand_core::{OsRng, RngCore};
+// rand_core 0.10 dropped `OsRng` from the root and the `RngCore` trait was
+// replaced with `TryRng`. Use `rand::rngs::SysRng` + `TryRng::try_fill_bytes`
+// (both re-exported from `rand` so we don't need `rand_core` directly).
+use rand::rngs::SysRng;
+use rand::TryRng as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::str::FromStr;
@@ -22,7 +26,9 @@ use std::str::FromStr;
 
 fn fresh_keypair() -> (SigningKey, PublicKey) {
     let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .expect("OS RNG must produce 32 bytes for test keypair");
     let signing = SigningKey::from_bytes(&secret);
     let pub_bytes = signing.verifying_key().to_bytes();
     (signing, PublicKey(pub_bytes))

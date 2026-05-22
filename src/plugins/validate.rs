@@ -479,9 +479,16 @@ mod tests {
     /// Generate a fresh ed25519 keypair and return (`signing_key`, `verifying_key` raw bytes).
     fn gen_keypair() -> (ed25519_dalek::SigningKey, PublicKey) {
         use ed25519_dalek::SigningKey;
-        use rand_core::{OsRng, RngCore};
+        // `rand 0.10` reorganised the RNG types: `OsRng` is replaced by
+        // `SysRng` (re-exported from `getrandom`) and the fallible API is
+        // `TryRng::try_fill_bytes`. Both are re-exported from `rand` so we
+        // don't need a separate `rand_core` dev-dep.
+        use rand::rngs::SysRng;
+        use rand::TryRng as _;
         let mut secret = [0u8; 32];
-        OsRng.fill_bytes(&mut secret);
+        SysRng
+            .try_fill_bytes(&mut secret)
+            .expect("OS RNG must produce 32 bytes for test keypair");
         let signing_key = SigningKey::from_bytes(&secret);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         (signing_key, PublicKey(pub_bytes))

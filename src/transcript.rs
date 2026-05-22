@@ -111,8 +111,15 @@ pub fn sanitize_path(name: &str) -> String {
         sanitized.truncate(PREFIX_CAP);
     }
 
+    // sha2 0.11 returns `hybrid_array::Array<u8, _>` which does not impl
+    // `LowerHex` (unlike 0.10's `GenericArray`). Hex-encode the bytes
+    // explicitly to keep the wire format byte-identical across the upgrade.
     let digest = Sha256::digest(name.as_bytes());
-    let hex = format!("{digest:x}");
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in &digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
     let suffix = &hex[..DIGEST_HEX_LEN];
 
     format!("{sanitized}-{suffix}")

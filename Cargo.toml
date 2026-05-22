@@ -74,18 +74,18 @@ regex = "1"
 # POSIX shell word-splitting — used to convert a single model-supplied
 # `args` string into argv tokens WITHOUT invoking a shell interpreter
 # (closes shell-injection attacks on chainlink/static-analysis dispatch).
-shlex = "1"
+shlex = "2"
 
 # OAuth and cryptography
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 rand = "0.10"
 url = "2"
 ed25519-dalek = "2"
 urlencoding = "2"
 
 # CLI enhancements
-rustyline = { version = "17", features = ["derive"] }
+rustyline = { version = "18", features = ["derive"] }
 indicatif = "0.18"
 crossterm = "0.29"
 arboard = "3"
@@ -94,13 +94,13 @@ arboard = "3"
 ratatui = "0.30"
 
 # SQLite for stateful memory
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Headless browser for web scraping (optional, heavy dependency)
 headless_chrome = { version = "1", optional = true }
-scraper = { version = "0.25", optional = true }
+scraper = { version = "0.27", optional = true }
 syntect = "5"
-similar = { version = "2", features = ["inline"] }
+similar = { version = "3", features = ["inline"] }
 
 [features]
 default = ["browser"]
@@ -111,9 +111,10 @@ tempfile = "3"
 tokio-test = "0.4"
 wiremock = "0.6"
 predicates = "3"
-rand_core = { version = "0.6", features = ["getrandom"] }
 # Property-based testing for round-trip / invariant coverage across the
 # provider adapters, parsers, and other algebraic surfaces.
+# (Note: `rand_core` is no longer a direct dev-dep — its public traits
+# `TryRng` / `OsRng-replacement SysRng` are re-exported via `rand` 0.10.)
 proptest = "1"
 
 [lints.clippy]
