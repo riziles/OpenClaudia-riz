@@ -502,7 +502,7 @@ fn cmd_next(db: &Database) -> Result<String, String> {
         _ => 4,
     };
     let mut sorted = open;
-    sorted.sort_by_key(|i| (priority_rank(&i.priority), i.id));
+    sorted.sort_by_key(|i| (priority_rank(i.priority.as_str()), i.id));
     let pick = &sorted[0];
     Ok(format!(
         "Suggested next: #{} [{}] {}",
