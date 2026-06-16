@@ -1,114 +1,181 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::LazyLock;
+
+/// Absolute, PATH-independent location of `git` for review helpers.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_output(args: &[&str]) -> Result<Output, String> {
+    Command::new(git_bin()?)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())
+}
+
+fn git_failure_message(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.trim();
+    if message.is_empty() {
+        format!("git exited with {}", output.status)
+    } else {
+        message.to_string()
+    }
+}
 
 /// Review uncommitted git changes or compare against a branch
 pub fn review_git_changes(args: &str) {
-    use std::process::Command;
-
-    let git_check = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output();
-
-    if git_check.is_err() || !git_check.unwrap().status.success() {
-        println!("\nNot a git repository.\n");
-        return;
+    match git_output(&["rev-parse", "--git-dir"]) {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            println!("\nNot a git repository.\n");
+            return;
+        }
+        Err(e) => {
+            eprintln!("\nFailed to run git: {e}\n");
+            return;
+        }
     }
 
     println!();
 
     if args.is_empty() {
-        println!("=== Git Status ===\n");
-        let status = Command::new("git").args(["status", "--short"]).output();
+        review_uncommitted_changes();
+    } else {
+        review_branch_comparison(args.trim());
+    }
+}
 
-        match status {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.is_empty() {
-                    println!("No changes detected.\n");
-                    return;
-                }
-                println!("{stdout}");
-            }
-            Err(e) => {
-                eprintln!("Failed to run git status: {e}\n");
+fn review_uncommitted_changes() {
+    println!("=== Git Status ===\n");
+    let status = git_output(&["status", "--short"]);
+
+    match status {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() {
+                println!("No changes detected.\n");
                 return;
             }
+            println!("{stdout}");
         }
-
-        println!("=== Uncommitted Changes ===\n");
-        let diff = Command::new("git").args(["diff", "HEAD"]).output();
-
-        match diff {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.is_empty() {
-                    println!("No diff to show (changes may be staged).\n");
-                } else {
-                    let lines: Vec<&str> = stdout.lines().collect();
-                    if lines.len() > 100 {
-                        for line in lines.iter().take(100) {
-                            println!("{line}");
-                        }
-                        println!(
-                            "\n... ({} more lines, use git diff directly for full output)\n",
-                            lines.len() - 100
-                        );
-                    } else {
-                        println!("{stdout}");
-                    }
-                }
-            }
-            Err(e) => eprintln!("Failed to run git diff: {e}\n"),
-        }
-    } else {
-        let branch = args.trim();
-        println!("=== Comparing against '{branch}' ===\n");
-
-        let branch_check = Command::new("git")
-            .args(["rev-parse", "--verify", branch])
-            .output();
-
-        if branch_check.is_err() || !branch_check.unwrap().status.success() {
-            eprintln!("Branch '{branch}' not found.\n");
+        Ok(output) => {
+            eprintln!(
+                "Failed to run git status: {}\n",
+                git_failure_message(&output)
+            );
             return;
         }
-
-        println!("Commits ahead of {branch}:\n");
-        let log = Command::new("git")
-            .args(["log", "--oneline", &format!("{branch}..HEAD")])
-            .output();
-
-        match log {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.is_empty() {
-                    println!("  (no commits ahead)\n");
-                } else {
-                    for line in stdout.lines() {
-                        println!("  {line}");
-                    }
-                    println!();
-                }
-            }
-            Err(e) => eprintln!("Failed to run git log: {e}\n"),
+        Err(e) => {
+            eprintln!("Failed to run git status: {e}\n");
+            return;
         }
+    }
 
-        println!("Changed files:\n");
-        let diff_stat = Command::new("git")
-            .args(["diff", "--stat", branch])
-            .output();
+    println!("=== Uncommitted Changes ===\n");
+    let diff = git_output(&["diff", "HEAD"]);
 
-        match diff_stat {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.is_empty() {
-                    println!("  (no changes)\n");
+    match diff {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() {
+                println!("No diff to show (changes may be staged).\n");
+            } else {
+                let lines: Vec<&str> = stdout.lines().collect();
+                if lines.len() > 100 {
+                    for line in lines.iter().take(100) {
+                        println!("{line}");
+                    }
+                    println!(
+                        "\n... ({} more lines, use git diff directly for full output)\n",
+                        lines.len() - 100
+                    );
                 } else {
                     println!("{stdout}");
                 }
             }
-            Err(e) => eprintln!("Failed to run git diff --stat: {e}\n"),
         }
+        Ok(output) => eprintln!("Failed to run git diff: {}\n", git_failure_message(&output)),
+        Err(e) => eprintln!("Failed to run git diff: {e}\n"),
+    }
+}
+
+fn review_branch_comparison(branch: &str) {
+    println!("=== Comparing against '{branch}' ===\n");
+
+    let verify_ref = format!("{branch}^{{commit}}");
+    let branch_check = git_output(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        verify_ref.as_str(),
+    ]);
+
+    let base_commit = match branch_check {
+        Ok(output) if output.status.success() => {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if commit.is_empty() {
+                eprintln!("Branch '{branch}' not found.\n");
+                return;
+            }
+            commit
+        }
+        Ok(_) => {
+            eprintln!("Branch '{branch}' not found.\n");
+            return;
+        }
+        Err(e) => {
+            eprintln!("Failed to run git rev-parse: {e}\n");
+            return;
+        }
+    };
+
+    println!("Commits ahead of {branch}:\n");
+    let range = format!("{base_commit}..HEAD");
+    let log = git_output(&["log", "--oneline", range.as_str()]);
+
+    match log {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() {
+                println!("  (no commits ahead)\n");
+            } else {
+                for line in stdout.lines() {
+                    println!("  {line}");
+                }
+                println!();
+            }
+        }
+        Ok(output) => eprintln!("Failed to run git log: {}\n", git_failure_message(&output)),
+        Err(e) => eprintln!("Failed to run git log: {e}\n"),
+    }
+
+    println!("Changed files:\n");
+    let diff_stat = git_output(&["diff", "--stat", base_commit.as_str()]);
+
+    match diff_stat {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() {
+                println!("  (no changes)\n");
+            } else {
+                println!("{stdout}");
+            }
+        }
+        Ok(output) => eprintln!(
+            "Failed to run git diff --stat: {}\n",
+            git_failure_message(&output)
+        ),
+        Err(e) => eprintln!("Failed to run git diff --stat: {e}\n"),
     }
 }
 
@@ -242,6 +309,42 @@ fn upsert_provider_api_key_config(
 mod tests {
     use super::*;
     use serde_yaml::Value as YamlValue;
+
+    #[test]
+    fn review_git_helpers_use_resolved_binary_path() {
+        let git = git_bin().expect("review tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("review.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        assert!(
+            production.contains("\"--end-of-options\""),
+            "branch verification must terminate git option parsing"
+        );
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production review code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains(".unwrap().status.success()"),
+                "production review code must not unwrap git probes; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
+    }
 
     #[test]
     fn upsert_provider_api_key_config_rejects_unreadable_utf8_without_overwrite() {
