@@ -256,12 +256,12 @@ mod tests {
         // Drive `clear_output_style` from a tempdir so we don't touch the
         // user's real `.openclaudia/`. The function reads `.openclaudia/...`
         // relative to the process cwd, so we chdir into the tempdir first.
+        let _cwd_lock = crate::tools::testutil::process_cwd_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let prev_cwd = std::env::current_dir().expect("cwd");
-        // NOTE: process-wide cwd mutation; this is the same pattern other
-        // tests in this repo use (e.g. the cron suite's `cwd_lock`). The
-        // assertions below are independent of the working directory, so a
-        // concurrent test changing cwd would not flake this case.
+        // NOTE: process-wide cwd mutation. Hold the shared cwd lock so
+        // cwd-sensitive tests cannot initialize global path state from this
+        // tempdir while this test is running.
         std::env::set_current_dir(dir.path()).expect("chdir");
 
         // Create `.openclaudia` as a FILE (not a directory). Then the
