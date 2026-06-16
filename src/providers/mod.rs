@@ -402,6 +402,54 @@ pub fn get_adapter(provider: &str) -> Result<&'static dyn ProviderAdapter, Provi
     Ok(adapter)
 }
 
+fn parse_models_response(body: &Value) -> Result<Vec<ModelInfo>, ProviderError> {
+    // Parse OpenAI-style response: { "data": [...], "object": "list" }
+    let data = body.get("data").and_then(Value::as_array).ok_or_else(|| {
+        ProviderError::InvalidResponse("Expected 'data' array in response".to_string())
+    })?;
+
+    let mut models = Vec::with_capacity(data.len());
+    for (index, model) in data.iter().enumerate() {
+        let id = model
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Model entry at index {index} missing non-empty string 'id': {model}"
+                ))
+            })?
+            .to_string();
+
+        let owned_by = match model.get("owned_by") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Model entry at index {index} has non-string 'owned_by': {model}"
+                ))
+            })?),
+        }
+        .map(str::to_string);
+
+        let created = match model.get("created") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_i64().ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Model entry at index {index} has non-integer 'created': {model}"
+                ))
+            })?),
+        };
+
+        models.push(ModelInfo {
+            id,
+            owned_by,
+            created,
+        });
+    }
+
+    Ok(models)
+}
+
 /// Fetch available models from a provider's `/v1/models` endpoint.
 /// Works with OpenAI-compatible APIs (LM Studio, `LocalAI`, Ollama, etc.)
 ///
@@ -453,24 +501,7 @@ pub async fn fetch_models(
         ProviderError::InvalidResponse(format!("Failed to parse models response: {e}"))
     })?;
 
-    // Parse OpenAI-style response: { "data": [...], "object": "list" }
-    let models = body["data"]
-        .as_array()
-        .ok_or_else(|| {
-            ProviderError::InvalidResponse("Expected 'data' array in response".to_string())
-        })?
-        .iter()
-        .filter_map(|m| {
-            let id = m["id"].as_str()?.to_string();
-            Some(ModelInfo {
-                id,
-                owned_by: m["owned_by"].as_str().map(String::from),
-                created: m["created"].as_i64(),
-            })
-        })
-        .collect();
-
-    Ok(models)
+    parse_models_response(&body)
 }
 
 #[cfg(test)]
@@ -714,6 +745,92 @@ mod tests {
         // Test RequestFailed variant
         let err = ProviderError::RequestFailed("connection refused".to_string());
         assert!(err.to_string().contains("connection"));
+    }
+
+    #[test]
+    fn parse_models_response_accepts_valid_openai_style_list() {
+        let body = json!({
+            "object": "list",
+            "data": [
+                {"id": "gpt-4.1", "owned_by": "openai", "created": 1_735_689_600},
+                {"id": "local-model"}
+            ]
+        });
+
+        let models = parse_models_response(&body).expect("valid model list should parse");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-4.1");
+        assert_eq!(models[0].owned_by.as_deref(), Some("openai"));
+        assert_eq!(models[0].created, Some(1_735_689_600));
+        assert_eq!(models[1].id, "local-model");
+        assert_eq!(models[1].owned_by, None);
+        assert_eq!(models[1].created, None);
+    }
+
+    #[test]
+    fn parse_models_response_rejects_missing_data_array() {
+        let err = parse_models_response(&json!({"object": "list"}))
+            .expect_err("missing data array must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("'data' array"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_response_rejects_model_missing_id() {
+        let body = json!({
+            "data": [
+                {"id": "good"},
+                {"owned_by": "provider"}
+            ]
+        });
+        let err = parse_models_response(&body).expect_err("missing model id must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("index 1"), "{msg}");
+                assert!(msg.contains("'id'"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_response_rejects_model_empty_id() {
+        let body = json!({"data": [{"id": ""}]});
+        let err = parse_models_response(&body).expect_err("empty model id must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("index 0"), "{msg}");
+                assert!(msg.contains("'id'"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_models_response_rejects_malformed_optional_fields() {
+        let bad_owner = parse_models_response(&json!({
+            "data": [{"id": "m", "owned_by": 123}]
+        }))
+        .expect_err("non-string owned_by must be invalid");
+        match bad_owner {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("owned_by"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+
+        let bad_created = parse_models_response(&json!({
+            "data": [{"id": "m", "created": "yesterday"}]
+        }))
+        .expect_err("non-integer created must be invalid");
+        match bad_created {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("created"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 
     #[test]
