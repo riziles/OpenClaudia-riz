@@ -114,40 +114,12 @@ impl ProviderAdapter for OllamaAdapter {
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
-        // Handle tool calls if present
-        let tool_calls: Option<Vec<Value>> = message
-            .get("tool_calls")
-            .and_then(|tc| tc.as_array())
-            .map(|calls| {
-                calls
-                    .iter()
-                    .filter_map(|call| {
-                        let func = call.get("function")?;
-                        Some(json!({
-                            "id": format!("call_{}", uuid::Uuid::new_v4()),
-                            "type": "function",
-                            "function": {
-                                "name": func.get("name")?,
-                                "arguments": func.get("arguments")
-                                    .map_or_else(|| "{}".to_string(), |a| {
-                                        if a.is_string() {
-                                            a.as_str().unwrap_or("{}").to_string()
-                                        } else {
-                                            serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string())
-                                        }
-                                    })
-                            }
-                        }))
-                    })
-                    .collect()
-            })
-            .filter(|v: &Vec<Value>| !v.is_empty());
-
         let mut openai_message = json!({
             "role": "assistant",
             "content": content
         });
 
+        let tool_calls = convert_ollama_tool_calls(message)?;
         if let Some(calls) = tool_calls {
             openai_message["tool_calls"] = json!(calls);
         }
@@ -241,5 +213,198 @@ impl ProviderAdapter for OllamaAdapter {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         })
+    }
+}
+
+fn convert_ollama_tool_calls(message: &Value) -> Result<Option<Vec<Value>>, ProviderError> {
+    let Some(tool_calls) = message.get("tool_calls") else {
+        return Ok(None);
+    };
+    let calls = tool_calls.as_array().ok_or_else(|| {
+        ProviderError::InvalidResponse("Ollama message.tool_calls must be an array".to_string())
+    })?;
+    if calls.is_empty() {
+        return Ok(None);
+    }
+
+    calls
+        .iter()
+        .enumerate()
+        .map(convert_ollama_tool_call)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn convert_ollama_tool_call((index, call): (usize, &Value)) -> Result<Value, ProviderError> {
+    let func = call.get("function").ok_or_else(|| {
+        ProviderError::InvalidResponse(format!(
+            "Ollama tool_call at index {index} missing 'function' object: {call}"
+        ))
+    })?;
+    let name = func
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse(format!(
+                "Ollama tool_call at index {index} missing non-empty function.name: {call}"
+            ))
+        })?;
+    let arguments = func.get("arguments").ok_or_else(|| {
+        ProviderError::InvalidResponse(format!(
+            "Ollama tool_call at index {index} missing function.arguments: {call}"
+        ))
+    })?;
+    let arguments = stringify_ollama_tool_arguments(index, call, arguments)?;
+
+    Ok(json!({
+        "id": format!("call_{}", uuid::Uuid::new_v4()),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments
+        }
+    }))
+}
+
+fn stringify_ollama_tool_arguments(
+    index: usize,
+    call: &Value,
+    arguments: &Value,
+) -> Result<String, ProviderError> {
+    let parsed = if let Some(args) = arguments.as_str() {
+        serde_json::from_str::<Value>(args).map_err(|e| {
+            ProviderError::InvalidResponse(format!(
+                "Ollama tool_call at index {index} has invalid JSON function.arguments: {e}; \
+                 tool_call: {call}"
+            ))
+        })?
+    } else {
+        arguments.clone()
+    };
+
+    if !parsed.is_object() {
+        return Err(ProviderError::InvalidResponse(format!(
+            "Ollama tool_call at index {index} has non-object function.arguments: expected JSON \
+             object, got {}; tool_call: {call}",
+            json_value_type_name(&parsed),
+        )));
+    }
+
+    serde_json::to_string(&parsed).map_err(|e| {
+        ProviderError::InvalidResponse(format!(
+            "Ollama tool_call at index {index} has unserializable function.arguments: {e}; \
+             tool_call: {call}"
+        ))
+    })
+}
+
+const fn json_value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_tool_response(arguments: Value) -> Value {
+        json!({
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "bash",
+                        "arguments": arguments
+                    }
+                }]
+            },
+            "done": true
+        })
+    }
+
+    #[test]
+    fn transform_response_serializes_object_tool_arguments() {
+        let response = base_tool_response(json!({"command": "pwd"}));
+        let out = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect("valid tool call should transform");
+        let call = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "bash");
+        assert_eq!(call["function"]["arguments"], r#"{"command":"pwd"}"#);
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn transform_response_accepts_stringified_object_tool_arguments() {
+        let response = base_tool_response(json!(r#"{"command":"pwd"}"#));
+        let out = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect("stringified object arguments should transform");
+        let call = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["arguments"], r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn transform_response_errors_on_malformed_tool_argument_string() {
+        let response = base_tool_response(json!("{not json"));
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("malformed tool arguments must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("function.arguments"), "{msg}");
+                assert!(msg.contains("invalid JSON"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_non_object_tool_arguments() {
+        let response = base_tool_response(json!([]));
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("non-object tool arguments must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("function.arguments"), "{msg}");
+                assert!(msg.contains("expected JSON object"), "{msg}");
+                assert!(msg.contains("array"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_missing_tool_function_name() {
+        let response = json!({
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {"arguments": {"command": "pwd"}}
+                }]
+            },
+            "done": true
+        });
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("missing tool name must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("function.name"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 }
