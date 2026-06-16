@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::config::ThinkingConfig;
-use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+use crate::proxy::{ChatCompletionRequest, ChatMessage, ContentPart, MessageContent};
 use crate::session::TokenUsage;
 
 use super::{ProviderAdapter, ProviderError};
@@ -101,55 +101,83 @@ impl GoogleAdapter {
     }
 
     /// Convert `OpenAI` messages to Gemini format
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
-        messages
-            .iter()
-            .filter(|m| m.role != "system") // System handled via systemInstruction
-            .map(|m| {
-                let role = match m.role.as_str() {
-                    "assistant" => "model",
-                    _ => "user",
-                };
+    fn convert_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError> {
+        let mut converted = Vec::new();
 
-                let parts = match &m.content {
-                    MessageContent::Text(t) => json!([{"text": t}]),
-                    MessageContent::Parts(parts) => {
-                        // Crosslink #850: a `ContentPart` with neither `text`
-                        // nor `image_url` used to fall through to an empty
-                        // `{"text": ""}` part — silently dropping video / audio
-                        // / file / any future variant the user sent. Emit a
-                        // `tracing::warn` naming the unknown content type so
-                        // the gap is observable in logs, then skip the part
-                        // instead of fabricating empty text.
-                        let converted: Vec<Value> = parts
-                            .iter()
-                            .filter_map(|p| {
-                                p.text.as_ref().map(|t| json!({"text": t})).or_else(|| {
-                                    p.image_url
-                                        .as_ref()
-                                        .map(|image| json!({"inlineData": image}))
-                                        .or_else(|| {
-                                            tracing::warn!(
-                                                content_type = ?p.content_type,
-                                                role = %m.role,
-                                                "dropping unknown content type in Google adapter \
-                                                 (not text / image_url) — see crosslink #850"
-                                            );
-                                            None
-                                        })
-                                })
-                            })
-                            .collect();
-                        Value::Array(converted)
-                    }
-                };
+        for (msg_index, message) in messages.iter().enumerate() {
+            if message.role == "system" {
+                // System handled via systemInstruction.
+                continue;
+            }
 
-                json!({
-                    "role": role,
-                    "parts": parts
-                })
-            })
-            .collect()
+            let role = match message.role.as_str() {
+                "assistant" => "model",
+                _ => "user",
+            };
+
+            let parts = match &message.content {
+                MessageContent::Text(text) => json!([{"text": text}]),
+                MessageContent::Parts(parts) => {
+                    json!(Self::convert_content_parts(
+                        msg_index,
+                        &message.role,
+                        parts
+                    )?)
+                }
+            };
+
+            converted.push(json!({
+                "role": role,
+                "parts": parts
+            }));
+        }
+
+        Ok(converted)
+    }
+
+    fn convert_content_parts(
+        msg_index: usize,
+        role: &str,
+        parts: &[ContentPart],
+    ) -> Result<Vec<Value>, ProviderError> {
+        let mut converted = Vec::with_capacity(parts.len());
+
+        for (part_index, part) in parts.iter().enumerate() {
+            match part.content_type.as_str() {
+                "text" => {
+                    let text = part.text.as_ref().ok_or_else(|| {
+                        ProviderError::RequestFailed(format!(
+                            "Google message at index {msg_index} role '{role}' text part at \
+                             index {part_index} missing 'text'"
+                        ))
+                    })?;
+                    converted.push(json!({"text": text}));
+                }
+                "image" | "image_url" => {
+                    let image = part.image_url.as_ref().ok_or_else(|| {
+                        ProviderError::RequestFailed(format!(
+                            "Google message at index {msg_index} role '{role}' image part at \
+                             index {part_index} missing 'image_url'"
+                        ))
+                    })?;
+                    converted.push(json!({"inlineData": image}));
+                }
+                other => {
+                    return Err(ProviderError::RequestFailed(format!(
+                        "Unsupported Google content part type '{other}' at message index \
+                         {msg_index}, part index {part_index}"
+                    )));
+                }
+            }
+        }
+
+        if converted.is_empty() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google message at index {msg_index} role '{role}' has no content parts"
+            )));
+        }
+
+        Ok(converted)
     }
 
     /// Extract system instruction.
@@ -208,7 +236,7 @@ impl ProviderAdapter for GoogleAdapter {
 
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         let mut body = json!({
-            "contents": Self::convert_messages(&request.messages)
+            "contents": Self::convert_messages(&request.messages)?
         });
 
         // Add system instruction if present
@@ -851,12 +879,55 @@ mod tests {
         }
     }
 
-    /// #850: a `ContentPart` with neither `text` nor `image_url` must be
-    /// dropped (and warned about) rather than silently coerced to an
-    /// empty text part — the latter loses the multimodal contract.
+    /// #850: a `ContentPart` with neither `text` nor `image_url` used to be
+    /// silently coerced or dropped. The request boundary now rejects it so the
+    /// caller sees the unsupported multimodal contract immediately.
     #[test]
-    fn unknown_content_part_is_dropped_not_emitted_as_empty_text() {
-        use crate::proxy::{ChatMessage, MessageContent};
+    fn transform_request_converts_text_and_image_parts() {
+        let request = ChatCompletionRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    ContentPart {
+                        content_type: "text".to_string(),
+                        text: Some("describe this".to_string()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        content_type: "image_url".to_string(),
+                        text: None,
+                        image_url: Some(json!({
+                            "mimeType": "image/png",
+                            "data": "iVBORw..."
+                        })),
+                    },
+                ]),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(64),
+            temperature: None,
+            tools: None,
+            stream: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let body = GoogleAdapter::new()
+            .transform_request(&request)
+            .expect("valid multimodal Gemini request should transform");
+        let parts = body["contents"][0]["parts"]
+            .as_array()
+            .expect("parts array");
+        assert_eq!(parts[0], json!({"text": "describe this"}));
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "iVBORw...");
+    }
+
+    #[test]
+    fn transform_request_errors_on_unknown_content_part_type() {
         let msg = ChatMessage {
             role: "user".to_string(),
             content: MessageContent::Parts(vec![
@@ -876,16 +947,91 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         };
-        let out = GoogleAdapter::convert_messages(std::slice::from_ref(&msg));
-        // One message, with `parts` containing only the recognized text.
-        let parts = out[0]["parts"].as_array().expect("parts is array");
-        assert_eq!(parts.len(), 1, "#850: unknown content type must be dropped");
-        assert_eq!(parts[0]["text"], "hello");
-        // The pre-fix code emitted `{"text": ""}` — must NOT appear.
-        assert!(
-            !parts.iter().any(|p| p["text"] == ""),
-            "#850: must not coerce unknown variant to empty text"
-        );
+        let request = ChatCompletionRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages: vec![msg],
+            max_tokens: Some(64),
+            temperature: None,
+            tools: None,
+            stream: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let err = GoogleAdapter::new()
+            .transform_request(&request)
+            .expect_err("unknown Google content part must fail request conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => assert!(msg.contains("video_url"), "{msg}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_request_errors_on_text_part_missing_text() {
+        let request = ChatCompletionRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart {
+                    content_type: "text".to_string(),
+                    text: None,
+                    image_url: None,
+                }]),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(64),
+            temperature: None,
+            tools: None,
+            stream: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let err = GoogleAdapter::new()
+            .transform_request(&request)
+            .expect_err("missing Google text part text must fail request conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => assert!(msg.contains("missing 'text'"), "{msg}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_request_errors_on_image_part_missing_image_url() {
+        let request = ChatCompletionRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart {
+                    content_type: "image_url".to_string(),
+                    text: None,
+                    image_url: None,
+                }]),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(64),
+            temperature: None,
+            tools: None,
+            stream: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let err = GoogleAdapter::new()
+            .transform_request(&request)
+            .expect_err("missing Google image_url must fail request conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => assert!(msg.contains("image_url"), "{msg}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
     }
 
     // ── crosslink #602 — stream_endpoint / supports_streaming overrides ─────
