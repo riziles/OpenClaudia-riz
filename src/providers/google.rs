@@ -263,26 +263,9 @@ impl ProviderAdapter for GoogleAdapter {
             .get("content")
             .and_then(|c| c.get("parts"))
             .and_then(|p| p.as_array())
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("functionCall"))
-                    .enumerate()
-                    .filter_map(|(i, func_call)| {
-                        let name = func_call.get("name")?.as_str()?;
-                        let args = serde_json::to_string(func_call.get("args")?).ok()?;
-                        Some(json!({
-                            "id": gemini_tool_call_id(i, name),
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": args,
-                            }
-                        }))
-                    })
-                    .collect()
-            })
-            .filter(|v: &Vec<Value>| !v.is_empty());
+            .map(|parts| extract_gemini_tool_calls(parts.as_slice()))
+            .transpose()?
+            .flatten();
 
         let mut message = json!({
             "role": "assistant",
@@ -389,6 +372,74 @@ impl ProviderAdapter for GoogleAdapter {
     }
 }
 
+fn extract_gemini_tool_calls(parts: &[Value]) -> Result<Option<Vec<Value>>, ProviderError> {
+    let mut calls = Vec::new();
+
+    for part in parts {
+        let Some(func_call) = part.get("functionCall") else {
+            continue;
+        };
+
+        if !func_call.is_object() {
+            return Err(ProviderError::InvalidResponse(format!(
+                "Gemini functionCall must be an object: {func_call}"
+            )));
+        }
+
+        let name = func_call
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Gemini functionCall missing non-empty string 'name': {func_call}"
+                ))
+            })?;
+
+        let args = func_call.get("args").ok_or_else(|| {
+            ProviderError::InvalidResponse(format!(
+                "Gemini functionCall missing object 'args': {func_call}"
+            ))
+        })?;
+
+        if !args.is_object() {
+            return Err(ProviderError::InvalidResponse(format!(
+                "Gemini functionCall has non-object 'args': expected JSON object, got {}",
+                args_type_name(args)
+            )));
+        }
+
+        let args = serde_json::to_string(args).map_err(|e| {
+            ProviderError::InvalidResponse(format!(
+                "Gemini functionCall has unserializable 'args': {e}; functionCall: {func_call}"
+            ))
+        })?;
+
+        let ordinal = calls.len();
+        calls.push(json!({
+            "id": gemini_tool_call_id(ordinal, name),
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": args,
+            }
+        }));
+    }
+
+    Ok((!calls.is_empty()).then_some(calls))
+}
+
+const fn args_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +505,78 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_0_bash");
         assert_eq!(calls[1]["id"], "call_1_bash");
         assert_ne!(calls[0]["id"], calls[1]["id"]);
+    }
+
+    #[test]
+    fn transform_response_errors_on_function_call_missing_name() {
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"args": {"command": "ls"}}}
+                    ]
+                }
+            }]
+        });
+
+        let err = GoogleAdapter::new()
+            .transform_response(body, false)
+            .expect_err("missing Gemini functionCall name must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("functionCall"), "{msg}");
+                assert!(msg.contains("name"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_function_call_missing_args() {
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "bash"}}
+                    ]
+                }
+            }]
+        });
+
+        let err = GoogleAdapter::new()
+            .transform_response(body, false)
+            .expect_err("missing Gemini functionCall args must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("functionCall"), "{msg}");
+                assert!(msg.contains("args"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_non_object_function_call_args() {
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "bash", "args": []}}
+                    ]
+                }
+            }]
+        });
+
+        let err = GoogleAdapter::new()
+            .transform_response(body, false)
+            .expect_err("non-object Gemini functionCall args must fail");
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("args"), "{msg}");
+                assert!(msg.contains("object"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 
     /// #850: a `ContentPart` with neither `text` nor `image_url` must be
