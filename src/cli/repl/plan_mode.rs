@@ -283,8 +283,10 @@ pub fn check_plan_mode_restriction(
         _ => return None,
     };
 
-    let args: serde_json::Value =
-        serde_json::from_str(tool_args).unwrap_or(serde_json::Value::Null);
+    let args = match parse_plan_mode_tool_args(tool_name, tool_args) {
+        Ok(args) => args,
+        Err(msg) => return Some(msg),
+    };
 
     // Use the canonical plan_realpath pinned at entry, NOT the
     // user-facing plan_file: re-resolving plan_file at check time is
@@ -304,6 +306,32 @@ pub fn check_plan_mode_restriction(
             tool_name,
             plan_state.plan_file.display()
         ))
+    }
+}
+
+fn parse_plan_mode_tool_args(
+    tool_name: &str,
+    tool_args: &str,
+) -> Result<serde_json::Value, String> {
+    let value = serde_json::from_str::<serde_json::Value>(tool_args)
+        .map_err(|e| format!("Invalid tool arguments JSON for '{tool_name}': {e}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
+            json_value_type_name(&value)
+        ));
+    }
+    Ok(value)
+}
+
+const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -355,6 +383,47 @@ mod tests {
         Box::leak(Box::new(dir));
         PlanModeState::enter_with_previous_mode(plan, prev.map(str::to_string))
             .expect("enter must succeed")
+    }
+
+    fn chat_session_in_plan_mode() -> ChatSession {
+        let mut session = ChatSession::new(
+            "claude-sonnet-4-6",
+            "anthropic",
+            openclaudia::modes::BehaviorMode::default(),
+        );
+        session.mode = AgentMode::Plan;
+        session.plan_mode = Some(make_plan_state(None));
+        session
+    }
+
+    #[test]
+    fn check_plan_mode_restriction_reports_malformed_tool_args() {
+        let session = chat_session_in_plan_mode();
+        let msg = check_plan_mode_restriction(&session, "read_file", "{not json")
+            .expect("malformed args must be rejected explicitly");
+
+        assert!(msg.contains("Invalid tool arguments JSON"), "{msg}");
+        assert!(msg.contains("read_file"), "{msg}");
+    }
+
+    #[test]
+    fn check_plan_mode_restriction_reports_non_object_tool_args() {
+        let session = chat_session_in_plan_mode();
+        let msg = check_plan_mode_restriction(&session, "read_file", "[]")
+            .expect("non-object args must be rejected explicitly");
+
+        assert!(msg.contains("expected a JSON object"), "{msg}");
+        assert!(msg.contains("array"), "{msg}");
+    }
+
+    #[test]
+    fn check_plan_mode_restriction_still_allows_read_only_object_args() {
+        let session = chat_session_in_plan_mode();
+
+        assert_eq!(
+            check_plan_mode_restriction(&session, "read_file", "{}"),
+            None
+        );
     }
 
     /// #618 fix: when `previous_mode` is `None` the restore falls back to
