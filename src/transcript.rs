@@ -20,6 +20,9 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::LazyLock;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +30,21 @@ use serde_json::Value;
 /// Crate version baked in by Cargo. Matches Claude Code's `version`
 /// field on each serialized message.
 pub const TRANSCRIPT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Absolute, PATH-independent location of `git` for transcript metadata.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
 
 /// On-disk envelope around a raw chat message. Field names match
 /// Claude Code's `SerializedMessage` type (camelCase over the wire).
@@ -139,6 +157,27 @@ pub fn transcript_path(cwd: &Path, session_id: &str) -> PathBuf {
     project_dir_for(cwd).join(format!("{session_id}.jsonl"))
 }
 
+fn git_head_mtime(cwd: &Path) -> Option<SystemTime> {
+    let git_path = cwd.join(".git");
+    let direct_head = git_path.join("HEAD");
+    if let Ok(mtime) = std::fs::metadata(&direct_head).and_then(|m| m.modified()) {
+        return Some(mtime);
+    }
+
+    let git_file = std::fs::read_to_string(&git_path).ok()?;
+    let git_dir = git_file.strip_prefix("gitdir:")?.trim();
+    let git_dir_path = Path::new(git_dir);
+    let resolved_git_dir = if git_dir_path.is_absolute() {
+        git_dir_path.to_path_buf()
+    } else {
+        cwd.join(git_dir_path)
+    };
+
+    std::fs::metadata(resolved_git_dir.join("HEAD"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// Best-effort git branch lookup via `git rev-parse --abbrev-ref HEAD`.
 /// Returns `None` when git isn't available or `cwd` isn't a repo.
 ///
@@ -154,10 +193,9 @@ pub fn transcript_path(cwd: &Path, session_id: &str) -> PathBuf {
 pub fn current_git_branch(cwd: &Path) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::time::SystemTime;
 
-    /// Per-cwd cache entry: last-observed `.git/HEAD` mtime + last branch
-    /// result. `mtime = None` is a sentinel for "no `.git/HEAD` could be
+    /// Per-cwd cache entry: last-observed git `HEAD` mtime + last branch
+    /// result. `mtime = None` is a sentinel for "no git HEAD could be
     /// stat'd", which still memoises the negative answer so a non-repo
     /// directory does not pay a subprocess on every line.
     type BranchCacheEntry = (Option<SystemTime>, Option<String>);
@@ -165,9 +203,7 @@ pub fn current_git_branch(cwd: &Path) -> Option<String> {
 
     static CACHE: Mutex<Option<BranchCache>> = Mutex::new(None);
 
-    let head_mtime = std::fs::metadata(cwd.join(".git").join("HEAD"))
-        .and_then(|m| m.modified())
-        .ok();
+    let head_mtime = git_head_mtime(cwd);
 
     {
         let guard = CACHE.lock().ok();
@@ -180,11 +216,12 @@ pub fn current_git_branch(cwd: &Path) -> Option<String> {
         }
     }
 
-    let branch = match std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
-        .output()
-    {
+    let branch = match git_command().and_then(|mut cmd| {
+        cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| e.to_string())
+    }) {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if s.is_empty() || s == "HEAD" {
@@ -503,6 +540,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn current_git_branch_uses_resolved_git_binary_path() {
+        let git = git_bin().expect("transcript tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("transcript.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production transcript code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn git_head_mtime_reads_worktree_gitdir_file() {
+        let tmp = TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let git_dir = tmp.path().join("repo/.git/worktrees/worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../repo/.git/worktrees/worktree\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+
+        assert!(
+            git_head_mtime(&worktree).is_some(),
+            "worktree .git file should resolve to the real gitdir HEAD"
+        );
     }
 
     #[test]
