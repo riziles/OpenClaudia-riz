@@ -1213,15 +1213,7 @@ impl AcpServer {
                 if line.is_empty() || line == "data: [DONE]" {
                     if line == "data: [DONE]" {
                         // Stream complete
-                        if tool_calls.is_empty() {
-                            return StreamResult::EndTurn {
-                                content: full_content,
-                            };
-                        }
-                        return StreamResult::ToolCalls {
-                            content: full_content,
-                            tool_calls,
-                        };
+                        return finish_acp_stream(full_content, tool_calls);
                     }
                     continue;
                 }
@@ -1231,15 +1223,7 @@ impl AcpServer {
                     if line.starts_with("event: ") {
                         let event_type = line.trim_start_matches("event: ");
                         if event_type == "message_stop" {
-                            if tool_calls.is_empty() {
-                                return StreamResult::EndTurn {
-                                    content: full_content,
-                                };
-                            }
-                            return StreamResult::ToolCalls {
-                                content: full_content,
-                                tool_calls,
-                            };
+                            return finish_acp_stream(full_content, tool_calls);
                         }
                     }
                     continue;
@@ -1279,31 +1263,24 @@ impl AcpServer {
                                     .unwrap_or(0)
                                     as usize;
 
+                                while tool_calls.len() <= index {
+                                    tool_calls.push(AccumulatedToolCall::default());
+                                }
+
+                                if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                    tool_calls[index].id = tc_id.to_string();
+                                }
+
                                 // New tool call
                                 if let Some(func) = tc_delta.get("function") {
                                     if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        while tool_calls.len() <= index {
-                                            tool_calls.push(AccumulatedToolCall {
-                                                id: String::new(),
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            });
-                                        }
                                         tool_calls[index].name = name.to_string();
                                         current_tool_index = Some(index);
                                     }
                                     if let Some(args) =
                                         func.get("arguments").and_then(|a| a.as_str())
                                     {
-                                        if tool_calls.len() > index {
-                                            tool_calls[index].arguments.push_str(args);
-                                        }
-                                    }
-                                }
-
-                                if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
-                                    if tool_calls.len() > index {
-                                        tool_calls[index].id = tc_id.to_string();
+                                        tool_calls[index].arguments.push_str(args);
                                     }
                                 }
                             }
@@ -1317,10 +1294,7 @@ impl AcpServer {
                                 };
                             }
                             if reason == "tool_calls" {
-                                return StreamResult::ToolCalls {
-                                    content: full_content,
-                                    tool_calls,
-                                };
+                                return finish_acp_stream(full_content, tool_calls);
                             }
                         }
                     }
@@ -1348,7 +1322,7 @@ impl AcpServer {
                                     let name = content_block
                                         .get("name")
                                         .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
+                                        .unwrap_or("");
                                     let tc_id = content_block
                                         .get("id")
                                         .and_then(|i| i.as_str())
@@ -1415,10 +1389,7 @@ impl AcpServer {
                                         };
                                     }
                                     if reason == "tool_use" {
-                                        return StreamResult::ToolCalls {
-                                            content: full_content,
-                                            tool_calls,
-                                        };
+                                        return finish_acp_stream(full_content, tool_calls);
                                     }
                                 }
                             }
@@ -1430,16 +1401,7 @@ impl AcpServer {
         }
 
         // Stream ended without explicit stop
-        if tool_calls.is_empty() {
-            StreamResult::EndTurn {
-                content: full_content,
-            }
-        } else {
-            StreamResult::ToolCalls {
-                content: full_content,
-                tool_calls,
-            }
-        }
+        finish_acp_stream(full_content, tool_calls)
     }
 
     // ========================================================================
@@ -2130,6 +2092,7 @@ async fn run_search_argv(program: &std::path::Path, argv: &[String]) -> AcpToolR
 // ============================================================================
 
 /// Result of streaming a provider response.
+#[derive(Debug)]
 enum StreamResult {
     /// Model finished with text content, no tool calls.
     EndTurn { content: String },
@@ -2145,11 +2108,55 @@ enum StreamResult {
 }
 
 /// A fully accumulated tool call from streaming chunks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AccumulatedToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+impl AccumulatedToolCall {
+    const fn is_complete(&self) -> bool {
+        !self.id.is_empty() && !self.name.is_empty()
+    }
+
+    fn missing_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.id.is_empty() {
+            missing.push("id");
+        }
+        if self.name.is_empty() {
+            missing.push("function.name");
+        }
+        missing
+    }
+}
+
+fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> StreamResult {
+    if tool_calls.is_empty() {
+        return StreamResult::EndTurn { content };
+    }
+
+    if let Some((index, call)) = tool_calls
+        .iter()
+        .enumerate()
+        .find(|(_, call)| !call.is_complete())
+    {
+        let missing = call.missing_fields().join(", ");
+        warn!(
+            index,
+            missing = %missing,
+            "Provider returned incomplete ACP streamed tool call"
+        );
+        return StreamResult::Error(format!(
+            "Provider returned incomplete tool call at index {index}: missing {missing}"
+        ));
+    }
+
+    StreamResult::ToolCalls {
+        content,
+        tool_calls,
+    }
 }
 
 /// Result of executing a tool via ACP.
@@ -2624,6 +2631,76 @@ mod search_security_tests {
 // the regression is impossible without removing the hook engine wiring from
 // `execute_tool_via_acp`.
 // ============================================================================
+
+#[cfg(test)]
+mod stream_tool_call_tests {
+    use super::{finish_acp_stream, AccumulatedToolCall, StreamResult};
+
+    #[test]
+    fn finish_stream_returns_complete_tool_calls() {
+        let result = finish_acp_stream(
+            "hello".to_string(),
+            vec![AccumulatedToolCall {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }],
+        );
+
+        match result {
+            StreamResult::ToolCalls {
+                content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "hello");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_1");
+                assert_eq!(tool_calls[0].name, "bash");
+            }
+            other => panic!("expected complete tool call to finish as ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_stream_errors_on_incomplete_tool_call() {
+        let result = finish_acp_stream(
+            String::new(),
+            vec![AccumulatedToolCall {
+                id: "call_missing_name".to_string(),
+                name: String::new(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }],
+        );
+
+        match result {
+            StreamResult::Error(message) => {
+                assert!(message.contains("incomplete tool call"), "{message}");
+                assert!(message.contains("function.name"), "{message}");
+            }
+            other => panic!("expected incomplete tool call to error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_stream_errors_on_missing_tool_call_id() {
+        let result = finish_acp_stream(
+            String::new(),
+            vec![AccumulatedToolCall {
+                id: String::new(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }],
+        );
+
+        match result {
+            StreamResult::Error(message) => {
+                assert!(message.contains("incomplete tool call"), "{message}");
+                assert!(message.contains("id"), "{message}");
+            }
+            other => panic!("expected missing id to error, got {other:?}"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tool_argument_tests {
