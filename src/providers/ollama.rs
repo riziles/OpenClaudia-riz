@@ -146,14 +146,32 @@ impl ProviderAdapter for OllamaAdapter {
     fn transform_response(&self, response: Value, _stream: bool) -> Result<Value, ProviderError> {
         // Ollama response format:
         // {"model": "...", "message": {"role": "assistant", "content": "..."}, "done": true, ...}
-        let message = response.get("message").ok_or_else(|| {
-            ProviderError::InvalidResponse("No message in Ollama response".to_string())
-        })?;
+        let model = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Ollama response missing non-empty string 'model': {response}"
+                ))
+            })?;
+        let message = response
+            .get("message")
+            .filter(|message| message.is_object())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Ollama response missing object 'message': {response}"
+                ))
+            })?;
 
         let content = message
             .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Ollama response message missing string 'content': {message}"
+                ))
+            })?;
 
         let mut openai_message = json!({
             "role": "assistant",
@@ -168,8 +186,12 @@ impl ProviderAdapter for OllamaAdapter {
         // Determine finish reason
         let done = response
             .get("done")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "Ollama response missing boolean 'done': {response}"
+                ))
+            })?;
         let finish_reason = if !done {
             "length"
         } else if openai_message.get("tool_calls").is_some() {
@@ -192,7 +214,7 @@ impl ProviderAdapter for OllamaAdapter {
             "id": format!("ollama-{}", uuid::Uuid::new_v4()),
             "object": "chat.completion",
             "created": chrono::Utc::now().timestamp(),
-            "model": response.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"),
+            "model": model,
             "choices": [{
                 "index": 0,
                 "message": openai_message,
@@ -392,6 +414,17 @@ mod tests {
         })
     }
 
+    fn base_text_response() -> Value {
+        json!({
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "hello"
+            },
+            "done": true
+        })
+    }
+
     #[test]
     fn transform_request_converts_valid_tools() {
         let request = request_with_tools(vec![json!({
@@ -531,6 +564,78 @@ mod tests {
         assert_eq!(call["function"]["name"], "bash");
         assert_eq!(call["function"]["arguments"], r#"{"command":"pwd"}"#);
         assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn transform_response_errors_on_missing_model() {
+        let mut response = base_text_response();
+        response.as_object_mut().expect("object").remove("model");
+
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("missing model must fail");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("'model'"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_missing_message_object() {
+        let response = json!({
+            "model": "llama3",
+            "message": null,
+            "done": true
+        });
+
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("missing message object must fail");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("'message'"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_missing_or_malformed_content() {
+        for message in [
+            json!({"role": "assistant"}),
+            json!({"role": "assistant", "content": null}),
+            json!({"role": "assistant", "content": ["not", "a", "string"]}),
+        ] {
+            let response = json!({
+                "model": "llama3",
+                "message": message,
+                "done": true
+            });
+
+            let err = OllamaAdapter::new()
+                .transform_response(response, false)
+                .expect_err("missing or malformed content must fail");
+
+            match err {
+                ProviderError::InvalidResponse(msg) => assert!(msg.contains("'content'"), "{msg}"),
+                other => panic!("expected InvalidResponse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn transform_response_errors_on_missing_done() {
+        let mut response = base_text_response();
+        response.as_object_mut().expect("object").remove("done");
+
+        let err = OllamaAdapter::new()
+            .transform_response(response, false)
+            .expect_err("missing done must fail");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => assert!(msg.contains("'done'"), "{msg}"),
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
     }
 
     #[test]
