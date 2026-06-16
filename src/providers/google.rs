@@ -483,7 +483,17 @@ const fn args_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderError> {
+/// Extract and concatenate text from Gemini `content.parts`.
+///
+/// Text parts must contain string `text`; native `functionCall` parts are
+/// allowed and skipped. Any other part shape is rejected so malformed provider
+/// payloads do not become silent empty assistant messages.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::InvalidResponse`] when a text part is not a string
+/// or when a part has neither supported text nor native function-call content.
+pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderError> {
     let mut content = String::new();
 
     for (index, part) in parts.iter().enumerate() {

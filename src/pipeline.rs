@@ -7,7 +7,7 @@ use crate::memory::MemoryDb;
 use crate::permissions::PermissionManager;
 use crate::providers::{
     convert_messages_to_anthropic_checked, convert_tools_to_anthropic,
-    convert_tools_to_gemini_functions, get_adapter,
+    convert_tools_to_gemini_functions, extract_gemini_text_content, get_adapter,
 };
 use crate::proxy::{self, normalize_base_url};
 use crate::session::TokenUsage;
@@ -733,18 +733,26 @@ pub fn classify_google_finish_reason(
     }
 }
 
-/// Extract structured tool calls from a Gemini non-streaming response.
-fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, String> {
-    let Some(parts) = gemini_json
+fn google_response_parts(gemini_json: &Value) -> Result<&[Value], String> {
+    let candidate = gemini_json
         .get("candidates")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
+        .ok_or_else(|| format!("Gemini response missing candidates[0]: {gemini_json}"))?;
+
+    candidate
+        .get("content")
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())
-    else {
-        return Ok(Vec::new());
-    };
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("Gemini candidate missing content.parts array: {candidate}"))
+}
 
+fn extract_google_text(parts: &[Value]) -> Result<String, String> {
+    extract_gemini_text_content(parts).map_err(|e| e.to_string())
+}
+
+/// Extract structured tool calls from Gemini `content.parts`.
+fn extract_google_tool_calls_from_parts(parts: &[Value]) -> Result<Vec<ToolCall>, String> {
     let mut calls = Vec::new();
 
     for part in parts {
@@ -791,6 +799,12 @@ fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, Strin
     Ok(calls)
 }
 
+/// Extract structured tool calls from a Gemini non-streaming response.
+#[cfg(test)]
+fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, String> {
+    extract_google_tool_calls_from_parts(google_response_parts(gemini_json)?)
+}
+
 const fn google_args_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -830,33 +844,24 @@ async fn handle_google_response(
     let gemini_json: Value =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
 
-    let text: String = gemini_json
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default();
-
     // Check for Gemini error responses
     if let Some(error) = gemini_json.get("error") {
         let msg = error
             .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown error");
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .ok_or_else(|| {
+                format!("Gemini API error missing non-empty string 'message': {error}")
+            })?;
         let code = error
             .get("code")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         return Err(format!("Gemini API error ({code}): {msg}"));
     }
+
+    let parts = google_response_parts(&gemini_json)?;
+    let text = extract_google_text(parts)?;
 
     // #788: surface Gemini SAFETY / RECITATION / BLOCKLIST blocks via the pure helper.
     let GoogleFinishClassification {
@@ -871,7 +876,7 @@ async fn handle_google_response(
         send_event!(tx, AppEvent::StreamText(text.clone()));
     }
 
-    let tool_calls = extract_google_tool_calls(&gemini_json)?;
+    let tool_calls = extract_google_tool_calls_from_parts(parts)?;
     let (input_tokens, output_tokens) = extract_google_usage(&gemini_json);
 
     // Execute tool calls if any
@@ -1819,6 +1824,59 @@ mod tests {
             guardrail_path_for_tool_call("notebook_edit", r#"{"notebook_path":"nb.ipynb"}"#),
             None
         );
+    }
+
+    #[test]
+    fn extract_google_text_concatenates_text_parts_and_allows_tool_calls() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "hello "},
+                        {"functionCall": {"name": "bash", "args": {"command": "pwd"}}},
+                        {"text": "world"}
+                    ]
+                }
+            }]
+        });
+
+        let parts = google_response_parts(&body).expect("parts should parse");
+        let text = extract_google_text(parts).expect("mixed text/tool response should parse");
+
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn google_response_parts_rejects_missing_parts() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {}
+            }]
+        });
+
+        let err = google_response_parts(&body).expect_err("missing parts must fail");
+
+        assert!(err.contains("content.parts"), "{err}");
+    }
+
+    #[test]
+    fn extract_google_text_rejects_non_string_text_part() {
+        let parts = vec![serde_json::json!({"text": 123})];
+
+        let err = extract_google_text(&parts).expect_err("non-string text must fail");
+
+        assert!(err.contains("'text'"), "{err}");
+    }
+
+    #[test]
+    fn extract_google_text_rejects_unsupported_part_shape() {
+        let parts = vec![serde_json::json!({
+            "inlineData": {"mimeType": "image/png", "data": "..."}
+        })];
+
+        let err = extract_google_text(&parts).expect_err("unsupported part must fail");
+
+        assert!(err.contains("supported text or functionCall"), "{err}");
     }
 
     #[test]

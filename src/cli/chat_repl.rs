@@ -47,7 +47,7 @@ use crate::{
 
 use openclaudia::providers::{
     convert_messages_to_anthropic_checked, convert_tools_to_anthropic,
-    convert_tools_to_gemini_functions,
+    convert_tools_to_gemini_functions, extract_gemini_text_content,
 };
 use openclaudia::tools::safe_truncate;
 use openclaudia::{
@@ -1117,7 +1117,7 @@ impl ChatRepl {
             match Self::emit_gemini_initial_text_and_calls(&gemini_json) {
                 Ok(parsed) => parsed,
                 Err(e) => {
-                    eprintln!("\nInvalid Gemini tool call response: {e}");
+                    eprintln!("\nInvalid Gemini response: {e}");
                     let _ = save_chat_session(&self.chat_session);
                     self.chat_session.messages.pop();
                     return;
@@ -1179,7 +1179,7 @@ impl ChatRepl {
     ) -> Result<(String, Vec<tools::ToolCall>), String> {
         use std::io::Write;
         let mut full_content = String::new();
-        let text = gemini_extract_text(gemini_json);
+        let text = gemini_extract_text(gemini_json)?;
         let tool_calls = gemini_extract_tool_calls(gemini_json)?;
         if !text.is_empty() {
             print!("{text}");
@@ -1563,7 +1563,13 @@ impl ChatRepl {
                     eprintln!("\nFailed to parse Gemini follow-up response");
                     return None;
                 };
-                let text = gemini_extract_text(&resp_json);
+                let text = match gemini_extract_text(&resp_json) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("\nInvalid Gemini follow-up response: {e}");
+                        return None;
+                    }
+                };
                 let calls = match gemini_extract_tool_calls(&resp_json) {
                     Ok(calls) => calls,
                     Err(e) => {
@@ -3139,32 +3145,27 @@ fn process_thinking_event(
     false
 }
 
-fn gemini_extract_text(json: &serde_json::Value) -> String {
-    json.get("candidates")
+fn gemini_response_parts(json: &serde_json::Value) -> Result<&[serde_json::Value], String> {
+    let candidate = json
+        .get("candidates")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
+        .ok_or_else(|| format!("Gemini response missing candidates[0]: {json}"))?;
+
+    candidate
+        .get("content")
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("Gemini candidate missing content.parts array: {candidate}"))
+}
+
+fn gemini_extract_text(json: &serde_json::Value) -> Result<String, String> {
+    let parts = gemini_response_parts(json)?;
+    extract_gemini_text_content(parts).map_err(|e| e.to_string())
 }
 
 fn gemini_extract_tool_calls(json: &serde_json::Value) -> Result<Vec<tools::ToolCall>, String> {
-    let Some(parts) = json
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-    else {
-        return Ok(Vec::new());
-    };
+    let parts = gemini_response_parts(json)?;
 
     let mut calls = Vec::new();
 
@@ -3368,6 +3369,72 @@ mod tests {
 
         assert_eq!(response["functionResponse"]["name"], "read_file");
         assert_eq!(response["functionResponse"]["response"]["error"], "denied");
+    }
+
+    #[test]
+    fn gemini_extract_text_concatenates_text_parts_and_allows_tool_calls() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "hello "},
+                        {"functionCall": {"name": "bash", "args": {"command": "pwd"}}},
+                        {"text": "world"}
+                    ]
+                }
+            }]
+        });
+
+        let text = gemini_extract_text(&body).expect("mixed text/tool response should parse");
+
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn gemini_response_parts_rejects_missing_parts() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {}
+            }]
+        });
+
+        let err = gemini_response_parts(&body).expect_err("missing parts must fail");
+
+        assert!(err.contains("content.parts"), "{err}");
+    }
+
+    #[test]
+    fn gemini_extract_text_rejects_non_string_text_part() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": 123}
+                    ]
+                }
+            }]
+        });
+
+        let err = gemini_extract_text(&body).expect_err("non-string text must fail");
+
+        assert!(err.contains("'text'"), "{err}");
+    }
+
+    #[test]
+    fn gemini_extract_text_rejects_unsupported_part_shape() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"inlineData": {"mimeType": "image/png", "data": "..."}}
+                    ]
+                }
+            }]
+        });
+
+        let err = gemini_extract_text(&body).expect_err("unsupported part must fail");
+
+        assert!(err.contains("supported text or functionCall"), "{err}");
     }
 
     #[test]
