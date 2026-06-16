@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+use crate::proxy::{ChatCompletionRequest, ChatMessage, ContentPart, MessageContent};
 use crate::session::TokenUsage;
 
 use super::{ProviderAdapter, ProviderError};
@@ -22,26 +22,62 @@ impl OllamaAdapter {
     }
 
     /// Convert `OpenAI` messages to Ollama format
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    fn convert_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError> {
         messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(msg_index, m)| {
                 let content = match &m.content {
                     MessageContent::Text(t) => t.clone(),
-                    MessageContent::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|p| p.text.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    MessageContent::Parts(parts) => {
+                        convert_multipart_message_content(msg_index, &m.role, parts)?
+                    }
                 };
 
-                json!({
+                Ok(json!({
                     "role": m.role,
                     "content": content
-                })
+                }))
             })
             .collect()
     }
+}
+
+fn convert_multipart_message_content(
+    msg_index: usize,
+    role: &str,
+    parts: &[ContentPart],
+) -> Result<String, ProviderError> {
+    let mut text_parts = Vec::new();
+
+    for (part_index, part) in parts.iter().enumerate() {
+        if let Some(text) = &part.text {
+            text_parts.push(text.clone());
+            continue;
+        }
+
+        if part.content_type == "text" {
+            return Err(ProviderError::RequestFailed(format!(
+                "Ollama message at index {msg_index} (role '{role}') has text content part at \
+                 index {part_index} without string 'text'"
+            )));
+        }
+
+        if part.content_type == "image_url" || part.image_url.is_some() {
+            return Err(ProviderError::Unsupported(format!(
+                "Ollama adapter does not support image content parts; message index {msg_index}, \
+                 part index {part_index}, role '{role}'"
+            )));
+        }
+
+        return Err(ProviderError::Unsupported(format!(
+            "Ollama adapter does not support content part type '{}' at message index \
+             {msg_index}, part index {part_index}, role '{role}'",
+            part.content_type
+        )));
+    }
+
+    Ok(text_parts.join("\n"))
 }
 
 impl Default for OllamaAdapter {
@@ -115,7 +151,7 @@ impl ProviderAdapter for OllamaAdapter {
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         let mut body = json!({
             "model": &request.model,
-            "messages": Self::convert_messages(&request.messages),
+            "messages": Self::convert_messages(&request.messages)?,
             "stream": request.stream.unwrap_or(false)
         });
 
@@ -378,22 +414,110 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn request_with_tools(tools: Vec<Value>) -> ChatCompletionRequest {
+    fn request_with_messages(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "llama3".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: MessageContent::Text("hello".to_string()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
+            messages,
             temperature: None,
             max_tokens: None,
             stream: None,
-            tools: Some(tools),
+            tools: None,
             tool_choice: None,
             extra: HashMap::new(),
+        }
+    }
+
+    fn request_with_tools(tools: Vec<Value>) -> ChatCompletionRequest {
+        let mut request = request_with_messages(vec![ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text("hello".to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        request.tools = Some(tools);
+        request
+    }
+
+    fn message_with_parts(parts: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Parts(parts),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn text_part(text: Option<&str>) -> ContentPart {
+        ContentPart {
+            content_type: "text".to_string(),
+            text: text.map(str::to_string),
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn transform_request_concatenates_text_content_parts() {
+        let request = request_with_messages(vec![message_with_parts(vec![
+            text_part(Some("hello")),
+            text_part(Some("world")),
+        ])]);
+
+        let body = OllamaAdapter::new()
+            .transform_request(&request)
+            .expect("text parts should convert");
+
+        assert_eq!(body["messages"][0]["content"], "hello\nworld");
+    }
+
+    #[test]
+    fn transform_request_errors_on_text_part_missing_text() {
+        let request = request_with_messages(vec![message_with_parts(vec![text_part(None)])]);
+
+        let err = OllamaAdapter::new()
+            .transform_request(&request)
+            .expect_err("text part without text must fail");
+
+        match err {
+            ProviderError::RequestFailed(msg) => assert!(msg.contains("without string"), "{msg}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_request_rejects_image_content_parts() {
+        let request = request_with_messages(vec![message_with_parts(vec![ContentPart {
+            content_type: "image_url".to_string(),
+            text: None,
+            image_url: Some(json!({"url": "data:image/png;base64,abc"})),
+        }])]);
+
+        let err = OllamaAdapter::new()
+            .transform_request(&request)
+            .expect_err("image content must not be dropped");
+
+        match err {
+            ProviderError::Unsupported(msg) => assert!(msg.contains("image content"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_request_rejects_unknown_content_part_type() {
+        let request = request_with_messages(vec![message_with_parts(vec![ContentPart {
+            content_type: "input_audio".to_string(),
+            text: None,
+            image_url: None,
+        }])]);
+
+        let err = OllamaAdapter::new()
+            .transform_request(&request)
+            .expect_err("unknown content part must not be dropped");
+
+        match err {
+            ProviderError::Unsupported(msg) => assert!(msg.contains("input_audio"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
