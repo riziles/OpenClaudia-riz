@@ -672,7 +672,7 @@ fn convert_messages_to_anthropic_impl(
     let mut result = Vec::new();
 
     for (msg_index, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let role = message_role_for_anthropic(msg_index, msg, strict_tool_arguments)?;
 
         // Skip system messages (handled separately)
         if role == "system" {
@@ -709,6 +709,34 @@ fn convert_messages_to_anthropic_impl(
     }
 
     Ok(result)
+}
+
+fn message_role_for_anthropic(
+    msg_index: usize,
+    msg: &Value,
+    strict: bool,
+) -> Result<&str, ProviderError> {
+    let Some(role) = msg
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|role| !role.is_empty())
+    else {
+        return if strict {
+            Err(ProviderError::RequestFailed(format!(
+                "Message at index {msg_index} missing non-empty string 'role': {msg}"
+            )))
+        } else {
+            Ok("user")
+        };
+    };
+
+    match role {
+        "system" | "tool" | "assistant" | "user" => Ok(role),
+        _ if !strict => Ok(role),
+        _ => Err(ProviderError::RequestFailed(format!(
+            "Message at index {msg_index} has unsupported role '{role}': {msg}"
+        ))),
+    }
 }
 
 fn convert_tool_result_message(
@@ -1127,6 +1155,80 @@ mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": arguments}
         }))
+    }
+
+    #[test]
+    fn convert_messages_checked_errors_on_missing_role() {
+        let err = convert_messages_to_anthropic_checked(&[json!({"content": "hi"})])
+            .expect_err("missing role must fail checked Anthropic conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("missing non-empty string 'role'"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_checked_errors_on_non_string_role() {
+        let err = convert_messages_to_anthropic_checked(&[json!({
+            "role": 7,
+            "content": "hi"
+        })])
+        .expect_err("non-string role must fail checked Anthropic conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("missing non-empty string 'role'"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_checked_errors_on_empty_role() {
+        let err = convert_messages_to_anthropic_checked(&[json!({
+            "role": "",
+            "content": "hi"
+        })])
+        .expect_err("empty role must fail checked Anthropic conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("missing non-empty string 'role'"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_checked_errors_on_unsupported_role() {
+        let err = convert_messages_to_anthropic_checked(&[json!({
+            "role": "developer",
+            "content": "hi"
+        })])
+        .expect_err("unsupported role must fail checked Anthropic conversion");
+
+        match err {
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("unsupported role"), "{msg}");
+                assert!(msg.contains("developer"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_compat_missing_role_still_defaults_to_user() {
+        let converted = convert_messages_to_anthropic(&[json!({"content": "hi"})]);
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "user");
     }
 
     #[test]
