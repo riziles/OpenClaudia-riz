@@ -13,7 +13,28 @@
 //! it deterministically without shelling out to real git.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
+
+/// Absolute, PATH-independent location of the `git` binary for `/commit`.
+///
+/// The shared commit pipeline performs staging and commits on behalf of slash
+/// commands. Resolve `git` once and invoke the absolute binary thereafter so a
+/// later PATH mutation cannot redirect commit operations.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
 
 /// Outcome of the shared commit pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,34 +137,42 @@ pub struct RealGitRunner;
 
 impl GitRunner for RealGitRunner {
     fn is_inside_work_tree(&self) -> bool {
-        Command::new("git")
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
-            .is_ok_and(|o| o.status.success())
+        git_command().is_ok_and(|mut cmd| {
+            cmd.args(["rev-parse", "--is-inside-work-tree"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
     }
 
     fn has_staged_changes(&self) -> bool {
-        Command::new("git")
-            .args(["diff", "--cached", "--stat"])
-            .output()
-            .is_ok_and(|o| !o.stdout.is_empty())
+        git_command().is_ok_and(|mut cmd| {
+            cmd.args(["diff", "--cached", "--stat"])
+                .output()
+                .is_ok_and(|o| !o.stdout.is_empty())
+        })
     }
 
     fn has_unstaged_changes(&self) -> bool {
-        Command::new("git")
-            .args(["diff", "--stat"])
-            .output()
-            .is_ok_and(|o| !o.stdout.is_empty())
+        git_command().is_ok_and(|mut cmd| {
+            cmd.args(["diff", "--stat"])
+                .output()
+                .is_ok_and(|o| !o.stdout.is_empty())
+        })
     }
 
     fn stage_all(&mut self) {
-        let _ = Command::new("git").args(["add", "-A"]).output();
+        if let Ok(mut cmd) = git_command() {
+            let _ = cmd.args(["add", "-A"]).output();
+        }
     }
 
     fn staged_files(&self) -> Vec<String> {
-        Command::new("git")
-            .args(["diff", "--cached", "--name-only"])
-            .output()
+        git_command()
+            .and_then(|mut cmd| {
+                cmd.args(["diff", "--cached", "--name-only"])
+                    .output()
+                    .map_err(|e| e.to_string())
+            })
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
                     .lines()
@@ -155,7 +184,8 @@ impl GitRunner for RealGitRunner {
     }
 
     fn commit(&mut self, message: &str) -> Result<String, String> {
-        match Command::new("git").args(["commit", "-m", message]).output() {
+        let mut cmd = git_command()?;
+        match cmd.args(["commit", "-m", message]).output() {
             Ok(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
             }
@@ -556,6 +586,31 @@ mod tests {
         match err {
             CommitError::CommitFailed(msg) => assert!(msg.contains("pre-commit")),
             CommitError::NotARepo => panic!("expected CommitFailed, got NotARepo"),
+        }
+    }
+
+    #[test]
+    fn real_git_runner_uses_resolved_binary_path() {
+        let git = git_bin().expect("commit pipeline tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("commit_pipeline.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")"),
+                "production commit pipeline must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
         }
     }
 }
