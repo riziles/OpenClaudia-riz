@@ -2946,14 +2946,21 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             );
             break;
         }
-        let body = crate::pipeline::build_request(
+        let body = match crate::pipeline::build_request(
             ctx.provider,
             ctx.model,
             session_messages,
             ctx.effort_level,
             ctx.claude_code_token,
             ctx.prompt_blocks,
-        );
+        ) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to build agentic follow-up request");
+                send_or_warn(ctx.tx, super::events::AppEvent::ApiError(e), ctx.session_id);
+                break;
+            }
+        };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
             client: ctx.client,
             endpoint: ctx.endpoint,
@@ -3030,14 +3037,20 @@ async fn run_api_turn_async(p: ApiTurnParams) {
             return;
         }
     }
-    let request_body = crate::pipeline::build_request(
+    let request_body = match crate::pipeline::build_request(
         &provider,
         &model,
         &session_messages,
         effort_level.as_str(),
         claude_code_token.as_deref(),
         prompt_blocks.as_ref(),
-    );
+    ) {
+        Ok(request_body) => request_body,
+        Err(e) => {
+            send_or_warn(&tx, super::events::AppEvent::ApiError(e), &session_id);
+            return;
+        }
+    };
     match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
         client: &client,
         endpoint: &endpoint,

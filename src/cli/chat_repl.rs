@@ -45,7 +45,7 @@ use crate::{
     ToolPermissionResult,
 };
 
-use openclaudia::providers::{convert_messages_to_anthropic, convert_tools_to_anthropic};
+use openclaudia::providers::{convert_messages_to_anthropic_checked, convert_tools_to_anthropic};
 use openclaudia::tools::safe_truncate;
 use openclaudia::{
     config, guardrails, memory, permissions::PermissionManager, plugins, prompt, proxy, session,
@@ -396,14 +396,21 @@ impl ChatRepl {
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
         self.install_system_prompt(&prompt_blocks);
 
-        let request_body = build_chat_request_body(
+        let request_body = match build_chat_request_body(
             &self.config.proxy.target,
             &self.chat_session.messages,
             &self.model,
             &prompt_blocks,
             &self.effort_level,
             self.claude_code_token.as_deref(),
-        );
+        ) {
+            Ok(request_body) => request_body,
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to build chat request");
+                eprintln!("\n\x1b[31mRequest build error: {err}\x1b[0m");
+                return Ok(Some(false));
+            }
+        };
         let provider = self
             .config
             .active_provider()
@@ -1939,7 +1946,14 @@ impl ChatRepl {
                 auto_learner,
             );
 
-            let followup_req = self.build_anthropic_followup(prompt_blocks);
+            let followup_req = match self.build_anthropic_followup(prompt_blocks) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build Anthropic follow-up request");
+                    eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
+                    break;
+                }
+            };
             full_content = String::new();
             if !self
                 .send_anthropic_followup(
@@ -2160,8 +2174,9 @@ impl ChatRepl {
     fn build_anthropic_followup(
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
-    ) -> serde_json::Value {
-        let anthropic_messages = convert_messages_to_anthropic(&self.chat_session.messages);
+    ) -> Result<serde_json::Value, String> {
+        let anthropic_messages = convert_messages_to_anthropic_checked(&self.chat_session.messages)
+            .map_err(|e| e.to_string())?;
         let openai_tools = tools::get_all_tool_definitions(true);
         let anthropic_tools =
             convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
@@ -2177,7 +2192,7 @@ impl ChatRepl {
         if self.claude_code_token.is_some() {
             openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
         }
-        followup_req
+        Ok(followup_req)
     }
 
     /// Send the Anthropic follow-up and stream its content into
@@ -2286,7 +2301,14 @@ impl ChatRepl {
             let surviving_tools = self.filter_xml_plan_blocked_tools(all_tools);
             self.send_xml_tool_results(&surviving_tools, memory_db);
 
-            let followup_req = self.build_xml_followup_request(prompt_blocks);
+            let followup_req = match self.build_xml_followup_request(prompt_blocks) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build XML follow-up request");
+                    eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
+                    break;
+                }
+            };
             let next = self.send_xml_followup_stream(followup_req, transport).await;
             match next {
                 Some(content) => {
@@ -2423,8 +2445,9 @@ impl ChatRepl {
     fn build_xml_followup_request(
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
-    ) -> serde_json::Value {
-        let anthropic_messages = convert_messages_to_anthropic(&self.chat_session.messages);
+    ) -> Result<serde_json::Value, String> {
+        let anthropic_messages = convert_messages_to_anthropic_checked(&self.chat_session.messages)
+            .map_err(|e| e.to_string())?;
         let mut followup_req = serde_json::json!({
             "model": self.model,
             "messages": anthropic_messages,
@@ -2435,7 +2458,7 @@ impl ChatRepl {
         if self.claude_code_token.is_some() {
             openclaudia::claude_credentials::inject_system_prompt(&mut followup_req);
         }
-        followup_req
+        Ok(followup_req)
     }
 
     async fn send_xml_followup_stream(
@@ -2550,7 +2573,14 @@ impl ChatRepl {
             self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db, auto_learner);
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
-            let request_body = self.build_openai_followup_request();
+            let request_body = match self.build_openai_followup_request() {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
+                    eprintln!("\n\x1b[31mRequest build error: {e}\x1b[0m");
+                    break;
+                }
+            };
             current_content = String::new();
             self.stream_openai_followup(
                 request_body,
@@ -2670,7 +2700,7 @@ impl ChatRepl {
 
     /// Build the OpenAI-compatible follow-up request body (handles both
     /// the Anthropic direct branch and the generic `OpenAI` shape).
-    fn build_openai_followup_request(&self) -> serde_json::Value {
+    fn build_openai_followup_request(&self) -> Result<serde_json::Value, String> {
         if self.config.proxy.target == "anthropic" {
             let system_msg = self
                 .chat_session
@@ -2679,7 +2709,9 @@ impl ChatRepl {
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
                 .and_then(|m| m.get("content").and_then(|c| c.as_str()))
                 .map(String::from);
-            let anthropic_messages = convert_messages_to_anthropic(&self.chat_session.messages);
+            let anthropic_messages =
+                convert_messages_to_anthropic_checked(&self.chat_session.messages)
+                    .map_err(|e| e.to_string())?;
             let openai_tools = tools::get_all_tool_definitions(true);
             let anthropic_tools =
                 convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
@@ -2697,15 +2729,15 @@ impl ChatRepl {
                     "cache_control": {"type": "ephemeral"}
                 }]);
             }
-            req
+            Ok(req)
         } else {
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "model": self.model,
                 "messages": self.chat_session.messages,
                 "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
                 "stream": true,
                 "tools": tools::get_all_tool_definitions(true)
-            })
+            }))
         }
     }
 

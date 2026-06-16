@@ -1063,9 +1063,12 @@ fn build_chat_body_anthropic(
     messages: &[serde_json::Value],
     model: &str,
     prompt_blocks: &openclaudia::prompt::SystemPromptBlocks,
-) -> serde_json::Value {
-    use openclaudia::providers::{convert_messages_to_anthropic, convert_tools_to_anthropic};
-    let anthropic_messages = convert_messages_to_anthropic(messages);
+) -> Result<serde_json::Value, String> {
+    use openclaudia::providers::{
+        convert_messages_to_anthropic_checked, convert_tools_to_anthropic,
+    };
+    let anthropic_messages =
+        convert_messages_to_anthropic_checked(messages).map_err(|e| e.to_string())?;
     let openai_tools = tools::get_all_tool_definitions(true);
     let anthropic_tools = convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
 
@@ -1078,7 +1081,7 @@ fn build_chat_body_anthropic(
     });
     // Multi-block system prompt: stable prefix cached, dynamic suffix reprocessed.
     req["system"] = openclaudia::providers::build_system_blocks(prompt_blocks);
-    req
+    Ok(req)
 }
 
 /// Translate `OpenAI`-format tool definitions into Gemini function declarations.
@@ -1186,9 +1189,9 @@ fn build_chat_request_body(
     prompt_blocks: &openclaudia::prompt::SystemPromptBlocks,
     effort_level: &str,
     claude_code_token: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let mut request_body = match target {
-        "anthropic" => build_chat_body_anthropic(messages, model, prompt_blocks),
+        "anthropic" => build_chat_body_anthropic(messages, model, prompt_blocks)?,
         "google" => build_chat_body_google(messages),
         _ => build_chat_body_openai_like(messages, model),
     };
@@ -1203,7 +1206,7 @@ fn build_chat_request_body(
         apply_anthropic_effort_level(&mut request_body, effort_level);
     }
 
-    request_body
+    Ok(request_body)
 }
 
 /// Build the per-turn API endpoint URL and auth headers.

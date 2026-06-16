@@ -5,7 +5,9 @@
 
 use crate::memory::MemoryDb;
 use crate::permissions::PermissionManager;
-use crate::providers::{convert_messages_to_anthropic, convert_tools_to_anthropic, get_adapter};
+use crate::providers::{
+    convert_messages_to_anthropic_checked, convert_tools_to_anthropic, get_adapter,
+};
 use crate::proxy::{self, normalize_base_url};
 use crate::session::TokenUsage;
 use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator};
@@ -72,15 +74,20 @@ pub struct TurnResult {
 /// multi-block array for cache efficiency (stable prefix with
 /// `cache_control`, dynamic suffix without).  Otherwise the system
 /// prompt is extracted from `messages` as a single cached block.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error when historical assistant `tool_calls` contain malformed
+/// Anthropic tool-call arguments that cannot be represented safely.
 pub fn build_anthropic_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
     claude_code_token: Option<&str>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
-) -> Value {
-    let anthropic_messages = convert_messages_to_anthropic(messages);
+) -> Result<Value, String> {
+    let anthropic_messages =
+        convert_messages_to_anthropic_checked(messages).map_err(|e| e.to_string())?;
     let openai_tools = tools::get_all_tool_definitions(true);
     let anthropic_tools = convert_tools_to_anthropic(openai_tools.as_array().unwrap_or(&vec![]));
 
@@ -134,7 +141,7 @@ pub fn build_anthropic_request(
         _ => {} // medium = default
     }
 
-    req
+    Ok(req)
 }
 
 /// Build an OpenAI-compatible request body (used by `OpenAI`, `DeepSeek`, Qwen, Z.AI).
@@ -221,7 +228,11 @@ pub fn build_google_request(messages: &[Value], effort_level: &str) -> Value {
 ///
 /// `prompt_blocks` is used only for the Anthropic path to enable multi-block
 /// cache-efficient system prompts.  Pass `None` for the legacy single-block path.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error when the selected provider's request conversion rejects
+/// malformed message history.
 pub fn build_request(
     provider: &str,
     model: &str,
@@ -229,7 +240,7 @@ pub fn build_request(
     effort_level: &str,
     claude_code_token: Option<&str>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
-) -> Value {
+) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
     // does the same in `resolveAppliedEffort`). If the env var is set
@@ -242,8 +253,8 @@ pub fn build_request(
         "anthropic" => {
             build_anthropic_request(model, messages, effective, claude_code_token, prompt_blocks)
         }
-        "google" => build_google_request(messages, effective),
-        _ => build_openai_request(model, messages, effective),
+        "google" => Ok(build_google_request(messages, effective)),
+        _ => Ok(build_openai_request(model, messages, effective)),
     }
 }
 
@@ -1784,7 +1795,8 @@ mod tests {
             serde_json::json!({"role": "system", "content": "You are helpful."}),
             serde_json::json!({"role": "user", "content": "hello"}),
         ];
-        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None)
+            .expect("anthropic request should build");
         assert_eq!(req["model"], "claude-sonnet-4-6");
         assert!(req["system"].is_array());
         // Legacy path: single block with cache_control
@@ -1806,7 +1818,8 @@ mod tests {
             "medium",
             None,
             Some(&blocks),
-        );
+        )
+        .expect("anthropic request should build");
         assert_eq!(req["model"], "claude-sonnet-4-6");
         let sys = req["system"].as_array().unwrap();
         // Two blocks: prefix (cached) + suffix (not cached)
@@ -1836,7 +1849,8 @@ mod tests {
             "medium",
             None,
             Some(&blocks),
-        );
+        )
+        .expect("anthropic request should build");
         let sys = req["system"].as_array().unwrap();
         // Empty suffix collapses to single cached block
         assert_eq!(sys.len(), 1);
@@ -1846,7 +1860,8 @@ mod tests {
     #[test]
     fn test_build_request_dispatches() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let req = build_request("openai", "gpt-4", &messages, "medium", None, None);
+        let req = build_request("openai", "gpt-4", &messages, "medium", None, None)
+            .expect("openai request should build");
         assert_eq!(req["model"], "gpt-4");
 
         let req = build_request(
@@ -1856,8 +1871,36 @@ mod tests {
             "medium",
             None,
             None,
-        );
+        )
+        .expect("anthropic request should build");
         assert_eq!(req["model"], "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn build_request_errors_on_malformed_anthropic_tool_call_arguments() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "run a tool"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "toolu_bad",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{not json"}
+                }]
+            }),
+        ];
+        let err = build_request(
+            "anthropic",
+            "claude-sonnet-4-6",
+            &messages,
+            "medium",
+            None,
+            None,
+        )
+        .expect_err("malformed tool_call arguments must reject Anthropic request build");
+        assert!(err.contains("function.arguments"), "{err}");
+        assert!(err.contains("invalid JSON"), "{err}");
     }
 
     #[test]
@@ -1888,24 +1931,28 @@ mod tests {
         }
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
 
-        let high = build_anthropic_request("claude-sonnet-4-6", &messages, "high", None, None);
+        let high = build_anthropic_request("claude-sonnet-4-6", &messages, "high", None, None)
+            .expect("high effort anthropic request should build");
         assert_eq!(
             high["thinking"]["budget_tokens"],
             crate::thinking::ULTRATHINK_BUDGET_TOKENS,
         );
         assert_eq!(high["max_tokens"], 40_000);
 
-        let maxr = build_anthropic_request("claude-sonnet-4-6", &messages, "max", None, None);
+        let maxr = build_anthropic_request("claude-sonnet-4-6", &messages, "max", None, None)
+            .expect("max effort anthropic request should build");
         assert_eq!(
             maxr["thinking"]["budget_tokens"],
             crate::thinking::ULTRATHINK_BUDGET_TOKENS,
         );
 
-        let low = build_anthropic_request("claude-sonnet-4-6", &messages, "low", None, None);
+        let low = build_anthropic_request("claude-sonnet-4-6", &messages, "low", None, None)
+            .expect("low effort anthropic request should build");
         assert!(low.get("thinking").is_none());
         assert_eq!(low["max_tokens"], 2048);
 
-        let med = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        let med = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None)
+            .expect("medium effort anthropic request should build");
         assert!(med.get("thinking").is_none());
         assert_eq!(med["max_tokens"], crate::DEFAULT_MAX_TOKENS);
         if let Some(v) = prev {
@@ -1929,7 +1976,8 @@ mod tests {
             std::env::remove_var("MAX_THINKING_TOKENS");
         }
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None)
+            .expect("medium effort anthropic request should build");
         // OC does NOT enable thinking for medium — gap #599: CC uses adaptive thinking
         assert!(
             req.get("thinking").is_none(),
@@ -1953,7 +2001,8 @@ mod tests {
             std::env::remove_var("MAX_THINKING_TOKENS");
         }
         let messages = vec![serde_json::json!({"role": "user", "content": "think"})];
-        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "high", None, None);
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "high", None, None)
+            .expect("high effort anthropic request should build");
         assert_eq!(
             req["thinking"]["type"], "enabled",
             "high effort must set thinking.type = enabled"
@@ -2075,7 +2124,8 @@ mod tests {
             req["stream"], true,
             "stream must always be true in OC requests"
         );
-        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None);
+        let req = build_anthropic_request("claude-sonnet-4-6", &messages, "medium", None, None)
+            .expect("anthropic request should build");
         assert_eq!(req["stream"], true);
         let req = build_google_request(&messages, "medium");
         // Google request body doesn't include "stream" — it's a separate code path
@@ -2220,7 +2270,8 @@ mod tests {
             "medium",
             None,
             None,
-        );
+        )
+        .expect("anthropic request should build");
         assert_eq!(
             req["thinking"]["budget_tokens"],
             crate::thinking::ULTRATHINK_BUDGET_TOKENS,
