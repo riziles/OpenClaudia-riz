@@ -779,7 +779,7 @@ fn extract_google_tool_calls_from_parts(parts: &[Value]) -> Result<Vec<ToolCall>
         if !args.is_object() {
             return Err(format!(
                 "Gemini functionCall has non-object 'args': expected JSON object, got {}",
-                google_args_type_name(args)
+                json_value_type_name(args)
             ));
         }
 
@@ -806,7 +806,7 @@ fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, Strin
     extract_google_tool_calls_from_parts(google_response_parts(gemini_json)?)
 }
 
-const fn google_args_type_name(value: &Value) -> &'static str {
+const fn json_value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -1497,8 +1497,7 @@ async fn execute_single_tool(
 }
 
 /// Build a human-readable one-line description of what a tool call will do.
-fn describe_tool_call(tool_name: &str, arguments: &str) -> String {
-    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+fn describe_tool_call(tool_name: &str, args: &Value) -> String {
     match tool_name {
         "read_file" => args
             .get("path")
@@ -1541,6 +1540,38 @@ fn describe_tool_call(tool_name: &str, arguments: &str) -> String {
         ),
         _ => format!("Running {tool_name}"),
     }
+}
+
+fn parse_tool_arguments_for_tui(tool_name: &str, arguments: &str) -> Result<Value, String> {
+    let value = serde_json::from_str::<Value>(arguments)
+        .map_err(|e| format!("Invalid tool arguments JSON for '{tool_name}': {e}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
+            json_value_type_name(&value)
+        ));
+    }
+    Ok(value)
+}
+
+fn malformed_tool_arguments_result(
+    tool_call: &ToolCall,
+    msg: &str,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<Value, ()> {
+    tx.send(AppEvent::ToolDone {
+        name: tool_call.function.name.clone(),
+        success: false,
+        content: msg.to_string(),
+    })
+    .map_err(|_| ())?;
+
+    Ok(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": format!("[ERROR] {msg}"),
+        "is_error": true
+    }))
 }
 
 /// Return the effective path that the pipeline should pre-check with
@@ -1595,6 +1626,17 @@ async fn execute_tool_calls_for_tui(
 
     for tool_call in tool_calls {
         let tool_name = &tool_call.function.name;
+        let tool_args = match parse_tool_arguments_for_tui(tool_name, &tool_call.function.arguments)
+        {
+            Ok(args) => args,
+            Err(msg) => match malformed_tool_arguments_result(tool_call, &msg, tx) {
+                Ok(result_json) => {
+                    results.push(result_json);
+                    continue;
+                }
+                Err(()) => break,
+            },
+        };
 
         // Check read/search blast radius guardrails against the effective
         // filesystem path, not the raw JSON argument envelope.
@@ -1638,7 +1680,7 @@ async fn execute_tool_calls_for_tui(
             }
         }
 
-        let args_desc = describe_tool_call(tool_name, &tool_call.function.arguments);
+        let args_desc = describe_tool_call(tool_name, &tool_args);
         send_event_or_break!(
             tx,
             AppEvent::ToolStart {
@@ -1824,6 +1866,74 @@ mod tests {
         assert_eq!(
             guardrail_path_for_tool_call("notebook_edit", r#"{"notebook_path":"nb.ipynb"}"#),
             None
+        );
+    }
+
+    #[test]
+    fn parse_tool_arguments_for_tui_rejects_malformed_and_non_object_json() {
+        let malformed = parse_tool_arguments_for_tui("bash", "{not json")
+            .expect_err("malformed tool args must fail before TUI prompting");
+        assert!(
+            malformed.contains("Invalid tool arguments JSON"),
+            "{malformed}"
+        );
+        assert!(malformed.contains("bash"), "{malformed}");
+
+        let non_object = parse_tool_arguments_for_tui("bash", "[]")
+            .expect_err("non-object tool args must fail before TUI prompting");
+        assert!(
+            non_object.contains("expected a JSON object"),
+            "{non_object}"
+        );
+        assert!(non_object.contains("array"), "{non_object}");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_for_tui_rejects_malformed_arguments_before_prompting() {
+        use std::sync::mpsc as std_mpsc;
+
+        let tool_call = ToolCall {
+            id: "call_bad".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: "{not json".to_string(),
+            },
+        };
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+
+        let (results, has_tools) =
+            execute_tool_calls_for_tui(&[tool_call], None, None, None, task_mgr, Some("s"), &tx)
+                .await;
+
+        assert!(has_tools);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], true);
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Invalid tool arguments JSON")),
+            "tool result should carry the parse error: {}",
+            results[0]
+        );
+
+        let mut saw_tool_done = false;
+        let mut saw_permission_request = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ToolDone { content, .. } => {
+                    saw_tool_done = content.contains("Invalid tool arguments JSON");
+                }
+                AppEvent::PermissionRequest { .. } => saw_permission_request = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_tool_done, "TUI should receive the parse failure");
+        assert!(
+            !saw_permission_request,
+            "malformed arguments must not trigger a permission prompt"
         );
     }
 
