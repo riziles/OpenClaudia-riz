@@ -996,26 +996,21 @@ impl McpServer {
 
         let result = self.transport.request("tools/list", None).await?;
 
-        if let Some(tools) = result.get("tools").and_then(|t| t.as_array()) {
-            self.tools = tools
-                .iter()
-                .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                .collect();
+        self.tools = parse_mcp_tools_list_response(&self.name, &result)?;
 
-            // Check if server supports tool list change notifications
-            let supports_list_changed = self
-                .capabilities
-                .tools
-                .as_ref()
-                .is_some_and(|t| t.list_changed);
+        // Check if server supports tool list change notifications
+        let supports_list_changed = self
+            .capabilities
+            .tools
+            .as_ref()
+            .is_some_and(|t| t.list_changed);
 
-            info!(
-                server = %self.name,
-                tool_count = self.tools.len(),
-                list_changed_supported = supports_list_changed,
-                "Discovered MCP tools"
-            );
-        }
+        info!(
+            server = %self.name,
+            tool_count = self.tools.len(),
+            list_changed_supported = supports_list_changed,
+            "Discovered MCP tools"
+        );
 
         Ok(())
     }
@@ -1124,15 +1119,7 @@ impl McpServer {
             .request("resources/list", Some(json!({})))
             .await?;
 
-        let resources: Vec<_> = result
-            .get("resources")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let resources = parse_mcp_resources_list_response(&self.name, &result)?;
 
         debug!(
             server = %self.name,
@@ -1195,6 +1182,61 @@ impl McpServer {
     pub async fn close(self) -> Result<(), McpError> {
         self.transport.close().await
     }
+}
+
+fn parse_mcp_tools_list_response(
+    server_name: &str,
+    result: &Value,
+) -> Result<Vec<McpTool>, McpError> {
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            McpError::Protocol(format!(
+                "MCP server '{server_name}' tools/list response missing 'tools' array: {result}"
+            ))
+        })?;
+
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            serde_json::from_value::<McpTool>(tool.clone()).map_err(|e| {
+                McpError::Protocol(format!(
+                    "MCP server '{server_name}' tools/list entry at index {index} is invalid: \
+                     {e}; entry: {tool}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_mcp_resources_list_response(
+    server_name: &str,
+    result: &Value,
+) -> Result<Vec<McpResource>, McpError> {
+    let resources = result
+        .get("resources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            McpError::Protocol(format!(
+                "MCP server '{server_name}' resources/list response missing 'resources' array: \
+                 {result}"
+            ))
+        })?;
+
+    resources
+        .iter()
+        .enumerate()
+        .map(|(index, resource)| {
+            serde_json::from_value::<McpResource>(resource.clone()).map_err(|e| {
+                McpError::Protocol(format!(
+                    "MCP server '{server_name}' resources/list entry at index {index} is \
+                     invalid: {e}; entry: {resource}"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Stub kinds for not-yet-implemented MCP transports (crosslink #630).
@@ -3567,6 +3609,60 @@ mod tests {
         assert_eq!(names, vec!["alpha", "beta"]);
     }
 
+    #[tokio::test]
+    async fn refresh_tools_errors_when_tools_array_missing() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "badtools", "version": "1"},
+                "capabilities": {"tools": {"listChanged": false}}
+            }),
+            Value::Null,
+            json!({}),
+        ]);
+
+        match McpServer::new_with_config(
+            "badtools",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        {
+            Err(McpError::Protocol(msg)) => {
+                assert!(msg.contains("tools/list"), "{msg}");
+                assert!(msg.contains("'tools' array"), "{msg}");
+            }
+            Err(other) => panic!("expected Protocol, got {other:?}"),
+            Ok(_) => panic!("missing tools array must fail MCP tool discovery"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_tools_errors_on_malformed_tool_entry() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "badtoolentry", "version": "1"},
+                "capabilities": {"tools": {"listChanged": false}}
+            }),
+            Value::Null,
+            json!({"tools": [{"description": "missing name"}]}),
+        ]);
+
+        match McpServer::new_with_config(
+            "badtoolentry",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        {
+            Err(McpError::Protocol(msg)) => {
+                assert!(msg.contains("tools/list entry"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            Err(other) => panic!("expected Protocol, got {other:?}"),
+            Ok(_) => panic!("malformed MCP tool entry must fail discovery"),
+        }
+    }
+
     /// Fix #627: when the server does NOT advertise `capabilities.tools`,
     /// `refresh_tools` returns `Ok(())` without issuing the wire call.
     /// We prove the wire was not touched by giving the transport ONLY
@@ -3686,5 +3782,61 @@ mod tests {
         .expect("handshake");
         assert!(!s_without.has_tools_capability());
         assert!(s_without.tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_resources_errors_when_resources_array_missing() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "badresources", "version": "1"},
+                "capabilities": {"resources": {"subscribe": false}}
+            }),
+            Value::Null,
+            json!({}),
+        ]);
+        let server = McpServer::new_with_config(
+            "badresources",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake should skip tools/list when tools capability is absent");
+
+        match server.list_resources().await {
+            Err(McpError::Protocol(msg)) => {
+                assert!(msg.contains("resources/list"), "{msg}");
+                assert!(msg.contains("'resources' array"), "{msg}");
+            }
+            Err(other) => panic!("expected Protocol, got {other:?}"),
+            Ok(_) => panic!("missing resources array must fail MCP resource listing"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_resources_errors_on_malformed_resource_entry() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "serverInfo": {"name": "badresourceentry", "version": "1"},
+                "capabilities": {"resources": {"subscribe": false}}
+            }),
+            Value::Null,
+            json!({"resources": [{"name": "missing-uri"}]}),
+        ]);
+        let server = McpServer::new_with_config(
+            "badresourceentry",
+            Box::new(transport),
+            McpServerConfig::new().with_initialize_timeout_secs(5),
+        )
+        .await
+        .expect("handshake should skip tools/list when tools capability is absent");
+
+        match server.list_resources().await {
+            Err(McpError::Protocol(msg)) => {
+                assert!(msg.contains("resources/list entry"), "{msg}");
+                assert!(msg.contains("index 0"), "{msg}");
+            }
+            Err(other) => panic!("expected Protocol, got {other:?}"),
+            Ok(_) => panic!("malformed MCP resource entry must fail listing"),
+        }
     }
 }
