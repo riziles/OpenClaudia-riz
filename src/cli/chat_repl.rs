@@ -1362,7 +1362,8 @@ impl ChatRepl {
                 function_responses.push(blocked);
                 continue;
             }
-            if !self.gemini_check_permission(tool_call) {
+            if let Some(blocked) = self.gemini_permission_error_response(tool_call) {
+                function_responses.push(blocked);
                 continue;
             }
             let result = self.gemini_run_single_tool(tool_call, memory_db, auto_learner);
@@ -1402,9 +1403,18 @@ impl ChatRepl {
     }
 
     /// Run the interactive permission check for a Gemini tool call.
-    /// Returns `true` if the caller should proceed with execution.
-    fn gemini_check_permission(&mut self, tool_call: &tools::ToolCall) -> bool {
-        let tool_args_val = parse_tool_args(&tool_call.function);
+    /// Returns a `functionResponse` error when the caller should not execute it.
+    fn gemini_permission_error_response(
+        &mut self,
+        tool_call: &tools::ToolCall,
+    ) -> Option<serde_json::Value> {
+        let tool_args_val = match parse_tool_args(&tool_call.function) {
+            Ok(args) => args,
+            Err(msg) => {
+                self.push_tool_result_message(&tool_call.id, &msg, true);
+                return Some(gemini_tool_error_response(tool_call, &msg));
+            }
+        };
         let result = if self.dangerously_skip_permissions {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
@@ -1414,7 +1424,13 @@ impl ChatRepl {
                 &mut self.always_allowed_tools,
             )
         };
-        matches!(result, ToolPermissionResult::Allowed)
+        match result {
+            ToolPermissionResult::Allowed => None,
+            ToolPermissionResult::Denied(msg) => {
+                self.push_tool_result_message(&tool_call.id, &msg, true);
+                Some(gemini_tool_error_response(tool_call, &msg))
+            }
+        }
     }
 
     /// Dispatch the tool, observe it for auto-learning, and return the
@@ -2092,7 +2108,13 @@ impl ChatRepl {
     /// Run the interactive permission check. On `Denied` push the error
     /// tool message and return `false`. On `Allowed` return `true`.
     fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> bool {
-        let tool_args_val = parse_tool_args(&tool_call.function);
+        let tool_args_val = match parse_tool_args(&tool_call.function) {
+            Ok(args) => args,
+            Err(msg) => {
+                self.push_tool_result_message(&tool_call.id, &msg, true);
+                return false;
+            }
+        };
         let result = if self.dangerously_skip_permissions {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
@@ -3008,11 +3030,39 @@ fn resolve_repl_adapter(
     }
 }
 
-fn parse_tool_args(func: &tools::FunctionCall) -> serde_json::Value {
-    serde_json::from_str(&func.arguments).unwrap_or_else(|e| {
-        tracing::warn!("Malformed tool arguments for '{}': {}", func.name, e);
-        serde_json::Value::Object(serde_json::Map::default())
+fn gemini_tool_error_response(tool_call: &tools::ToolCall, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "functionResponse": {
+            "name": &tool_call.function.name,
+            "response": {"error": message}
+        }
     })
+}
+
+fn parse_tool_args(func: &tools::FunctionCall) -> Result<serde_json::Value, String> {
+    let value = serde_json::from_str::<serde_json::Value>(&func.arguments).map_err(|e| {
+        tracing::warn!("Malformed tool arguments for '{}': {}", func.name, e);
+        format!("Invalid tool arguments JSON for '{}': {e}", func.name)
+    })?;
+    if !value.is_object() {
+        return Err(format!(
+            "Invalid tool arguments JSON for '{}': expected a JSON object, got {}",
+            func.name,
+            json_value_type_name(&value)
+        ));
+    }
+    Ok(value)
+}
+
+const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn tool_call_signature(tc: &tools::ToolCall) -> String {
@@ -3221,6 +3271,53 @@ fn new_rustyline_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tool_args_rejects_malformed_or_non_object_json() {
+        let malformed = tools::FunctionCall {
+            name: "bash".to_string(),
+            arguments: "{not json".to_string(),
+        };
+        let err = parse_tool_args(&malformed).expect_err("malformed JSON must fail closed");
+        assert!(err.contains("Invalid tool arguments JSON"), "{err}");
+        assert!(err.contains("bash"), "{err}");
+
+        let non_object = tools::FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "[]".to_string(),
+        };
+        let err = parse_tool_args(&non_object).expect_err("non-object JSON must fail closed");
+        assert!(err.contains("expected a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn parse_tool_args_accepts_object_json() {
+        let func = tools::FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"src/main.rs\"}".to_string(),
+        };
+
+        let parsed = parse_tool_args(&func).expect("object JSON should parse");
+
+        assert_eq!(parsed["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn gemini_tool_error_response_uses_tool_name_and_message() {
+        let tool_call = tools::ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let response = gemini_tool_error_response(&tool_call, "denied");
+
+        assert_eq!(response["functionResponse"]["name"], "read_file");
+        assert_eq!(response["functionResponse"]["response"]["error"], "denied");
+    }
 
     /// #601 — `emit_max_turns_event` returns the canonical
     /// `Reached maximum number of turns (N)` message string and the
