@@ -13,7 +13,7 @@ use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 
 /// Maximum file size (10 MiB) accepted for LSP analysis.
@@ -23,6 +23,21 @@ use std::thread;
 /// circuits with a clear error before even spawning the server.  See issue
 /// #648.
 pub const LSP_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Absolute, PATH-independent location of `git` for LSP gitignore filtering.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
 
 /// Process-wide registry of open files per LSP server binary.
 ///
@@ -144,17 +159,14 @@ fn is_marked_open(server_cmd: &str, path: &Path) -> bool {
 /// always return `false`.
 ///
 /// Parity with CC `LSPTool.ts:137-139` + `manager.ts:100-110` (`isLspConnected`).
-/// OC checks via `which` since it has no long-lived server pool yet; once one
-/// exists this function should be updated to query the pool's liveness map.
+/// OC checks with the `which` crate since it has no long-lived server pool yet;
+/// once one exists this function should query the pool's liveness map.
 #[must_use]
 pub fn is_lsp_connected(language_or_ext: &str) -> bool {
     let Some((server_cmd, _)) = resolve_language_server(language_or_ext) else {
         return false;
     };
-    Command::new("which")
-        .arg(server_cmd)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    which::which(server_cmd).is_ok()
 }
 
 /// Resolve a bare language name OR a file extension to a server command.
@@ -1343,7 +1355,6 @@ fn uri_to_local_path(uri: &str) -> Option<std::path::PathBuf> {
 /// since the model relies on the locations to navigate the codebase.
 fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
     use std::collections::HashSet;
-    use std::process::Command as ProcCommand;
 
     if locations.is_empty() {
         return locations;
@@ -1369,12 +1380,14 @@ fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
     // `git check-ignore --stdin` reads NUL- or newline-separated paths and
     // prints back only the ones that ARE ignored. Exit status 0 = at least one
     // ignored; 1 = none ignored; 128 = error (not a repo etc).
-    let out = ProcCommand::new("git")
-        .args(["check-ignore", "--stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let out = git_command().and_then(|mut cmd| {
+        cmd.args(["check-ignore", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())
+    });
 
     let Ok(mut child) = out else {
         return locations;
@@ -1582,6 +1595,38 @@ fn symbol_kind_name(kind: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_external_probes_use_resolved_helpers() {
+        let git = git_bin().expect("lsp tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("lsp.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production lsp code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains("Command::new(\"which\")")
+                    && !code.contains("std::process::Command::new(\"which\")"),
+                "production lsp code must not invoke bare which; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
+    }
 
     #[test]
     fn test_detect_language_server() {
