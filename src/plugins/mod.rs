@@ -599,6 +599,7 @@ impl Plugin {
                     .to_string(),
             ));
         }
+        validate_plugin_dir_name(&manifest.name)?;
         Ok(())
     }
 
@@ -1551,6 +1552,28 @@ mod tests {
         let result = Plugin::load(&plugin_dir);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("spaces"));
+    }
+
+    #[test]
+    fn test_invalid_manifest_path_like_name() {
+        for bad_name in ["../evil", "bad/name", "bad\\name", ".hidden", "CON"] {
+            let dir = TempDir::new().unwrap();
+            let plugin_dir = dir.path().join("bad");
+            let cc_dir = plugin_dir.join(".claude-plugin");
+            fs::create_dir_all(&cc_dir).unwrap();
+            fs::write(
+                cc_dir.join("plugin.json"),
+                serde_json::json!({"name": bad_name}).to_string(),
+            )
+            .unwrap();
+
+            let result = Plugin::load(&plugin_dir);
+
+            assert!(
+                result.is_err(),
+                "manifest name {bad_name:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -1611,14 +1611,19 @@ fn plugin_action_manage(plugin_manager: &plugins::PluginManager) {
 /// Remove a plugin from install tracking, delete its on-disk directory,
 /// and refresh the in-memory manager.
 fn plugin_action_uninstall(plugin: &str, plugin_manager: &mut plugins::PluginManager) {
+    let uninstall_dir = match plugin_install_dir_for_name(plugin) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("\nInvalid plugin name '{plugin}': {e}\n");
+            return;
+        }
+    };
     let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut installed = plugins::InstalledPlugins::load(&project_root);
     if installed.remove(plugin) {
         if let Err(e) = installed.save(&project_root) {
             tracing::warn!("Failed to save install tracking: {}", e);
         }
-        let plugins_dir = std::path::PathBuf::from(".openclaudia/plugins");
-        let uninstall_dir = plugins_dir.join(plugin);
         if uninstall_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&uninstall_dir) {
                 eprintln!("Warning: Could not remove plugin directory: {e}");
@@ -1661,8 +1666,15 @@ fn plugin_install(
                 match plugins::Plugin::load(path) {
                     Ok(loaded) => {
                         let name = loaded.name().to_string();
-                        let plugins_dir = std::path::PathBuf::from(".openclaudia/plugins");
-                        let dest = plugins_dir.join(&name);
+                        let dest = match plugin_install_dir_for_name(&name) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to install plugin: invalid plugin name '{name}': {e}\n"
+                                );
+                                return;
+                            }
+                        };
                         if let Err(e) = plugins::copy_dir_recursive(path, &dest) {
                             eprintln!("Failed to install plugin: {e}\n");
                             return;
@@ -1792,6 +1804,11 @@ fn plugin_validate(path: Option<String>) {
         println!("  /plugin validate .claude-plugin/plugin.json - Validate manifest file");
         println!("  /plugin validate /path/to/plugin-directory\n");
     }
+}
+
+fn plugin_install_dir_for_name(plugin: &str) -> Result<std::path::PathBuf, plugins::PluginError> {
+    plugins::validate_plugin_dir_name(plugin)?;
+    Ok(std::path::PathBuf::from(".openclaudia/plugins").join(plugin))
 }
 
 fn plugin_marketplace(
@@ -2092,7 +2109,7 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 //
 #[cfg(test)]
 mod tests {
-    use super::{handle_slash_command, SlashCommandResult};
+    use super::{handle_slash_command, plugin_install_dir_for_name, SlashCommandResult};
 
     /// Convenience: empty message vec, dummy provider + model.
     fn ctx() -> Vec<serde_json::Value> {
@@ -2516,6 +2533,26 @@ mod tests {
         assert!(
             result.is_some(),
             "unknown slash command must not return None"
+        );
+    }
+
+    #[test]
+    fn plugin_install_dir_rejects_path_like_plugin_names() {
+        for bad in ["../outside", "bad/name", "bad\\name", ".hidden", "CON"] {
+            assert!(
+                plugin_install_dir_for_name(bad).is_err(),
+                "plugin name {bad:?} must not be usable as an install path"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_install_dir_accepts_safe_plugin_name() {
+        let path = plugin_install_dir_for_name("safe-plugin").expect("safe name should pass");
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(".openclaudia/plugins/safe-plugin")
         );
     }
 
