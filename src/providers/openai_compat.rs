@@ -254,28 +254,47 @@ fn validate_openai_chat_response(provider: &str, response: &Value) -> Result<(),
                 ))
             })?;
 
-        if let Some(role) = message.get("role") {
-            if !role.is_string() {
-                return Err(ProviderError::InvalidResponse(format!(
-                    "{provider} response choices[{choice_index}].message.role must be a string: {message}"
-                )));
-            }
-        }
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|role| !role.is_empty())
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "{provider} response choices[{choice_index}].message.role must be a \
+                     non-empty string: {message}"
+                ))
+            })?;
 
-        if let Some(content) = message.get("content") {
-            if !content.is_string() && !content.is_null() {
+        let has_content = match message.get("content") {
+            Some(Value::String(_)) => true,
+            Some(Value::Null) | None => false,
+            Some(_) => {
                 return Err(ProviderError::InvalidResponse(format!(
                     "{provider} response choices[{choice_index}].message.content must be a string or null: {message}"
                 )));
             }
-        }
+        };
 
-        if let Some(tool_calls) = message.get("tool_calls") {
-            if !tool_calls.is_array() {
+        let has_tool_calls = match message.get("tool_calls") {
+            Some(tool_calls) if tool_calls.is_array() => true,
+            Some(_) => {
                 return Err(ProviderError::InvalidResponse(format!(
                     "{provider} response choices[{choice_index}].message.tool_calls must be an array: {message}"
                 )));
             }
+            None => false,
+        };
+
+        let has_refusal = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|refusal| !refusal.is_empty());
+
+        if !has_content && !has_tool_calls && !has_refusal {
+            return Err(ProviderError::InvalidResponse(format!(
+                "{provider} response choices[{choice_index}].message must contain string \
+                 content, tool_calls, or a non-empty refusal: {message}"
+            )));
         }
 
         if let Some(finish_reason) = choice.get("finish_reason") {
@@ -569,6 +588,129 @@ mod tests {
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transform_response_rejects_message_missing_role() {
+        let a = OpenAiCompatibleAdapter::new(
+            "openai",
+            "/v1/chat/completions",
+            ThinkingInjector::OpenAiReasoningEffort,
+            true,
+        );
+
+        let err = a
+            .transform_response(json!({"choices": [{"message": {"content": "hi"}}]}), false)
+            .expect_err("message without role must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("message.role"), "{msg}");
+                assert!(msg.contains("non-empty string"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_empty_message_role() {
+        let a = OpenAiCompatibleAdapter::new(
+            "openai",
+            "/v1/chat/completions",
+            ThinkingInjector::OpenAiReasoningEffort,
+            true,
+        );
+
+        let err = a
+            .transform_response(
+                json!({"choices": [{"message": {"role": "", "content": "hi"}}]}),
+                false,
+            )
+            .expect_err("empty message role must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("message.role"), "{msg}");
+                assert!(msg.contains("non-empty string"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_message_without_payload() {
+        let a = OpenAiCompatibleAdapter::new(
+            "deepseek",
+            "/v1/chat/completions",
+            ThinkingInjector::DeepSeekEnableThinking,
+            false,
+        );
+
+        let err = a
+            .transform_response(
+                json!({"choices": [{"message": {"role": "assistant"}}]}),
+                false,
+            )
+            .expect_err("message without content, tool calls, or refusal must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("must contain"), "{msg}");
+                assert!(msg.contains("content"), "{msg}");
+                assert!(msg.contains("tool_calls"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_null_content_without_payload() {
+        let a = OpenAiCompatibleAdapter::new(
+            "qwen",
+            "/v1/chat/completions",
+            ThinkingInjector::QwenEnableThinking,
+            false,
+        );
+
+        let err = a
+            .transform_response(
+                json!({"choices": [{"message": {"role": "assistant", "content": null}}]}),
+                false,
+            )
+            .expect_err("null content without tool calls or refusal must be invalid");
+
+        match err {
+            ProviderError::InvalidResponse(msg) => {
+                assert!(msg.contains("must contain"), "{msg}");
+                assert!(msg.contains("refusal"), "{msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_response_accepts_refusal_payload() {
+        let a = OpenAiCompatibleAdapter::new(
+            "openai",
+            "/v1/chat/completions",
+            ThinkingInjector::OpenAiReasoningEffort,
+            true,
+        );
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "I can't help with that."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        assert_eq!(
+            a.transform_response(response.clone(), false).unwrap(),
+            response
+        );
     }
 
     #[test]
