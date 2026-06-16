@@ -115,12 +115,12 @@
                     document.getElementById('auth-url').textContent = authUrl;
                     document.getElementById('auth-url').style.display = 'block';
                     document.getElementById('open-url').style.display = 'inline-block';
-                    showStatus('Authorization URL generated! Visit the URL to continue.', 'success');
+                    showTextStatus('Authorization URL generated! Visit the URL to continue.', 'success');
                 } else {
-                    showStatus('Failed to start authorization: ' + (data.error || 'Unknown error'), 'error');
+                    showTextStatus('Failed to start authorization: ' + errorMessage(data), 'error');
                 }
             } catch (error) {
-                showStatus('Error: ' + error.message, 'error');
+                showTextStatus('Error: ' + error.message, 'error');
             }
         }
 
@@ -130,8 +130,8 @@
 
         async function submitCode() {
             const code = document.getElementById('auth-code').value.trim();
-            if (!code) { showStatus('Please enter an authorization code', 'error'); return; }
-            if (!currentState) { showStatus('Please start authorization first', 'error'); return; }
+            if (!code) { showTextStatus('Please enter an authorization code', 'error'); return; }
+            if (!currentState) { showTextStatus('Please start authorization first', 'error'); return; }
 
             try {
                 const response = await fetch('/auth/device/submit', {
@@ -148,17 +148,32 @@
                         msg += '<strong>To use with curl:</strong><br>';
                         msg += '<code>curl -b "anthropic_session=' + data.session_id + '" http://localhost:8080/v1/messages ...</code>';
                     }
-                    showStatus(msg, 'success');
+                    showHtmlStatus(msg, 'success');
                     document.getElementById('auth-code').value = '';
                 } else {
-                    showStatus('Authentication failed: ' + (data.error || 'Unknown error'), 'error');
+                    showTextStatus('Authentication failed: ' + errorMessage(data), 'error');
                 }
             } catch (error) {
-                showStatus('Error: ' + error.message, 'error');
+                showTextStatus('Error: ' + error.message, 'error');
             }
         }
 
-        function showStatus(message, type) {
+        function errorMessage(data) {
+            if (data && data.error) {
+                if (typeof data.error === 'string') return data.error;
+                if (typeof data.error.message === 'string') return data.error.message;
+            }
+            if (data && typeof data.message === 'string') return data.message;
+            return 'Unknown error';
+        }
+
+        function showTextStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = type;
+        }
+
+        function showHtmlStatus(message, type) {
             const status = document.getElementById('status');
             status.innerHTML = message;
             status.className = type;

@@ -2160,6 +2160,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn device_flow_page_surfaces_structured_proxy_errors_as_text() {
+        let html = include_str!("../assets/device_flow.html");
+
+        assert!(html.contains("function errorMessage(data)"), "{html}");
+        assert!(html.contains("data.error.message"), "{html}");
+        assert!(html.contains("status.textContent = message"), "{html}");
+        assert!(
+            html.contains(
+                "showTextStatus('Authentication failed: ' + errorMessage(data), 'error')"
+            ),
+            "{html}"
+        );
+    }
+
     // ── Phase 2 spec-pinning tests (#552 / spec #537 B-proxy) ────────────────
 
     /// Spec — `normalize_base_url` strips trailing slashes and `/v1` suffix.
