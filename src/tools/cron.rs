@@ -120,14 +120,11 @@ impl ScheduleStore {
     /// `ScheduleLock` for the same path across both the `load` and the
     /// matching `save`; otherwise concurrent writers will silently
     /// clobber each other's updates (the bug fixed in crosslink #403).
-    fn load_locked(path: &Path) -> Self {
-        if path.exists() {
-            std::fs::read_to_string(path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Self::default()
+    fn load_locked(path: &Path) -> Result<Self, FileError> {
+        match file_error::read_json(path) {
+            Ok(store) => Ok(store),
+            Err(err) if err.io_kind() == Some(std::io::ErrorKind::NotFound) => Ok(Self::default()),
+            Err(err) => Err(err),
         }
     }
 
@@ -413,7 +410,10 @@ fn execute_cron_create_at<S: BuildHasher>(
         Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
     };
 
-    let mut store = ScheduleStore::load_locked(&path);
+    let mut store = match ScheduleStore::load_locked(&path) {
+        Ok(store) => store,
+        Err(e) => return (format!("Failed to load schedule store: {e}"), true),
+    };
 
     // Check for duplicate names
     if store.schedules.iter().any(|s| s.name == name) {
@@ -507,7 +507,10 @@ fn execute_cron_delete_at<S: BuildHasher>(
         Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
     };
 
-    let mut store = ScheduleStore::load_locked(&path);
+    let mut store = match ScheduleStore::load_locked(&path) {
+        Ok(store) => store,
+        Err(e) => return (format!("Failed to load schedule store: {e}"), true),
+    };
 
     // Resolve the deletion target *under the lock* so concurrent reorders
     // of the list cannot shift an index out from under us.
@@ -567,7 +570,10 @@ fn execute_cron_list_at<S: BuildHasher>(
         Ok(l) => l,
         Err(e) => return (format!("Failed to lock schedule store: {e}"), true),
     };
-    let store = ScheduleStore::load_locked(&path);
+    let store = match ScheduleStore::load_locked(&path) {
+        Ok(store) => store,
+        Err(e) => return (format!("Failed to load schedule store: {e}"), true),
+    };
 
     if store.schedules.is_empty() {
         return ("No scheduled tasks.".to_string(), false);
@@ -975,7 +981,7 @@ mod tests {
         let (_, is_err) = execute_cron_create_at(&args, &path);
         assert!(!is_err);
 
-        let store = ScheduleStore::load_locked(&path);
+        let store = ScheduleStore::load_locked(&path).expect("created store should load");
         let s = store
             .schedules
             .iter()
@@ -1036,7 +1042,7 @@ mod tests {
 
         // All N schedules must be present — without the flock, several would
         // be silently lost.
-        let store = ScheduleStore::load_locked(&path);
+        let store = ScheduleStore::load_locked(&path).expect("concurrent store should load");
         assert_eq!(
             store.schedules.len(),
             N,
@@ -1188,10 +1194,47 @@ mod tests {
             );
         }
 
-        let reloaded = ScheduleStore::load_locked(&path);
+        let reloaded = ScheduleStore::load_locked(&path).expect("saved store should load");
         assert_eq!(reloaded.schedules.len(), 2);
         assert!(reloaded.schedules.iter().any(|s| s.name == "atomic_seed"));
         assert!(reloaded.schedules.iter().any(|s| s.name == "atomic_second"));
+    }
+
+    #[test]
+    fn schedule_load_locked_rejects_malformed_json_without_overwrite() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let path = temp_schedules_path(&tmp);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+
+        let err = ScheduleStore::load_locked(&path)
+            .expect_err("malformed schedule store must not default to empty");
+        assert!(
+            matches!(err, FileError::Json { .. }),
+            "expected JSON error, got {err:?}"
+        );
+
+        let mut args = HashMap::new();
+        args.insert(
+            "name".to_string(),
+            Value::String("must_not_overwrite".to_string()),
+        );
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 * * * *".to_string()),
+        );
+        args.insert("prompt".to_string(), Value::String("p".to_string()));
+        let (msg, is_err) = execute_cron_create_at(&args, &path);
+
+        assert!(is_err, "create should fail on corrupt store: {msg}");
+        assert!(msg.contains("Failed to load schedule store"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{not json",
+            "corrupt store must be preserved for operator recovery"
+        );
     }
 
     /// #909 — Two consecutive `save_locked` calls publish without collision
@@ -1220,7 +1263,7 @@ mod tests {
             store.save_locked(&path).expect("save");
         }
 
-        let reloaded = ScheduleStore::load_locked(&path);
+        let reloaded = ScheduleStore::load_locked(&path).expect("final store should load");
         assert_eq!(reloaded.schedules.len(), 1);
         assert_eq!(reloaded.schedules[0].name, "name4");
     }
