@@ -7,6 +7,9 @@ use openclaudia::skills;
 use openclaudia::tools::file_index::FileIndex;
 use openclaudia::tools::safe_truncate;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::LazyLock;
 
 /// Plugin slash command actions
 pub enum PluginAction {
@@ -107,6 +110,36 @@ pub enum SlashCommandResult {
 /// shared table (`/commit-push-pr` = 15 chars) plus a little slack.
 const SLASH_INVOCATION_WIDTH: usize = 19;
 
+/// Absolute, PATH-independent location of `git` for slash-command helpers.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+/// Absolute, PATH-independent location of `gh` for PR automation.
+static GH_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("gh").map_err(|e| format!("gh binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn gh_bin() -> Result<&'static Path, String> {
+    match &*GH_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
+
+fn gh_command() -> Result<Command, String> {
+    Ok(Command::new(gh_bin()?))
+}
+
 pub fn slash_help() {
     // Sections (Slash / Memory / Activity / Plugin / Skill) come from the
     // shared SLASH_SECTIONS table so the CLI printer and the TUI help
@@ -152,9 +185,8 @@ pub fn slash_help() {
 pub fn slash_doctor() {
     println!("\nRunning diagnostics...\n");
     print!("  Git... ");
-    match std::process::Command::new("git")
-        .args(["--version"])
-        .output()
+    match git_command()
+        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
     {
         Ok(o) if o.status.success() => {
             println!("\u{2713} {}", String::from_utf8_lossy(&o.stdout).trim());
@@ -200,9 +232,8 @@ pub fn slash_doctor() {
         println!("\u{2713} {} skill(s)", loaded_skills.len());
     }
     print!("  GitHub CLI (gh)... ");
-    match std::process::Command::new("gh")
-        .args(["--version"])
-        .output()
+    match gh_command()
+        .and_then(|mut cmd| cmd.args(["--version"]).output().map_err(|e| e.to_string()))
     {
         Ok(o) if o.status.success() => println!(
             "\u{2713} {}",
@@ -366,10 +397,12 @@ fn prompt_confirm_line(prompt: &str) -> String {
 /// Returns the current branch name, or an empty string when `git` is
 /// unavailable / not in a repo.  Pure git-status probe — no I/O on stdin.
 fn current_branch() -> String {
-    use std::process::Command;
-    Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
+    git_command()
+        .and_then(|mut cmd| {
+            cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .map_err(|e| e.to_string())
+        })
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
 }
@@ -393,15 +426,18 @@ fn confirm_push_to_branch(branch: &str) -> bool {
 /// Push the current branch to origin, asking for confirmation when on a
 /// protected branch. Returns the branch name on success, or `None` to bail.
 fn commit_push_pr_push() -> Option<String> {
-    use std::process::Command;
     let branch = current_branch();
     if !confirm_push_to_branch(&branch) {
         return None;
     }
-    match Command::new("git")
-        .args(["push", "-u", "origin", &branch])
-        .output()
-    {
+    let mut cmd = match git_command() {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            println!("\u{2717} {e}");
+            return None;
+        }
+    };
+    match cmd.args(["push", "-u", "origin", &branch]).output() {
         Ok(o) if o.status.success() => {
             println!("\u{2713} Pushed to origin/{branch}");
             Some(branch)
@@ -423,22 +459,20 @@ fn commit_push_pr_push() -> Option<String> {
 /// Create a GitHub pull request via the `gh` CLI using the last commit subject
 /// as the title. No-ops with a hint when `gh` is not installed.
 fn commit_push_pr_create_pr(branch: String) {
-    use std::process::Command;
-    if !Command::new("which")
-        .arg("gh")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    let Ok(mut gh) = gh_command() else {
         println!("(gh CLI not found — install it to auto-create PRs)");
         return;
-    }
-    let last_msg = Command::new("git")
-        .args(["log", "-1", "--format=%s"])
-        .output()
+    };
+    let last_msg = git_command()
+        .and_then(|mut cmd| {
+            cmd.args(["log", "-1", "--format=%s"])
+                .output()
+                .map_err(|e| e.to_string())
+        })
         .map_or(branch, |o| {
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         });
-    match Command::new("gh")
+    match gh
         .args(["pr", "create", "--title", &last_msg, "--body", ""])
         .output()
     {
@@ -2109,7 +2143,9 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 //
 #[cfg(test)]
 mod tests {
-    use super::{handle_slash_command, plugin_install_dir_for_name, SlashCommandResult};
+    use super::{
+        gh_bin, git_bin, handle_slash_command, plugin_install_dir_for_name, SlashCommandResult,
+    };
 
     /// Convenience: empty message vec, dummy provider + model.
     fn ctx() -> Vec<serde_json::Value> {
@@ -2534,6 +2570,52 @@ mod tests {
             result.is_some(),
             "unknown slash command must not return None"
         );
+    }
+
+    #[test]
+    fn slash_git_helpers_use_resolved_binary_paths() {
+        let git = git_bin().expect("slash tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        if let Ok(gh) = gh_bin() {
+            assert!(
+                gh.is_absolute(),
+                "gh_bin must resolve gh to an absolute path, got {}",
+                gh.display()
+            );
+        }
+
+        let src = include_str!("slash.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production slash code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains("Command::new(\"gh\")")
+                    && !code.contains("std::process::Command::new(\"gh\")"),
+                "production slash code must not invoke bare gh; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains("Command::new(\"which\")")
+                    && !code.contains("std::process::Command::new(\"which\")"),
+                "production slash code must not probe PATH with bare which; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
     }
 
     #[test]
