@@ -1314,6 +1314,10 @@ pub fn format_search_results(results: &[SearchResult]) -> String {
         );
     }
 
+    output.push_str(
+        "REMINDER: You MUST include the sources above when using this information in your response.",
+    );
+
     output
 }
 

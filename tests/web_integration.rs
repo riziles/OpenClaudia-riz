@@ -13,12 +13,12 @@
 //! ### Gap issues pinned (no fixes, only documentation)
 //!
 //! - #603  Preapproved domain allowlist missing — `gap_603_no_preapproved_allowlist`
-//! - #605  Multi-backend / citation reminder missing — `gap_605_no_citation_reminder`
 //! - #608  No secondary model distillation — `gap_608_no_prompt_parameter`
 //!
 //! ### Fixed regressions pinned
 //!
 //! - #610  DDG result URLs pass SSRF validation — `duckduckgo_parser_drops_ssrf_urls_before_formatting`
+//! - #605  Search output includes citation reminder — `web_search_results_include_citation_reminder`
 //!
 //! ### Browser tests (headless Chrome)
 //!
@@ -608,13 +608,9 @@ fn gap_603_no_preapproved_allowlist() {
     // No assertion — this test documents the gap, not a current bug.
 }
 
-/// GAP #605 — No citation reminder appended to `web_search` results.
-///
-/// CC WebSearchTool.ts:427 appends:
-/// "REMINDER: You MUST include the sources above ..."
-/// OC `format_search_results` does NOT include this reminder.
+/// Regression #605 — `web_search` results include a citation reminder.
 #[test]
-fn gap_605_no_citation_reminder() {
+fn web_search_results_include_citation_reminder() {
     let results = vec![SearchResult {
         title: "Result".to_string(),
         url: "https://example.com".to_string(),
@@ -622,11 +618,9 @@ fn gap_605_no_citation_reminder() {
     }];
     let output = format_search_results(&results);
 
-    // PIN: OC does not append a citation reminder. CC does.
-    // When #605 lands, this assertion should be inverted.
     assert!(
-        !output.contains("REMINDER"),
-        "GAP #605: citation reminder appeared unexpectedly — update this test when #605 lands"
+        output.contains("REMINDER: You MUST include the sources above"),
+        "web_search output must remind agents to cite returned sources"
     );
 }
 
