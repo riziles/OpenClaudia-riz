@@ -1,8 +1,8 @@
 //! End-to-end tests for `tools::registry::registry()` —
 //! global invariants across the full HANDLERS table:
 //! every registered handler has a matching name, every
-//! definition is well-formed, exactly 4 handlers declare
-//! a `permission_target` (Bash/Edit/NotebookEdit/Write),
+//! definition is well-formed, exactly 5 handlers declare
+//! a `permission_target` (Bash/Edit/NotebookEdit/WebFetch/Write),
 //! and the registry has the documented tool count.
 //!
 //! Sprint 160 of the verification effort. Sprint 23 / 132
@@ -183,12 +183,13 @@ fn every_handler_required_fields_are_in_properties() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn exactly_4_handlers_declare_permission_target() {
-    // AUTHORING DISCOVERY: 4 mutating tools (not 3 as initial
-    // assumption suggested). notebook_edit also declares a
-    // permission_target since it overwrites .ipynb on disk.
+fn exactly_5_handlers_declare_permission_target() {
+    // AUTHORING DISCOVERY: 5 gated tools. notebook_edit also declares a
+    // permission_target since it overwrites .ipynb on disk; web_fetch declares
+    // a URL target so preapproved documentation hosts can bypass prompts while
+    // arbitrary network reads still ask.
     // PINS the actual catalog: bash + edit_file + notebook_edit
-    // + write_file. Adding a new mutating tool: append here
+    // + web_fetch + write_file. Adding a new gated tool: append here
     // AND in src/tools/registry.rs's permission_target impl.
     let reg = registry();
     let mut with_target: Vec<&str> = Vec::new();
@@ -201,8 +202,14 @@ fn exactly_4_handlers_declare_permission_target() {
     with_target.sort_unstable();
     assert_eq!(
         with_target,
-        vec!["bash", "edit_file", "notebook_edit", "write_file"],
-        "PINS PERMISSION TARGETS: exactly 4 mutating tools"
+        vec![
+            "bash",
+            "edit_file",
+            "notebook_edit",
+            "web_fetch",
+            "write_file"
+        ],
+        "PINS PERMISSION TARGETS: exactly 5 gated tools"
     );
 }
 

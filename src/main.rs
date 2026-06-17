@@ -13,8 +13,11 @@
 mod cli;
 
 use openclaudia::{
-    config, guardrails, memory, permissions::PermissionManager, plugins, prompt,
-    proxy::normalize_base_url, tui, vdd,
+    config, guardrails, memory,
+    permissions::{CheckResult, PermissionManager},
+    plugins, prompt,
+    proxy::normalize_base_url,
+    tui, vdd,
 };
 
 use clap::{builder::PossibleValuesParser, Parser, Subcommand};
@@ -574,16 +577,16 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
 /// Result of an interactive permission prompt for a tool call.
 enum ToolPermissionResult {
     /// User allowed execution (or tool doesn't need permission).
-    Allowed,
+    Allowed { checked: bool },
     /// User denied execution.
     Denied(String),
 }
 
 /// Returns `true` for tools that require an explicit permission decision before execution.
 ///
-/// Read-only / informational tools (e.g. `read_file`, `grep`, `web_fetch`) return `false`
+/// Read-only / informational tools (e.g. `read_file`, `grep`) return `false`
 /// and are always executed without prompting. Write / destructive tools (`bash`,
-/// `write_file`, `edit_file`) return `true`.
+/// `write_file`, `edit_file`) and network fetches that are not preapproved return `true`.
 fn tool_needs_permission(tool_name: &str) -> bool {
     !matches!(
         tool_name,
@@ -591,7 +594,6 @@ fn tool_needs_permission(tool_name: &str) -> bool {
             | "list_files"
             | "grep"
             | "glob"
-            | "web_fetch"
             | "web_search"
             | "ask_user_question"
             | "task_create"
@@ -655,16 +657,29 @@ fn check_tool_permission_interactive(
     tool_name: &str,
     tool_args: &serde_json::Value,
     always_allowed: &mut std::collections::HashSet<String>,
+    permission_mgr: Option<&PermissionManager>,
 ) -> ToolPermissionResult {
     use std::io::Write as _;
 
     if !tool_needs_permission(tool_name) {
-        return ToolPermissionResult::Allowed;
+        return ToolPermissionResult::Allowed { checked: false };
     }
 
-    // Check session-level "always allow" cache
+    if let Some(mgr) = permission_mgr {
+        match mgr.check(tool_name, tool_args) {
+            CheckResult::Allowed => return ToolPermissionResult::Allowed { checked: true },
+            CheckResult::Denied(reason) => {
+                return ToolPermissionResult::Denied(format!("Permission denied: {reason}"));
+            }
+            CheckResult::NeedsPrompt { .. } => {}
+        }
+    }
+
+    // Check session-level "always allow" cache after hard-safety/config rules.
     if always_allowed.contains(tool_name) {
-        return ToolPermissionResult::Allowed;
+        return ToolPermissionResult::Allowed {
+            checked: permission_mgr.is_some(),
+        };
     }
 
     let description = tool_call_description(tool_name, tool_args);
@@ -682,13 +697,17 @@ fn check_tool_permission_interactive(
     let response = input.trim().to_lowercase();
 
     match response.as_str() {
-        "y" | "yes" | "" => ToolPermissionResult::Allowed,
+        "y" | "yes" | "" => ToolPermissionResult::Allowed {
+            checked: permission_mgr.is_some(),
+        },
         "a" | "always" => {
             always_allowed.insert(tool_name.to_string());
             eprintln!(
                 "\x1b[32m✓ Will auto-allow '{tool_name}' for the rest of this session.\x1b[0m"
             );
-            ToolPermissionResult::Allowed
+            ToolPermissionResult::Allowed {
+                checked: permission_mgr.is_some(),
+            }
         }
         _ => ToolPermissionResult::Denied(format!(
             "Permission denied by user for tool '{tool_name}'"
@@ -716,7 +735,7 @@ const fn check_tool_unrestricted(
     _tool_name: &str,
     _tool_args: &serde_json::Value,
 ) -> ToolPermissionResult {
-    ToolPermissionResult::Allowed
+    ToolPermissionResult::Allowed { checked: false }
 }
 
 /// Interactive chat mode (default command)
@@ -808,10 +827,11 @@ fn init_permission_manager(
     if dangerously_skip_permissions {
         return PermissionManager::unrestricted();
     }
-    PermissionManager::new(
+    PermissionManager::new_with_web_fetch_preapproved(
         std::path::PathBuf::from(".openclaudia/permissions.json"),
         true,
         config.permissions.default_allow.clone(),
+        config.web_fetch.preapproved_domains.clone(),
     )
 }
 

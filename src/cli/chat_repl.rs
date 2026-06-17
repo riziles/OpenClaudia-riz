@@ -56,6 +56,20 @@ use openclaudia::{
 };
 use rustyline::error::ReadlineError;
 
+fn execute_tool_with_memory_after_permission(
+    tool_call: &tools::ToolCall,
+    memory_db: Option<&memory::MemoryDb>,
+    permission_mgr: &PermissionManager,
+    permission_already_checked: bool,
+) -> tools::ToolResult {
+    if permission_already_checked {
+        let bypass_mgr = PermissionManager::unrestricted();
+        tools::execute_tool_with_memory(tool_call, memory_db, Some(&bypass_mgr))
+    } else {
+        tools::execute_tool_with_memory(tool_call, memory_db, Some(permission_mgr))
+    }
+}
+
 /// Arguments accepted by [`ChatRepl::new`] — kept as a struct so the
 /// public `cmd_chat` signature stays a thin wrapper.
 pub struct ChatReplArgs {
@@ -1468,11 +1482,20 @@ impl ChatRepl {
                 function_responses.push(blocked);
                 continue;
             }
-            if let Some(blocked) = self.gemini_permission_error_response(tool_call) {
-                function_responses.push(blocked);
-                continue;
-            }
-            let result = self.gemini_run_single_tool(tool_call, memory_db, auto_learner);
+            let permission_already_checked = match self.gemini_permission_error_response(tool_call)
+            {
+                Ok(checked) => checked,
+                Err(blocked) => {
+                    function_responses.push(blocked);
+                    continue;
+                }
+            };
+            let result = self.gemini_run_single_tool(
+                tool_call,
+                memory_db,
+                auto_learner,
+                permission_already_checked,
+            );
             function_responses.push(self.gemini_record_tool_outcome(tool_call, &result));
         }
         function_responses
@@ -1513,12 +1536,12 @@ impl ChatRepl {
     fn gemini_permission_error_response(
         &mut self,
         tool_call: &tools::ToolCall,
-    ) -> Option<serde_json::Value> {
+    ) -> Result<bool, serde_json::Value> {
         let tool_args_val = match parse_tool_args(&tool_call.function) {
             Ok(args) => args,
             Err(msg) => {
                 self.push_tool_result_message(&tool_call.id, &msg, true);
-                return Some(gemini_tool_error_response(tool_call, &msg));
+                return Err(gemini_tool_error_response(tool_call, &msg));
             }
         };
         let result = if self.dangerously_skip_permissions {
@@ -1528,13 +1551,14 @@ impl ChatRepl {
                 &tool_call.function.name,
                 &tool_args_val,
                 &mut self.always_allowed_tools,
+                Some(&self.permission_mgr),
             )
         };
         match result {
-            ToolPermissionResult::Allowed => None,
+            ToolPermissionResult::Allowed { checked } => Ok(checked),
             ToolPermissionResult::Denied(msg) => {
                 self.push_tool_result_message(&tool_call.id, &msg, true);
-                Some(gemini_tool_error_response(tool_call, &msg))
+                Err(gemini_tool_error_response(tool_call, &msg))
             }
         }
     }
@@ -1546,6 +1570,7 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
+        permission_already_checked: bool,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         if let Err(e) = self.audit_logger.log_security(
@@ -1563,9 +1588,11 @@ impl ChatRepl {
         }
 
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
-        let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+        let result = execute_tool_with_memory_after_permission(
+            tool_call,
+            memory_db,
+            &self.permission_mgr,
+            permission_already_checked,
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
@@ -2212,10 +2239,15 @@ impl ChatRepl {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        if !self.push_permission_or_proceed(tool_call) {
+        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call) else {
             return;
-        }
-        let result = self.run_tool_with_audit(tool_call, memory_db, auto_learner);
+        };
+        let result = self.run_tool_with_audit(
+            tool_call,
+            memory_db,
+            auto_learner,
+            permission_already_checked,
+        );
 
         let (final_content, was_marker) = process_tool_result_marker(
             &mut self.chat_session,
@@ -2263,13 +2295,14 @@ impl ChatRepl {
     }
 
     /// Run the interactive permission check. On `Denied` push the error
-    /// tool message and return `false`. On `Allowed` return `true`.
-    fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> bool {
+    /// tool message and return `None`. On `Allowed` return whether the
+    /// lower-level permission gate has already been checked.
+    fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> Option<bool> {
         let tool_args_val = match parse_tool_args(&tool_call.function) {
             Ok(args) => args,
             Err(msg) => {
                 self.push_tool_result_message(&tool_call.id, &msg, true);
-                return false;
+                return None;
             }
         };
         let result = if self.dangerously_skip_permissions {
@@ -2279,6 +2312,7 @@ impl ChatRepl {
                 &tool_call.function.name,
                 &tool_args_val,
                 &mut self.always_allowed_tools,
+                Some(&self.permission_mgr),
             )
         };
         match result {
@@ -2289,9 +2323,9 @@ impl ChatRepl {
                     "content": format!("[ERROR] {}", msg),
                     "is_error": true
                 }));
-                false
+                None
             }
-            ToolPermissionResult::Allowed => true,
+            ToolPermissionResult::Allowed { checked } => Some(checked),
         }
     }
 
@@ -2303,6 +2337,7 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
+        permission_already_checked: bool,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         if let Err(e) = self.audit_logger.log_security(
@@ -2319,9 +2354,11 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
-        let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+        let result = execute_tool_with_memory_after_permission(
+            tool_call,
+            memory_db,
+            &self.permission_mgr,
+            permission_already_checked,
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
@@ -3056,10 +3093,15 @@ impl ChatRepl {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        if !self.push_permission_or_proceed(tool_call) {
+        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call) else {
             return;
-        }
-        let result = self.run_openai_tool_unaudited(tool_call, memory_db, auto_learner);
+        };
+        let result = self.run_openai_tool_unaudited(
+            tool_call,
+            memory_db,
+            auto_learner,
+            permission_already_checked,
+        );
 
         let (final_content, was_marker) = process_tool_result_marker(
             &mut self.chat_session,
@@ -3081,12 +3123,15 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
+        permission_already_checked: bool,
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
-        let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+        let result = execute_tool_with_memory_after_permission(
+            tool_call,
+            memory_db,
+            &self.permission_mgr,
+            permission_already_checked,
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result

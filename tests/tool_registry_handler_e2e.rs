@@ -179,6 +179,15 @@ fn edit_file_handler_declares_edit_canonical() {
 }
 
 #[test]
+fn web_fetch_handler_declares_webfetch_canonical_with_url_arg_key() {
+    let r = registry();
+    let handler = r.get("web_fetch").expect("web_fetch registered");
+    let target = handler.permission_target().expect("MUST declare target");
+    assert_eq!(target.canonical, "WebFetch");
+    assert_eq!(target.arg_key, "url");
+}
+
+#[test]
 fn read_only_tools_declare_no_permission_target() {
     // Documented contract: tools with no side effects return
     // None from permission_target() — the default impl.

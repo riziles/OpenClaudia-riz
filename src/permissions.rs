@@ -359,6 +359,8 @@ pub struct PermissionManager {
     session_rules: Vec<PermissionRule>,
     /// Default allow patterns from config
     default_allow: Vec<String>,
+    /// `WebFetch` hosts that bypass the interactive prompt.
+    web_fetch_preapproved_domains: Vec<String>,
     /// Path to the persistence file
     persist_path: PathBuf,
     /// Whether the permission system is enabled
@@ -391,6 +393,25 @@ impl PermissionManager {
         enabled: bool,
         default_allow: Vec<String>,
     ) -> Self {
+        Self::new_with_web_fetch_preapproved(
+            persist_path,
+            enabled,
+            default_allow,
+            crate::config::default_preapproved_domains(),
+        )
+    }
+
+    /// Create a new `PermissionManager` with an explicit `web_fetch`
+    /// preapproved-domain catalog.
+    ///
+    /// Passing an empty list disables the `web_fetch` prompt bypass while
+    /// keeping the rest of the permission system unchanged.
+    pub fn new_with_web_fetch_preapproved(
+        persist_path: impl Into<PathBuf>,
+        enabled: bool,
+        default_allow: Vec<String>,
+        web_fetch_preapproved_domains: Vec<String>,
+    ) -> Self {
         let persist_path = persist_path.into();
         let persisted_rules = Self::load_persisted_rules(&persist_path);
 
@@ -405,6 +426,7 @@ impl PermissionManager {
             persisted_rules,
             session_rules: Vec::new(),
             default_allow,
+            web_fetch_preapproved_domains,
             persist_path,
             enabled,
             consecutive_denials: 0,
@@ -434,6 +456,7 @@ impl PermissionManager {
             persisted_rules: Vec::new(),
             session_rules: Vec::new(),
             default_allow: Vec::new(),
+            web_fetch_preapproved_domains: Vec::new(),
             persist_path: PathBuf::new(),
             enabled: false,
             consecutive_denials: 0,
@@ -540,7 +563,12 @@ impl PermissionManager {
             }
         }
 
-        // 3. Check config default_allow patterns
+        // 3. CC-parity web_fetch prompt bypass for known documentation hosts.
+        if self.web_fetch_preapproved_allowed(&canonical_tool, &target) {
+            return CheckResult::Allowed;
+        }
+
+        // 4. Check config default_allow patterns
         for pattern in &self.default_allow {
             if Self::glob_matches(pattern, &target) {
                 Self::log_permission_decision(
@@ -554,11 +582,28 @@ impl PermissionManager {
             }
         }
 
-        // 4. No rule matched -- caller should prompt the user
+        // 5. No rule matched -- caller should prompt the user
         CheckResult::NeedsPrompt {
             tool: canonical_tool,
             target,
         }
+    }
+
+    fn web_fetch_preapproved_allowed(&self, canonical_tool: &str, target: &str) -> bool {
+        if canonical_tool != "WebFetch"
+            || !crate::config::is_preapproved(target, &self.web_fetch_preapproved_domains)
+        {
+            return false;
+        }
+
+        Self::log_permission_decision(
+            "allowed",
+            "web_fetch_preapproved",
+            canonical_tool,
+            target,
+            "",
+        );
+        true
     }
 
     /// Context-aware permission check (crosslink #570).
@@ -1651,6 +1696,21 @@ mod phase2_spec_pins {
         PermissionManager::new(path, false, vec![])
     }
 
+    fn enabled_with_web_fetch_preapproved(
+        default_allow: Vec<&str>,
+        preapproved: Vec<&str>,
+    ) -> (PermissionManager, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("perms.json");
+        let mgr = PermissionManager::new_with_web_fetch_preapproved(
+            &path,
+            true,
+            default_allow.into_iter().map(str::to_string).collect(),
+            preapproved.into_iter().map(str::to_string).collect(),
+        );
+        (mgr, dir)
+    }
+
     // ── B1 · Check order: always-allow → session → default_allow → NeedsPrompt ─
 
     /// B1-allow-1: persisted always-allow fires before every other tier.
@@ -2357,6 +2417,51 @@ mod phase2_spec_pins {
         assert_eq!(r2, CheckResult::Allowed);
     }
 
+    /// #603: `web_fetch` declares a permission target, but the default
+    /// preapproved documentation catalog bypasses the prompt for known hosts.
+    #[test]
+    fn web_fetch_preapproved_default_catalog_returns_allowed() {
+        let (mgr, _dir) = enabled(vec![]);
+        let r = mgr.check("web_fetch", &json!({"url": "https://docs.python.org/3/"}));
+        assert_eq!(
+            r,
+            CheckResult::Allowed,
+            "#603: docs.python.org is in the default preapproved web_fetch catalog"
+        );
+    }
+
+    /// #603: user config can explicitly disable the preapproved catalog by
+    /// setting `web_fetch.preapproved_domains = []`.
+    #[test]
+    fn web_fetch_empty_preapproved_catalog_needs_prompt() {
+        let (mgr, _dir) = enabled_with_web_fetch_preapproved(vec![], vec![]);
+        let r = mgr.check("web_fetch", &json!({"url": "https://docs.python.org/3/"}));
+        assert_eq!(
+            r,
+            CheckResult::NeedsPrompt {
+                tool: "WebFetch".to_string(),
+                target: "https://docs.python.org/3/".to_string(),
+            },
+            "#603: empty preapproved catalog must not silently allow web_fetch"
+        );
+    }
+
+    /// #603: arbitrary hosts still prompt even when the default catalog is
+    /// populated.
+    #[test]
+    fn web_fetch_non_preapproved_host_needs_prompt() {
+        let (mgr, _dir) = enabled(vec![]);
+        let r = mgr.check("web_fetch", &json!({"url": "https://example.invalid/"}));
+        assert_eq!(
+            r,
+            CheckResult::NeedsPrompt {
+                tool: "WebFetch".to_string(),
+                target: "https://example.invalid/".to_string(),
+            },
+            "#603: only configured documentation hosts bypass the web_fetch prompt"
+        );
+    }
+
     /// #782: malformed args (wrong JSON type for the declared `arg_key`)
     /// must be Denied — the legacy invariant for `bash`/`edit_file`/
     /// `write_file` is preserved by the registry-driven lookup, and now
@@ -2402,7 +2507,6 @@ mod phase2_spec_pins {
             "glob",                  // pure read (#567)
             "grep",                  // pure read (#568)
             "crosslink",             // library-backed issue tracker
-            "web_fetch",             // network read
             "web_search",            // network read
             "web_browser",           // network read
             "todo_write",            // in-memory session state

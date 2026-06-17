@@ -306,6 +306,13 @@ pub fn execute_tool_with_memory(
         return gated;
     }
 
+    execute_tool_with_memory_unchecked(tool_call, memory_db)
+}
+
+fn execute_tool_with_memory_unchecked(
+    tool_call: &ToolCall,
+    memory_db: Option<&MemoryDb>,
+) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
         Err(result) => return result,
@@ -359,6 +366,14 @@ pub fn execute_tool_full(
         return gated;
     }
 
+    execute_tool_full_unchecked(tool_call, memory_db, app_config)
+}
+
+fn execute_tool_full_unchecked(
+    tool_call: &ToolCall,
+    memory_db: Option<&MemoryDb>,
+    app_config: Option<&AppConfig>,
+) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
         Err(result) => return result,
@@ -380,15 +395,15 @@ pub fn execute_tool_full(
             |config| subagent::execute_task_tool(&args, config),
         ),
         "agent_output" => subagent::execute_agent_output_tool(&args),
-        // For all other tools, delegate to the existing function and
-        // unwrap its already-built `ToolResult` back into the pair so the
-        // single trailing constructor handles all arms uniformly.
-        // The permission check has already run at the top of this function;
-        // the inner `execute_tool_with_memory` call will re-consult the gate
-        // with the same manager — Allowed is idempotent, so this is safe.
         _ => {
-            let inner = execute_tool_with_memory(tool_call, memory_db, permission_mgr);
-            (inner.content, inner.is_error)
+            let mut ctx = ToolContext {
+                memory_db,
+                app_config,
+                task_mgr: None,
+            };
+            registry::registry()
+                .dispatch(tool_call.function.name.as_str(), &args, &mut ctx)
+                .unwrap_or_else(|| (format!("Unknown tool: {}", tool_call.function.name), true))
         }
     };
 
@@ -688,6 +703,21 @@ pub fn execute_tool_with_tasks(
         return gated;
     }
 
+    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
+}
+
+/// Execute a tool after the caller has already made the permission decision.
+///
+/// Interactive callers use this after a typed permission result or user
+/// prompt so a one-time approval cannot be converted into a nested legacy
+/// `PERMISSION_PROMPT` result.
+#[must_use]
+pub(crate) fn execute_tool_with_tasks_unchecked(
+    tool_call: &ToolCall,
+    memory_db: Option<&MemoryDb>,
+    app_config: Option<&AppConfig>,
+    task_mgr: Option<&mut TaskManager>,
+) -> ToolResult {
     let args = match parse_tool_arguments_map(tool_call) {
         Ok(args) => args,
         Err(result) => return result,
@@ -696,7 +726,7 @@ pub fn execute_tool_with_tasks(
     // Subagent tools (task / agent_output) need app_config and are handled
     // inside execute_tool_full before the registry is consulted.
     if matches!(tool_call.function.name.as_str(), "task" | "agent_output") {
-        return execute_tool_full(tool_call, memory_db, app_config, permission_mgr);
+        return execute_tool_full_unchecked(tool_call, memory_db, app_config);
     }
 
     // All other tools — including task_create/task_update/task_get/task_list —
@@ -748,16 +778,7 @@ pub fn execute_tool_with_permission_required(
         }
         PermissionOutcome::Allowed => {}
     }
-    // Gate has already succeeded; delegate to the legacy path. We pass the
-    // same manager in so the inner re-check is a no-op fast path rather
-    // than a fail-open None.
-    execute_tool_with_tasks(
-        tool_call,
-        memory_db,
-        app_config,
-        task_mgr,
-        Some(permission_mgr),
-    )
+    execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr)
 }
 
 /// Typed-outcome dispatch: runs the permission gate and returns a structured [`ExecutionOutcome`].
@@ -786,11 +807,8 @@ pub fn execute_tool_gated(
             target,
         },
         PermissionOutcome::Allowed => {
-            // Gate already succeeded; delegate. Thread the manager through
-            // so the nested re-check is a fast-path Allowed rather than a
-            // fail-open None + migration warning.
             let result =
-                execute_tool_with_tasks(tool_call, memory_db, app_config, task_mgr, permission_mgr);
+                execute_tool_with_tasks_unchecked(tool_call, memory_db, app_config, task_mgr);
             ExecutionOutcome::Result(result)
         }
     }

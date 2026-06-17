@@ -101,7 +101,6 @@ fn safe_read_only_tools_do_not_need_permission() {
         "list_files",
         "grep",
         "glob",
-        "web_fetch",
         "web_search",
         "ask_user_question",
         "todo_read",
@@ -118,11 +117,17 @@ fn safe_read_only_tools_do_not_need_permission() {
 }
 
 #[test]
-fn write_and_edit_tools_need_permission() {
-    for t in &["write_file", "edit_file", "bash", "notebook_edit"] {
+fn write_edit_and_non_preapproved_network_tools_need_permission() {
+    for t in &[
+        "write_file",
+        "edit_file",
+        "bash",
+        "notebook_edit",
+        "web_fetch",
+    ] {
         assert!(
             tool_needs_permission(t),
-            "destructive tool {t:?} MUST need permission"
+            "gated tool {t:?} MUST need permission"
         );
     }
 }

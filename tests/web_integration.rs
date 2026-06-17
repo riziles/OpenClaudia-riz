@@ -10,12 +10,9 @@
 //! | 4. `web_fetch` success output format    | `fetch_url_success_output_contains_url_line`, `fetch_url_success_truncates_at_50k` |
 //! | 5. `web_fetch` HTTP error path          | `fetch_url_http_404_returns_error`, `fetch_url_http_500_returns_error` |
 //!
-//! ### Gap issues pinned (no fixes, only documentation)
-//!
-//! - #603  Preapproved domain allowlist missing — `gap_603_no_preapproved_allowlist`
-//!
 //! ### Fixed regressions pinned
 //!
+//! - #603  Preapproved domain allowlist bypasses prompts — `web_fetch_preapproved_domain_permission_bypass`
 //! - #610  DDG result URLs pass SSRF validation — `duckduckgo_parser_drops_ssrf_urls_before_formatting`
 //! - #605  Search output includes citation reminder — `web_search_results_include_citation_reminder`
 //! - #608  `web_fetch` schema exposes prompt distillation — `web_fetch_schema_exposes_prompt_parameter`
@@ -28,10 +25,12 @@
 //! ```
 //! Set `OPENCLAUDIA_TEST_BROWSER=1` to confirm opt-in intent (tests log a warning if absent).
 
+use openclaudia::permissions::{CheckResult, PermissionManager};
 #[cfg(feature = "browser")]
 use openclaudia::web::parse_duckduckgo_results_from_html;
 use openclaudia::web::{fetch_url, fetch_with_browser, format_search_results, SearchResult};
 use serde_json::json;
+use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -570,43 +569,27 @@ fn domain_matches_test(host: &str, needle: &str) -> bool {
     host == needle || host.ends_with(&format!(".{needle}"))
 }
 
-// ===========================================================================
-// Gap pins — document current OC behavior that DIVERGES from CC spec.
-// These tests are NOT expected to be fixed here; they pin the gap so that
-// when the feature lands, the test suite fails and forces an update.
-// ===========================================================================
-
-/// GAP #603 — No preapproved domain allowlist (CC preapproved.ts).
-///
-/// CC: ~130 code-documentation domains (docs.python.org, react.dev, etc.) bypass
-/// the permission prompt for `web_fetch` (GET-only). OC has no equivalent.
-///
-/// This test pins the absence: a fetch to a "preapproved" CC domain still
-/// goes through the full `validate_url` path in OC with no special treatment.
-/// When #603 lands, this test should be updated to verify the allowlist.
 #[test]
-fn gap_603_no_preapproved_allowlist() {
-    // CC preapproved.ts line 14: docs.python.org is in PREAPPROVED_HOSTS.
-    // OC: no special handling — the URL is treated identically to any other.
-    // Verify: OC does not short-circuit for this domain (no panic, no special error).
-    // A live fetch would hit the network; we just confirm the entry path works.
-    use openclaudia::tools::{FunctionCall, ToolCall};
+fn web_fetch_preapproved_domain_permission_bypass() {
+    let dir = TempDir::new().expect("tempdir");
+    let mgr = PermissionManager::new_with_web_fetch_preapproved(
+        dir.path().join("permissions.json"),
+        true,
+        Vec::new(),
+        vec!["docs.python.org".to_string()],
+    );
 
-    // Intentionally do NOT make a network call — just confirm no panic on entry.
-    // The real gap is the absence of a permission bypass, not a crash.
-    // GAP: when #603 lands, OC should return behavior='allow' immediately for
-    // preapproved hosts without requiring user permission.
-    let _ = ToolCall {
-        id: "gap603".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "web_fetch".to_string(),
-            // Use a URL that would be preapproved in CC but needs no real network here
-            arguments: r#"{"url": "https://docs.python.org/3/"}"#.to_string(),
-        },
-    };
-    // Pin: OC has no PREAPPROVED_HOSTS concept. Tracked as #603.
-    // No assertion — this test documents the gap, not a current bug.
+    let allowed = mgr.check("web_fetch", &json!({"url": "https://docs.python.org/3/"}));
+    assert_eq!(allowed, CheckResult::Allowed);
+
+    let prompt = mgr.check("web_fetch", &json!({"url": "https://example.invalid/"}));
+    assert_eq!(
+        prompt,
+        CheckResult::NeedsPrompt {
+            tool: "WebFetch".to_string(),
+            target: "https://example.invalid/".to_string(),
+        }
+    );
 }
 
 /// Regression #605 — `web_search` results include a citation reminder.

@@ -635,6 +635,12 @@ impl ToolHandler for WebFetchHandler {
             }
         })
     }
+    fn permission_target(&self) -> Option<PermissionTarget> {
+        Some(PermissionTarget {
+            canonical: "WebFetch",
+            arg_key: "url",
+        })
+    }
     fn execute(&self, args: &HashMap<String, Value>, ctx: &mut ToolContext<'_>) -> (String, bool) {
         web::execute_web_fetch_with_config(args, ctx.app_config)
     }
