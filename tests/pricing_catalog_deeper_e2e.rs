@@ -19,7 +19,9 @@
 use openclaudia::session::{
     calculate_cost, calculate_cost_fast_mode, calculate_cost_with_ttl, get_pricing,
     web_search_cost, CacheWriteTtl, ModelPricing, PricingError, TokenUsage,
-    FAST_MODE_INPUT_PER_MILLION, FAST_MODE_OUTPUT_PER_MILLION, WEB_SEARCH_REQUEST_USD,
+    FAST_MODE_INPUT_PER_MILLION, FAST_MODE_OUTPUT_PER_MILLION,
+    OPUS_4_8_FAST_MODE_INPUT_PER_MILLION, OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION,
+    WEB_SEARCH_REQUEST_USD,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -41,6 +43,16 @@ fn fast_mode_output_per_million_is_150_dollars() {
     assert_eq!(FAST_MODE_OUTPUT_PER_MILLION, 150.0);
 }
 
+#[test]
+fn opus_4_8_fast_mode_input_per_million_is_10_dollars() {
+    assert_eq!(OPUS_4_8_FAST_MODE_INPUT_PER_MILLION, 10.0);
+}
+
+#[test]
+fn opus_4_8_fast_mode_output_per_million_is_50_dollars() {
+    assert_eq!(OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION, 50.0);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section B — get_pricing lookup matrix
 // ───────────────────────────────────────────────────────────────────────────
@@ -49,6 +61,52 @@ fn fast_mode_output_per_million_is_150_dollars() {
 fn get_pricing_for_known_anthropic_model_returns_some() {
     let pricing = get_pricing("claude-sonnet-4-5-20250929");
     assert!(pricing.is_some());
+}
+
+#[test]
+fn get_pricing_for_current_anthropic_models_returns_documented_rates() {
+    let fable = get_pricing("claude-fable-5").expect("fable");
+    assert_eq!(fable.input_per_million, 10.0);
+    assert_eq!(fable.output_per_million, 50.0);
+
+    let opus48 = get_pricing("claude-opus-4-8").expect("opus 4.8");
+    assert_eq!(opus48.input_per_million, 5.0);
+    assert_eq!(opus48.output_per_million, 25.0);
+    assert_eq!(
+        opus48.fast_mode_input_per_million,
+        Some(OPUS_4_8_FAST_MODE_INPUT_PER_MILLION)
+    );
+    assert_eq!(
+        opus48.fast_mode_output_per_million,
+        Some(OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION)
+    );
+
+    let opus47 = get_pricing("claude-opus-4-7").expect("opus 4.7");
+    assert_eq!(opus47.input_per_million, 5.0);
+    assert_eq!(opus47.output_per_million, 25.0);
+    assert_eq!(
+        opus47.fast_mode_input_per_million,
+        Some(FAST_MODE_INPUT_PER_MILLION)
+    );
+}
+
+#[test]
+fn get_pricing_for_current_openai_gpt5_models_returns_documented_rates() {
+    let gpt55 = get_pricing("gpt-5.5").expect("gpt-5.5");
+    assert_eq!(gpt55.input_per_million, 5.0);
+    assert_eq!(gpt55.output_per_million, 30.0);
+
+    let gpt55_pro = get_pricing("gpt-5.5-pro").expect("gpt-5.5-pro");
+    assert_eq!(gpt55_pro.input_per_million, 30.0);
+    assert_eq!(gpt55_pro.output_per_million, 180.0);
+
+    let gpt54_mini = get_pricing("gpt-5.4-mini").expect("gpt-5.4-mini");
+    assert_eq!(gpt54_mini.input_per_million, 0.75);
+    assert_eq!(gpt54_mini.output_per_million, 4.5);
+
+    let gpt52_pro = get_pricing("gpt-5.2-pro").expect("gpt-5.2-pro");
+    assert_eq!(gpt52_pro.input_per_million, 21.0);
+    assert_eq!(gpt52_pro.output_per_million, 168.0);
 }
 
 #[test]

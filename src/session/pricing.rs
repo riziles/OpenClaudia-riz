@@ -34,8 +34,9 @@
 //!
 //! ## Fast-mode pricing tier (#642)
 //!
-//! Opus 4.6+ in `/fast` mode bills at the `COST_TIER_30_150` sheet
-//! ($30 input / $150 output per Mtok).  Per-model overrides live on
+//! Claude Opus fast mode bills at a premium rate that varies by model:
+//! Opus 4.6 / 4.7 use $30 input / $150 output per MTok, while Opus 4.8
+//! uses $10 input / $50 output per MTok. Per-model overrides live on
 //! [`ModelPricing::fast_mode_input_per_million`] /
 //! [`ModelPricing::fast_mode_output_per_million`] and the
 //! [`calculate_cost_fast_mode`] entry point swaps those rates in when
@@ -68,15 +69,19 @@ use thiserror::Error;
 /// (crosslink #641).  Matches CC `modelCost.ts:139`.
 pub const WEB_SEARCH_REQUEST_USD: f64 = 0.01;
 
-/// Fast-mode (Opus 4.6+ `/fast`) input rate per million tokens
-/// (`COST_TIER_30_150`).  Used as the default for the Opus 4.6+
-/// `fast_mode_input_per_million` slot — see #642.
+/// Fast-mode input rate for Claude Opus 4.6 / 4.7 per million tokens
+/// (`COST_TIER_30_150`) — see #642.
 pub const FAST_MODE_INPUT_PER_MILLION: f64 = 30.0;
 
-/// Fast-mode (Opus 4.6+ `/fast`) output rate per million tokens
-/// (`COST_TIER_30_150`).  Used as the default for the Opus 4.6+
-/// `fast_mode_output_per_million` slot — see #642.
+/// Fast-mode output rate for Claude Opus 4.6 / 4.7 per million tokens
+/// (`COST_TIER_30_150`) — see #642.
 pub const FAST_MODE_OUTPUT_PER_MILLION: f64 = 150.0;
+
+/// Fast-mode input rate for Claude Opus 4.8 per million tokens.
+pub const OPUS_4_8_FAST_MODE_INPUT_PER_MILLION: f64 = 10.0;
+
+/// Fast-mode output rate for Claude Opus 4.8 per million tokens.
+pub const OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION: f64 = 50.0;
 
 /// Errors returned by [`calculate_cost`] / [`calculate_cost_with_ttl`].
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -107,32 +112,32 @@ pub enum CacheWriteTtl {
 
 /// Pricing data for a model (per million tokens).
 ///
-/// All multipliers are applied against [`Self::input_per_million`]; see
-/// module docs for the cache-write TTL split.
+/// Cache multipliers are applied against the effective input rate selected
+/// by the cost calculator; see module docs for the cache-write TTL split.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     /// Cost per million input tokens (USD).
     pub input_per_million: f64,
     /// Cost per million output tokens (USD).
     pub output_per_million: f64,
-    /// Multiplier applied to [`Self::input_per_million`] for prompt-cache
-    /// reads.  Industry-standard 0.1× for Anthropic; the same ratio is
-    /// re-used as a conservative default for providers without explicit
-    /// cache-read pricing.
+    /// Multiplier applied to the active input rate for prompt-cache reads.
+    /// Industry-standard 0.1× for Anthropic; the same ratio is re-used as
+    /// a conservative default for providers without explicit cache-read
+    /// pricing.
     pub cache_read_multiplier: f64,
-    /// Multiplier applied to [`Self::input_per_million`] for prompt-cache
-    /// writes with the default 5 m ephemeral TTL.  1.25× for Anthropic.
+    /// Multiplier applied to the active input rate for prompt-cache writes
+    /// with the default 5 m ephemeral TTL.  1.25× for Anthropic.
     pub cache_write_5m_multiplier: f64,
-    /// Multiplier applied to [`Self::input_per_million`] for prompt-cache
-    /// writes with the 1 h TTL.  2.0× for Anthropic.  Providers that
-    /// don't expose a 1 h tier mirror the 5 m multiplier here so the
-    /// selection logic stays uniform.
+    /// Multiplier applied to the active input rate for prompt-cache writes
+    /// with the 1 h TTL.  2.0× for Anthropic.  Providers that don't expose
+    /// a 1 h tier mirror the 5 m multiplier here so the selection logic
+    /// stays uniform.
     pub cache_write_1hr_multiplier: f64,
     /// Per-million-token input rate to bill when the request is issued
     /// in fast mode (`/fast`).  `None` for models without a fast tier;
     /// [`calculate_cost_fast_mode`] then falls back to
-    /// [`Self::input_per_million`].  Populated to `Some(30.0)` for Opus
-    /// 4.6+ to mirror CC `COST_TIER_30_150` (see #642).
+    /// [`Self::input_per_million`].  Populated for Claude Opus models
+    /// with a documented fast-mode tier (see #642).
     pub fast_mode_input_per_million: Option<f64>,
     /// Per-million-token output rate to bill in fast mode.  Same
     /// fallback rules as [`Self::fast_mode_input_per_million`].
@@ -158,8 +163,7 @@ impl ModelPricing {
 
     /// Anthropic pricing with an explicit fast-mode tier (#642).
     ///
-    /// Used for Opus 4.6+ to map `/fast` requests onto
-    /// `COST_TIER_30_150` ($30 in / $150 out per Mtok).
+    /// Used for Claude Opus models with a separate fast-mode rate sheet.
     const fn anthropic_with_fast_mode(
         input_per_million: f64,
         output_per_million: f64,
@@ -248,11 +252,13 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // ---------------------------------------------------------------------
     // Anthropic — claude family
     //
-    // `claude-opus-4-` covers both the dated 2025-05-14 release and the
-    // forward-rolled `claude-opus-4-5` / `-6` / `-7` aliases that map to
-    // the same Opus rate sheet; the dash anchors the prefix so it cannot
-    // accidentally match a future `claude-opus-40-…`.
+    // `claude-opus-4-` covers the original dated 2025-05-14 Opus 4
+    // release. Newer Opus 4.5+ dateless IDs have separate pricing rows
+    // and MUST remain above the generic prefix.
     // ---------------------------------------------------------------------
+    ("claude-fable-5", ModelPricing::anthropic(10.0, 50.0)),
+    ("claude-mythos-5", ModelPricing::anthropic(10.0, 50.0)),
+    ("claude-mythos-preview", ModelPricing::anthropic(10.0, 50.0)),
     ("claude-3-5-haiku", ModelPricing::anthropic(0.80, 4.0)),
     ("claude-3-5-sonnet", ModelPricing::anthropic(3.0, 15.0)),
     ("claude-3-7-sonnet", ModelPricing::anthropic(3.0, 15.0)),
@@ -260,16 +266,24 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("claude-3-opus", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-3-sonnet", ModelPricing::anthropic(3.0, 15.0)),
     ("claude-haiku-4", ModelPricing::anthropic(1.0, 5.0)),
-    // Opus 4.6+ carries a fast-mode tier ($30/$150) per CC
-    // `COST_TIER_30_150` (modelCost.ts:147-153 — see #642).  These
+    (
+        "claude-opus-4-8",
+        ModelPricing::anthropic_with_fast_mode(
+            5.0,
+            25.0,
+            OPUS_4_8_FAST_MODE_INPUT_PER_MILLION,
+            OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION,
+        ),
+    ),
+    // Opus 4.6 / 4.7 carry the $30/$150 fast-mode tier. These
     // specific-suffix rows MUST precede the generic `claude-opus-4-`
-    // prefix below, otherwise the ordered prefix table would resolve a
-    // bare-rate row first and lose the fast-mode override.
+    // prefix below, otherwise the ordered prefix table would resolve the
+    // old Opus 4 row first and lose the fast-mode override.
     (
         "claude-opus-4-6",
         ModelPricing::anthropic_with_fast_mode(
-            15.0,
-            75.0,
+            5.0,
+            25.0,
             FAST_MODE_INPUT_PER_MILLION,
             FAST_MODE_OUTPUT_PER_MILLION,
         ),
@@ -277,12 +291,14 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     (
         "claude-opus-4-7",
         ModelPricing::anthropic_with_fast_mode(
-            15.0,
-            75.0,
+            5.0,
+            25.0,
             FAST_MODE_INPUT_PER_MILLION,
             FAST_MODE_OUTPUT_PER_MILLION,
         ),
     ),
+    ("claude-opus-4-5", ModelPricing::anthropic(5.0, 25.0)),
+    ("claude-opus-4-1", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-opus-4-", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-opus-4", ModelPricing::anthropic(15.0, 75.0)),
     ("claude-sonnet-4-", ModelPricing::anthropic(3.0, 15.0)),
@@ -293,7 +309,8 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // ---------------------------------------------------------------------
     // OpenAI
     //
-    // Note the `gpt-5.2` → `gpt-5` and `gpt-4.1-nano` → `gpt-4.1-mini` →
+    // Note the `gpt-5.5-pro` → `gpt-5.5`, `gpt-5.4-pro` → `gpt-5.4`,
+    // `gpt-5.2-pro` → `gpt-5.2`, and `gpt-4.1-nano` → `gpt-4.1-mini` →
     // `gpt-4.1` ordering: each shorter prefix must follow its longer
     // siblings or the longer ones become unreachable.
     // ---------------------------------------------------------------------
@@ -304,10 +321,22 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("gpt-4.1", ModelPricing::other(2.0, 8.0)),
     ("gpt-4-turbo", ModelPricing::other(10.0, 30.0)),
     ("gpt-4", ModelPricing::other(30.0, 60.0)),
-    ("gpt-5.2", ModelPricing::other(2.0, 8.0)),
-    ("gpt-5-nano", ModelPricing::other(0.10, 0.40)),
-    ("gpt-5-mini", ModelPricing::other(0.50, 2.0)),
-    ("gpt-5", ModelPricing::other(2.0, 8.0)),
+    ("gpt-5.5-pro", ModelPricing::other(30.0, 180.0)),
+    ("gpt-5.5", ModelPricing::other(5.0, 30.0)),
+    ("gpt-5.4-pro", ModelPricing::other(30.0, 180.0)),
+    ("gpt-5.4-mini", ModelPricing::other(0.75, 4.50)),
+    ("gpt-5.4-nano", ModelPricing::other(0.20, 1.25)),
+    ("gpt-5.4", ModelPricing::other(2.50, 15.0)),
+    ("gpt-5.3-codex", ModelPricing::other(1.75, 14.0)),
+    ("gpt-5.2-pro", ModelPricing::other(21.0, 168.0)),
+    ("gpt-5.2", ModelPricing::other(1.75, 14.0)),
+    ("gpt-5.1-codex-mini", ModelPricing::other(0.25, 2.0)),
+    ("gpt-5.1-codex", ModelPricing::other(1.25, 10.0)),
+    ("gpt-5.1", ModelPricing::other(1.25, 10.0)),
+    ("gpt-5-pro", ModelPricing::other(15.0, 120.0)),
+    ("gpt-5-nano", ModelPricing::other(0.05, 0.40)),
+    ("gpt-5-mini", ModelPricing::other(0.25, 2.0)),
+    ("gpt-5", ModelPricing::other(1.25, 10.0)),
     ("o1-mini", ModelPricing::other(3.0, 12.0)),
     ("o1-preview", ModelPricing::other(15.0, 60.0)),
     ("o1", ModelPricing::other(15.0, 60.0)),
@@ -569,13 +598,12 @@ fn calculate_cost_impl(
 
     let input_cost = input * input_rate / 1_000_000.0;
     let output_cost = output * output_rate / 1_000_000.0;
-    // Cache multipliers stay anchored to the *standard* input rate (not
-    // the fast-mode rate): cache reads/writes are billed at Anthropic's
-    // base ratios irrespective of `/fast`, matching CC behaviour.
-    let cache_read_cost =
-        cache_read * pricing.input_per_million * pricing.cache_read_multiplier / 1_000_000.0;
+    // Cache-token multipliers apply to the active input rate. For
+    // Anthropic fast mode, cache reads/writes use the fast-mode input
+    // price before applying the documented cache multiplier.
+    let cache_read_cost = cache_read * input_rate * pricing.cache_read_multiplier / 1_000_000.0;
     let cache_write_cost =
-        cache_write * pricing.input_per_million * pricing.cache_write_multiplier(ttl) / 1_000_000.0;
+        cache_write * input_rate * pricing.cache_write_multiplier(ttl) / 1_000_000.0;
     // Per #641: flat per-request charge for server-side web search.
     let web_search = web_search_cost(extras.web_search_requests);
 
@@ -626,9 +654,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn ordering_gpt_5_2_resolves_before_gpt_5() {
-        // gpt-5.2 has its own row at $2/M input / $8/M output (identical
-        // to gpt-5 today, but the *resolution path* must hit the 5.2
-        // row, not the 5 row).
+        // gpt-5.2 has its own row at $1.75/M input / $14/M output. The
+        // resolution path must hit the 5.2 row, not the generic 5 row.
         let idx_5_2 = PRICING_TABLE
             .iter()
             .position(|(p, _)| *p == "gpt-5.2")
@@ -645,6 +672,37 @@ mod tests {
         // And the lookup actually resolves.
         assert!(get_pricing("gpt-5.2").is_some());
         assert!(get_pricing("gpt-5.2-turbo").is_some());
+    }
+
+    #[test]
+    fn ordering_current_gpt5_subfamilies_precede_generic_gpt5() {
+        let idx_5 = PRICING_TABLE
+            .iter()
+            .position(|(p, _)| *p == "gpt-5")
+            .expect("table must contain gpt-5 prefix");
+        for prefix in [
+            "gpt-5.5-pro",
+            "gpt-5.5",
+            "gpt-5.4-pro",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.4",
+            "gpt-5.3-codex",
+            "gpt-5.2-pro",
+            "gpt-5.2",
+            "gpt-5.1-codex-mini",
+            "gpt-5.1-codex",
+            "gpt-5.1",
+            "gpt-5-pro",
+            "gpt-5-nano",
+            "gpt-5-mini",
+        ] {
+            let idx = PRICING_TABLE
+                .iter()
+                .position(|(p, _)| *p == prefix)
+                .unwrap_or_else(|| panic!("table must contain {prefix} prefix"));
+            assert!(idx < idx_5, "{prefix} ({idx}) must precede gpt-5 ({idx_5})");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -769,16 +827,39 @@ mod tests {
         // will fail loudly if PRICING_TABLE is out of sync.
         let provider_models: &[&str] = &[
             // Anthropic provider
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
             "claude-3-5-haiku-20241022",
             "claude-3-sonnet",
             "claude-code-20250219",
             "claude-opus-4",
+            "claude-opus-4-5",
             "claude-opus-4-6",
             "claude-opus-4-7",
+            "claude-opus-4-8",
             // OpenAI provider
             "gpt-4",
             "gpt-4o",
             "gpt-4o-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5-pro",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.2-pro",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.4-pro",
+            "gpt-5.5",
+            "gpt-5.5-2026-04-23",
+            "gpt-5.5-pro",
             "o1",
             "o1-preview",
             "o3",
@@ -851,6 +932,22 @@ mod tests {
         let p = get_pricing("claude-opus-4-20250514").expect("opus-4 must be known");
         assert!((p.input_per_million - 15.0).abs() < f64::EPSILON);
         assert!((p.output_per_million - 75.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("claude-opus-4-8").expect("opus-4-8 must be known");
+        assert!((p.input_per_million - 5.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 25.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("claude-fable-5").expect("fable must be known");
+        assert!((p.input_per_million - 10.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 50.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("gpt-5.5-pro").expect("gpt-5.5-pro must be known");
+        assert!((p.input_per_million - 30.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 180.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("gpt-5.4-mini").expect("gpt-5.4-mini must be known");
+        assert!((p.input_per_million - 0.75).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 4.50).abs() < f64::EPSILON);
     }
 
     /// Case-insensitive lookup on the input.
@@ -927,20 +1024,25 @@ mod tests {
         assert!(cost.abs() < f64::EPSILON);
     }
 
-    /// Sanity: claude-opus-4 prefix covers the dated id, the -5/-6/-7
-    /// roll-forwards, AND a bare `claude-opus-4` alias.
+    /// Sanity: claude-opus-4 prefix covers the original dated id and bare
+    /// alias at the retired Opus 4 rate, while newer dateless Opus IDs
+    /// resolve through their own lower-cost rows.
     #[test]
     fn claude_opus_4_prefix_covers_dated_and_rollforward() {
-        for id in [
-            "claude-opus-4",
-            "claude-opus-4-20250514",
-            "claude-opus-4-5",
-            "claude-opus-4-6",
-            "claude-opus-4-7",
-        ] {
+        for id in ["claude-opus-4", "claude-opus-4-20250514"] {
             let p = get_pricing(id).unwrap_or_else(|| panic!("{id} must resolve"));
             assert!((p.input_per_million - 15.0).abs() < f64::EPSILON, "{id}");
             assert!((p.output_per_million - 75.0).abs() < f64::EPSILON, "{id}");
+        }
+        for id in [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        ] {
+            let p = get_pricing(id).unwrap_or_else(|| panic!("{id} must resolve"));
+            assert!((p.input_per_million - 5.0).abs() < f64::EPSILON, "{id}");
+            assert!((p.output_per_million - 25.0).abs() < f64::EPSILON, "{id}");
         }
     }
 
@@ -1034,11 +1136,11 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         };
-        // Standard tier: $15 in + $75 out = $90 for 1M+1M.
+        // Standard tier: $5 in + $25 out = $30 for 1M+1M.
         let standard = calculate_cost("claude-opus-4-6", &usage).expect("opus-4-6 must resolve");
         assert!(
-            (standard - 90.0).abs() < 1e-9,
-            "opus-4-6 standard tier: 1M input + 1M output = $90 (got {standard})"
+            (standard - 30.0).abs() < 1e-9,
+            "opus-4-6 standard tier: 1M input + 1M output = $30 (got {standard})"
         );
         // Fast tier: $30 in + $150 out = $180 for the same usage.
         let fast =
@@ -1053,6 +1155,52 @@ mod tests {
         assert!(
             (fast47 - 180.0).abs() < 1e-9,
             "opus-4-7 fast tier: 1M input + 1M output = $180 (got {fast47})"
+        );
+        // Opus 4.8 has its own lower fast-mode tier: $10 + $50 = $60.
+        let fast48 =
+            calculate_cost_fast_mode("claude-opus-4-8", &usage).expect("opus-4-8 must resolve");
+        assert!(
+            (fast48 - 60.0).abs() < 1e-9,
+            "opus-4-8 fast tier: 1M input + 1M output = $60 (got {fast48})"
+        );
+    }
+
+    #[test]
+    fn fast_mode_cache_tokens_use_fast_input_rate() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+        };
+        let extras = UsageExtras::ZERO;
+
+        let opus_48 = calculate_cost_full(
+            "claude-opus-4-8",
+            &usage,
+            &extras,
+            CacheWriteTtl::FiveMinutes,
+            true,
+        )
+        .expect("opus-4-8 must resolve");
+        // Fast-mode input $10/M: cache read $1 + 5m cache write $12.50.
+        assert!(
+            (opus_48 - 13.50).abs() < 1e-9,
+            "opus-4-8 fast cache cost must use fast input rate; got {opus_48}"
+        );
+
+        let opus_46 = calculate_cost_full(
+            "claude-opus-4-6",
+            &usage,
+            &extras,
+            CacheWriteTtl::FiveMinutes,
+            true,
+        )
+        .expect("opus-4-6 must resolve");
+        // Fast-mode input $30/M: cache read $3 + 5m cache write $37.50.
+        assert!(
+            (opus_46 - 40.50).abs() < 1e-9,
+            "opus-4-6 fast cache cost must use fast input rate; got {opus_46}"
         );
     }
 
@@ -1086,11 +1234,15 @@ mod tests {
         );
     }
 
-    /// #642 — the ordered prefix table puts opus-4-6 / opus-4-7
+    /// #642 — the ordered prefix table puts opus-4-6 / opus-4-7 / opus-4-8
     /// BEFORE `claude-opus-4-`, otherwise the fast-mode override would
     /// be silently lost.  Regression guard against re-ordering.
     #[test]
     fn fast_mode_rows_precede_generic_opus_4_prefix() {
+        let idx_48 = PRICING_TABLE
+            .iter()
+            .position(|(p, _)| *p == "claude-opus-4-8")
+            .expect("table must contain claude-opus-4-8");
         let idx_46 = PRICING_TABLE
             .iter()
             .position(|(p, _)| *p == "claude-opus-4-6")
@@ -1103,6 +1255,10 @@ mod tests {
             .iter()
             .position(|(p, _)| *p == "claude-opus-4-")
             .expect("table must contain claude-opus-4-");
+        assert!(
+            idx_48 < idx_generic,
+            "claude-opus-4-8 ({idx_48}) must precede claude-opus-4- ({idx_generic})"
+        );
         assert!(
             idx_46 < idx_generic,
             "claude-opus-4-6 ({idx_46}) must precede claude-opus-4- ({idx_generic}) — \
@@ -1119,6 +1275,9 @@ mod tests {
         let p47 = get_pricing("claude-opus-4-7").expect("must resolve");
         assert_eq!(p47.fast_mode_input_per_million, Some(30.0));
         assert_eq!(p47.fast_mode_output_per_million, Some(150.0));
+        let p48 = get_pricing("claude-opus-4-8").expect("must resolve");
+        assert_eq!(p48.fast_mode_input_per_million, Some(10.0));
+        assert_eq!(p48.fast_mode_output_per_million, Some(50.0));
     }
 
     // -----------------------------------------------------------------------
