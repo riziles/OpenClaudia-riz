@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -892,6 +892,28 @@ impl HookEngine {
         cmd.env("CLAUDE_PROJECT_DIR", project_dir);
     }
 
+    async fn write_hook_stdin<W>(stdin: &mut W, input_json: &str) -> Result<(), HookError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        stdin.write_all(input_json.as_bytes()).await.map_err(|e| {
+            HookError::CommandFailed(format!("failed to write hook input to stdin: {e}"))
+        })?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| HookError::CommandFailed(format!("failed to close hook input stdin: {e}")))
+    }
+
+    async fn terminate_child_after_stdin_failure(child: &mut Child) {
+        if let Err(e) = child.start_kill() {
+            debug!(error = %e, "Failed to kill hook process after stdin failure");
+        }
+        if let Err(e) = child.wait().await {
+            debug!(error = %e, "Failed to reap hook process after stdin failure");
+        }
+    }
+
     /// Execute a command hook.
     ///
     /// Two execution paths:
@@ -941,10 +963,17 @@ impl HookEngine {
             .spawn()
             .map_err(|e| HookError::CommandFailed(e.to_string()))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(input_json.as_bytes()).await {
-                warn!("Failed to write hook input to stdin: {}", e);
-            }
+        let Some(mut stdin) = child.stdin.take() else {
+            Self::terminate_child_after_stdin_failure(&mut child).await;
+            return Err(HookError::CommandFailed(
+                "hook stdin unavailable".to_string(),
+            ));
+        };
+        let stdin_result = Self::write_hook_stdin(&mut stdin, input_json).await;
+        drop(stdin);
+        if let Err(e) = stdin_result {
+            Self::terminate_child_after_stdin_failure(&mut child).await;
+            return Err(e);
         }
 
         let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
@@ -1010,6 +1039,32 @@ mod tests {
     use super::*;
     use crate::config::{HooksConfig, SandboxMode};
     use merge::merge_claude_hooks;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct FailingAsyncWrite;
+
+    impl tokio::io::AsyncWrite for FailingAsyncWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic broken pipe",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_hook_event_config_keys() {
@@ -1078,6 +1133,22 @@ mod tests {
 
         assert!(result.allowed);
         assert!(result.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_stdin_write_failure_returns_command_failed() {
+        let mut writer = FailingAsyncWrite;
+        let err = HookEngine::write_hook_stdin(&mut writer, "{}")
+            .await
+            .expect_err("broken stdin write must fail");
+
+        match err {
+            HookError::CommandFailed(message) => {
+                assert!(message.contains("stdin"), "{message}");
+                assert!(message.contains("synthetic broken pipe"), "{message}");
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
     }
 
     // ========================================================================
