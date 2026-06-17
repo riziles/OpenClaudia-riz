@@ -1249,6 +1249,12 @@ fn u64_to_u32_saturating(v: u64) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
+/// Convert a zero-based LSP position component to a one-based user-facing
+/// coordinate without overflowing on malformed huge server values.
+fn lsp_position_to_user_coordinate(v: u64) -> u32 {
+    u64_to_u32_saturating(v).saturating_add(1)
+}
+
 /// Extract a flat text rendering of a `Hover.contents` payload.
 ///
 /// Per LSP spec, `contents` may be:
@@ -1446,20 +1452,19 @@ fn parse_locations(data: Option<&Value>) -> Vec<LspLocation> {
                 line: start
                     .get("line")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or(0, u64_to_u32_saturating)
-                    + 1,
+                    .map_or(1, lsp_position_to_user_coordinate),
                 character: start
                     .get("character")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or(0, u64_to_u32_saturating),
+                    .map_or(1, lsp_position_to_user_coordinate),
                 end_line: end
                     .and_then(|e| e.get("line"))
                     .and_then(serde_json::Value::as_u64)
-                    .map(|l| u64_to_u32_saturating(l) + 1),
+                    .map(lsp_position_to_user_coordinate),
                 end_character: end
                     .and_then(|e| e.get("character"))
                     .and_then(serde_json::Value::as_u64)
-                    .map(u64_to_u32_saturating),
+                    .map(lsp_position_to_user_coordinate),
                 preview: None,
             })
         })
@@ -1489,20 +1494,19 @@ fn parse_call_hierarchy(data: Option<&Value>, key: &str) -> Vec<LspLocation> {
                 line: start
                     .get("line")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or(0, u64_to_u32_saturating)
-                    + 1,
+                    .map_or(1, lsp_position_to_user_coordinate),
                 character: start
                     .get("character")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or(0, u64_to_u32_saturating),
+                    .map_or(1, lsp_position_to_user_coordinate),
                 end_line: end
                     .and_then(|e| e.get("line"))
                     .and_then(serde_json::Value::as_u64)
-                    .map(|l| u64_to_u32_saturating(l) + 1),
+                    .map(lsp_position_to_user_coordinate),
                 end_character: end
                     .and_then(|e| e.get("character"))
                     .and_then(serde_json::Value::as_u64)
-                    .map(u64_to_u32_saturating),
+                    .map(lsp_position_to_user_coordinate),
                 preview: item.get("name").and_then(Value::as_str).map(str::to_string),
             })
         })
@@ -1700,9 +1704,9 @@ mod tests {
         let locs = parse_locations(Some(&data));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].line, 11); // 0-indexed to 1-indexed
-        assert_eq!(locs[0].character, 5);
+        assert_eq!(locs[0].character, 6);
         assert_eq!(locs[0].end_line, Some(11));
-        assert_eq!(locs[0].end_character, Some(15));
+        assert_eq!(locs[0].end_character, Some(16));
     }
 
     #[test]
@@ -1714,6 +1718,23 @@ mod tests {
         let locs = parse_locations(Some(&data));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].line, 1);
+    }
+
+    #[test]
+    fn parse_locations_saturates_huge_lsp_coordinates() {
+        let data = json!([{
+            "uri": "file:///test.rs",
+            "range": {
+                "start": {"line": u64::MAX, "character": u64::MAX},
+                "end": {"line": u64::MAX, "character": u64::MAX}
+            }
+        }]);
+        let locs = parse_locations(Some(&data));
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].line, u32::MAX);
+        assert_eq!(locs[0].character, u32::MAX);
+        assert_eq!(locs[0].end_line, Some(u32::MAX));
+        assert_eq!(locs[0].end_character, Some(u32::MAX));
     }
 
     #[test]
@@ -1887,11 +1908,10 @@ mod tests {
     // Spec B1: goToDefinition — server selection + location return
     // ─────────────────────────────────────────────────────────────
 
-    /// B1a — Coordinate system: OC converts 0-based LSP lines to 1-based by
-    /// adding 1 to `start.line`. `character` is NOT adjusted (stays 0-based).
-    /// Gap: character should also become 1-based per spec, but OC omits that.
+    /// B1a — Coordinate system: OC converts 0-based LSP line/character
+    /// positions to 1-based user-facing coordinates.
     #[test]
-    fn spec_b1_coordinate_conversion_line_1based_character_0based() {
+    fn spec_b1_coordinate_conversion_line_and_character_1based() {
         let data = json!([{
             "uri": "file:///foo.rs",
             "range": {
@@ -1901,10 +1921,10 @@ mod tests {
         }]);
         let locs = parse_locations(Some(&data));
         assert_eq!(locs.len(), 1);
-        // OC adds 1 to line (0→1-based); pinning that exact conversion.
         assert_eq!(locs[0].line, 10);
-        // OC does NOT add 1 to character — it stays 0-based. (Gap vs CC spec.)
-        assert_eq!(locs[0].character, 3);
+        assert_eq!(locs[0].character, 4);
+        assert_eq!(locs[0].end_line, Some(10));
+        assert_eq!(locs[0].end_character, Some(13));
     }
 
     /// B1b — OC stores the raw `file://…` URI, not a workspace-relative path.
@@ -1941,7 +1961,7 @@ mod tests {
         // targetSelectionRange is the symbol name; preferred over targetRange.
         // Line is 0-based at the wire → 1-based here, so 7 → 8.
         assert_eq!(locs[0].line, 8);
-        assert_eq!(locs[0].character, 4);
+        assert_eq!(locs[0].character, 5);
     }
 
     /// `LocationLink` without `targetSelectionRange` should fall back to
@@ -2293,6 +2313,8 @@ mod tests {
         assert_eq!(result.action, "prepareCallHierarchy");
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].line, 5); // 4 + 1 (1-based)
+        assert_eq!(result.results[0].character, 1); // 0 + 1 (1-based)
+        assert_eq!(result.results[0].end_character, Some(4));
         assert_eq!(result.results[0].preview.as_deref(), Some("foo"));
     }
 
@@ -2322,6 +2344,8 @@ mod tests {
         assert_eq!(result.action, "incomingCalls");
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].uri, "file:///caller.rs");
+        assert_eq!(result.results[0].character, 1);
+        assert_eq!(result.results[0].end_character, Some(7));
 
         let resp_out = json!({
             "id": 2,
@@ -2347,6 +2371,8 @@ mod tests {
         assert_eq!(result_out.action, "outgoingCalls");
         assert_eq!(result_out.results.len(), 1);
         assert_eq!(result_out.results[0].uri, "file:///callee.rs");
+        assert_eq!(result_out.results[0].character, 1);
+        assert_eq!(result_out.results[0].end_character, Some(7));
     }
 
     // Spec B6: Server crash mid-call → explicit error, not hang
