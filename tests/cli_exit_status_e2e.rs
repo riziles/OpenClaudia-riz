@@ -728,6 +728,36 @@ fn start_rejects_model_flag_instead_of_ignoring_it() {
 }
 
 #[test]
+fn start_rejects_root_model_flag_instead_of_ignoring_it() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["--model", "gpt-5.5", "start"])
+        .output()
+        .expect("openclaudia start must run");
+
+    assert!(
+        !output.status.success(),
+        "root --model with start must fail instead of being ignored; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--model cannot be used with 'start'"),
+        "root --model should be rejected by OpenClaudia preflight; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("No configuration found"),
+        "root --model should fail before start config loading; got {combined:?}"
+    );
+}
+
+#[test]
 fn acp_accepts_its_own_model_flag() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
@@ -752,6 +782,94 @@ fn acp_accepts_its_own_model_flag() {
     assert!(
         !combined.contains("unexpected argument '--model'"),
         "acp owns --model and must not reject it; got {combined:?}"
+    );
+}
+
+#[test]
+fn acp_accepts_root_model_flag() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["--model", "gpt-5.5", "acp"])
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        !output.status.success(),
+        "acp without config still fails, but not because root --model was rejected"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("No configuration found") || combined.contains("no configuration found"),
+        "acp with root --model should parse and then fail on missing config; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("--model cannot be used"),
+        "acp is allowed to inherit root --model; got {combined:?}"
+    );
+}
+
+#[test]
+fn acp_rejects_root_resume_flag_instead_of_ignoring_it() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["--resume", "acp"])
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        !output.status.success(),
+        "root --resume with acp must fail instead of being ignored; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--resume/--continue cannot be used with 'acp'"),
+        "root --resume should be rejected by OpenClaudia preflight; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("No configuration found"),
+        "root --resume should fail before acp config loading; got {combined:?}"
+    );
+}
+
+#[test]
+fn doctor_rejects_root_target_flag_instead_of_ignoring_it() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["--target", "openai", "doctor"])
+        .output()
+        .expect("openclaudia doctor must run");
+
+    assert!(
+        !output.status.success(),
+        "root --target with doctor must fail instead of being ignored; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--target cannot be used with 'doctor'"),
+        "root --target should be rejected by OpenClaudia preflight; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("No configuration found"),
+        "root --target should fail before doctor config loading; got {combined:?}"
     );
 }
 

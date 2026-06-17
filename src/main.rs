@@ -265,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    reject_ignored_root_flags_for_subcommand(&cli)?;
+
     match cli.command {
         None if cli.tui_mode => {
             // Legacy rustyline REPL (--tui-mode is now the escape hatch name, kept for compat)
@@ -314,6 +316,58 @@ async fn main() -> anyhow::Result<()> {
             port,
             target,
         }) => cli::commands::loop_cmd::cmd_loop(max_iterations, port, target.or(cli.target)).await,
+    }
+}
+
+fn reject_ignored_root_flags_for_subcommand(cli: &Cli) -> anyhow::Result<()> {
+    let Some(command) = cli.command.as_ref() else {
+        return Ok(());
+    };
+
+    let command_name = subcommand_name(command);
+    let allows_root_target = matches!(
+        command,
+        Commands::Start { .. } | Commands::Acp { .. } | Commands::Loop { .. }
+    );
+    let allows_root_model = matches!(command, Commands::Acp { .. });
+
+    if cli.model.is_some() && !allows_root_model {
+        anyhow::bail!("--model cannot be used with '{command_name}'");
+    }
+    if cli.target.is_some() && !allows_root_target {
+        anyhow::bail!("--target cannot be used with '{command_name}'");
+    }
+    if cli.resume {
+        anyhow::bail!("--resume/--continue cannot be used with '{command_name}'");
+    }
+    if cli.session_id.is_some() {
+        anyhow::bail!("--session-id cannot be used with '{command_name}'");
+    }
+    if cli.coordinator {
+        anyhow::bail!("--coordinator cannot be used with '{command_name}'");
+    }
+    if cli.dangerously_skip_permissions {
+        anyhow::bail!("--dangerously-skip-permissions cannot be used with '{command_name}'");
+    }
+    if cli.tui_mode {
+        anyhow::bail!("--tui-mode cannot be used with '{command_name}'");
+    }
+    if cli.mode.is_some() {
+        anyhow::bail!("--mode cannot be used with '{command_name}'");
+    }
+
+    Ok(())
+}
+
+const fn subcommand_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Init { .. } => "init",
+        Commands::Auth { .. } => "auth",
+        Commands::Start { .. } => "start",
+        Commands::Config => "config",
+        Commands::Doctor => "doctor",
+        Commands::Acp { .. } => "acp",
+        Commands::Loop { .. } => "loop",
     }
 }
 
