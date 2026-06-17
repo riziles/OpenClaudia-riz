@@ -663,19 +663,11 @@ impl SessionManager {
         }
     }
 
-    /// Get the current session, creating one if none exists
-    ///
-    /// # Panics
-    ///
-    /// Panics if session creation succeeds but the internal option is still `None`
-    /// (should be unreachable).
+    /// Get the current session, creating one if none exists.
     pub fn get_or_create_session(&mut self) -> &Session {
-        if self.current_session.is_none() {
-            self.current_session = Some(self.create_session());
-        }
+        let persist_dir = self.persist_dir.clone();
         self.current_session
-            .as_ref()
-            .expect("session must exist after get_or_create")
+            .get_or_insert_with(|| Self::create_session_for_persist_dir(&persist_dir))
     }
 
     /// Get the current session mutably
@@ -710,10 +702,10 @@ impl SessionManager {
         self.vdd_pending_context.take()
     }
 
-    /// Create a new session (initializer or coding based on history)
-    fn create_session(&self) -> Session {
+    fn create_session_for_persist_dir(persist_dir: &Path) -> Session {
         // Check if there's a previous session to continue from
-        if let Some(last_session) = self.load_latest_session() {
+        let latest_path = persist_dir.join("latest.json");
+        if let Some(last_session) = Self::load_session_from_path(&latest_path) {
             info!(
                 parent_id = %last_session.id,
                 "Creating coding session continuing from previous"
@@ -725,27 +717,14 @@ impl SessionManager {
         }
     }
 
-    /// Start a fresh initializer session
-    ///
-    /// # Panics
-    ///
-    /// Panics if session assignment succeeds but the internal option is still `None`
-    /// (should be unreachable).
+    /// Start a fresh initializer session.
     pub fn start_initializer(&mut self) -> &Session {
         let session = Session::new_initializer();
         info!(session_id = %session.id, "Started initializer session");
-        self.current_session = Some(session);
-        self.current_session
-            .as_ref()
-            .expect("session must exist after assignment")
+        self.current_session.insert(session)
     }
 
-    /// Start a coding session from a parent
-    ///
-    /// # Panics
-    ///
-    /// Panics if session assignment succeeds but the internal option is still `None`
-    /// (should be unreachable).
+    /// Start a coding session from a parent.
     pub fn start_coding(&mut self, parent_id: &str) -> &Session {
         let session = Session::new_coding(parent_id);
         info!(
@@ -753,10 +732,7 @@ impl SessionManager {
             parent_id = %parent_id,
             "Started coding session"
         );
-        self.current_session = Some(session);
-        self.current_session
-            .as_ref()
-            .expect("session must exist after assignment")
+        self.current_session.insert(session)
     }
 
     /// End the current session and persist it.
@@ -830,19 +806,18 @@ impl SessionManager {
             return None;
         }
         let path = self.persist_dir.join(format!("{session_id}.json"));
-        self.load_session_from_path(&path)
+        Self::load_session_from_path(&path)
     }
 
     /// Load the most recent session
     #[must_use]
     pub fn load_latest_session(&self) -> Option<Session> {
         let path = self.persist_dir.join("latest.json");
-        self.load_session_from_path(&path)
+        Self::load_session_from_path(&path)
     }
 
     /// Load a session from a file path
-    #[allow(clippy::unused_self)]
-    fn load_session_from_path(&self, path: &Path) -> Option<Session> {
+    fn load_session_from_path(path: &Path) -> Option<Session> {
         if !path.exists() {
             return None;
         }
@@ -906,7 +881,7 @@ impl SessionManager {
                     if path.file_stem().is_some_and(|s| s == "latest") {
                         continue;
                     }
-                    if let Some(session) = self.load_session_from_path(&path) {
+                    if let Some(session) = Self::load_session_from_path(&path) {
                         sessions.push(session);
                     }
                 }
@@ -1014,17 +989,10 @@ impl OwnedSessionGuard<'_> {
     ///
     /// Forwards any error returned by [`SessionManager::end_session`].
     ///
-    /// # Panics
-    ///
-    /// Panics if called on a guard whose backing manager reference has
-    /// already been taken — this is unreachable for a guard obtained via
-    /// [`SessionManager::create_session_guard`], because `end` consumes
-    /// `self` by value.
     pub fn end(mut self) -> Result<Session, EndSessionError> {
-        let manager = self
-            .manager
-            .take()
-            .expect("OwnedSessionGuard::end called on a drained guard");
+        let Some(manager) = self.manager.take() else {
+            return Err(EndSessionError::NotFound);
+        };
         manager.end_session(self.handoff_notes.as_deref())
     }
 }
@@ -1602,6 +1570,22 @@ mod tests {
         let err = manager
             .end_session(None)
             .expect_err("end_session with no active session must be Err");
+        assert!(
+            matches!(err, EndSessionError::NotFound),
+            "expected EndSessionError::NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn owned_session_guard_end_without_manager_returns_not_found() {
+        let guard = OwnedSessionGuard {
+            manager: None,
+            handoff_notes: None,
+        };
+
+        let err = guard
+            .end()
+            .expect_err("drained guard should return a typed error, not panic");
         assert!(
             matches!(err, EndSessionError::NotFound),
             "expected EndSessionError::NotFound, got {err:?}"
