@@ -235,6 +235,60 @@ fn auth_state_mismatch_exits_nonzero_before_token_exchange() {
 }
 
 #[test]
+fn start_rejects_model_flag_instead_of_ignoring_it() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["start", "--model", "gpt-5.5"])
+        .output()
+        .expect("openclaudia start must run");
+
+    assert!(
+        !output.status.success(),
+        "start --model must fail at CLI parsing instead of ignoring the model; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--model'"),
+        "start --model should be rejected by clap; got {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("No configuration found"),
+        "start --model should fail before config loading; got {stderr:?}"
+    );
+}
+
+#[test]
+fn acp_accepts_its_own_model_flag() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let output = isolated_command(&cwd, &home)
+        .args(["acp", "--model", "gpt-5.5"])
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        !output.status.success(),
+        "acp without config still fails, but not because --model was rejected"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("No configuration found") || combined.contains("no configuration found"),
+        "acp --model should parse and then fail on missing config; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("unexpected argument '--model'"),
+        "acp owns --model and must not reject it; got {combined:?}"
+    );
+}
+
+#[test]
 fn help_describes_tui_mode_as_legacy_repl_escape_hatch() {
     let output = Command::new(env!("CARGO_BIN_EXE_openclaudia"))
         .arg("--help")

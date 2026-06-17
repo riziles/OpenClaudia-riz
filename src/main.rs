@@ -79,7 +79,7 @@ struct Cli {
     command: Option<Commands>,
 
     /// Model to use for chat
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     model: Option<String>,
 
     /// Target provider to use for chat
