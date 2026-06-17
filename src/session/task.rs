@@ -116,11 +116,6 @@ impl TaskManager {
     }
 
     /// Create a new task. Returns the created task.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal tasks vector is somehow empty after pushing
-    /// (should be unreachable).
     pub fn create_task(
         &mut self,
         subject: String,
@@ -140,10 +135,9 @@ impl TaskManager {
             blocked_by: Vec::new(),
             created_at: Utc::now(),
         };
+        let idx = self.tasks.len();
         self.tasks.push(task);
-        self.tasks
-            .last()
-            .expect("tasks must be non-empty after push")
+        &self.tasks[idx]
     }
 
     /// Get a task by ID.
@@ -193,10 +187,6 @@ impl TaskManager {
     /// a dependency references itself or a nonexistent task, or the task
     /// is deleted (deletion is signaled via `Err` with a message).
     ///
-    /// # Panics
-    ///
-    /// Panics if internal lookups fail after validation (should be unreachable).
-    ///
     /// crosslink #874: the previous 150-line god function has been split into
     /// focused helpers (status transition, dependency validation, reverse-
     /// edge sync). Dependency existence checks build a `HashMap<&str, usize>`
@@ -232,9 +222,11 @@ impl TaskManager {
         self.validate_dependency_edges(task_id, add_blocks.as_deref(), add_blocked_by.as_deref())?;
 
         // Phase 3: apply scalar field updates and the new edges.
+        let task = self
+            .get_task_mut(task_id)
+            .ok_or_else(|| format!("Task '{task_id}' disappeared before update"))?;
         Self::apply_task_fields(
-            self.get_task_mut(task_id)
-                .expect("task must exist after validation"),
+            task,
             new_status,
             subject,
             description,
@@ -247,10 +239,10 @@ impl TaskManager {
         // are always symmetric.
         self.sync_reverse_edges(task_id);
 
-        Ok(Some(
-            self.get_task(task_id)
-                .expect("task must exist after update"),
-        ))
+        let task = self
+            .get_task(task_id)
+            .ok_or_else(|| format!("Task '{task_id}' disappeared after update"))?;
+        Ok(Some(task))
     }
 
     /// Apply (or short-circuit) a status transition. Returns the new
