@@ -1,5 +1,28 @@
 use openclaudia::tools::safe_truncate;
 
+fn spawn_browser_opener(auth_url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(opener) = which::which("rundll32") {
+            let _ = std::process::Command::new(opener)
+                .args(["url.dll,FileProtocolHandler", auth_url])
+                .spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(opener) = which::which("open") {
+            let _ = std::process::Command::new(opener).arg(auth_url).spawn();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(opener) = which::which("xdg-open") {
+            let _ = std::process::Command::new(opener).arg(auth_url).spawn();
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 /// Authenticate with Claude Max subscription via OAuth
 pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
@@ -72,22 +95,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     println!("  {auth_url}\n");
 
     // Try to open browser automatically
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &auth_url])
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(&auth_url).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&auth_url)
-            .spawn();
-    }
+    spawn_browser_opener(&auth_url);
 
     println!("Step 2: Sign in to Claude and authorize the application.");
     println!("Step 3: Copy the code shown (format: CODE#STATE)\n");
@@ -163,4 +171,41 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     println!("Claude Max subscription automatically when target is 'anthropic'.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn auth_browser_openers_use_resolved_binaries() {
+        let source = include_str!("auth.rs");
+        let cfg_test = source
+            .find("#[cfg(test)]")
+            .expect("test marker must be present");
+        let production = &source[..cfg_test];
+
+        for bare in [
+            "Command::new(\"rundll32\")",
+            "Command::new(\"open\")",
+            "Command::new(\"xdg-open\")",
+            "std::process::Command::new(\"rundll32\")",
+            "std::process::Command::new(\"open\")",
+            "std::process::Command::new(\"xdg-open\")",
+        ] {
+            assert!(
+                !production.contains(bare),
+                "auth opener must not invoke bare platform command: {bare}"
+            );
+        }
+
+        for resolver in [
+            "which::which(\"rundll32\")",
+            "which::which(\"open\")",
+            "which::which(\"xdg-open\")",
+        ] {
+            assert!(
+                production.contains(resolver),
+                "auth opener must resolve platform command with {resolver}"
+            );
+        }
+    }
 }
