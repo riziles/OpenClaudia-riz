@@ -44,7 +44,7 @@ use super::{ApiKey, ProviderAdapter, ProviderError};
 pub(super) enum ThinkingInjector {
     /// No provider-specific thinking parameter is emitted.
     None,
-    /// `OpenAI` o1/o3/o4 reasoning models.
+    /// `OpenAI` reasoning-family models.
     ///
     /// Sets `reasoning_effort` to the configured value (default
     /// `"medium"`) if and only if `thinking.enabled` is true AND the
@@ -85,11 +85,8 @@ impl ThinkingInjector {
             Self::None => {}
             Self::OpenAiReasoningEffort => {
                 if thinking.enabled {
-                    let is_reasoning_model = model.starts_with("o1")
-                        || model.starts_with("o3")
-                        || model.starts_with("o4");
                     let effort = thinking.reasoning_effort.as_deref().unwrap_or("medium");
-                    if is_reasoning_model {
+                    if is_openai_reasoning_model(model) {
                         body["reasoning_effort"] = json!(effort);
                         debug!("Added OpenAI reasoning params: effort={}", effort);
                     } else {
@@ -103,7 +100,7 @@ impl ThinkingInjector {
                         warn!(
                             model = %model,
                             ignored_reasoning_effort = %effort,
-                            "ignoring reasoning_effort: model is not in the o1/o3/o4 reasoning family — \
+                            "ignoring reasoning_effort: model is not in the OpenAI reasoning family — \
                              configured thinking is a no-op for this model",
                         );
                     }
@@ -139,6 +136,23 @@ impl ThinkingInjector {
             }
         }
     }
+}
+
+fn is_openai_reasoning_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"]
+        .iter()
+        .any(|family| is_model_family(&model, family))
+}
+
+fn is_model_family(model: &str, family: &str) -> bool {
+    if model == family {
+        return true;
+    }
+
+    model
+        .strip_prefix(family)
+        .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('.'))
 }
 
 /// Shared `OpenAI`-compatible adapter parameterized on the provider's
@@ -379,9 +393,28 @@ mod tests {
     }
 
     #[test]
+    fn openai_reasoning_effort_set_for_gpt5_model_family() {
+        for model in ["gpt-5", "gpt-5.5", "gpt-5.3-codex", "gpt-5.1-codex-max"] {
+            let mut body = serde_json::to_value(req(model)).unwrap();
+            ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_on(), model);
+            assert_eq!(
+                body["reasoning_effort"], "medium",
+                "{model} should receive reasoning_effort"
+            );
+        }
+    }
+
+    #[test]
     fn openai_reasoning_effort_absent_for_non_reasoning_model() {
         let mut body = serde_json::to_value(req("gpt-4")).unwrap();
         ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_on(), "gpt-4");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_effort_absent_for_near_miss_model_family() {
+        let mut body = serde_json::to_value(req("gpt-50")).unwrap();
+        ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &thinking_on(), "gpt-50");
         assert!(body.get("reasoning_effort").is_none());
     }
 

@@ -1,8 +1,9 @@
 //! `OpenAI` Chat Completions API adapter.
 //!
 //! Thin newtype around [`OpenAiCompatibleAdapter`]. The only `OpenAI`-specific
-//! configuration is the `reasoning_effort` injection for o1/o3/o4 reasoning
-//! models — every other behaviour is the shared OpenAI-compatible path.
+//! configuration is the `reasoning_effort` injection for `OpenAI`
+//! reasoning-family models - every other behaviour is the shared
+//! OpenAI-compatible path.
 //!
 //! See crosslink #281 for the Stovepipe-de-duplication that introduced
 //! this shape.
@@ -17,7 +18,7 @@ use super::openai_compat::{OpenAiCompatibleAdapter, ThinkingInjector};
 use super::{ApiKey, ProviderAdapter, ProviderError};
 
 /// `OpenAI` API adapter (Chat Completions, with optional `reasoning_effort`
-/// for o1/o3/o4-series models).
+/// for `OpenAI` reasoning-family models).
 pub struct OpenAIAdapter(OpenAiCompatibleAdapter);
 
 impl OpenAIAdapter {

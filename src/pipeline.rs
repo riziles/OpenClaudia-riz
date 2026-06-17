@@ -148,10 +148,10 @@ pub fn build_anthropic_request(
 
 /// Build an OpenAI-compatible request body (used by `OpenAI`, `DeepSeek`, Qwen, Z.AI).
 ///
-/// `effort_level` propagates as `reasoning_effort` for `high`/`max` to
-/// unlock o1/o3 reasoning; `max` downgrades to `high` because the API
-/// only accepts the level on a subset of models (matches Claude Code's
-/// `modelSupportsMaxEffort` clamp).
+/// `effort_level` propagates as `reasoning_effort` for `high`/`max`;
+/// `max` downgrades to `high` because the API only accepts the level on
+/// a subset of models (matches Claude Code's `modelSupportsMaxEffort`
+/// clamp).
 #[must_use]
 pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str) -> Value {
     let mut req = serde_json::json!({

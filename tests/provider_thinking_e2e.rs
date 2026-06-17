@@ -7,7 +7,7 @@
 //! provider-specific thinking controls not modeled here:
 //!
 //!   - **`OpenAI`**: `reasoning_effort: "low|medium|high"`,
-//!     ONLY for o1/o3/o4 models.
+//!     only for OpenAI reasoning-family models.
 //!   - **`DeepSeek`**: `enable_thinking: true` when enabled;
 //!     ABSENT when disabled (silent no-op).
 //!   - **`Qwen`**: `enable_thinking` ALWAYS written (true OR false).
@@ -72,7 +72,7 @@ const fn disabled_thinking() -> ThinkingConfig {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — OpenAI: reasoning_effort gated by o1/o3/o4 model family
+// Section A - OpenAI: reasoning_effort gated by reasoning model family
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -102,13 +102,39 @@ fn openai_thinking_defaults_reasoning_effort_to_medium() {
 }
 
 #[test]
+fn openai_thinking_injects_reasoning_effort_for_gpt5_model() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("gpt-5.5");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
+        .expect("transform");
+    assert_eq!(
+        body["reasoning_effort"], "high",
+        "GPT-5 model with thinking enabled MUST set reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn openai_thinking_injects_reasoning_effort_for_gpt5_codex_model() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+    let req = minimal_request("gpt-5.3-codex");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
+        .expect("transform");
+    assert_eq!(
+        body["reasoning_effort"], "high",
+        "GPT-5 Codex model with thinking enabled MUST set reasoning_effort; got {body}"
+    );
+}
+
+#[test]
 fn openai_thinking_ignored_for_non_reasoning_model() {
     let adapter = get_adapter("openai").expect("openai adapter");
     let req = minimal_request("gpt-4o");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
         .expect("transform");
-    // gpt-4o is NOT in o1/o3/o4 — reasoning_effort MUST NOT be set.
+    // gpt-4o is not in the reasoning family, so reasoning_effort MUST NOT be set.
     assert!(
         body.get("reasoning_effort").is_none(),
         "non-reasoning model MUST NOT receive reasoning_effort; got {body}"
@@ -295,7 +321,7 @@ fn each_provider_uses_a_distinct_thinking_field() {
         .unwrap()
         .transform_request_with_thinking(&req, &thinking)
         .unwrap();
-    // a-model is NOT o1/o3/o4 so openai injects nothing — that's
+    // a-model is not in the reasoning family so openai injects nothing - that's
     // the documented behaviour pinned in Section A.
     assert!(openai.get("reasoning_effort").is_none());
 
