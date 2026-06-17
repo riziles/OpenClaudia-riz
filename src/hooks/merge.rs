@@ -98,12 +98,24 @@ pub(crate) fn enforce_total_size(value: &Value) -> Result<(), MergeError> {
 pub fn merge_hooks_config(base: HooksConfig, other: HooksConfig) -> HooksConfig {
     let mut merged = base;
 
+    if other.policy.is_some() {
+        merged.policy = other.policy;
+    }
     dedup_hook_entries(&mut merged.session_start, other.session_start);
     dedup_hook_entries(&mut merged.session_end, other.session_end);
     dedup_hook_entries(&mut merged.pre_tool_use, other.pre_tool_use);
     dedup_hook_entries(&mut merged.post_tool_use, other.post_tool_use);
+    dedup_hook_entries(
+        &mut merged.post_tool_use_failure,
+        other.post_tool_use_failure,
+    );
     dedup_hook_entries(&mut merged.user_prompt_submit, other.user_prompt_submit);
     dedup_hook_entries(&mut merged.stop, other.stop);
+    dedup_hook_entries(&mut merged.subagent_start, other.subagent_start);
+    dedup_hook_entries(&mut merged.subagent_stop, other.subagent_stop);
+    dedup_hook_entries(&mut merged.pre_compact, other.pre_compact);
+    dedup_hook_entries(&mut merged.permission_request, other.permission_request);
+    dedup_hook_entries(&mut merged.notification, other.notification);
     dedup_hook_entries(&mut merged.pre_adversary_review, other.pre_adversary_review);
     dedup_hook_entries(
         &mut merged.post_adversary_review,

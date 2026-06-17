@@ -22,6 +22,8 @@
 //!   - **All slot coverage** — every documented slot
 //!     (`session_start`, `session_end`, `pre_tool_use`, etc.) is
 //!     merged.
+//!   - **Policy precedence** — an explicit policy from a later layer
+//!     replaces an earlier policy.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -224,11 +226,9 @@ pre_tool_use:
 
 #[test]
 fn merge_propagates_across_every_documented_slot() {
-    // Each of the 8 slots that merge_hooks_config touches —
-    // session_start, session_end, pre_tool_use, post_tool_use,
-    // user_prompt_submit, stop, pre_adversary_review,
-    // post_adversary_review, vdd_conflict, vdd_converged —
-    // gets exactly one entry from `other` when `base` is empty.
+    // Every public hook slot gets exactly one entry from `other` when
+    // `base` is empty. This catches drift when HooksConfig gains a new
+    // lifecycle event but merge_hooks_config is not updated.
     let base = HooksConfig::default();
     let other = cfg(r#"
 session_start:
@@ -239,9 +239,29 @@ pre_tool_use:
   - hooks: [{type: command, command: "x"}]
 post_tool_use:
   - hooks: [{type: command, command: "x"}]
+post_tool_use_failure:
+  - hooks: [{type: command, command: "x"}]
 user_prompt_submit:
   - hooks: [{type: command, command: "x"}]
 stop:
+  - hooks: [{type: command, command: "x"}]
+subagent_start:
+  - hooks: [{type: command, command: "x"}]
+subagent_stop:
+  - hooks: [{type: command, command: "x"}]
+pre_compact:
+  - hooks: [{type: command, command: "x"}]
+permission_request:
+  - hooks: [{type: command, command: "x"}]
+notification:
+  - hooks: [{type: command, command: "x"}]
+pre_adversary_review:
+  - hooks: [{type: command, command: "x"}]
+post_adversary_review:
+  - hooks: [{type: command, command: "x"}]
+vdd_conflict:
+  - hooks: [{type: command, command: "x"}]
+vdd_converged:
   - hooks: [{type: command, command: "x"}]
 "#);
     let merged = merge_hooks_config(base, other);
@@ -250,14 +270,78 @@ stop:
         ("session_end", merged.session_end.len()),
         ("pre_tool_use", merged.pre_tool_use.len()),
         ("post_tool_use", merged.post_tool_use.len()),
+        ("post_tool_use_failure", merged.post_tool_use_failure.len()),
         ("user_prompt_submit", merged.user_prompt_submit.len()),
         ("stop", merged.stop.len()),
+        ("subagent_start", merged.subagent_start.len()),
+        ("subagent_stop", merged.subagent_stop.len()),
+        ("pre_compact", merged.pre_compact.len()),
+        ("permission_request", merged.permission_request.len()),
+        ("notification", merged.notification.len()),
+        ("pre_adversary_review", merged.pre_adversary_review.len()),
+        ("post_adversary_review", merged.post_adversary_review.len()),
+        ("vdd_conflict", merged.vdd_conflict.len()),
+        ("vdd_converged", merged.vdd_converged.len()),
     ] {
         assert_eq!(
             *count, 1,
             "slot {name:?} must receive other's entry; got {count}"
         );
     }
+}
+
+#[test]
+fn merge_explicit_later_policy_replaces_base_policy() {
+    let base = cfg(r#"
+policy:
+  allowed_commands: ["python"]
+  sandbox: env_scrub
+"#);
+    let other = cfg(r#"
+policy:
+  allowed_commands: ["node"]
+  sandbox: full_sandbox
+"#);
+
+    let merged = merge_hooks_config(base, other);
+    let policy = merged
+        .policy
+        .expect("later explicit policy must be retained");
+    let allowed = policy
+        .allowed_commands
+        .expect("allowed_commands must be retained");
+
+    assert!(
+        allowed.contains("node"),
+        "later policy allowed_commands must win: {allowed:?}"
+    );
+    assert!(
+        !allowed.contains("python"),
+        "earlier policy must be replaced: {allowed:?}"
+    );
+    assert_eq!(
+        policy.sandbox,
+        openclaudia::config::SandboxMode::FullSandbox
+    );
+}
+
+#[test]
+fn merge_absent_later_policy_preserves_base_policy() {
+    let base = cfg(r#"
+policy:
+  allowed_commands: ["python"]
+  sandbox: env_scrub
+"#);
+    let other = HooksConfig::default();
+
+    let merged = merge_hooks_config(base, other);
+    let policy = merged.policy.expect("base policy must be preserved");
+    let allowed = policy
+        .allowed_commands
+        .expect("base allowed_commands must be retained");
+
+    assert!(allowed.contains("python"));
+    assert_eq!(policy.sandbox, openclaudia::config::SandboxMode::EnvScrub);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
