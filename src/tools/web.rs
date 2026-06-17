@@ -25,13 +25,15 @@ use tokio::runtime::Runtime;
 /// calls still go through `Handle::current()` + `block_in_place` so
 /// they participate in the caller's own runtime (no nested-runtime
 /// panic and no thread-jump to the shared runtime).
-static SHARED_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+static SHARED_RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(build_shared_runtime);
+
+fn build_shared_runtime() -> Result<Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("openclaudia-web-tools")
         .build()
-        .expect("shared web-tools tokio runtime builds with default settings")
-});
+        .map_err(|e| format!("failed to build shared web-tools runtime: {e}"))
+}
 
 /// Drive `fut` to completion from a synchronous tool handler.
 ///
@@ -67,7 +69,8 @@ where
     F::Output: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
-    SHARED_RUNTIME.spawn(async move {
+    let runtime = SHARED_RUNTIME.as_ref().map_err(Clone::clone)?;
+    runtime.spawn(async move {
         // Best-effort: if the receiver disappears (caller's thread
         // was cancelled), drop the result silently rather than
         // panicking from inside the runtime.
@@ -356,6 +359,12 @@ mod tests {
     }
 
     // ── crosslink #368: runtime sharing & no per-call construction ─────────
+
+    #[test]
+    fn shared_runtime_builder_succeeds() {
+        let runtime = build_shared_runtime().expect("shared runtime builder must succeed");
+        drop(runtime);
+    }
 
     /// Forensic test for crosslink #368.
     ///
