@@ -1,5 +1,12 @@
 use std::fs;
 
+#[cfg(windows)]
+fn resolved_process_command(binary: &str) -> Result<std::process::Command, String> {
+    which::which(binary)
+        .map(std::process::Command::new)
+        .map_err(|e| format!("{binary} binary not found on PATH: {e}"))
+}
+
 /// Display structured questions to the user and collect answers.
 /// Returns a JSON string mapping question text to selected answer(s).
 #[allow(clippy::too_many_lines)]
@@ -150,9 +157,12 @@ pub fn open_external_editor() -> Option<String> {
     println!("\nOpening {editor}...");
 
     #[cfg(windows)]
-    let status = Command::new("cmd")
-        .args(["/C", &editor, temp_file.to_str().unwrap_or("")])
-        .status();
+    let status = resolved_process_command("cmd").and_then(|mut command| {
+        command
+            .args(["/C", &editor, temp_file.to_str().unwrap_or("")])
+            .status()
+            .map_err(|e| e.to_string())
+    });
 
     #[cfg(not(windows))]
     let status = Command::new(&editor).arg(&temp_file).status();
@@ -183,6 +193,28 @@ pub fn open_external_editor() -> Option<String> {
             eprintln!("Failed to open editor '{editor}': {e}\n");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn repl_editor_windows_shell_uses_resolved_cmd() {
+        let source = include_str!("input.rs");
+        let cfg_test = source
+            .find("#[cfg(test)]")
+            .expect("test marker must be present");
+        let production = &source[..cfg_test];
+
+        assert!(
+            !production.contains("Command::new(\"cmd\")")
+                && !production.contains("std::process::Command::new(\"cmd\")"),
+            "external editor wrapper must not invoke bare cmd"
+        );
+        assert!(
+            production.contains("which::which(binary)"),
+            "external editor wrapper must resolve cmd through the Rust resolver"
+        );
     }
 }
 
