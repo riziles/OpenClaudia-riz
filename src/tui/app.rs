@@ -2151,28 +2151,6 @@ impl App {
         self.spawn_api_turn();
     }
 
-    /// Spawn a subprocess on the tokio runtime and post the result back
-    /// to the TUI event loop as [`AppEvent::ShellDone`].
-    ///
-    /// This is the seam that closes crosslink #371. Slash commands like
-    /// `/diff` and the `!<cmd>` shell escape used to call
-    /// `std::process::Command::new(...).output()` directly on the sync
-    /// event loop thread, which blocked rendering for the full lifetime
-    /// of the child. The helper instead dispatches the work to
-    /// `runtime_handle.spawn(...)` using `tokio::process::Command` so
-    /// the loop keeps ticking; results arrive asynchronously via the
-    /// existing mpsc channel that already carries streaming API events.
-    ///
-    /// `cmd[0]` is the program; `cmd[1..]` are its args. The empty
-    /// vector is a logic bug — we return a no-op join handle instead of
-    /// panicking on `split_first` because the caller can be exercised
-    /// from outside `run()` (e.g. tests).
-    ///
-    /// If no runtime is bound yet (`self.runtime_handle == None`) the
-    /// helper still returns a `JoinHandle<()>` so the call site has a
-    /// single, total signature — it just posts an error `ShellDone`
-    /// (`exit_code` = None, stderr explaining the missing runtime) via
-    /// `std::thread::spawn`.
     /// Run a synchronous filesystem closure off the TUI event loop on the
     /// tokio blocking pool and emit a [`AppEvent::ShellDone`] when done
     /// (crosslink #270 / #371 follow-up).
@@ -2239,19 +2217,38 @@ impl App {
         });
     }
 
-    fn spawn_shell(&self, cmd: Vec<&str>, target: SpawnTarget) -> tokio::task::JoinHandle<()> {
+    /// Spawn a subprocess on the tokio runtime and post the result back
+    /// to the TUI event loop as [`AppEvent::ShellDone`].
+    ///
+    /// This is the seam that closes crosslink #371. Slash commands like
+    /// `/diff` and the `!<cmd>` shell escape used to call
+    /// `std::process::Command::new(...).output()` directly on the sync
+    /// event loop thread, which blocked rendering for the full lifetime
+    /// of the child. The helper instead dispatches the work to
+    /// `runtime_handle.spawn(...)` using `tokio::process::Command` so
+    /// the loop keeps ticking; results arrive asynchronously via the
+    /// existing mpsc channel that already carries streaming API events.
+    ///
+    /// `cmd[0]` is the program; `cmd[1..]` are its args. The empty
+    /// vector is a logic bug — we report it through `ShellDone` instead
+    /// of panicking on `split_first` because the caller can be exercised
+    /// from outside `run()` (e.g. tests).
+    ///
+    /// If no runtime is bound yet (`self.runtime_handle == None`) the
+    /// helper posts an error `ShellDone` (`exit_code` = None, stderr
+    /// explaining the missing runtime) and returns `None`.
+    fn spawn_shell(
+        &self,
+        cmd: Vec<&str>,
+        target: SpawnTarget,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
         let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
 
         let Some(handle) = self.runtime_handle.clone() else {
             // No runtime — surface as a failed ShellDone so the receiver
-            // still gets called. We need a real JoinHandle to satisfy the
-            // return type; spawn an immediately-ready future via a
-            // detached single-threaded runtime would re-introduce
-            // blocking, so instead we synthesize one through a
-            // best-effort tokio::spawn that may itself fail. Falling
-            // back to a thread keeps the contract.
+            // still gets called.
             if let Some(tx) = tx {
                 let _ = tx.send(AppEvent::ShellDone {
                     target,
@@ -2260,24 +2257,10 @@ impl App {
                     exit_code: None,
                 });
             }
-            // We still owe a JoinHandle. Spawn a no-op future on a
-            // throwaway runtime so the type checks. This branch is
-            // only reachable before `run()` initialises the handle.
-            return tokio::runtime::Builder::new_current_thread()
-                .build()
-                .map_or_else(
-                    |_| {
-                        // As a last resort, panic — there is literally
-                        // no way to manufacture a JoinHandle without a
-                        // runtime, and being here means the test
-                        // harness is misconfigured.
-                        panic!("spawn_shell called with no runtime_handle and no fallback runtime");
-                    },
-                    |rt| rt.spawn(async {}),
-                );
+            return None;
         };
 
-        handle.spawn(async move {
+        Some(handle.spawn(async move {
             let Some((exe, rest)) = argv.split_first() else {
                 if let Some(tx) = tx {
                     let _ = tx.send(AppEvent::ShellDone {
@@ -2310,7 +2293,7 @@ impl App {
             if let Some(tx) = tx {
                 let _ = tx.send(evt);
             }
-        })
+        }))
     }
 
     /// Spawn an async API turn on the tokio runtime.
@@ -3454,6 +3437,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spawn_shell_without_runtime_reports_error_without_panicking() {
+        let mut app = App::new("test-model", "test-provider");
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        app.api_event_tx = Some(tx);
+
+        let join = app.spawn_shell(vec!["echo", "unused"], SpawnTarget::Diff);
+        assert!(
+            join.is_none(),
+            "spawn_shell must not manufacture a task without a runtime"
+        );
+
+        let (target, stdout, stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(100))
+            .expect("expected ShellDone error when runtime is unavailable");
+        assert!(matches!(target, SpawnTarget::Diff));
+        assert!(stdout.is_empty());
+        assert!(
+            stderr.contains("no async runtime bound"),
+            "stderr should explain missing runtime, got {stderr:?}"
+        );
+        assert_eq!(exit_code, None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_shell_returns_immediately_and_runs_in_background() {
         // The helper must not block the calling (event-loop) thread. We
@@ -3464,7 +3470,9 @@ mod tests {
         let rx = wire_app(&mut app);
 
         let call_start = Instant::now();
-        let join = app.spawn_shell(vec!["sleep", "0.4"], SpawnTarget::Diff);
+        let join = app
+            .spawn_shell(vec!["sleep", "0.4"], SpawnTarget::Diff)
+            .expect("runtime-backed spawn_shell should return a task handle");
         let call_elapsed = call_start.elapsed();
 
         // Pre-#371 implementation blocked for the full child lifetime.
@@ -3490,7 +3498,9 @@ mod tests {
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
 
-        let join = app.spawn_shell(vec!["echo", "hello-371"], SpawnTarget::Diff);
+        let join = app
+            .spawn_shell(vec!["echo", "hello-371"], SpawnTarget::Diff)
+            .expect("runtime-backed spawn_shell should return a task handle");
         join.await.expect("spawn_shell task panicked");
 
         let (target, stdout, _stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(500))
@@ -3510,12 +3520,14 @@ mod tests {
         let mut app = App::new("test-model", "test-provider");
         let rx = wire_app(&mut app);
 
-        let join = app.spawn_shell(
-            vec!["bash", "-c", "exit 7"],
-            SpawnTarget::ShellCommand {
-                displayed: "exit 7".to_string(),
-            },
-        );
+        let join = app
+            .spawn_shell(
+                vec!["bash", "-c", "exit 7"],
+                SpawnTarget::ShellCommand {
+                    displayed: "exit 7".to_string(),
+                },
+            )
+            .expect("runtime-backed spawn_shell should return a task handle");
         join.await.expect("spawn_shell task panicked");
 
         let (target, _stdout, _stderr, exit_code) =
