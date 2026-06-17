@@ -150,6 +150,15 @@ struct SseFrameCtx<'a> {
 /// Spinner template — uses indicatif placeholder syntax, not `format!`.
 const SPINNER_TMPL: &str = "{spinner:.cyan} {msg}";
 
+fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::ProviderConfig, String> {
+    config.active_provider().ok_or_else(|| {
+        format!(
+            "No provider configured for target '{}'",
+            config.proxy.target
+        )
+    })
+}
+
 impl ChatRepl {
     /// Resolve config + auth + provider + session and return a fully
     /// initialized REPL. `Ok(None)` means setup printed a user-facing
@@ -196,12 +205,12 @@ impl ChatRepl {
 
         guardrails::configure(&config.guardrails);
 
-        let Some(provider) = config.active_provider() else {
-            eprintln!(
-                "No provider configured for target '{}'",
-                config.proxy.target
-            );
-            return Ok(None);
+        let provider = match active_provider_for_turn(&config) {
+            Ok(provider) => provider,
+            Err(err) => {
+                eprintln!("{err}");
+                return Ok(None);
+            }
         };
 
         let Some(ChatAuth {
@@ -414,10 +423,14 @@ impl ChatRepl {
                 return Ok(Some(false));
             }
         };
-        let provider = self
-            .config
-            .active_provider()
-            .expect("provider validated during new()");
+        let provider = match active_provider_for_turn(&self.config) {
+            Ok(provider) => provider,
+            Err(err) => {
+                tracing::error!(error = %err, "Missing active provider during chat turn");
+                eprintln!("\n\x1b[31mRequest configuration error: {err}\x1b[0m");
+                return Ok(Some(false));
+            }
+        };
         let (endpoint, headers) = build_chat_endpoint_and_headers(
             &self.config.proxy.target,
             &self.model,
@@ -3331,6 +3344,42 @@ fn new_rustyline_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_provider_for_turn_returns_configured_provider() {
+        let config: config::AppConfig = serde_yaml::from_str(
+            r#"
+proxy:
+  target: anthropic
+providers:
+  anthropic:
+    base_url: "https://api.anthropic.com"
+"#,
+        )
+        .expect("fixture config must parse");
+
+        let provider =
+            active_provider_for_turn(&config).expect("anthropic provider should be active");
+
+        assert_eq!(provider.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn active_provider_for_turn_reports_missing_provider() {
+        let config: config::AppConfig = serde_yaml::from_str(
+            r#"
+proxy:
+  target: missing
+providers: {}
+"#,
+        )
+        .expect("fixture config must parse");
+
+        let err = active_provider_for_turn(&config)
+            .expect_err("missing active provider must return an error");
+
+        assert_eq!(err, "No provider configured for target 'missing'");
+    }
 
     #[test]
     fn parse_tool_args_rejects_malformed_or_non_object_json() {
