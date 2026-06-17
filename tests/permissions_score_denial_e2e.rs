@@ -120,6 +120,22 @@ fn bash_destructive_token_in_middle_of_command_still_vetoes() {
 }
 
 #[test]
+fn bash_dangerous_constructs_score_zero_even_with_safe_prefixes() {
+    for dangerous in &[
+        "echo hi | sh",
+        "cat <(printf hi)",
+        "ls && pwd",
+        "find . -exec rm {} \\;",
+    ] {
+        let score = auto_allow_score("bash", &json!({"command": dangerous}));
+        assert!(
+            (score - 0.0).abs() < f32::EPSILON,
+            "dangerous construct {dangerous:?} MUST score 0.0; got {score}"
+        );
+    }
+}
+
+#[test]
 fn bash_leading_whitespace_does_not_defeat_safe_prefix_match() {
     // The function trim_starts before prefix-matching.
     let score = auto_allow_score("bash", &json!({"command": "   ls -la"}));

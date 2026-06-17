@@ -99,16 +99,15 @@ fn bash_ls_does_not_meet_threshold_0_96() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section C — Destructive Bash (score 0.0) falls through
+// Section C — Unsafe Bash (score 0.0) never auto-allows
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn bash_rm_rf_does_not_auto_allow_at_any_positive_threshold() {
-    // PINS DOC: rm -rf → score 0.0.
+fn bash_rm_rf_is_hard_denied_before_classifier_allows() {
+    // PINS DOC: hard safety beats classifier scoring.
     let (mgr, _dir) = fresh_manager();
     let outcome = mgr.check_auto_allow("bash", &json!({"command": "rm -rf /tmp/x"}), 0.1);
-    // 0.0 < 0.1 → falls through to check().
-    assert!(matches!(outcome, CheckResult::NeedsPrompt { .. }));
+    assert!(matches!(outcome, CheckResult::Denied(_)));
 }
 
 #[test]
@@ -119,12 +118,21 @@ fn bash_sudo_does_not_auto_allow() {
 }
 
 #[test]
-fn bash_destructive_at_threshold_0_auto_allows() {
-    // PINS BOUND: predicate is `score >= threshold`. score 0.0 >= 0.0
-    // means a threshold of exactly 0.0 auto-allows everything.
+fn bash_zero_score_at_threshold_0_does_not_auto_allow() {
+    // PINS BOUND: zero is a veto score, not a valid auto-allow score,
+    // even when the configured threshold is exactly 0.0.
     let (mgr, _dir) = fresh_manager();
-    let outcome = mgr.check_auto_allow("bash", &json!({"command": "rm -rf /tmp/x"}), 0.0);
-    assert_eq!(outcome, CheckResult::Allowed);
+    let outcome = mgr.check_auto_allow("bash", &json!({"command": "sudo something"}), 0.0);
+    assert!(matches!(outcome, CheckResult::NeedsPrompt { .. }));
+}
+
+#[test]
+fn bash_dangerous_construct_does_not_auto_allow_despite_safe_prefix() {
+    // `echo` is a high-scoring safe prefix by itself, but piping it into
+    // an interpreter is a Bash-policy dangerous construct and must prompt.
+    let (mgr, _dir) = fresh_manager();
+    let outcome = mgr.check_auto_allow("bash", &json!({"command": "echo hi | sh"}), 0.9);
+    assert!(matches!(outcome, CheckResult::NeedsPrompt { .. }));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
