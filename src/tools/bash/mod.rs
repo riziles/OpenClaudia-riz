@@ -24,13 +24,13 @@ use crate::tools::args::{into_legacy, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread;
 use uuid::Uuid;
 
@@ -50,6 +50,42 @@ fn bash_bin() -> Result<&'static Path, String> {
 
 fn bash_command() -> Result<Command, String> {
     Ok(Command::new(bash_bin()?))
+}
+
+fn recover_mutex_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    op: &'static str,
+    resource: &'static str,
+    shell_id: Option<&str>,
+) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|p| {
+        tracing::error!(
+            target: "openclaudia::bash",
+            event = "mutex_poisoned",
+            op,
+            resource,
+            shell_id = shell_id.unwrap_or(""),
+            "background shell mutex poisoned; recovering inner state"
+        );
+        p.into_inner()
+    })
+}
+
+fn spawn_output_reader<R>(
+    stream: R,
+    buffer: Arc<Mutex<Vec<String>>>,
+    op: &'static str,
+    resource: &'static str,
+    shell_id: String,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for line in reader.lines().map_while(Result::ok) {
+            recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(line);
+        }
+    });
 }
 
 /// Background shell process with captured output
@@ -136,10 +172,7 @@ impl BackgroundShellManager {
         // The lock is contended only by other spawn/list/kill calls, and
         // `Command::spawn` is a fast `fork+exec` syscall, so holding it
         // for the duration is acceptable for the cap=50 workload.
-        let mut shells = self
-            .shells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
 
         // GC sweep: remove finished shells whose output has been retrieved at least once
         shells.retain(|_id, s| {
@@ -204,28 +237,24 @@ impl BackgroundShellManager {
         // `reaped` so a caller never observes a finished shell without an
         // exit code.
         if let Some(stdout) = child.stdout.take() {
-            let buffer = Arc::clone(&stdout_buffer);
-            thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Ok(mut buf) = buffer.lock() {
-                        buf.push(line);
-                    }
-                }
-            });
+            spawn_output_reader(
+                stdout,
+                Arc::clone(&stdout_buffer),
+                "stdout_reader",
+                "stdout_buffer",
+                shell_id.clone(),
+            );
         }
 
         // Spawn thread to read stderr
         if let Some(stderr) = child.stderr.take() {
-            let buffer = Arc::clone(&stderr_buffer);
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Ok(mut buf) = buffer.lock() {
-                        buf.push(line);
-                    }
-                }
-            });
+            spawn_output_reader(
+                stderr,
+                Arc::clone(&stderr_buffer),
+                "stderr_reader",
+                "stderr_buffer",
+                shell_id.clone(),
+            );
         }
 
         // Spawn thread to wait for process and capture exit status
@@ -233,11 +262,15 @@ impl BackgroundShellManager {
         let finished_clone = Arc::clone(&finished);
         let reaped_clone = Arc::clone(&reaped);
         let mut child_for_wait = child;
+        let wait_shell_id = shell_id.clone();
         thread::spawn(move || {
             if let Ok(status) = child_for_wait.wait() {
-                if let Ok(mut es) = exit_status_clone.lock() {
-                    *es = status.code();
-                }
+                *recover_mutex_lock(
+                    &exit_status_clone,
+                    "wait",
+                    "exit_status",
+                    Some(&wait_shell_id),
+                ) = status.code();
                 // Order matters: set `reaped` AFTER `exit_status` so
                 // `get_output` cannot observe `reaped=true` with
                 // `exit_status=None`.
@@ -274,17 +307,7 @@ impl BackgroundShellManager {
         // structure. We recover the inner state but loudly log so operators
         // see the poison event in audit logs rather than treating it as
         // invisible silent absorption.
-        let shells = self.shells.lock().unwrap_or_else(|p| {
-            tracing::error!(
-                target: "openclaudia::bash",
-                event = "mutex_poisoned",
-                op = "get_output",
-                shell_id,
-                "background shell manager mutex poisoned; recovering inner state \
-                 (see crosslink #678 for invariant rationale)"
-            );
-            p.into_inner()
-        });
+        let shells = recover_mutex_lock(&self.shells, "get_output", "shells", Some(shell_id));
         let shell = shells
             .get(shell_id)
             .ok_or_else(|| format!("Shell '{shell_id}' not found"))?;
@@ -294,17 +317,19 @@ impl BackgroundShellManager {
         // Swap buffers atomically — take all lines, leave empty vec.
         // This minimizes lock hold time and prevents data loss from
         // concurrent writer threads.
-        let stdout_lines: Vec<String> = shell
-            .stdout_buffer
-            .lock()
-            .map(|mut buf| std::mem::take(&mut *buf))
-            .unwrap_or_default();
+        let stdout_lines: Vec<String> = std::mem::take(&mut *recover_mutex_lock(
+            &shell.stdout_buffer,
+            "get_output",
+            "stdout_buffer",
+            Some(shell_id),
+        ));
 
-        let stderr_lines: Vec<String> = shell
-            .stderr_buffer
-            .lock()
-            .map(|mut buf| std::mem::take(&mut *buf))
-            .unwrap_or_default();
+        let stderr_lines: Vec<String> = std::mem::take(&mut *recover_mutex_lock(
+            &shell.stderr_buffer,
+            "get_output",
+            "stderr_buffer",
+            Some(shell_id),
+        ));
 
         // Join outside the lock
         if !stdout_lines.is_empty() {
@@ -342,7 +367,12 @@ impl BackgroundShellManager {
         // process actually produced a code (i.e. wasn't killed in a way that
         // returned `None`).
         let is_reaped = shell.reaped.load(Ordering::SeqCst);
-        let exit_code = shell.exit_status.lock().ok().and_then(|es| *es);
+        let exit_code = *recover_mutex_lock(
+            &shell.exit_status,
+            "get_output",
+            "exit_status",
+            Some(shell_id),
+        );
         let is_running = !is_reaped;
 
         Ok((output, is_running, exit_code))
@@ -357,17 +387,7 @@ impl BackgroundShellManager {
         // Crosslink #678: see get_output for poison-recovery rationale. The
         // log carries shell_id so the audit trail names the specific call
         // that observed poisoning.
-        let mut shells = self.shells.lock().unwrap_or_else(|p| {
-            tracing::error!(
-                target: "openclaudia::bash",
-                event = "mutex_poisoned",
-                op = "kill",
-                shell_id,
-                "background shell manager mutex poisoned; recovering inner state \
-                 (see crosslink #678 for invariant rationale)"
-            );
-            p.into_inner()
-        });
+        let mut shells = recover_mutex_lock(&self.shells, "kill", "shells", Some(shell_id));
 
         if let Some(shell) = shells.remove(shell_id) {
             if !shell.finished.load(Ordering::SeqCst) {
@@ -394,16 +414,7 @@ impl BackgroundShellManager {
     /// List all background shells
     pub(crate) fn list(&self) -> Vec<(String, String, bool)> {
         // Crosslink #678: see get_output for poison-recovery rationale.
-        let shells = self.shells.lock().unwrap_or_else(|p| {
-            tracing::error!(
-                target: "openclaudia::bash",
-                event = "mutex_poisoned",
-                op = "list",
-                "background shell manager mutex poisoned; recovering inner state \
-                 (see crosslink #678 for invariant rationale)"
-            );
-            p.into_inner()
-        });
+        let shells = recover_mutex_lock(&self.shells, "list", "shells", None);
         shells
             .iter()
             .map(|(id, shell)| {
