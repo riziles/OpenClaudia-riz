@@ -30,6 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -87,8 +88,8 @@ fn validate_session_file_id(id: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Write data to a file atomically: write to a uniquely-named temp file
-/// in the same directory, then rename.
+/// Write data to a file atomically and durably: write to a uniquely-named
+/// temp file in the same directory, fsync it, then rename.
 ///
 /// The staging name is `<file>.<pid>.<uuid>.tmp` rather than
 /// `<file>.tmp`. The previous fixed `.tmp` extension meant two
@@ -102,18 +103,46 @@ fn validate_session_file_id(id: &str) -> Result<(), &'static str> {
 /// never collide and the rename always promotes the bytes that *this*
 /// caller wrote.
 ///
-/// On rename failure the staging file is cleaned up so a crashing or
-/// erroring caller does not leave `<file>.<pid>.<uuid>.tmp` debris in
-/// the persist directory.
+/// On any write, sync, or rename failure the staging file is cleaned up so a
+/// crashing or erroring caller does not leave `<file>.<pid>.<uuid>.tmp` debris
+/// in the persist directory.
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let tmp_path = unique_staging_path(path);
-    fs::write(&tmp_path, data)?;
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
     if let Err(e) = fs::rename(&tmp_path, path) {
         // Best-effort cleanup; ignore the unlink error so the caller
         // sees the original rename failure, which is the actionable one.
         let _ = fs::remove_file(&tmp_path);
         return Err(e.into());
     }
+
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -1171,6 +1200,58 @@ mod tests {
             fs::read(&outside_path).unwrap(),
             b"sentinel",
             "cleanup must not remove paths derived from an embedded hostile id"
+        );
+    }
+
+    fn staging_files_for(path: &Path) -> Vec<PathBuf> {
+        let parent = path.parent().expect("path has parent");
+        let prefix = path
+            .file_name()
+            .expect("path has file name")
+            .to_string_lossy()
+            .into_owned();
+        fs::read_dir(parent)
+            .expect("read parent")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                    && candidate != path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_publishes_final_bytes_without_staging_debris() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.json");
+
+        atomic_write(&path, br#"{"ok":true}"#).expect("atomic write succeeds");
+
+        assert_eq!(
+            fs::read(&path).expect("read final"),
+            br#"{"ok":true}"#,
+            "atomic_write must publish the exact payload"
+        );
+        assert!(
+            staging_files_for(&path).is_empty(),
+            "successful atomic_write must not leave staging files"
+        );
+    }
+
+    #[test]
+    fn atomic_write_cleans_staging_file_when_rename_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.json");
+        fs::create_dir(&path).expect("target path is an existing directory");
+
+        let _err = atomic_write(&path, b"payload").expect_err("rename over directory must fail");
+
+        assert!(
+            staging_files_for(&path).is_empty(),
+            "failed atomic_write must clean its staging file"
         );
     }
 
