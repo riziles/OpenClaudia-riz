@@ -45,12 +45,12 @@ fn acp_config_yaml_with_explicit_max_iterations_overrides_default() {
 }
 
 #[test]
-fn acp_config_yaml_with_zero_max_iterations_is_accepted() {
-    // PINS DOC: 0 is accepted (no compile-time validation
-    // that max_iterations > 0).
+fn acp_config_yaml_with_zero_max_iterations_rejects() {
+    // PINS DOC: 0 is rejected because max_iterations is the ACP runaway-loop
+    // safety belt; disabling it should not be possible via config.
     let yaml = "max_iterations: 0";
-    let cfg: AcpConfig = serde_yaml::from_str(yaml).expect("parse");
-    assert_eq!(cfg.max_iterations, 0);
+    let outcome: Result<AcpConfig, _> = serde_yaml::from_str(yaml);
+    assert!(outcome.is_err(), "zero max_iterations MUST be rejected");
 }
 
 #[test]

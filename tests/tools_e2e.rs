@@ -127,8 +127,9 @@ fn accumulator_filters_empty_partials_on_finalize() {
         finalized.is_empty(),
         "partial with no function.name must be filtered, got {finalized:?}"
     );
-    // has_tool_calls should report true though — there's an id present.
-    assert!(acc.has_tool_calls());
+    // has_tool_calls should remain false because id-only partials cannot
+    // finalize into executable tool calls.
+    assert!(!acc.has_tool_calls());
 }
 
 #[test]

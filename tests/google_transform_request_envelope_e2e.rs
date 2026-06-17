@@ -240,9 +240,9 @@ fn google_transform_parts_with_image_url_becomes_inline_data() {
 }
 
 #[test]
-fn google_transform_parts_with_neither_text_nor_image_skipped_not_empty_text() {
-    // PINS #850: bare ContentPart with neither text nor image_url
-    // is SKIPPED entirely (not fabricated as empty text).
+fn google_transform_parts_with_unsupported_type_rejects_instead_of_skipping() {
+    // PINS #850 replacement contract: unsupported ContentPart variants fail
+    // closed instead of being silently dropped or fabricated as empty text.
     let adapter = get_adapter("google").unwrap();
     let request = req(
         "m",
@@ -266,15 +266,14 @@ fn google_transform_parts_with_neither_text_nor_image_skipped_not_empty_text() {
             extra: std::collections::HashMap::new(),
         }],
     );
-    let body = adapter.transform_request(&request).expect("ok");
-    let parts = body["contents"][0]["parts"].as_array().expect("parts");
-    // The video part is SKIPPED — only the text part remains.
+    let err = adapter
+        .transform_request(&request)
+        .expect_err("unsupported content part type must reject");
+    let err = err.to_string();
     assert_eq!(
-        parts.len(),
-        1,
-        "unknown content_type MUST be skipped (#850); got {parts:?}"
+        err,
+        "Request failed: Unsupported Google content part type 'video' at message index 0, part index 0"
     );
-    assert_eq!(parts[0]["text"], "only text part");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

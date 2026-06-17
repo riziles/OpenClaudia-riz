@@ -28,11 +28,11 @@ use serde_json::json;
 fn opus_falls_back_to_sonnet() {
     assert_eq!(
         overload_fallback_for("claude-opus-4-7"),
-        "claude-sonnet-4-5"
+        "claude-sonnet-4-6"
     );
     assert_eq!(
         overload_fallback_for("claude-3-opus-20240229"),
-        "claude-sonnet-4-5"
+        "claude-sonnet-4-6"
     );
 }
 
@@ -69,7 +69,7 @@ fn o_series_falls_back_to_gpt_4o_mini() {
 
 #[test]
 fn gemini_pro_falls_back_to_flash() {
-    assert_eq!(overload_fallback_for("gemini-2.5-pro"), "gemini-2.5-flash");
+    assert_eq!(overload_fallback_for("gemini-2.5-pro"), "gemini-3.5-flash");
 }
 
 #[test]

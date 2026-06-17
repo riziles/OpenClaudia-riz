@@ -756,13 +756,27 @@ fn b5g_denylist_pipe_to_shell_case_insensitive() {
 /// These must NOT be blocked by the denylist.
 #[test]
 fn b5h_safe_commands_not_blocked() {
-    let safe_commands = [
-        "ls -la",
-        "cargo test",
-        "rm -rf target/",
-        "echo hello",
-        "git status",
-        "find . -name '*.rs'",
+    let temp = tempfile::Builder::new()
+        .prefix(".tmp-openclaudia-b5h-")
+        .tempdir_in(".")
+        .expect("tempdir for rm safety case");
+    let cleanup_target = temp.path().join("target");
+    std::fs::create_dir_all(&cleanup_target).expect("cleanup target dir");
+    let cleanup_root = temp
+        .path()
+        .file_name()
+        .expect("tempdir has a file name")
+        .to_string_lossy();
+    let cleanup_root = shlex::try_quote(&cleanup_root).expect("quote cleanup root");
+    let cleanup_command = format!("rm -rf {cleanup_root}/target");
+
+    let safe_commands = vec![
+        "ls -la".to_string(),
+        "cargo --version".to_string(),
+        cleanup_command,
+        "echo hello".to_string(),
+        "git status".to_string(),
+        "find . -name '*.rs'".to_string(),
     ];
     for cmd in safe_commands {
         let result = execute_tool(&make_tool_call("bash", &json!({ "command": cmd })));

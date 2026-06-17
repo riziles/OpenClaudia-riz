@@ -380,7 +380,7 @@ struct ScheduledJob {
 ///
 /// let db = Arc::new(MemoryDb::open_for_project(std::path::Path::new("/tmp")).unwrap());
 /// let mut sched = JobScheduler::new(Arc::clone(&db));
-/// sched.register(Arc::new(MemoryConsolidationJob), ONE_HOUR);
+/// sched.register(Arc::new(MemoryConsolidationJob), Duration::from_secs(3600));
 /// // Call `sched.tick()` from your idle loop; it only runs jobs whose
 /// // interval has elapsed.
 /// let outcomes = sched.tick();

@@ -219,9 +219,9 @@ fn has_tool_calls_false_on_empty() {
 }
 
 #[test]
-fn has_tool_calls_requires_at_least_one_non_empty_id() {
-    // AUTHORING DISCOVERY: has_tool_calls checks
-    // `any(|tc| !tc.id.is_empty())`, NOT just len > 0.
+fn has_tool_calls_requires_at_least_one_finalizable_call() {
+    // AUTHORING DISCOVERY: has_tool_calls checks for a complete call
+    // with both `id` and `function.name`, NOT just len > 0 or id-only.
     // A delta that pre-allocates a slot but never sets `id`
     // returns false for has_tool_calls.
     let mut acc = ToolCallAccumulator::new();
@@ -233,9 +233,19 @@ fn has_tool_calls_requires_at_least_one_non_empty_id() {
         "PINS: slot without id MUST NOT count as a tool call"
     );
 
-    // Now provide an id → predicate flips to true.
+    // Now provide an id without a function name; the partial still cannot
+    // finalize into an executable tool call.
     acc.process_delta(&json!({
         "tool_calls": [{"index": 0, "id": "c1"}]
+    }));
+    assert!(
+        !acc.has_tool_calls(),
+        "PINS: id-only slot MUST NOT count as a tool call"
+    );
+
+    // Add the function name and the predicate flips to true.
+    acc.process_delta(&json!({
+        "tool_calls": [{"index": 0, "function": {"name": "bash"}}]
     }));
     assert!(acc.has_tool_calls());
 }

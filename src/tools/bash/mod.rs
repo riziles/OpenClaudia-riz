@@ -74,6 +74,7 @@ fn recover_mutex_lock<'a, T>(
 fn spawn_output_reader<R>(
     stream: R,
     buffer: Arc<Mutex<Vec<String>>>,
+    done: Arc<AtomicBool>,
     op: &'static str,
     resource: &'static str,
     shell_id: String,
@@ -85,6 +86,7 @@ fn spawn_output_reader<R>(
         for line in reader.lines().map_while(Result::ok) {
             recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(line);
         }
+        done.store(true, Ordering::SeqCst);
     });
 }
 
@@ -106,6 +108,8 @@ struct BackgroundShell {
     /// exit status. Post-fix only the wait thread writes this flag and
     /// it implies `exit_status` has been populated under `SeqCst`.
     finished: Arc<AtomicBool>,
+    stdout_done: Arc<AtomicBool>,
+    stderr_done: Arc<AtomicBool>,
     /// Distinct from `finished`: set by the wait thread immediately
     /// after writing `exit_status`. Consulted by `get_output` so that
     /// (`is_running=false`, `exit_code=None`) is unreachable.
@@ -129,10 +133,10 @@ struct BackgroundShell {
     ///   pre-fix and is preserved).
     ///
     /// Setting the flag on drain eliminates the happens-before requirement
-    /// between `finished` and `output_retrieved_after_finish`: the drain is
-    /// the only event that matters for GC. `AtomicBool` with `SeqCst`
-    /// synchronises observation between the polling thread and the GC sweep
-    /// in `spawn`.
+    /// between `finished` and `output_retrieved_after_finish`; GC additionally
+    /// waits for both output readers to hit EOF and for their buffers to be
+    /// empty, so a poll that happens before the child's final stdout/stderr
+    /// is delivered cannot make that output collectable.
     output_retrieved_after_finish: AtomicBool,
 }
 
@@ -177,11 +181,27 @@ impl BackgroundShellManager {
         // for the duration is acceptable for the cap=50 workload.
         let mut shells = recover_mutex_lock(&self.shells, "spawn", "shells", None);
 
-        // GC sweep: remove finished shells whose output has been retrieved at least once
+        // GC sweep: remove finished shells whose output has been retrieved at
+        // least once and whose reader threads have fully drained their pipes.
+        // A first poll can happen before a quick child emits its final output;
+        // without the reader-done + empty-buffer checks, a concurrent spawn can
+        // collect that shell before the caller has a chance to read the line.
         shells.retain(|_id, s| {
             let is_finished = s.finished.load(Ordering::SeqCst);
             let output_retrieved = s.output_retrieved_after_finish.load(Ordering::SeqCst);
-            !is_finished || !output_retrieved
+            if !is_finished || !output_retrieved {
+                return true;
+            }
+            let stdout_done = s.stdout_done.load(Ordering::SeqCst);
+            let stderr_done = s.stderr_done.load(Ordering::SeqCst);
+            if !stdout_done || !stderr_done {
+                return true;
+            }
+            let stdout_empty =
+                recover_mutex_lock(&s.stdout_buffer, "spawn_gc", "stdout_buffer", None).is_empty();
+            let stderr_empty =
+                recover_mutex_lock(&s.stderr_buffer, "spawn_gc", "stderr_buffer", None).is_empty();
+            !(stdout_empty && stderr_empty)
         });
 
         if shells.len() >= MAX_BACKGROUND_SHELLS {
@@ -225,6 +245,8 @@ impl BackgroundShellManager {
         let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
         let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
         let finished = Arc::new(AtomicBool::new(false));
+        let stdout_done = Arc::new(AtomicBool::new(false));
+        let stderr_done = Arc::new(AtomicBool::new(false));
         let reaped = Arc::new(AtomicBool::new(false));
         let exit_status = Arc::new(Mutex::new(None));
 
@@ -243,10 +265,13 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stdout,
                 Arc::clone(&stdout_buffer),
+                Arc::clone(&stdout_done),
                 "stdout_reader",
                 "stdout_buffer",
                 shell_id.clone(),
             );
+        } else {
+            stdout_done.store(true, Ordering::SeqCst);
         }
 
         // Spawn thread to read stderr
@@ -254,10 +279,13 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stderr,
                 Arc::clone(&stderr_buffer),
+                Arc::clone(&stderr_done),
                 "stderr_reader",
                 "stderr_buffer",
                 shell_id.clone(),
             );
+        } else {
+            stderr_done.store(true, Ordering::SeqCst);
         }
 
         // Spawn thread to wait for process and capture exit status
@@ -288,6 +316,8 @@ impl BackgroundShellManager {
             command: command.to_string(),
             owner,
             finished,
+            stdout_done,
+            stderr_done,
             reaped,
             exit_status,
             pid,

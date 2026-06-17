@@ -260,7 +260,7 @@ fn has_tool_calls_returns_false_on_empty() {
 fn has_tool_calls_returns_true_after_delta_processed() {
     let mut acc = ToolCallAccumulator::new();
     acc.process_delta(&json!({
-        "tool_calls": [{"index": 0, "id": "x"}]
+        "tool_calls": [{"index": 0, "id": "x", "function": {"name": "bash"}}]
     }));
     assert!(acc.has_tool_calls());
 }
@@ -269,7 +269,7 @@ fn has_tool_calls_returns_true_after_delta_processed() {
 fn clear_resets_state_to_empty() {
     let mut acc = ToolCallAccumulator::new();
     acc.process_delta(&json!({
-        "tool_calls": [{"index": 0, "id": "x"}]
+        "tool_calls": [{"index": 0, "id": "x", "function": {"name": "bash"}}]
     }));
     assert!(acc.has_tool_calls());
     acc.clear();
