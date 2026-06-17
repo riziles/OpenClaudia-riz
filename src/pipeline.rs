@@ -2456,9 +2456,8 @@ mod tests {
         );
     }
 
-    /// B1 — retry loop only covers 429, 503, 529 (NOT 408 — gap #597).
-    ///
-    /// This tests the request-builder side: a 200 response contains `stream: true`.
+    /// B1 — request builders keep the streaming flag contract separate from
+    /// retry classification.
     #[test]
     fn b1_build_request_stream_flag_always_set() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];

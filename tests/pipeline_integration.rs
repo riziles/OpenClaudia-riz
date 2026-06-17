@@ -1,4 +1,4 @@
-//! Integration tests for `pipeline.rs` — B1 (retry on 429/529/503) and
+//! Integration tests for `pipeline.rs` — B1 (retry on transient API failures) and
 //! B3 (SSE tool-call accumulation).
 //!
 //! Uses `wiremock` to fake the upstream HTTP endpoint so no live network
@@ -102,23 +102,23 @@ fn b3_openai_tool_accumulator_partial_arguments() {
     assert!(calls[0].function.arguments.contains("path"));
 }
 
-// ── B1: Retry loop — pin current (broken) state ──────────────────────────────
+// ── B1: Retry loop ───────────────────────────────────────────────────────────
 
-/// B1 — OC retries exactly 3 times on 429 then fails.
+/// B1 — OC retries exactly 10 times on 429 then fails.
 ///
-/// CURRENT CONTRACT (broken): `max_retries` is hard-coded to 3.
-/// Gap #592 tracks raising this to match CC's default of 10.
+/// Current contract: [`openclaudia::pipeline::MAX_API_RETRIES`] matches CC's
+/// default of 10 retry attempts.
 ///
-/// The retry loop runs `for attempt in 0..=max_retries` (0,1,2,3).
-/// On the final attempt (attempt == 3 == `max_retries`), the
+/// The retry loop runs `for attempt in 0..=MAX_API_RETRIES`.
+/// On the final attempt (attempt == 10 == `MAX_API_RETRIES`), the
 /// `attempt < max_retries` guard is false so OC falls through to
 /// `if !resp.status().is_success()` and returns `Err("API error 429: …")`.
-/// Total requests = 4 (initial + 3 retries).
+/// Total requests = 11 (initial + 10 retries).
 #[tokio::test]
-async fn b1_retry_max_is_3_pin_gap_592() {
+async fn b1_retry_max_matches_cc_10_attempts() {
     let server = MockServer::start().await;
 
-    // Return 429 forever — OC exhausts 3 retries then returns API error
+    // Return 429 forever — OC exhausts 10 retries then returns API error.
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(
@@ -126,7 +126,7 @@ async fn b1_retry_max_is_3_pin_gap_592() {
                 .insert_header("retry-after", "0")
                 .set_body_string("Too Many Requests"),
         )
-        .expect(4) // OC: initial + 3 retries = 4 total (gap #592: CC does 10)
+        .expect(11) // initial + MAX_API_RETRIES (10)
         .mount(&server)
         .await;
 
@@ -152,12 +152,9 @@ async fn b1_retry_max_is_3_pin_gap_592() {
     })
     .await;
 
-    // After exhausting 3 retries, the final 429 falls through to the
-    // non-success branch: Err("API error 429: …").
-    // Gap #592: CC would try 10 times and surface a CannotRetryError.
     assert!(
         result.is_err(),
-        "must fail after max retries (current limit 3, gap #592)"
+        "must fail after max retries (current limit 10)"
     );
     let err = result.unwrap_err();
     assert!(
@@ -296,16 +293,27 @@ async fn b1_retry_after_header_used_verbatim_no_jitter_gap_596() {
     );
 }
 
-/// B1 — 408 is NOT retried (pin current behaviour; gap #597 tracks the fix).
+/// B1 — 408 is retried as a transient request timeout.
 #[tokio::test]
-async fn b1_408_not_retried_pin_gap_597() {
+async fn b1_408_is_retried() {
     let server = MockServer::start().await;
 
-    // 408 — OC currently does NOT retry this (gap #597: CC does)
+    // First call: 408 — should be retried.
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(408).set_body_string("Request Timeout"))
-        .expect(1) // OC makes exactly 1 request — no retry on 408
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Second call: 200 with a minimal SSE body.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(SSE_TEXT_ONLY),
+        )
         .mount(&server)
         .await;
 
@@ -331,13 +339,7 @@ async fn b1_408_not_retried_pin_gap_597() {
     })
     .await;
 
-    // OC returns API error immediately for 408 — no retry
-    assert!(result.is_err(), "408 must not be retried (gap #597)");
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("API error 408"),
-        "error must include status code, got: {err}"
-    );
+    assert!(result.is_ok(), "408 must be retried and succeed on 2nd try");
 }
 
 // ── B3: process_sse_event pure-function contract ──────────────────────────────
