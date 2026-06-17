@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -27,6 +28,21 @@ const MAX_SUBAGENT_TURNS: usize = 50;
 
 /// Maximum tokens for subagent responses
 const SUBAGENT_MAX_TOKENS: u32 = 8192;
+
+/// Absolute, PATH-independent location of `git` for subagent worktree isolation.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
 
 /// Agent types available for spawning
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,6 +725,27 @@ pub struct WorktreeIsolation {
     pub branch_name: String,
 }
 
+fn validate_worktree_agent_id(agent_id: &str) -> Result<(), String> {
+    if agent_id.is_empty() {
+        return Err("agent_id is required for worktree isolation".to_string());
+    }
+    if agent_id.len() > 64 {
+        return Err("agent_id is too long for worktree isolation".to_string());
+    }
+    if agent_id.starts_with('-') {
+        return Err("agent_id must not start with '-' for worktree isolation".to_string());
+    }
+    if !agent_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "invalid agent_id '{agent_id}' for worktree isolation: only ASCII letters, digits, '-' and '_' are allowed"
+        ));
+    }
+    Ok(())
+}
+
 impl WorktreeIsolation {
     /// Create a new git worktree for agent isolation.
     ///
@@ -717,12 +754,16 @@ impl WorktreeIsolation {
     /// Returns `Err` if git is not available, the current directory is not
     /// a git repository, or the worktree/branch creation fails.
     pub fn create(agent_id: &str) -> Result<Self, String> {
+        validate_worktree_agent_id(agent_id)?;
         let branch_name = format!("agent/{agent_id}");
 
         // Find the git root
-        let git_root = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
+        let git_root = git_command()
+            .and_then(|mut cmd| {
+                cmd.args(["rev-parse", "--show-toplevel"])
+                    .output()
+                    .map_err(|e| e.to_string())
+            })
             .map_err(|e| format!("git not available: {e}"))?;
 
         if !git_root.status.success() {
@@ -739,15 +780,16 @@ impl WorktreeIsolation {
         let worktree_path = worktree_dir.join(agent_id);
 
         // Create the worktree
-        let result = std::process::Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                worktree_path.to_str().unwrap_or(""),
-                "-b",
-                &branch_name,
-            ])
-            .output()
+        let result = git_command()
+            .and_then(|mut cmd| {
+                cmd.arg("worktree")
+                    .arg("add")
+                    .arg(&worktree_path)
+                    .arg("-b")
+                    .arg(&branch_name)
+                    .output()
+                    .map_err(|e| e.to_string())
+            })
             .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
         if !result.status.success() {
@@ -764,14 +806,13 @@ impl WorktreeIsolation {
     /// Check if the worktree has uncommitted changes
     #[must_use]
     pub fn has_changes(&self) -> bool {
-        let result = std::process::Command::new("git")
-            .args([
-                "-C",
-                self.worktree_path.to_str().unwrap_or(""),
-                "diff",
-                "--stat",
-            ])
-            .output();
+        let result = git_command().and_then(|mut cmd| {
+            cmd.arg("-C")
+                .arg(&self.worktree_path)
+                .args(["diff", "--stat"])
+                .output()
+                .map_err(|e| e.to_string())
+        });
 
         match result {
             Ok(output) => !output.stdout.is_empty(),
@@ -794,14 +835,15 @@ impl WorktreeIsolation {
             ));
         }
 
-        let result = std::process::Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                self.worktree_path.to_str().unwrap_or(""),
-                "--force",
-            ])
-            .output()
+        let result = git_command()
+            .and_then(|mut cmd| {
+                cmd.arg("worktree")
+                    .arg("remove")
+                    .arg(&self.worktree_path)
+                    .arg("--force")
+                    .output()
+                    .map_err(|e| e.to_string())
+            })
             .map_err(|e| format!("Failed to remove worktree: {e}"))?;
 
         if !result.status.success() {
@@ -810,9 +852,11 @@ impl WorktreeIsolation {
         }
 
         // Also delete the branch
-        let _ = std::process::Command::new("git")
-            .args(["branch", "-D", &self.branch_name])
-            .output();
+        let _ = git_command().and_then(|mut cmd| {
+            cmd.args(["branch", "-D", &self.branch_name])
+                .output()
+                .map_err(|e| e.to_string())
+        });
 
         Ok(())
     }
@@ -1804,6 +1848,64 @@ pub fn execute_agent_output_tool<S: BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_git_helpers_use_resolved_binary_path() {
+        let git = git_bin().expect("subagent tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("subagent.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production subagent code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_agent_id_validation_rejects_path_and_ref_injection() {
+        let too_long = "a".repeat(65);
+        for bad in [
+            "",
+            "../escape",
+            "nested/path",
+            "nested\\path",
+            "-leading-dash",
+            "with space",
+            "semi;colon",
+            "dollar$var",
+            "emoji-\u{2603}",
+            too_long.as_str(),
+        ] {
+            assert!(
+                validate_worktree_agent_id(bad).is_err(),
+                "agent_id {bad:?} must not be accepted for worktree isolation"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_agent_id_validation_accepts_generated_and_resume_ids() {
+        for ok in ["1234abcd", "agent_1234", "resume-id-1234"] {
+            assert!(
+                validate_worktree_agent_id(ok).is_ok(),
+                "agent_id {ok:?} should be accepted for worktree isolation"
+            );
+        }
+    }
 
     #[test]
     fn test_agent_type_parsing() {
