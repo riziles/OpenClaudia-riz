@@ -1,10 +1,11 @@
 //! End-to-end tests for `list_mcp_resources` and
-//! `read_mcp_resource` dispatch — both are currently
-//! documented stubs that surface a "not wired" error
-//! when invoked through the registry. This file pins
-//! the schema is published (so the model sees them in
-//! the tool list) while the dispatch returns the
-//! documented unimplemented marker.
+//! `read_mcp_resource` registry dispatch.
+//!
+//! These tools are no longer documented stubs: the proxy/TUI startup path
+//! installs a process-wide MCP manager and the registry handlers dispatch
+//! into it. This file pins the dispatch-layer contract that can be tested
+//! without starting an external MCP server: schema publication, argument
+//! validation, no-manager diagnostics, and read-only classification.
 //!
 //! Sprint 155 of the verification effort. Sprint 123
 //! covered the underlying `McpResource` / `McpCapabilities`
@@ -39,61 +40,80 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — list_mcp_resources: documented unimplemented stub
+// Section A — list_mcp_resources: no-manager diagnostics
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn list_mcp_resources_no_args_returns_documented_not_wired_error() {
+fn list_mcp_resources_no_args_reports_missing_registered_manager() {
     let (msg, is_err) = dispatch("list_mcp_resources", &HashMap::new());
-    assert!(is_err, "stub MUST surface as error so model knows to skip");
     assert!(
-        msg.contains("list_mcp_resources is not wired into the tool dispatch system yet"),
-        "MUST surface documented stub message; got {msg:?}"
+        is_err,
+        "without a registered MCP manager the handler must error"
+    );
+    assert!(
+        msg.contains("No MCP manager has been installed for this session"),
+        "must explain that no manager is registered; got {msg:?}"
+    );
+    assert!(
+        msg.contains("mcp.servers") && msg.contains(".openclaudia/config.yaml"),
+        "must point users at MCP configuration; got {msg:?}"
     );
 }
 
 #[test]
-fn list_mcp_resources_with_server_arg_still_returns_stub_error() {
+fn list_mcp_resources_with_server_arg_reports_missing_registered_manager() {
     let args = args_with(&[("server", json!("any-server-name"))]);
     let (msg, is_err) = dispatch("list_mcp_resources", &args);
     assert!(is_err);
-    // Stub ignores args; same documented message.
-    assert!(msg.contains("not wired into the tool dispatch system yet"));
+    assert!(msg.contains("No MCP manager has been installed for this session"));
 }
 
 #[test]
-fn list_mcp_resources_with_arbitrary_args_returns_stub_error_no_panic() {
+fn list_mcp_resources_with_arbitrary_args_reports_error_no_panic() {
     let args = args_with(&[
         ("server", json!("x")),
         ("extra", json!({"k": "v"})),
         ("count", json!(42)),
     ]);
-    let (_msg, _is_err) = dispatch("list_mcp_resources", &args);
+    let (msg, is_err) = dispatch("list_mcp_resources", &args);
+    assert!(is_err);
+    assert!(msg.contains("No MCP manager has been installed for this session"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section B — read_mcp_resource: documented unimplemented stub
+// Section B — read_mcp_resource: argument validation and no-manager diagnostics
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn read_mcp_resource_no_args_returns_documented_not_wired_error() {
+fn read_mcp_resource_no_args_reports_missing_server_before_manager_lookup() {
     let (msg, is_err) = dispatch("read_mcp_resource", &HashMap::new());
     assert!(is_err);
     assert!(
-        msg.contains("read_mcp_resource is not wired into the tool dispatch system yet"),
-        "MUST surface documented stub message; got {msg:?}"
+        msg.contains("read_mcp_resource: missing required argument `server`"),
+        "must validate required server arg before manager lookup; got {msg:?}"
     );
 }
 
 #[test]
-fn read_mcp_resource_with_server_and_uri_still_returns_stub_error() {
+fn read_mcp_resource_with_server_but_no_uri_reports_missing_uri() {
+    let args = args_with(&[("server", json!("test-server"))]);
+    let (msg, is_err) = dispatch("read_mcp_resource", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("read_mcp_resource: missing required argument `uri`"),
+        "must validate required uri arg before manager lookup; got {msg:?}"
+    );
+}
+
+#[test]
+fn read_mcp_resource_with_server_and_uri_without_manager_reports_configuration_error() {
     let args = args_with(&[
         ("server", json!("test-server")),
         ("uri", json!("file:///example")),
     ]);
     let (msg, is_err) = dispatch("read_mcp_resource", &args);
     assert!(is_err);
-    assert!(msg.contains("not wired into the tool dispatch system yet"));
+    assert!(msg.contains("No MCP manager has been installed for this session"));
 }
 
 #[test]
@@ -103,7 +123,9 @@ fn read_mcp_resource_with_arbitrary_args_no_panic() {
         ("uri", json!("y")),
         ("extra", json!([1, 2, 3])),
     ]);
-    let (_msg, _is_err) = dispatch("read_mcp_resource", &args);
+    let (msg, is_err) = dispatch("read_mcp_resource", &args);
+    assert!(is_err);
+    assert!(msg.contains("No MCP manager has been installed for this session"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -159,30 +181,33 @@ fn list_mcp_resources_schema_description_mentions_mcp_servers() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — Stub-message uniformity
+// Section D — Current dispatch diagnostics
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn both_mcp_resource_tools_share_documented_unimplemented_phrasing() {
-    // PINS UNIFORMITY: both stub tools end their message with
-    // "not wired into the tool dispatch system yet" + a note
-    // about the schema being published.
+fn mcp_resource_tool_diagnostics_no_longer_claim_unimplemented_stub() {
     let (l_msg, _) = dispatch("list_mcp_resources", &HashMap::new());
-    let (r_msg, _) = dispatch("read_mcp_resource", &HashMap::new());
+    let read_args = args_with(&[
+        ("server", json!("test-server")),
+        ("uri", json!("file:///example")),
+    ]);
+    let (r_msg, _) = dispatch("read_mcp_resource", &read_args);
 
-    assert!(l_msg.contains("not wired into the tool dispatch system yet"));
-    assert!(r_msg.contains("not wired into the tool dispatch system yet"));
-    assert!(l_msg.contains("schema is published"));
-    assert!(r_msg.contains("schema is published"));
+    for msg in [l_msg, r_msg] {
+        assert!(
+            !msg.contains("not wired into the tool dispatch system yet"),
+            "MCP resource handlers are wired now; stale stub message: {msg:?}"
+        );
+        assert!(
+            !msg.contains("schema is published"),
+            "schema-only diagnostic is stale now that dispatch is wired: {msg:?}"
+        );
+    }
 }
 
 #[test]
-fn stub_messages_name_the_offending_tool_so_model_knows_which_failed() {
-    // PINS DIAGNOSTIC: each stub names ITSELF in the error so
-    // the model can tell list vs read failed.
-    let (l_msg, _) = dispatch("list_mcp_resources", &HashMap::new());
+fn read_mcp_resource_argument_errors_name_the_offending_tool() {
     let (r_msg, _) = dispatch("read_mcp_resource", &HashMap::new());
-    assert!(l_msg.starts_with("list_mcp_resources"));
     assert!(r_msg.starts_with("read_mcp_resource"));
 }
 

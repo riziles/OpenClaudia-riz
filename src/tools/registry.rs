@@ -1335,12 +1335,10 @@ impl ToolHandler for TaskListHandler {
 
 // ── mcp resource tools ────────────────────────────────────────────────────────
 //
-// These two tools have schemas exposed to the model but their dispatch was
-// never wired into the registry — calling them today falls through to the
-// "Unknown tool" path. Tracked as a latent bug separate from #463; the handler
-// stubs below at least bind the schema next to a named handler so the next
-// person to wire MCP resources into the tool dispatch system finds an obvious
-// landing pad instead of an orphan schema.
+// These tools dispatch through the process-wide MCP manager installed by the
+// proxy/TUI startup path. Keeping schema and dispatch in the registry prevents
+// MCP resource support from drifting back into an advertised-but-unreachable
+// tool surface.
 
 struct ListMcpResourcesHandler;
 impl ToolHandler for ListMcpResourcesHandler {
