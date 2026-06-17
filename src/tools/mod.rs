@@ -1009,14 +1009,21 @@ mod tests {
     #[test]
     fn test_list_files() {
         let _cwd_lock = testutil::process_cwd_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("write fixture Cargo.toml");
+
         let mut args = HashMap::new();
-        args.insert("path".to_string(), json!(env!("CARGO_MANIFEST_DIR")));
+        args.insert("path".to_string(), json!(dir.path().to_str().unwrap()));
         let (output, is_error) = file::execute_list_files(&args);
-        assert!(!is_error, "list_files should succeed for project root");
-        assert!(!output.is_empty(), "project root should contain files");
+        assert!(!is_error, "list_files should succeed for temp fixture");
+        assert!(!output.is_empty(), "temp fixture should contain files");
         assert!(
             output.contains("Cargo.toml"),
-            "Project root should contain Cargo.toml, got: {output}"
+            "temp fixture should contain Cargo.toml, got: {output}"
         );
     }
 
