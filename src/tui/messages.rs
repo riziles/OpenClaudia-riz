@@ -195,6 +195,8 @@ pub enum EffortLevel {
     Low,
     Medium,
     High,
+    Max,
+    Auto,
 }
 
 impl EffortLevel {
@@ -205,6 +207,8 @@ impl EffortLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Max => "max",
+            Self::Auto => "auto",
         }
     }
 
@@ -215,6 +219,8 @@ impl EffortLevel {
             Self::Low => "\u{25CB}",
             Self::Medium => "\u{25D0}",
             Self::High => "\u{25CF}",
+            Self::Max => "\u{25C6}",
+            Self::Auto => "\u{25C7}",
         }
     }
 
@@ -224,7 +230,7 @@ impl EffortLevel {
         match self {
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
-            Self::High => Self::Low,
+            Self::High | Self::Max | Self::Auto => Self::Low,
         }
     }
 }
@@ -239,9 +245,11 @@ impl FromStr for EffortLevel {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "low" => Self::Low,
-            "high" => Self::High,
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "low" | "l" => Self::Low,
+            "high" | "h" => Self::High,
+            "max" | "x" => Self::Max,
+            "auto" | "unset" => Self::Auto,
             _ => Self::Medium,
         })
     }
@@ -781,6 +789,8 @@ mod tests {
         assert_eq!(EffortLevel::Low.cycled(), EffortLevel::Medium);
         assert_eq!(EffortLevel::Medium.cycled(), EffortLevel::High);
         assert_eq!(EffortLevel::High.cycled(), EffortLevel::Low);
+        assert_eq!(EffortLevel::Max.cycled(), EffortLevel::Low);
+        assert_eq!(EffortLevel::Auto.cycled(), EffortLevel::Low);
     }
 
     #[test]
@@ -791,6 +801,10 @@ mod tests {
             EffortLevel::Medium
         );
         assert_eq!("high".parse::<EffortLevel>().unwrap(), EffortLevel::High);
+        assert_eq!("max".parse::<EffortLevel>().unwrap(), EffortLevel::Max);
+        assert_eq!("x".parse::<EffortLevel>().unwrap(), EffortLevel::Max);
+        assert_eq!("auto".parse::<EffortLevel>().unwrap(), EffortLevel::Auto);
+        assert_eq!("unset".parse::<EffortLevel>().unwrap(), EffortLevel::Auto);
         // Unknown falls back to Medium
         assert_eq!(
             "unknown".parse::<EffortLevel>().unwrap(),
@@ -800,7 +814,13 @@ mod tests {
 
     #[test]
     fn effort_level_display_matches_as_str() {
-        for level in [EffortLevel::Low, EffortLevel::Medium, EffortLevel::High] {
+        for level in [
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Max,
+            EffortLevel::Auto,
+        ] {
             assert_eq!(level.to_string(), level.as_str());
         }
     }

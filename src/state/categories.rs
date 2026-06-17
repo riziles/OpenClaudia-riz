@@ -271,6 +271,7 @@ pub enum EffortLevel {
     Medium,
     High,
     Max,
+    Auto,
 }
 
 impl EffortLevel {
@@ -282,6 +283,7 @@ impl EffortLevel {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Max => "max",
+            Self::Auto => "auto",
         }
     }
 
@@ -294,7 +296,8 @@ impl EffortLevel {
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
-            "max" => Some(Self::Max),
+            "max" | "x" => Some(Self::Max),
+            "auto" | "unset" => Some(Self::Auto),
             _ => None,
         }
     }
@@ -409,6 +412,9 @@ mod tests {
         assert_eq!(EffortLevel::parse("med"), Some(EffortLevel::Medium));
         assert_eq!(EffortLevel::parse("High"), Some(EffortLevel::High));
         assert_eq!(EffortLevel::parse("max"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::parse("x"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::parse("auto"), Some(EffortLevel::Auto));
+        assert_eq!(EffortLevel::parse("unset"), Some(EffortLevel::Auto));
         assert_eq!(EffortLevel::parse("xxl"), None);
     }
 
@@ -419,6 +425,7 @@ mod tests {
         assert_eq!(EffortLevel::Medium.as_str(), "medium");
         assert_eq!(EffortLevel::High.as_str(), "high");
         assert_eq!(EffortLevel::Max.as_str(), "max");
+        assert_eq!(EffortLevel::Auto.as_str(), "auto");
     }
 
     #[test]

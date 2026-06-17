@@ -223,7 +223,7 @@ The default full-screen TUI intentionally exposes a focused slash-command set. T
 | `/exit`, `/quit` | Exit the TUI |
 | `/status` | Show model, provider, effort, and token estimate |
 | `/mode` | Toggle between Build and Plan modes |
-| `/effort [low\|medium\|high]` | Set or cycle effort level |
+| `/effort [low\|medium\|high\|max\|auto]` | Set or cycle effort level |
 
 ### TUI Sessions
 

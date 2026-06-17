@@ -92,7 +92,7 @@ pub enum SlashCommandResult {
     ToggleVim,
     /// Invoke a skill (inject its prompt as the next user message)
     Skill(String),
-    /// Set effort level for the session (low/medium/high)
+    /// Set effort level for the session (low/medium/high/max/auto)
     SetEffort(String),
     /// Cycle effort level: low → medium → high → low
     CycleEffort,
@@ -1352,12 +1352,22 @@ pub fn slash_effort(args: &str) -> SlashCommandResult {
             println!("\n\u{2713} Effort set to \x1b[32mhigh\x1b[0m (thorough, slower)\n");
             SlashCommandResult::SetEffort("high".to_string())
         }
+        "max" | "x" => {
+            println!("\n\u{2713} Effort set to \x1b[35mmax\x1b[0m (maximum thinking)\n");
+            SlashCommandResult::SetEffort("max".to_string())
+        }
+        "auto" | "unset" => {
+            println!("\n\u{2713} Effort set to \x1b[36mauto\x1b[0m (provider default)\n");
+            SlashCommandResult::SetEffort("auto".to_string())
+        }
         "" => SlashCommandResult::CycleEffort,
         _ => {
-            println!("\nUsage: /effort [low|medium|high]");
+            println!("\nUsage: /effort [low|medium|high|max|auto]");
             println!("  low    - Quick answers, minimal thinking");
             println!("  medium - Balanced (default)");
             println!("  high   - Thorough, more thinking time");
+            println!("  max    - Maximum thinking where supported");
+            println!("  auto   - Omit effort hints and use provider default");
             println!("  (no argument cycles through levels)\n");
             SlashCommandResult::Handled
         }
@@ -2746,25 +2756,23 @@ mod tests {
         );
     }
 
-    /// OC: `/effort max` is not a valid level — returns `Handled` (usage printed).
-    /// CC: `/effort max` is a valid session-only level.  Pinned divergence.
+    /// OC: `/effort max` returns `SetEffort("max")`.
     #[test]
-    fn spec_effort_max_not_supported_returns_handled() {
+    fn spec_effort_max_returns_set_effort() {
         let result = handle_slash_command("/effort max", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
-            matches!(result, Some(SlashCommandResult::Handled)),
-            "/effort max must return Handled — OC does not support max level (gap)"
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "max"),
+            "/effort max must return SetEffort(\"max\")"
         );
     }
 
-    /// OC: `/effort auto` is not a valid level — returns `Handled`.
-    /// CC: `/effort auto` clears effort level.  Pinned divergence.
+    /// OC: `/effort auto` returns `SetEffort("auto")`.
     #[test]
-    fn spec_effort_auto_not_supported_returns_handled() {
+    fn spec_effort_auto_returns_set_effort() {
         let result = handle_slash_command("/effort auto", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
-            matches!(result, Some(SlashCommandResult::Handled)),
-            "/effort auto must return Handled — OC does not support auto/unset (gap)"
+            matches!(result, Some(SlashCommandResult::SetEffort(ref s)) if s == "auto"),
+            "/effort auto must return SetEffort(\"auto\")"
         );
     }
 

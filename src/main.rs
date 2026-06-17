@@ -1189,33 +1189,38 @@ fn build_chat_body_anthropic(
 }
 
 /// Build the Gemini request body.
-fn build_chat_body_google(messages: &[serde_json::Value]) -> Result<serde_json::Value, String> {
-    openclaudia::pipeline::build_google_request(messages, "medium")
+fn build_chat_body_google(
+    messages: &[serde_json::Value],
+    effort_level: &str,
+) -> Result<serde_json::Value, String> {
+    openclaudia::pipeline::build_google_request(messages, effort_level)
 }
 
 /// Build the generic OpenAI-compatible request body.
-fn build_chat_body_openai_like(messages: &[serde_json::Value], model: &str) -> serde_json::Value {
-    serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
-        "stream": true,
-        "tools": tools::get_all_tool_definitions(true)
-    })
+fn build_chat_body_openai_like(
+    messages: &[serde_json::Value],
+    model: &str,
+    effort_level: &str,
+) -> serde_json::Value {
+    openclaudia::pipeline::build_openai_request(model, messages, effort_level)
 }
 
 /// Apply Anthropic-specific `effort_level` mapping in place.
 fn apply_anthropic_effort_level(request_body: &mut serde_json::Value, effort_level: &str) {
     match effort_level {
-        "high" => {
-            request_body["thinking"] =
-                serde_json::json!({"type": "enabled", "budget_tokens": 10000});
-            request_body["max_tokens"] = serde_json::json!(16000);
+        "high" | "max" => {
+            if let Some(budget) =
+                openclaudia::thinking::anthropic_thinking_budget(Some(effort_level))
+            {
+                request_body["thinking"] =
+                    serde_json::json!({"type": "enabled", "budget_tokens": budget});
+                request_body["max_tokens"] = serde_json::json!(40_000);
+            }
         }
         "low" => {
             request_body["max_tokens"] = serde_json::json!(2048);
         }
-        _ => {} // medium = default
+        _ => {} // medium/auto = default
     }
 }
 
@@ -1238,8 +1243,8 @@ fn build_chat_request_body(
 ) -> Result<serde_json::Value, String> {
     let mut request_body = match target {
         "anthropic" => build_chat_body_anthropic(messages, model, prompt_blocks)?,
-        "google" => build_chat_body_google(messages)?,
-        _ => build_chat_body_openai_like(messages, model),
+        "google" => build_chat_body_google(messages, effort_level)?,
+        _ => build_chat_body_openai_like(messages, model, effort_level),
     };
 
     // Inject Claude Code OAuth system prompt when using OAuth auth.
@@ -1429,6 +1434,60 @@ mod tests {
             resolve_model_name(None, None, "unknown-provider"),
             "gpt-5.5"
         );
+    }
+
+    #[test]
+    fn legacy_chat_request_builder_propagates_max_effort() {
+        let prev = std::env::var("MAX_THINKING_TOKENS").ok();
+        unsafe {
+            std::env::remove_var("MAX_THINKING_TOKENS");
+        }
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let prompt_blocks = openclaudia::prompt::SystemPromptBlocks {
+            stable_prefix: "stable".to_string(),
+            dynamic_suffix: String::new(),
+        };
+
+        let anthropic = build_chat_request_body(
+            "anthropic",
+            &messages,
+            "claude-sonnet-4-6",
+            &prompt_blocks,
+            "max",
+            None,
+        )
+        .expect("anthropic request must build");
+        assert_eq!(
+            anthropic["thinking"]["budget_tokens"],
+            openclaudia::thinking::ULTRATHINK_BUDGET_TOKENS
+        );
+        assert_eq!(anthropic["max_tokens"], 40_000);
+
+        let openai =
+            build_chat_request_body("openai", &messages, "o3", &prompt_blocks, "max", None)
+                .expect("openai-like request must build");
+        assert_eq!(openai["reasoning_effort"], "high");
+
+        let google = build_chat_request_body(
+            "google",
+            &messages,
+            "gemini-2.5-pro",
+            &prompt_blocks,
+            "max",
+            None,
+        )
+        .expect("google request must build");
+        assert_eq!(
+            google["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24_576
+        );
+
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("MAX_THINKING_TOKENS", v);
+            }
+        }
     }
 
     /// Crosslink #802: the per-target default model table is the single

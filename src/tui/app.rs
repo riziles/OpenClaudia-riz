@@ -1944,13 +1944,7 @@ impl App {
             if parts.len() == 2 {
                 let level = parts[1].trim();
                 // FromStr for EffortLevel is Infallible; unknown strings map to Medium.
-                let parsed: EffortLevel = level.parse().unwrap_or(EffortLevel::Medium);
-                if matches!(
-                    parsed,
-                    EffortLevel::Low | EffortLevel::Medium | EffortLevel::High
-                ) {
-                    self.effort_level = parsed;
-                }
+                self.effort_level = level.parse().unwrap_or(EffortLevel::Medium);
             } else {
                 self.effort_level = self.effort_level.cycled();
             }

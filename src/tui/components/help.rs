@@ -85,7 +85,7 @@ const KEYBIND_SECTIONS: &[(&str, &[Shortcut])] = &[
             },
             Shortcut {
                 keys: "env CLAUDE_CODE_EFFORT_LEVEL=…",
-                description: "low/medium/high/max/unset — overrides the in-session effort",
+                description: "low/medium/high/max/auto/unset — overrides the in-session effort",
             },
         ],
     ),

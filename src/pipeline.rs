@@ -252,10 +252,9 @@ pub fn build_request(
 ) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
-    // does the same in `resolveAppliedEffort`). If the env var is set
-    // to `unset` / `auto` we drop to `medium` — keeping effort out of
-    // the request body entirely isn't an option for OC's existing
-    // string-typed signature, and `medium` is the API's no-op level.
+    // does the same in `resolveAppliedEffort`). If env says `unset` /
+    // `auto`, `medium` flows through as the request builders' no-op
+    // effort level, omitting provider effort hints.
     let resolved = crate::thinking::resolve_effort(effort_level, messages);
     let effective = resolved.as_deref().unwrap_or("medium");
     match provider {

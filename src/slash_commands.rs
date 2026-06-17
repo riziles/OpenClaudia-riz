@@ -92,7 +92,10 @@ const CORE: &[SlashCommand] = &[
     ),
     cmd("/plan", "Toggle between Build and Plan modes"),
     cmd("/vim", "Toggle vim mode (show mode indicator in prompt)"),
-    cmd("/effort [level]", "Set effort level (low/medium/high)"),
+    cmd(
+        "/effort [level]",
+        "Set effort level (low/medium/high/max/auto)",
+    ),
     cmd("/keybindings", "Show configured keyboard shortcuts"),
     cmd("/rename <title>", "Rename the current session"),
     cmd("/version", "Show version and system information"),
@@ -194,7 +197,10 @@ const TUI_CORE: &[SlashCommand] = &[
         "Show model, provider, effort, and token estimate",
     ),
     cmd("/mode", "Toggle between Build and Plan modes"),
-    cmd("/effort [low|medium|high]", "Set or cycle effort level"),
+    cmd(
+        "/effort [low|medium|high|max|auto]",
+        "Set or cycle effort level",
+    ),
 ];
 
 const TUI_SESSIONS: &[SlashCommand] = &[
