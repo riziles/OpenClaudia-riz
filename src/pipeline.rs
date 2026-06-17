@@ -486,6 +486,41 @@ fn backoff_with_jitter(attempt: u32) -> u64 {
     raw.max(1)
 }
 
+fn retry_jitter_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()))
+}
+
+const fn retry_after_with_jitter_from(
+    retry_after_secs: u64,
+    jitter_seed: u64,
+) -> std::time::Duration {
+    let base_ms = retry_after_secs.saturating_mul(1_000);
+    if base_ms == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let max_jitter_ms = base_ms / 4;
+    let jitter_ms = jitter_seed % (max_jitter_ms + 1);
+    std::time::Duration::from_millis(base_ms.saturating_add(jitter_ms))
+}
+
+fn retry_after_with_jitter(retry_after_secs: u64) -> std::time::Duration {
+    retry_after_with_jitter_from(retry_after_secs, retry_jitter_seed())
+}
+
+fn retry_delay_label(delay: std::time::Duration) -> String {
+    let millis = delay.as_millis();
+    if millis.is_multiple_of(1_000) {
+        format!("{}s", millis / 1_000)
+    } else {
+        let seconds = millis / 1_000;
+        let hundredths = (millis % 1_000) / 10;
+        format!("{seconds}.{hundredths:02}s")
+    }
+}
+
 /// Map a model name to a lighter sibling that's suitable as a fallback when
 /// the requested model is sustainedly overloaded (HTTP 529).
 ///
@@ -581,12 +616,15 @@ async fn send_with_retry(
         let status = resp.status().as_u16();
 
         if is_retryable_status(status) && attempt < MAX_API_RETRIES {
-            let base_wait = resp
+            let wait = resp
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or_else(|| backoff_with_jitter(attempt));
+                .map_or_else(
+                    || std::time::Duration::from_secs(backoff_with_jitter(attempt)),
+                    retry_after_with_jitter,
+                );
             tracing::warn!(
                 target: "openclaudia::retry",
                 event = "api_retry",
@@ -594,13 +632,14 @@ async fn send_with_retry(
                 attempt = attempt + 1,
                 max_attempts = MAX_API_RETRIES + 1,
                 status,
-                wait_secs = base_wait,
+                wait_ms = wait.as_millis(),
                 "transient API status, retrying"
             );
+            let delay_label = retry_delay_label(wait);
             let _ = tx.send(AppEvent::StreamText(format!(
-                "\n(Retrying in {base_wait}s — {status}...)\n"
+                "\n(Retrying in {delay_label} — {status}...)\n"
             )));
-            tokio::time::sleep(std::time::Duration::from_secs(base_wait)).await;
+            tokio::time::sleep(wait).await;
             continue;
         }
 
@@ -3210,6 +3249,43 @@ mod tests {
             let wait = backoff_with_jitter(0);
             assert!(wait >= 1, "wait must be >=1, got {wait}");
         }
+    }
+
+    #[test]
+    fn issue_596_retry_after_zero_keeps_zero_delay() {
+        assert_eq!(
+            retry_after_with_jitter_from(0, u64::MAX),
+            std::time::Duration::ZERO,
+            "Retry-After: 0 must stay zero so deterministic tests and immediate retry semantics hold"
+        );
+    }
+
+    #[test]
+    fn issue_596_retry_after_jitter_is_additive_and_bounded() {
+        let base = std::time::Duration::from_secs(4);
+        let max = std::time::Duration::from_secs(5);
+
+        let no_jitter = retry_after_with_jitter_from(4, 0);
+        let max_jitter = retry_after_with_jitter_from(4, 1_000);
+
+        assert_eq!(no_jitter, base);
+        assert_eq!(max_jitter, max);
+        for seed in [1, 42, 999, 1_001, u64::MAX] {
+            let wait = retry_after_with_jitter_from(4, seed);
+            assert!(
+                (base..=max).contains(&wait),
+                "Retry-After jitter must stay within 0-25%; seed={seed}, wait={wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_596_retry_delay_label_formats_fractional_seconds() {
+        assert_eq!(retry_delay_label(std::time::Duration::from_secs(3)), "3s");
+        assert_eq!(
+            retry_delay_label(std::time::Duration::from_millis(1_250)),
+            "1.25s"
+        );
     }
 
     /// #592: `max_retries` cap is the CC-parity value (10). Pins via the

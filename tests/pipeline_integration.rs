@@ -216,15 +216,14 @@ async fn b1_503_is_retried() {
     assert!(result.is_ok(), "503 must be retried and succeed on 2nd try");
 }
 
-/// B1 — `Retry-After` header is used verbatim when present.
+/// B1 — `Retry-After` header is honored when present.
 ///
-/// OC parses `Retry-After` as `u64` seconds and sleeps exactly that long.
-/// Gap #596 tracks that CC adds 0–25% jitter on top; OC does not.
+/// OC parses `Retry-After` as `u64` seconds and adds bounded jitter in the
+/// runtime helper. This integration test uses `retry-after: 0` to avoid any
+/// actual sleep while still pinning the retry path.
 /// Gap #595 tracks that CC emits a typed `api_retry` event; OC emits plain text.
-///
-/// This test uses `retry-after: 0` to avoid any actual sleep.
 #[tokio::test]
-async fn b1_retry_after_header_used_verbatim_no_jitter_gap_596() {
+async fn b1_retry_after_zero_retries_without_sleep() {
     let server = MockServer::start().await;
 
     // First call returns 429 with Retry-After: 0 (no jitter to wait for)
