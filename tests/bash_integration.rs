@@ -651,8 +651,9 @@ fn b4c_env_scrub_allowlist_drops_arbitrary_names() {
 /// B5a — `rm -rf /` is blocked with `is_error=true`
 ///
 /// OC: `denied_reason` matches "rm -rf /" substring (policy.rs:94).
-/// GAP: OC does NOT check IFS injection, unicode whitespace, process substitution,
-/// UNC paths, CR tokenization, obfuscated flags, brace expansion, /proc/environ.
+/// OC also hard-denies IFS reassignment and `/proc/*/environ` reads.
+/// GAP: OC does NOT check unicode whitespace, process substitution, UNC paths,
+/// CR tokenization, obfuscated flags, or brace expansion.
 /// Ref crosslink #589.
 #[test]
 fn b5a_denylist_blocks_rm_rf_root() {
@@ -808,6 +809,46 @@ fn b5j_denylist_blocks_dd_to_block_device() {
         "B5j: dd writing to block device must be blocked; got: {}",
         result.content
     );
+}
+
+#[test]
+fn b5k_denylist_blocks_ifs_reassignment() {
+    let result = execute_tool(&make_tool_call(
+        "bash",
+        &json!({ "command": "IFS=$'\\n'; cmd" }),
+    ));
+    assert!(
+        result.is_error,
+        "B5k: IFS reassignment must be blocked; got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("rejected"),
+        "B5k: error must say 'rejected'; got: {}",
+        result.content
+    );
+}
+
+#[test]
+fn b5l_denylist_blocks_proc_environ_reads() {
+    for command in [
+        "cat /proc/1/environ",
+        "tr '\\0' '\\n' < /proc/self/environ",
+        "cat '/proc/self/environ'",
+        "cat \"/proc/1/environ\"",
+    ] {
+        let result = execute_tool(&make_tool_call("bash", &json!({ "command": command })));
+        assert!(
+            result.is_error,
+            "B5l: /proc environ read must be blocked for {command:?}; got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("rejected"),
+            "B5l: error must say 'rejected' for {command:?}; got: {}",
+            result.content
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

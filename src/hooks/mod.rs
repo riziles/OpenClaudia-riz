@@ -914,6 +914,17 @@ impl HookEngine {
         }
     }
 
+    async fn wait_for_hook_output(
+        child: Child,
+        timeout_secs: u64,
+    ) -> Result<std::process::Output, HookError> {
+        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(e)) => Err(HookError::CommandFailed(e.to_string())),
+            Err(_) => Err(HookError::Timeout(timeout_secs)),
+        }
+    }
+
     /// Execute a command hook.
     ///
     /// Two execution paths:
@@ -972,14 +983,20 @@ impl HookEngine {
         let stdin_result = Self::write_hook_stdin(&mut stdin, input_json).await;
         drop(stdin);
         if let Err(e) = stdin_result {
-            Self::terminate_child_after_stdin_failure(&mut child).await;
+            let output = Self::wait_for_hook_output(child, timeout_secs).await?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.is_empty() {
+                    debug!(stderr = %stderr, "Hook stderr");
+                }
+                return Ok((Self::parse_hook_output(&stdout), 0));
+            }
             return Err(e);
         }
 
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
+        match Self::wait_for_hook_output(child, timeout_secs).await {
+            Ok(output) => {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -988,8 +1005,7 @@ impl HookEngine {
                 }
                 Ok((Self::parse_hook_output(&stdout), exit_code))
             }
-            Ok(Err(e)) => Err(HookError::CommandFailed(e.to_string())),
-            Err(_) => Err(HookError::Timeout(timeout_secs)),
+            Err(e) => Err(e),
         }
     }
 

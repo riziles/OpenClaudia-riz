@@ -9,13 +9,12 @@
 //! rather than the leaf modules in isolation.
 //!
 //! Coverage shape:
-//!   - **bash command injection catalog** — 16 attack strings spanning
+//!   - **bash command injection catalog** — hostile strings spanning
 //!     command substitution, process substitution, pipe-to-interpreter,
-//!     eval/source/dot, and find-exec. Every one must be rejected by
-//!     `execute_tool` when issued as a bash call (either with a
-//!     non-zero `is_error` or with an output explicitly naming the
-//!     denial). Includes a counter-test of 10 benign commands that
-//!     must NOT be flagged.
+//!     eval/source/dot, find-exec, tokenization bypass, and environment
+//!     exfiltration. Every one must be caught by `validate_command` or
+//!     `dangerous_shell_construct`. Includes a counter-test of 10 benign
+//!     commands that must NOT be flagged.
 //!   - **path constraints** — install a `PathConstraints` rooted on a
 //!     tempdir, verify the `allows()` predicate accepts paths inside
 //!     and refuses traversal-via-dotdot and absolute paths to
@@ -92,6 +91,12 @@ const ATTACK_STRINGS: &[&str] = &[
     "find . -execdir rm {} ;",
     // HEREDOC with expansion
     "cat <<EOF\n$(rm /tmp/openclaudia-injection-canary)\nEOF",
+    // tokenization bypass / environment exfiltration
+    "IFS=$'\\n'; cmd",
+    "cat /proc/1/environ",
+    "tr '\\0' '\\n' < /proc/self/environ",
+    "cat '/proc/self/environ'",
+    "cat \"/proc/1/environ\"",
 ];
 
 /// Drive each attack string through the public policy gates

