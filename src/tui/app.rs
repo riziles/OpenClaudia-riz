@@ -18,10 +18,27 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::file_error::{self, FileError};
+
+/// Absolute, PATH-independent location of `git` for synchronous TUI helpers.
+static GIT_BIN: LazyLock<Result<PathBuf, String>> =
+    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
+
+fn git_bin() -> Result<&'static Path, String> {
+    match &*GIT_BIN {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
+fn git_command() -> Result<Command, String> {
+    Ok(Command::new(git_bin()?))
+}
 
 /// Process-wide shutdown flag for the TUI event loop.
 ///
@@ -1993,10 +2010,11 @@ impl App {
 
     /// Handle the `/review` slash command (shows truncated `git diff HEAD`).
     fn handle_slash_review(&mut self) {
-        let content = match std::process::Command::new("git")
-            .args(["diff", "HEAD"])
-            .output()
-        {
+        let content = match git_command().and_then(|mut cmd| {
+            cmd.args(["diff", "HEAD"])
+                .output()
+                .map_err(|e| e.to_string())
+        }) {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 if stdout.is_empty() {
@@ -3185,9 +3203,35 @@ async fn handle_turn_result(
 #[cfg(test)]
 mod tests {
     use super::expand_file_refs;
-    use super::{ApiClient, App, AppEvent, SpawnTarget};
+    use super::{git_bin, ApiClient, App, AppEvent, SpawnTarget};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tui_git_helpers_use_resolved_binary_path() {
+        let git = git_bin().expect("tui tests require git on PATH");
+        assert!(
+            git.is_absolute(),
+            "git_bin must resolve git to an absolute path, got {}",
+            git.display()
+        );
+
+        let src = include_str!("app.rs");
+        let cfg_test = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must be present");
+        let production = &src[..cfg_test];
+
+        for (idx, raw_line) in production.lines().enumerate() {
+            let code = raw_line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("Command::new(\"git\")")
+                    && !code.contains("std::process::Command::new(\"git\")"),
+                "production TUI app code must not invoke bare git; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+        }
+    }
 
     // ── ApiClient extraction (crosslink #253) ───────────────────────────
 
