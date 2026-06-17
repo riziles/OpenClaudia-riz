@@ -33,38 +33,64 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
 
     // Handle --status flag
     if status {
-        let sessions: Vec<_> = {
-            let _store = OAuthStore::new();
-            let persist_path =
-                dirs::data_local_dir().map(|d| d.join("openclaudia").join("oauth_sessions.json"));
-
-            persist_path
-                .filter(|path| path.exists())
-                .and_then(|path| std::fs::read_to_string(&path).ok())
-                .and_then(|content| {
-                    serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
-                        &content,
-                    )
-                    .ok()
-                })
-                .map(|sessions| sessions.into_iter().collect())
-                .unwrap_or_default()
-        };
-
-        if sessions.is_empty() {
-            println!("Not authenticated with Claude Max.");
-            println!("Run 'openclaudia auth' to authenticate.");
-        } else {
-            println!("Authenticated with Claude Max.");
-            println!("Sessions: {}", sessions.len());
-            for (id, data) in &sessions {
-                let expires = data
-                    .get("credentials")
-                    .and_then(|c| c.get("expires_at"))
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown");
-                println!("  {} (expires: {})", safe_truncate(id, 8), expires);
+        let credentials_path = openclaudia::claude_credentials::credentials_path().map_or_else(
+            || "~/.claude/.credentials.json".to_string(),
+            |path| path.display().to_string(),
+        );
+        match openclaudia::claude_credentials::peek_credentials() {
+            Ok(Some(status)) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let remaining_secs = (status.expires_at_ms - now_ms).max(0) / 1000;
+                println!("Claude credentials ({credentials_path}):");
+                println!(
+                    "  subscription : {}",
+                    status.subscription_type.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "  inference    : {}",
+                    if status.has_inference_scope {
+                        "yes"
+                    } else {
+                        "no (chat will fail)"
+                    }
+                );
+                if status.expired {
+                    println!("  status       : expired (auto-refreshes on next use)");
+                } else if status.expires_soon {
+                    println!("  status       : valid, expiring soon (auto-refreshes on next use)");
+                } else {
+                    println!(
+                        "  status       : valid (~{}h{}m remaining)",
+                        remaining_secs / 3600,
+                        (remaining_secs % 3600) / 60
+                    );
+                }
             }
+            Ok(None) => {
+                println!("No Claude credentials at {credentials_path}.");
+                println!("Run 'openclaudia auth', or log in with Claude Code / openclaude.");
+            }
+            Err(e) => {
+                eprintln!("Could not read {credentials_path}: {e}");
+            }
+        }
+
+        let session_count = dirs::data_local_dir()
+            .map(|d| d.join("openclaudia").join("oauth_sessions.json"))
+            .filter(|path| path.exists())
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .and_then(|content| {
+                serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                    &content,
+                )
+                .ok()
+            })
+            .map_or(0, |sessions| sessions.len());
+        println!();
+        if session_count == 0 {
+            println!("Native OAuth session store: empty.");
+        } else {
+            println!("Native OAuth session store: {session_count} session(s).");
         }
         return Ok(());
     }
@@ -151,6 +177,32 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     } else {
         println!("Using Bearer token authentication (personal Claude Max account)");
         println!("  Granted scopes: {}", session.granted_scopes.join(", "));
+    }
+
+    if session
+        .granted_scopes
+        .iter()
+        .any(|scope| scope == "user:inference")
+    {
+        match openclaudia::claude_credentials::store_credentials(
+            &session.credentials.access_token,
+            session.credentials.refresh_token.as_deref(),
+            session.credentials.expires_at.timestamp_millis(),
+            session.granted_scopes.clone(),
+            None,
+            None,
+        ) {
+            Ok(()) => {
+                let path = openclaudia::claude_credentials::credentials_path().map_or_else(
+                    || "~/.claude/.credentials.json".into(),
+                    |p| p.display().to_string(),
+                );
+                println!("Saved Claude credentials to {path}");
+            }
+            Err(e) => eprintln!("Warning: could not write Claude credentials: {e}"),
+        }
+    } else {
+        eprintln!("Note: granted scopes lack 'user:inference'; skipped writing Claude credentials");
     }
 
     let session_id = session.id.clone();
