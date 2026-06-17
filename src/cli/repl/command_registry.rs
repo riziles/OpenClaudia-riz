@@ -90,7 +90,7 @@ use super::slash::{
     handle_mode_command, slash_add_dir, slash_agents, slash_branch, slash_btw, slash_commit,
     slash_commit_push_pr, slash_config, slash_context, slash_continue, slash_copy, slash_cost,
     slash_debug, slash_doctor, slash_effort, slash_fast, slash_find, slash_help, slash_history,
-    slash_hooks, slash_init, slash_login, slash_model, slash_permissions, slash_plugin,
+    slash_hooks, slash_init, slash_login, slash_mcp, slash_model, slash_permissions, slash_plugin,
     slash_rewind, slash_sessions, slash_skill, slash_version,
 };
 use crate::cli::display::theme::handle_theme_command;
@@ -507,6 +507,18 @@ impl CommandHandler for ConfigCommand {
     }
 }
 
+// ── /mcp ────────────────────────────────────────────────────────────────────
+
+struct McpCommand;
+impl CommandHandler for McpCommand {
+    fn name(&self) -> &'static str {
+        "mcp"
+    }
+    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_mcp(args)
+    }
+}
+
 // ── /permissions ────────────────────────────────────────────────────────────
 
 struct PermissionsCommand;
@@ -792,6 +804,7 @@ static HANDLERS: &[&dyn CommandHandler] = &[
     &VersionCommand,
     &DoctorCommand,
     &ConfigCommand,
+    &McpCommand,
     &PermissionsCommand,
     &HooksCommand,
     &DebugCommand,

@@ -166,23 +166,18 @@ const TIME_TRAVEL: &[SlashCommand] = &[
     ),
 ];
 
-/// Interactive management overlays (crosslink #663, #666). The slash
-/// entries are registered here so users can discover them via /help;
-/// the actual TUI overlay implementations are tracked in #520 and the
-/// per-command issues.
+/// Management/status commands (crosslink #663, #666). These are intentionally
+/// read-only in the legacy REPL; live MCP lifecycle controls require the
+/// process-wide MCP manager that the full-screen TUI installs at startup.
 const MANAGEMENT: &[SlashCommand] = &[
-    cmd("/mcp", "Open the MCP server settings overlay"),
+    cmd("/mcp", "Show configured MCP servers"),
     cmd(
-        "/mcp enable <name|all>",
-        "Enable a registered MCP server (or all of them)",
+        "/mcp list",
+        "List MCP servers declared by plugins and .mcp.json",
     ),
     cmd(
-        "/mcp disable <name|all>",
-        "Disable a registered MCP server (or all of them)",
-    ),
-    cmd(
-        "/mcp reconnect <name>",
-        "Force-reconnect a stalled MCP server",
+        "/mcp help",
+        "Show MCP command usage and lifecycle limitations",
     ),
     cmd("/permissions", "Show permission rules and MCP allowlists"),
     cmd("/hooks", "Show configured lifecycle hooks"),

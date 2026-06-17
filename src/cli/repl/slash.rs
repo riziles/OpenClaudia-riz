@@ -342,6 +342,157 @@ pub fn slash_hooks() -> SlashCommandResult {
     SlashCommandResult::Handled
 }
 
+pub fn slash_mcp(args: &str) -> SlashCommandResult {
+    let mut parts = args.split_whitespace();
+    let subcmd = parts.next().unwrap_or("").to_ascii_lowercase();
+
+    match subcmd.as_str() {
+        "" | "status" | "list" => print_mcp_status(),
+        "help" => print_mcp_help(),
+        "enable" | "disable" | "reconnect" => {
+            println!("\nMCP lifecycle controls are not available in the legacy REPL.");
+            println!(
+                "Edit plugin MCP declarations, then restart OpenClaudia so startup can reconnect them."
+            );
+            println!();
+        }
+        "add" => {
+            println!("\nUsage: declare MCP servers in a plugin manifest `mcpServers` block.");
+            println!("Project .mcp.json files are detected for diagnostics but are not auto-connected here.");
+            println!();
+        }
+        unknown => {
+            println!("\nUnknown MCP subcommand: {unknown}");
+            print_mcp_help();
+        }
+    }
+
+    SlashCommandResult::Handled
+}
+
+fn print_mcp_help() {
+    println!("\nMCP Commands:\n");
+    println!("  /mcp        - Show MCP server status");
+    println!("  /mcp list   - List configured MCP servers");
+    println!("  /mcp help   - Show this help");
+    println!();
+    println!("MCP servers are connected at startup from enabled plugin `mcpServers` declarations.");
+    println!("Restart OpenClaudia after changing plugin MCP configuration.\n");
+}
+
+fn print_mcp_status() {
+    println!("\nMCP:\n");
+    print_plugin_mcp_status();
+    print_project_mcp_status(Path::new(".mcp.json"));
+
+    let manager_status = if openclaudia::mcp::registered_manager().is_some() {
+        "installed"
+    } else {
+        "not installed in this process"
+    };
+    println!("  Live MCP manager: {manager_status}");
+    println!();
+}
+
+fn print_plugin_mcp_status() {
+    let mut plugin_manager = match plugins::PluginManager::try_new() {
+        Ok(manager) => manager,
+        Err(e) => {
+            println!("  Plugin MCP servers: unavailable ({e})");
+            return;
+        }
+    };
+
+    let discovery_errors = plugin_manager.discover();
+    if !discovery_errors.is_empty() {
+        println!("  Plugin discovery warnings: {}", discovery_errors.len());
+    }
+
+    let mut servers = plugin_manager.all_mcp_servers();
+    if servers.is_empty() {
+        println!("  Plugin MCP servers: none declared");
+        return;
+    }
+
+    let total = servers.len();
+    servers.sort_by(|(a_plugin, a_server), (b_plugin, b_server)| {
+        a_plugin
+            .name()
+            .cmp(b_plugin.name())
+            .then_with(|| a_server.name.cmp(&b_server.name))
+    });
+
+    println!("  Plugin MCP servers: {total}");
+    for (plugin, server) in servers.into_iter().take(STATUS_ITEM_LIMIT) {
+        println!(
+            "    {}/{} [{}] {}{}",
+            plugin.name(),
+            server.name,
+            server.transport,
+            mcp_server_endpoint(&server),
+            server
+                .timeout
+                .map(|ms| format!(" (timeout {ms}ms)"))
+                .unwrap_or_default()
+        );
+    }
+    if total > STATUS_ITEM_LIMIT {
+        println!("    ... {} more server(s)", total - STATUS_ITEM_LIMIT);
+    }
+}
+
+fn mcp_server_endpoint(server: &plugins::PluginMcpServer) -> String {
+    match server.transport.as_str() {
+        "stdio" => server.command.as_deref().map_or_else(
+            || "<missing command>".to_string(),
+            |command| {
+                if server.args.is_empty() {
+                    command.to_string()
+                } else {
+                    format!("{} {}", command, server.args.join(" "))
+                }
+            },
+        ),
+        "http" => server.url.as_deref().unwrap_or("<missing url>").to_string(),
+        _ => "unsupported transport".to_string(),
+    }
+}
+
+fn print_project_mcp_status(path: &Path) {
+    match project_mcp_server_count(path) {
+        Ok(Some(count)) => println!(
+            "  Project .mcp.json: {count} server(s) declared (diagnostic only in the legacy REPL)"
+        ),
+        Ok(None) => println!("  Project .mcp.json: not found"),
+        Err(e) => println!("  Project .mcp.json: invalid ({e})"),
+    }
+}
+
+fn project_mcp_server_count(path: &Path) -> Result<Option<usize>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    project_mcp_server_count_from_str(&content).map(Some)
+}
+
+fn project_mcp_server_count_from_str(content: &str) -> Result<usize, String> {
+    let value = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
+    let servers = if let Some(servers) = value.get("mcpServers") {
+        servers
+            .as_object()
+            .ok_or_else(|| "`mcpServers` must be an object".to_string())?
+    } else {
+        value
+            .as_object()
+            .ok_or_else(|| ".mcp.json root must be an object".to_string())?
+    };
+    Ok(servers.len())
+}
+
 fn load_persisted_permission_rules(path: &Path) -> Result<Option<Vec<PermissionRule>>, String> {
     if !path.exists() {
         return Ok(None);
@@ -2584,7 +2735,7 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 mod tests {
     use super::{
         gh_bin, git_bin, handle_slash_command, hook_status_lines, permission_status_lines,
-        plugin_install_dir_for_name, SlashCommandResult,
+        plugin_install_dir_for_name, project_mcp_server_count_from_str, SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
     use openclaudia::permissions::{PermissionDecision, PermissionRule};
@@ -3260,19 +3411,27 @@ mod tests {
         );
     }
 
-    /// Gap E (#663): `/mcp` — OC has no `/mcp` command at all.
+    /// Gap E (#663): `/mcp` now reports configured MCP servers instead of
+    /// falling through to the unknown-command path.
     #[test]
-    fn gap_missing_mcp_returns_handled() {
-        let result = handle_slash_command("/mcp", &mut ctx(), "anthropic", "claude-sonnet");
+    fn mcp_command_is_registered_and_returns_handled() {
+        assert!(
+            super::super::command_registry::registry()
+                .get("mcp")
+                .is_some(),
+            "/mcp must be registered, not unknown-command fallback"
+        );
+        let result = handle_slash_command("/mcp help", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
-            "/mcp must return Handled — command not yet implemented (gap #663)"
+            "/mcp help must return Handled through the registry"
         );
     }
 
-    /// Gap E (#663): `/mcp add <server>` — same unknown-command path.
+    /// Gap E (#663): `/mcp add <server>` now returns an explicit diagnostic
+    /// instead of falling through as an unknown command.
     #[test]
-    fn gap_missing_mcp_add_returns_handled() {
+    fn mcp_add_returns_handled_with_guidance() {
         let result = handle_slash_command(
             "/mcp add my-server",
             &mut ctx(),
@@ -3281,7 +3440,35 @@ mod tests {
         );
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
-            "/mcp add must return Handled — command not yet implemented (gap #663)"
+            "/mcp add must return Handled with configuration guidance"
+        );
+    }
+
+    #[test]
+    fn project_mcp_count_accepts_claude_code_wrapper_shape() {
+        let count = project_mcp_server_count_from_str(
+            r#"{"mcpServers":{"github":{"command":"gh","args":["api"]},"docs":{"type":"http","url":"https://example.com/mcp"}}}"#,
+        )
+        .expect("wrapper shape must parse");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn project_mcp_count_accepts_direct_map_shape() {
+        let count = project_mcp_server_count_from_str(
+            r#"{"github":{"command":"gh"},"docs":{"type":"http","url":"https://example.com/mcp"}}"#,
+        )
+        .expect("direct map shape must parse");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn project_mcp_count_rejects_non_object_mcp_servers() {
+        let err = project_mcp_server_count_from_str(r#"{"mcpServers":[]}"#)
+            .expect_err("array mcpServers must be rejected");
+        assert!(
+            err.contains("mcpServers"),
+            "error should identify mcpServers shape: {err}"
         );
     }
 
