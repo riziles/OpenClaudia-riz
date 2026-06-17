@@ -72,6 +72,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("Could not read {credentials_path}: {e}");
+                anyhow::bail!("could not read Claude credentials: {e}");
             }
         }
 

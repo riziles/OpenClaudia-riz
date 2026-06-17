@@ -27,6 +27,8 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "KIMI_API_KEY",
     "MOONSHOT_API_KEY",
     "MINIMAX_API_KEY",
+    "CLAUDE_CONFIG_HOME_DIR",
+    "CLAUDE_CONFIG_DIR",
 ];
 
 fn assert_missing_config_is_failure(args: &[&str]) {
@@ -231,6 +233,38 @@ fn auth_state_mismatch_exits_nonzero_before_token_exchange() {
     assert!(
         !combined.contains("Exchanging code for tokens"),
         "state mismatch must abort before network token exchange; got {combined:?}"
+    );
+}
+
+#[test]
+fn auth_status_with_malformed_credentials_exits_nonzero() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let claude_config = home.path().join("claude-config");
+    fs::create_dir_all(&claude_config).expect("claude config dir");
+    fs::write(claude_config.join(".credentials.json"), "{not valid json")
+        .expect("malformed credentials fixture");
+
+    let output = isolated_command(&cwd, &home)
+        .args(["auth", "--status"])
+        .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
+        .output()
+        .expect("openclaudia auth --status must run");
+
+    assert!(
+        !output.status.success(),
+        "auth --status must fail when an existing credentials file is malformed; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Could not read") && combined.contains(".credentials.json"),
+        "status failure should identify the unreadable credentials file; got {combined:?}"
     );
 }
 
