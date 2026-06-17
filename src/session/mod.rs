@@ -963,22 +963,12 @@ impl OwnedSessionGuard<'_> {
         self.handoff_notes = Some(notes.into());
     }
 
-    /// Borrow the active session.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the guard has already been consumed via [`Self::end`].
+    /// Borrow the active session, if the guard still owns one.
     #[must_use]
-    pub const fn session(&self) -> &Session {
-        // `as_ref` + `expect` on `Option` keep this `const`-compatible on
-        // stable rustc — the panic message is only evaluated on the error
-        // path.
+    pub const fn session(&self) -> Option<&Session> {
         match self.manager.as_ref() {
-            Some(m) => match m.get_session() {
-                Some(s) => s,
-                None => panic!("guard invariant: a session is active"),
-            },
-            None => panic!("guard is live"),
+            Some(m) => m.get_session(),
+            None => None,
         }
     }
 
@@ -1592,6 +1582,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owned_session_guard_session_returns_none_without_manager() {
+        let guard = OwnedSessionGuard {
+            manager: None,
+            handoff_notes: None,
+        };
+
+        assert!(
+            guard.session().is_none(),
+            "drained guard must not panic when borrowing session"
+        );
+    }
+
     /// (3) `end_session` with a broken persist dir returns
     ///     `Err(PersistFailed { .. })` — failures are NOT swallowed.
     #[test]
@@ -1630,7 +1633,11 @@ mod tests {
             guard.set_handoff_notes("drop-persist");
             // Capture the id via the guard while the session is still
             // live (the guard's borrow of `manager` is exclusive).
-            guard.session().id.clone()
+            guard
+                .session()
+                .expect("guard must expose the active session")
+                .id
+                .clone()
         };
         // ^^ `guard` is dropped here; Drop must call end_session and persist.
 
