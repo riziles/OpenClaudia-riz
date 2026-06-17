@@ -2,8 +2,8 @@
 //!
 //! Each test covers a cross-tool or cross-behavior flow that cannot be verified
 //! in a single-function unit test. The write → read → edit → read flow (Behavior 1+4+6)
-//! is the primary focus; presence/absence of `GlobTool` and `GrepTool` exports (gap issues
-//! #567 and #568) is also pinned here.
+//! is the primary focus; public `glob` and `grep` dispatch through
+//! `execute_tool` is also pinned here.
 //!
 //! Naming convention: `<behavior_slug>_<scenario>` so the audit mapping is clear.
 
@@ -258,53 +258,79 @@ fn read_image_extensions_dispatched_as_image() {
 }
 
 // =============================================================================
-// Gap #567: GlobTool — assert it is NOT exported from tools::file
+// GlobTool — public execute_tool dispatch
 // =============================================================================
 
 #[test]
-fn glob_tool_not_exported_from_file_module() {
-    // Gap #567: OC has no native GlobTool. File discovery uses bash.
-    // This test pins the CURRENT (missing) state. When #567 is fixed, this
-    // test should be updated to assert the new export exists.
-    //
-    // We can't directly assert the absence of a symbol at runtime in Rust, so
-    // we verify via the execute_tool dispatch: calling a "glob_tool" name must
-    // return an error (unknown tool), not succeed.
-    let call = make_call("glob_tool", &json!({ "pattern": "**/*.rs" }));
+fn glob_tool_finds_matching_files_through_execute_tool() {
+    let dir = TempDir::new().expect("tempdir");
+    fs::write(dir.path().join("alpha.rs"), "fn alpha() {}\n").expect("write alpha");
+    fs::write(dir.path().join("beta.rs"), "fn beta() {}\n").expect("write beta");
+    fs::write(dir.path().join("notes.txt"), "not rust\n").expect("write notes");
+
+    let call = make_call(
+        "glob",
+        &json!({
+            "pattern": "*.rs",
+            "path": dir.path().to_string_lossy()
+        }),
+    );
     let r = execute_tool(&call);
     assert!(
-        r.is_error,
-        "glob_tool must return error (tool not implemented, gap #567): {}",
+        !r.is_error,
+        "glob must be implemented and succeed through execute_tool: {}",
+        r.content
+    );
+    assert!(r.content.contains("alpha.rs"), "must include alpha.rs");
+    assert!(r.content.contains("beta.rs"), "must include beta.rs");
+    assert!(
+        !r.content.contains("notes.txt"),
+        "*.rs glob must not include notes.txt: {}",
         r.content
     );
 }
 
 // =============================================================================
-// Gap #568: GrepTool — assert it is NOT exported from tools::file
+// GrepTool — public execute_tool dispatch
 // =============================================================================
 
 #[test]
-fn grep_tool_not_exported_from_file_module() {
-    // Gap #568: OC has no native GrepTool. Regex search uses bash.
-    // Pinned as current (missing) state; update when #568 is resolved.
-    let call = make_call("grep_tool", &json!({ "pattern": "fn main" }));
+fn grep_tool_finds_matching_lines_through_execute_tool() {
+    let dir = TempDir::new().expect("tempdir");
+    fs::write(
+        dir.path().join("src.txt"),
+        "first line\nneedle: important result\nlast line\n",
+    )
+    .expect("write source");
+    fs::write(dir.path().join("other.txt"), "no match here\n").expect("write other");
+
+    let call = make_call(
+        "grep",
+        &json!({
+            "pattern": "needle",
+            "path": dir.path().to_string_lossy()
+        }),
+    );
     let r = execute_tool(&call);
     assert!(
-        r.is_error,
-        "grep_tool must return error (tool not implemented, gap #568): {}",
+        !r.is_error,
+        "grep must be implemented and succeed through execute_tool: {}",
+        r.content
+    );
+    assert!(r.content.contains("needle: important result"));
+    assert!(
+        !r.content.contains("no match here"),
+        "grep output must include only matching files/lines: {}",
         r.content
     );
 }
 
 // =============================================================================
-// Behavior 5: replace_all with multi-occurrence — OC rejects (gap #569)
+// Behavior 5: replace_all with multi-occurrence
 // =============================================================================
 
 #[test]
-fn edit_replace_all_multi_occurrence_currently_errors() {
-    // Behavior 5 (GAP #569): OC unconditionally rejects multi-occurrence edits
-    // even when replace_all=true is passed. CC would replace all occurrences.
-    // Pinned as current (broken) OC behavior; tracked in gap issue #569.
+fn edit_replace_all_multi_occurrence_replaces_every_match() {
     let _lock = READ_TRACKER_LOCK.lock().expect("lock");
     reset_read_tracker();
 
@@ -326,16 +352,16 @@ fn edit_replace_all_multi_occurrence_currently_errors() {
         }),
     );
     let r = execute_tool(&edit_call);
-    // OC: still errors — replace_all is silently ignored for N>1 occurrences
     assert!(
-        r.is_error,
-        "OC rejects replace_all multi-occurrence (gap #569): {}",
+        !r.is_error,
+        "replace_all multi-occurrence edit must succeed: {}",
         r.content
     );
-    // File must be unmodified
-    let disk = fs::read_to_string(&path).expect("read back");
     assert!(
-        disk.contains("foo bar foo"),
-        "file unmodified after rejected replace_all"
+        r.content.contains("Replaced 3 occurrences"),
+        "edit output should report every replacement: {}",
+        r.content
     );
+    let disk = fs::read_to_string(&path).expect("read back");
+    assert_eq!(disk, "qux bar qux baz qux\n");
 }
