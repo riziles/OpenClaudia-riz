@@ -14,6 +14,11 @@ pub async fn cmd_acp(
         Ok(mut c) => {
             if let Some(ref target) = target_override {
                 c.proxy.target.clone_from(target);
+            } else if let Some(ref model) = model_override {
+                let detected = openclaudia::proxy::determine_provider(model, &c);
+                if detected != c.proxy.target {
+                    c.proxy.target = detected;
+                }
             }
             c
         }

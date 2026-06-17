@@ -181,6 +181,27 @@ providers:
     .expect("config file");
 }
 
+fn write_anthropic_target_with_openai_key_config(cwd: &tempfile::TempDir) {
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        r#"
+proxy:
+  port: 8080
+  host: "127.0.0.1"
+  target: anthropic
+providers:
+  anthropic:
+    base_url: https://api.anthropic.com
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai-test-key
+"#,
+    )
+    .expect("config file");
+}
+
 fn held_loopback_port() -> (TcpListener, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind held port");
     let port = listener.local_addr().expect("local addr").port();
@@ -420,6 +441,64 @@ fn acp_rejects_keyless_remote_provider_before_handshake() {
     assert!(
         combined.contains("OPENAI_API_KEY"),
         "remote ACP auth failure should name the provider env var; got {combined:?}"
+    );
+}
+
+#[test]
+fn acp_model_override_autodetects_provider_when_target_not_explicit() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_anthropic_target_with_openai_key_config(&cwd);
+
+    let output = isolated_command(&cwd, &home)
+        .args(["acp", "--model", "gpt-5.5"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        output.status.success(),
+        "acp should infer OpenAI from gpt model when no target override is supplied; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("ANTHROPIC_API_KEY"),
+        "acp model autodetect should not ask for Anthropic credentials; got {combined:?}"
+    );
+}
+
+#[test]
+fn acp_explicit_target_takes_precedence_over_model_autodetect() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_anthropic_target_with_openai_key_config(&cwd);
+
+    let output = isolated_command(&cwd, &home)
+        .args(["acp", "--target", "anthropic", "--model", "gpt-5.5"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        !output.status.success(),
+        "explicit anthropic target should win over gpt model autodetection; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("ANTHROPIC_API_KEY"),
+        "explicit target auth failure should name Anthropic credentials; got {combined:?}"
     );
 }
 
