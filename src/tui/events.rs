@@ -41,6 +41,27 @@ pub enum SpawnTarget {
     ShellCommand { displayed: String },
 }
 
+/// Fully resolved provider switch payload for the TUI event loop.
+///
+/// Resolution can touch disk and, for Anthropic OAuth, await the Claude
+/// credential store. The background task sends this owned bundle back to
+/// the UI thread, which then applies it atomically to App state.
+#[derive(Debug, Clone)]
+pub struct ProviderSwitch {
+    /// Provider name selected by the slash command, normalised to lowercase.
+    pub provider: String,
+    /// Model selected from provider config or the shared provider default table.
+    pub model: String,
+    /// Fully resolved chat endpoint used by subsequent API turns.
+    pub endpoint: String,
+    /// Fully resolved request headers, including auth and custom provider headers.
+    pub headers: Vec<(String, String)>,
+    /// Claude Code OAuth bearer for Anthropic subscription auth.
+    pub claude_code_token: Option<String>,
+    /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.
+    pub prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+}
+
 /// Application events from multiple sources.
 pub enum AppEvent {
     /// Terminal key event
@@ -123,6 +144,10 @@ pub enum AppEvent {
         /// Empty when no sensible fallback is known.
         model_hint: String,
     },
+    /// A `/provider <name>` background resolution completed successfully.
+    ProviderSwitchReady(ProviderSwitch),
+    /// A `/provider <name>` background resolution failed.
+    ProviderSwitchError(String),
 }
 
 /// Handles terminal events in a background thread, merges with async events.

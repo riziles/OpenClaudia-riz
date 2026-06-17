@@ -4,7 +4,7 @@
 //! Provides a scrollable message view, text input area, status bar,
 //! and streaming response display wired to the real API pipeline.
 
-use super::events::{AppEvent, EventHandler, SpawnTarget};
+use super::events::{AppEvent, EventHandler, ProviderSwitch, SpawnTarget};
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
@@ -465,6 +465,110 @@ fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
         .find_map(|(name, handler)| (*name == text).then_some(*handler))
 }
 
+struct ProviderSwitchAuth {
+    api_key: Option<crate::providers::ApiKey>,
+    claude_code_token: Option<String>,
+}
+
+fn missing_provider_auth_message(target: &str) -> String {
+    let env_var = match target {
+        "openai" => "OPENAI_API_KEY",
+        "google" | "gemini" => "GOOGLE_API_KEY",
+        "zai" | "glm" | "zhipu" => "ZAI_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "qwen" | "alibaba" => "QWEN_API_KEY",
+        "kimi" | "moonshot" => "KIMI_API_KEY or MOONSHOT_API_KEY",
+        "minimax" => "MINIMAX_API_KEY",
+        _ => "API_KEY",
+    };
+    format!("No API key configured for '{target}'. Set {env_var} or add it to config.")
+}
+
+async fn resolve_provider_switch_auth(
+    target: &str,
+    provider: &crate::config::ProviderConfig,
+) -> Result<ProviderSwitchAuth, String> {
+    if target == "anthropic" && provider.api_key.is_none() {
+        if !crate::claude_credentials::has_claude_code_credentials() {
+            return Err(
+                "No API key configured for Anthropic. Log in with Claude Code or set ANTHROPIC_API_KEY."
+                    .to_string(),
+            );
+        }
+        let creds = crate::claude_credentials::load_credentials()
+            .await
+            .map_err(|e| {
+                format!(
+                    "Claude Code credentials unusable: {e}. Log in with Claude Code or set ANTHROPIC_API_KEY."
+                )
+            })?;
+        return Ok(ProviderSwitchAuth {
+            api_key: None,
+            claude_code_token: Some(creds.access_token),
+        });
+    }
+
+    if let Some(api_key) = &provider.api_key {
+        return Ok(ProviderSwitchAuth {
+            api_key: Some(api_key.clone()),
+            claude_code_token: None,
+        });
+    }
+
+    Err(missing_provider_auth_message(target))
+}
+
+async fn resolve_provider_switch(
+    requested: String,
+    prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+) -> Result<ProviderSwitch, String> {
+    let target = requested.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        return Err("Usage: /provider <name>".to_string());
+    }
+
+    crate::providers::get_adapter(&target).map_err(|e| e.to_string())?;
+
+    let config = crate::config::load_config().map_err(|e| format!("Config load failed: {e}"))?;
+    let provider = config
+        .get_provider(&target)
+        .cloned()
+        .ok_or_else(|| format!("No provider config found for '{target}'."))?;
+    let auth = resolve_provider_switch_auth(&target, &provider).await?;
+    let model = provider
+        .model
+        .clone()
+        .unwrap_or_else(|| crate::providers::default_model_for_target(&target).to_string());
+    let extra_headers: Vec<(String, String)> = provider
+        .headers
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let endpoint = crate::pipeline::resolve_endpoint(
+        &target,
+        &model,
+        &provider.base_url,
+        auth.claude_code_token.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let headers = crate::pipeline::resolve_headers(
+        &target,
+        auth.api_key.as_ref(),
+        auth.claude_code_token.as_deref(),
+        &extra_headers,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ProviderSwitch {
+        provider: target,
+        model,
+        endpoint,
+        headers,
+        claude_code_token: auth.claude_code_token,
+        prompt_blocks,
+    })
+}
+
 /// Which input mode the TUI is in when a keystroke arrives (crosslink #364).
 ///
 /// The three values map 1:1 to the three explicit `handle_key_*` methods
@@ -861,6 +965,38 @@ impl App {
         self.api_client.claude_code_token = claude_code_token;
     }
 
+    fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
+        let ProviderSwitch {
+            provider,
+            model,
+            endpoint,
+            headers,
+            claude_code_token,
+            prompt_blocks,
+        } = switch;
+
+        self.provider = provider;
+        self.model = model;
+        self.chat_session.provider.clone_from(&self.provider);
+        self.chat_session.model.clone_from(&self.model);
+        self.chat_session.touch();
+
+        let system_prompt = self.system_prompt.clone();
+        self.set_api_config(
+            endpoint,
+            headers,
+            system_prompt,
+            prompt_blocks,
+            claude_code_token,
+        );
+        let _ = save_session(&self.chat_session);
+        self.persist_transcript_tail();
+        self.messages.add(DisplayMessage::system(format!(
+            "Provider switched to {} ({})",
+            self.provider, self.model
+        )));
+    }
+
     /// Get an event sender for pushing async API events into the TUI loop.
     #[must_use]
     pub fn event_sender(&self) -> Option<std::sync::mpsc::Sender<AppEvent>> {
@@ -1086,27 +1222,35 @@ impl App {
                 self.handle_shell_done(target, &stdout, &stderr, exit_code);
             }
             Ok(AppEvent::OverloadFallback { model_hint }) => {
-                // Crosslink #598: the retry loop exhausted its budget on a
-                // 529 overload. Surface an advisory to the user so they
-                // know the upstream is sustainedly over capacity. Auto-
-                // switching is intentionally NOT done here — the model-
-                // routing decision belongs to the session/config layer,
-                // not the TUI render path.
-                let msg = if model_hint.is_empty() {
-                    "Upstream model is sustainedly overloaded (HTTP 529). \
-                     Consider waiting or switching to a lighter model."
-                        .to_string()
-                } else {
-                    format!(
-                        "Upstream model is sustainedly overloaded (HTTP 529). \
-                         Consider switching to '{model_hint}' for this session."
-                    )
-                };
-                self.messages.add(DisplayMessage::error(msg));
+                self.handle_overload_fallback(&model_hint);
+            }
+            Ok(AppEvent::ProviderSwitchReady(switch)) => {
+                self.apply_provider_switch(switch);
+            }
+            Ok(AppEvent::ProviderSwitchError(msg)) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Provider switch failed: {msg}"
+                )));
             }
             Err(_) => return false,
         }
         true
+    }
+
+    /// Surface sustained upstream overload as advisory UI, without changing
+    /// provider/model routing behind the user's back.
+    fn handle_overload_fallback(&mut self, model_hint: &str) {
+        let msg = if model_hint.is_empty() {
+            "Upstream model is sustainedly overloaded (HTTP 529). \
+             Consider waiting or switching to a lighter model."
+                .to_string()
+        } else {
+            format!(
+                "Upstream model is sustainedly overloaded (HTTP 529). \
+                 Consider switching to '{model_hint}' for this session."
+            )
+        };
+        self.messages.add(DisplayMessage::error(msg));
     }
 
     /// Finalise the turn when the pipeline emits `ResponseDone`.
@@ -1977,6 +2121,62 @@ impl App {
         )));
     }
 
+    fn handle_slash_provider(&mut self, text: &str) -> bool {
+        if text == "/provider" {
+            self.messages.add(DisplayMessage::system(format!(
+                "Provider: {}\nModel: {}\nEndpoint: {}\nUsage: /provider <name>\nSupported: {}",
+                self.provider,
+                self.model,
+                self.api_client.endpoint,
+                crate::providers::SUPPORTED_PROVIDERS.join(", ")
+            )));
+            return true;
+        }
+
+        let Some(requested) = text.strip_prefix("/provider ") else {
+            return false;
+        };
+        let requested = requested.trim();
+        if requested.is_empty() {
+            self.messages
+                .add(DisplayMessage::system("Usage: /provider <name>"));
+            return true;
+        }
+        if self.is_waiting {
+            self.messages.add(DisplayMessage::error(
+                "Cannot switch provider while a response is in flight.",
+            ));
+            return true;
+        }
+
+        let Some(handle) = self.runtime_handle.clone() else {
+            self.messages.add(DisplayMessage::error(
+                "No async runtime bound; cannot switch providers.",
+            ));
+            return true;
+        };
+        let Some(tx) = self.event_sender() else {
+            self.messages.add(DisplayMessage::error(
+                "No TUI event channel bound; cannot switch providers.",
+            ));
+            return true;
+        };
+
+        let requested = requested.to_string();
+        let prompt_blocks = self.api_client.prompt_blocks.clone();
+        self.messages.add(DisplayMessage::system(format!(
+            "Switching provider to {requested}..."
+        )));
+        handle.spawn(async move {
+            let event = match resolve_provider_switch(requested, prompt_blocks).await {
+                Ok(switch) => AppEvent::ProviderSwitchReady(switch),
+                Err(err) => AppEvent::ProviderSwitchError(err),
+            };
+            let _ = tx.send(event);
+        });
+        true
+    }
+
     /// Handle the `/cost` slash command.
     fn handle_slash_cost(&mut self) {
         let tokens = self.chat_session.estimate_tokens();
@@ -2105,6 +2305,9 @@ impl App {
 
     /// Handle diagnostic/info slash commands. Returns true if handled.
     fn handle_diagnostic_slash(&mut self, text: &str) -> bool {
+        if self.handle_slash_provider(text) {
+            return true;
+        }
         if text == "/cost" {
             self.handle_slash_cost();
             return true;
@@ -2923,6 +3126,13 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::OverloadFallback { model_hint } => {
             format!("OverloadFallback({model_hint})")
         }
+        super::events::AppEvent::ProviderSwitchReady(switch) => {
+            format!("ProviderSwitchReady({})", switch.provider)
+        }
+        super::events::AppEvent::ProviderSwitchError(e) => {
+            let snippet: String = e.chars().take(80).collect();
+            format!("ProviderSwitchError({snippet:?})")
+        }
     }
 }
 
@@ -3235,8 +3445,8 @@ async fn handle_turn_result(
 mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        current_exe_command, git_bin, save_session, ApiClient, App, AppEvent, SpawnTarget,
-        TuiSession,
+        current_exe_command, git_bin, save_session, ApiClient, App, AppEvent, ProviderSwitch,
+        SpawnTarget, TuiSession,
     };
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -3352,6 +3562,61 @@ mod tests {
         assert_eq!(
             app.api_client.claude_code_token.as_deref(),
             Some("oauth-token")
+        );
+    }
+
+    #[test]
+    fn apply_provider_switch_updates_metadata_and_transport() {
+        let mut app = App::new("old-model", "anthropic");
+        let original_session_id = app.chat_session.id.clone();
+        let blocks = crate::prompt::SystemPromptBlocks {
+            stable_prefix: "stable".to_string(),
+            dynamic_suffix: "dynamic".to_string(),
+        };
+        app.set_api_config(
+            "https://old.example/v1/messages".to_string(),
+            vec![("x-api-key".to_string(), "old-key".to_string())],
+            "system prompt".to_string(),
+            Some(blocks.clone()),
+            Some("oauth-token".to_string()),
+        );
+
+        app.apply_provider_switch(ProviderSwitch {
+            provider: "kimi".to_string(),
+            model: "kimi-k2.7-code".to_string(),
+            endpoint: "https://api.moonshot.ai/v1/chat/completions".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer kimi-key".to_string())],
+            claude_code_token: None,
+            prompt_blocks: Some(blocks.clone()),
+        });
+
+        assert_eq!(app.provider, "kimi");
+        assert_eq!(app.model, "kimi-k2.7-code");
+        assert_eq!(app.chat_session.id, original_session_id);
+        assert_eq!(app.chat_session.provider, "kimi");
+        assert_eq!(app.chat_session.model, "kimi-k2.7-code");
+        assert_eq!(
+            app.api_client.endpoint,
+            "https://api.moonshot.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            app.api_client.headers,
+            vec![("Authorization".to_string(), "Bearer kimi-key".to_string())]
+        );
+        assert!(app.api_client.claude_code_token.is_none());
+        assert_eq!(
+            app.api_client
+                .prompt_blocks
+                .as_ref()
+                .map(crate::prompt::SystemPromptBlocks::to_combined),
+            Some(blocks.to_combined())
+        );
+        assert!(
+            app.messages
+                .messages
+                .iter()
+                .any(|msg| msg.content.contains("Provider switched to kimi")),
+            "switch should emit a visible status message"
         );
     }
 

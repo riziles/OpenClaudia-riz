@@ -383,6 +383,39 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "text-generation-webui",
 ];
 
+/// Canonical per-target default model table.
+///
+/// Shared by CLI startup and TUI live provider switching so a provider
+/// change inside an existing session uses the same fallback model as a
+/// freshly-started session.
+pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
+    ("anthropic", "claude-opus-4-6"),
+    ("google", "gemini-2.5-flash"),
+    ("gemini", "gemini-2.5-flash"),
+    ("zai", "glm-5"),
+    ("glm", "glm-5"),
+    ("zhipu", "glm-5"),
+    ("deepseek", "deepseek-chat"),
+    ("qwen", "qwen3.5-plus"),
+    ("alibaba", "qwen3.5-plus"),
+    ("kimi", "kimi-k2.7-code"),
+    ("moonshot", "kimi-k2.7-code"),
+    ("minimax", "MiniMax-M3"),
+];
+
+/// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
+/// Currently every non-table target is treated as OpenAI-compatible.
+pub const DEFAULT_MODEL_FALLBACK: &str = "gpt-5.2";
+
+/// Look up the canonical default model for a target, or [`DEFAULT_MODEL_FALLBACK`].
+#[must_use]
+pub fn default_model_for_target(target: &str) -> &'static str {
+    DEFAULT_MODELS_BY_TARGET
+        .iter()
+        .find_map(|(t, m)| (*t == target).then_some(*m))
+        .unwrap_or(DEFAULT_MODEL_FALLBACK)
+}
+
 /// Resolve a provider name to its singleton adapter.
 ///
 /// Returns `&'static dyn ProviderAdapter` — no allocation, no per-call

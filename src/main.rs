@@ -944,46 +944,10 @@ fn chdir_to_git_root() {
     }
 }
 
-/// Canonical per-target default model table.
-///
-/// Single source of truth for the per-provider fallback model picked by
-/// [`resolve_model_name`] when neither the `-m` flag nor the provider's
-/// configured model is set (crosslink #802). The table is `&'static` so
-/// callers can grep for every literal model string the proxy ships, and
-/// the round-trip test `default_models_table_is_canonical` pins each entry
-/// against the matching adapter, giving us a compile-/test-time guard
-/// against silent drift (`claude-opus-4-6` → `4-7` → `4-8` …).
-const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
-    ("anthropic", "claude-opus-4-6"),
-    ("google", "gemini-2.5-flash"),
-    ("gemini", "gemini-2.5-flash"),
-    ("zai", "glm-5"),
-    ("glm", "glm-5"),
-    ("zhipu", "glm-5"),
-    ("deepseek", "deepseek-chat"),
-    ("qwen", "qwen3.5-plus"),
-    ("alibaba", "qwen3.5-plus"),
-    ("kimi", "kimi-k2.7-code"),
-    ("moonshot", "kimi-k2.7-code"),
-    ("minimax", "MiniMax-M3"),
-];
-
-/// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
-/// Currently every non-table target is treated as OpenAI-compatible.
-const DEFAULT_MODEL_FALLBACK: &str = "gpt-5.2";
-
-/// Look up the canonical default model for a target, or [`DEFAULT_MODEL_FALLBACK`].
-fn default_model_for_target(target: &str) -> &'static str {
-    DEFAULT_MODELS_BY_TARGET
-        .iter()
-        .find_map(|(t, m)| (*t == target).then_some(*m))
-        .unwrap_or(DEFAULT_MODEL_FALLBACK)
-}
-
 /// Resolve the model name to use for a chat session.
 ///
 /// Priority: explicit `-m` flag > provider's configured model > a
-/// per-target default sourced from [`DEFAULT_MODELS_BY_TARGET`]. Pure
+/// per-target default sourced from [`openclaudia::providers::DEFAULT_MODELS_BY_TARGET`]. Pure
 /// function — no I/O, no mutation. Extracted from `cmd_chat` per crosslink
 /// #262.
 fn resolve_model_name(
@@ -993,7 +957,7 @@ fn resolve_model_name(
 ) -> String {
     model_override
         .or(provider_model)
-        .unwrap_or_else(|| default_model_for_target(target).to_string())
+        .unwrap_or_else(|| openclaudia::providers::default_model_for_target(target).to_string())
 }
 
 /// Parse a behavioral-mode string (`--mode`) into a `BehaviorMode`.
@@ -1448,24 +1412,24 @@ mod tests {
     ///   round-trip and force a deliberate version bump.
     #[test]
     fn default_models_table_is_canonical_for_resolver() {
-        for (target, expected_model) in DEFAULT_MODELS_BY_TARGET {
+        for (target, expected_model) in openclaudia::providers::DEFAULT_MODELS_BY_TARGET {
             let got = resolve_model_name(None, None, target);
             assert_eq!(
                 got, *expected_model,
                 "DEFAULT_MODELS_BY_TARGET entry for `{target}` must round-trip through resolve_model_name"
             );
             assert_eq!(
-                default_model_for_target(target),
+                openclaudia::providers::default_model_for_target(target),
                 *expected_model,
                 "default_model_for_target must agree with DEFAULT_MODELS_BY_TARGET for `{target}`"
             );
         }
         // The fallback constant pins the openai/unknown default literal too.
         assert_eq!(
-            default_model_for_target("definitely-not-a-known-target"),
-            DEFAULT_MODEL_FALLBACK
+            openclaudia::providers::default_model_for_target("definitely-not-a-known-target"),
+            openclaudia::providers::DEFAULT_MODEL_FALLBACK
         );
-        assert_eq!(DEFAULT_MODEL_FALLBACK, "gpt-5.2");
+        assert_eq!(openclaudia::providers::DEFAULT_MODEL_FALLBACK, "gpt-5.2");
     }
 
     /// #802 (companion): the table must not contain duplicate target keys —
@@ -1475,7 +1439,7 @@ mod tests {
     fn default_models_table_keys_are_unique_and_non_empty() {
         use std::collections::HashSet;
         let mut seen: HashSet<&str> = HashSet::new();
-        for (target, _) in DEFAULT_MODELS_BY_TARGET {
+        for (target, _) in openclaudia::providers::DEFAULT_MODELS_BY_TARGET {
             assert!(!target.is_empty(), "target key must not be empty");
             assert!(
                 seen.insert(target),
