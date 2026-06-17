@@ -2,13 +2,21 @@ use openclaudia::{
     config,
     mcp::McpManager,
     plugins::{PluginError, PluginManager},
-    providers::{get_adapter, ProviderError},
+    providers::{get_adapter, ProviderAdapter, ProviderError},
     rules::RulesEngine,
     session::SessionManager,
 };
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
+
+const DOCTOR_ADAPTER_PROVIDER: &str = "anthropic";
+
+fn lookup_doctor_adapter(
+    provider_name: &str,
+) -> Result<&'static dyn ProviderAdapter, ProviderError> {
+    get_adapter(provider_name)
+}
 
 #[allow(clippy::too_many_lines)]
 /// Check configuration and connectivity
@@ -266,23 +274,26 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     // Test provider adapters and error variants
     print!("\nProvider adapters... ");
-    // Crosslink #433: `get_adapter` now returns Result. `"anthropic"` is
-    // a known canonical name, so this unwrap is infallible — but using
-    // `expect` documents the invariant at the call site rather than
-    // hiding it behind `.unwrap()`.
-    let adapter = get_adapter("anthropic").expect("anthropic is a built-in adapter name");
-    println!("{} adapter OK", adapter.name());
+    match lookup_doctor_adapter(DOCTOR_ADAPTER_PROVIDER) {
+        Ok(adapter) => {
+            println!("{} adapter OK", adapter.name());
 
-    let test_response = serde_json::json!({
-        "id": "test",
-        "content": [{"type": "text", "text": "test"}],
-        "model": "test-model",
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 10, "output_tokens": 5}
-    });
-    match adapter.transform_response(test_response, false) {
-        Ok(transformed) => info!("Response transformed: {}", transformed["object"]),
-        Err(e) => info!("Transform error (expected): {}", e),
+            let test_response = serde_json::json!({
+                "id": "test",
+                "content": [{"type": "text", "text": "test"}],
+                "model": "test-model",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            });
+            match adapter.transform_response(test_response, false) {
+                Ok(transformed) => info!("Response transformed: {}", transformed["object"]),
+                Err(e) => info!("Transform error (expected): {}", e),
+            }
+        }
+        Err(e) => {
+            println!("FAILED: {e}");
+            info!("Provider adapter lookup failed: {}", e);
+        }
     }
 
     let _invalid = ProviderError::InvalidResponse("test".to_string());
@@ -332,4 +343,27 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     println!("\nDoctor check complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_doctor_adapter_resolves_builtin_provider() {
+        let adapter = lookup_doctor_adapter(DOCTOR_ADAPTER_PROVIDER).expect("doctor provider");
+        assert_eq!(adapter.name(), "anthropic");
+    }
+
+    #[test]
+    fn lookup_doctor_adapter_returns_provider_errors() {
+        match lookup_doctor_adapter("missing-provider") {
+            Ok(adapter) => panic!("unexpected adapter {}", adapter.name()),
+            Err(ProviderError::UnknownProvider { name, supported }) => {
+                assert_eq!(name, "missing-provider");
+                assert!(supported.contains(&"anthropic"));
+            }
+            Err(err) => panic!("unexpected provider error: {err}"),
+        }
+    }
 }
