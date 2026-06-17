@@ -33,7 +33,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+use tracing::error;
 
 /// LSP `DiagnosticSeverity` (LSP §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +130,19 @@ impl DiagnosticRegistry {
         }
     }
 
+    fn inner_guard(
+        &self,
+        operation: &'static str,
+    ) -> Option<MutexGuard<'_, HashMap<String, Vec<Diagnostic>>>> {
+        match self.inner.lock() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                error!(operation, error = %err, "LSP diagnostic registry lock poisoned");
+                None
+            }
+        }
+    }
+
     /// Replace the entire diagnostic list for `uri` (matches LSP's
     /// `publishDiagnostics` semantics — each publish is a full
     /// replacement for that file).
@@ -140,7 +154,7 @@ impl DiagnosticRegistry {
             // clever, we just bound the storage.
             diags.truncate(self.per_file_cap);
         }
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.inner_guard("set") {
             if diags.is_empty() {
                 g.remove(uri);
             } else {
@@ -152,9 +166,7 @@ impl DiagnosticRegistry {
     /// Borrow-clone every diagnostic currently held for `uri`.
     #[must_use]
     pub fn get(&self, uri: &str) -> Vec<Diagnostic> {
-        self.inner
-            .lock()
-            .ok()
+        self.inner_guard("get")
             .and_then(|g| g.get(uri).cloned())
             .unwrap_or_default()
     }
@@ -163,16 +175,14 @@ impl DiagnosticRegistry {
     /// The registry is empty after this call — used by injectors at
     /// turn boundaries.
     pub fn drain(&self) -> HashMap<String, Vec<Diagnostic>> {
-        self.inner
-            .lock()
-            .map_or_else(|_| HashMap::new(), |mut g| std::mem::take(&mut *g))
+        self.inner_guard("drain")
+            .map_or_else(HashMap::new, |mut g| std::mem::take(&mut *g))
     }
 
     /// Total diagnostic count across every URI.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.inner
-            .lock()
+        self.inner_guard("total")
             .map_or(0, |g| g.values().map(Vec::len).sum())
     }
 }

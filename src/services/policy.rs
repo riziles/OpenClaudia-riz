@@ -34,8 +34,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
+use tracing::error;
 
 /// Policy-related errors surfaced to call sites.
 #[derive(Debug, Error)]
@@ -119,23 +120,37 @@ struct ToolCounters {
 }
 
 impl ToolCounters {
+    fn guard(
+        &self,
+        operation: &'static str,
+    ) -> Option<MutexGuard<'_, HashMap<(String, String), usize>>> {
+        match self.inner.lock() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                error!(operation, error = %err, "Policy tool counter lock poisoned");
+                None
+            }
+        }
+    }
+
     fn count(&self, session_id: &str, tool: &str) -> usize {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&(session_id.to_string(), tool.to_string())).copied())
+        let Some(g) = self.guard("count") else {
+            return 0;
+        };
+        g.get(&(session_id.to_string(), tool.to_string()))
+            .copied()
             .unwrap_or(0)
     }
 
     fn increment(&self, session_id: &str, tool: &str) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.guard("increment") {
             *g.entry((session_id.to_string(), tool.to_string()))
                 .or_insert(0) += 1;
         }
     }
 
     fn reset_session(&self, session_id: &str) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.guard("reset_session") {
             g.retain(|(sid, _), _| sid != session_id);
         }
     }

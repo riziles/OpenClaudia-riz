@@ -24,8 +24,9 @@
 //! short-circuits with the synthetic 429 instead of talking to the
 //! upstream. The wiring is the follow-up — this commit lands the seam.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+use tracing::error;
 
 /// What the next live request should observe under mock pressure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,10 +90,20 @@ impl MockRateLimit {
         }
     }
 
+    fn inner_guard(&self, operation: &'static str) -> Option<MutexGuard<'_, MockInner>> {
+        match self.inner.lock() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                error!(operation, error = %err, "Rate-limit mock lock poisoned");
+                None
+            }
+        }
+    }
+
     /// Configure the mock to throttle the next `count` requests with
     /// `retry_after` back-off and a custom `reason`.
     pub fn throttle_next(&self, count: usize, retry_after: Duration, reason: &str) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.inner_guard("throttle_next") {
             g.enabled = true;
             g.remaining_throttle = count;
             g.retry_after = retry_after;
@@ -103,7 +114,7 @@ impl MockRateLimit {
     /// Flip the kill switch. `false` means "every request proceeds";
     /// `true` re-enables the configured throttle behaviour.
     pub fn set_enabled(&self, enabled: bool) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.inner_guard("set_enabled") {
             g.enabled = enabled;
         }
     }
@@ -111,12 +122,13 @@ impl MockRateLimit {
     /// Number of `record_call` invocations the mock has seen.
     #[must_use]
     pub fn calls_recorded(&self) -> usize {
-        self.inner.lock().map_or(0, |g| g.calls_recorded)
+        self.inner_guard("calls_recorded")
+            .map_or(0, |g| g.calls_recorded)
     }
 
     /// Reset the mock to the dormant state.
     pub fn reset(&self) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.inner_guard("reset") {
             g.enabled = false;
             g.remaining_throttle = 0;
             g.calls_recorded = 0;
@@ -132,7 +144,7 @@ impl Default for MockRateLimit {
 
 impl RateLimitMock for MockRateLimit {
     fn next_response(&self) -> MockResponse {
-        let Ok(mut g) = self.inner.lock() else {
+        let Some(mut g) = self.inner_guard("next_response") else {
             return MockResponse::Proceed;
         };
         if !g.enabled || g.remaining_throttle == 0 {
@@ -146,7 +158,7 @@ impl RateLimitMock for MockRateLimit {
     }
 
     fn record_call(&self) {
-        if let Ok(mut g) = self.inner.lock() {
+        if let Some(mut g) = self.inner_guard("record_call") {
             g.calls_recorded += 1;
         }
     }
