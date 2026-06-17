@@ -1,6 +1,7 @@
 use openclaudia::{
     claude_credentials, config,
     mcp::McpManager,
+    pipeline,
     plugins::PluginManager,
     providers::{get_adapter, ProviderAdapter, ProviderError},
     rules::RulesEngine,
@@ -18,6 +19,11 @@ enum ActiveProviderAuthRequirement {
     NotRequiredForLocal,
     AnthropicCanUseClaudeCode,
     MissingApiKey { env_var: &'static str },
+}
+
+struct DoctorResolvedAuth {
+    auth_ok: bool,
+    claude_code_token: Option<String>,
 }
 
 fn lookup_doctor_adapter(
@@ -64,23 +70,32 @@ fn active_provider_auth_requirement(
 async fn check_active_provider_auth(
     provider_name: &str,
     provider: &config::ProviderConfig,
-) -> bool {
+) -> DoctorResolvedAuth {
     print!("\nActive provider auth... ");
     match active_provider_auth_requirement(provider_name, provider) {
         ActiveProviderAuthRequirement::ConfiguredApiKey => {
             println!("configured");
-            true
+            DoctorResolvedAuth {
+                auth_ok: true,
+                claude_code_token: None,
+            }
         }
         ActiveProviderAuthRequirement::NotRequiredForLocal => {
             println!("not required for local provider");
-            true
+            DoctorResolvedAuth {
+                auth_ok: true,
+                claude_code_token: None,
+            }
         }
         ActiveProviderAuthRequirement::AnthropicCanUseClaudeCode => {
             if !claude_credentials::has_claude_code_credentials() {
                 println!(
                     "FAILED (no API key or Claude Code credentials; set ANTHROPIC_API_KEY or run `claude`)"
                 );
-                return false;
+                return DoctorResolvedAuth {
+                    auth_ok: false,
+                    claude_code_token: None,
+                };
             }
 
             match claude_credentials::load_credentials().await {
@@ -90,19 +105,55 @@ async fn check_active_provider_auth(
                         creds.subscription_type.as_deref().unwrap_or("unknown"),
                         creds.rate_limit_tier.as_deref().unwrap_or("default")
                     );
-                    true
+                    DoctorResolvedAuth {
+                        auth_ok: true,
+                        claude_code_token: Some(creds.access_token),
+                    }
                 }
                 Err(err) => {
                     println!("FAILED (Claude Code credentials unusable: {err})");
-                    false
+                    DoctorResolvedAuth {
+                        auth_ok: false,
+                        claude_code_token: None,
+                    }
                 }
             }
         }
         ActiveProviderAuthRequirement::MissingApiKey { env_var } => {
             println!("FAILED (set {env_var} or configure providers.{provider_name}.api_key)");
-            false
+            DoctorResolvedAuth {
+                auth_ok: false,
+                claude_code_token: None,
+            }
         }
     }
+}
+
+fn doctor_model_for_provider(provider_name: &str, provider: &config::ProviderConfig) -> String {
+    provider.model.clone().unwrap_or_else(|| {
+        openclaudia::providers::default_model_for_target(provider_name).to_string()
+    })
+}
+
+fn resolve_doctor_endpoint(
+    provider_name: &str,
+    provider: &config::ProviderConfig,
+    claude_code_token: Option<&str>,
+) -> Result<String, ProviderError> {
+    let model = doctor_model_for_provider(provider_name, provider);
+    pipeline::resolve_endpoint(provider_name, &model, &provider.base_url, claude_code_token)
+}
+
+fn doctor_http_status_is_reachable(status: reqwest::StatusCode) -> bool {
+    if status.is_server_error() {
+        return false;
+    }
+    !matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -151,18 +202,61 @@ pub async fn cmd_doctor() -> anyhow::Result<()> {
 
     if let Some(config) = &loaded_config {
         if let Some(provider) = config.active_provider() {
-            if !check_active_provider_auth(&config.proxy.target, provider).await {
+            let auth = check_active_provider_auth(&config.proxy.target, provider).await;
+            if !auth.auth_ok {
                 has_failures = true;
             }
 
-            print!("\nConnectivity to {}... ", config.proxy.target);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()?;
-            match client.get(&provider.base_url).send().await {
-                Ok(_) => println!("OK"),
-                Err(e) => {
-                    println!("FAILED: {e}");
+            print!("\nEndpoint reachability for {}... ", config.proxy.target);
+            match resolve_doctor_endpoint(
+                &config.proxy.target,
+                provider,
+                auth.claude_code_token.as_deref(),
+            ) {
+                Ok(endpoint) => {
+                    let extra_headers: Vec<(String, String)> = provider
+                        .headers
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    match pipeline::resolve_headers(
+                        &config.proxy.target,
+                        provider.api_key.as_ref(),
+                        auth.claude_code_token.as_deref(),
+                        &extra_headers,
+                    ) {
+                        Ok(headers) => {
+                            let client = reqwest::Client::builder()
+                                .timeout(Duration::from_secs(5))
+                                .build()?;
+                            let mut request = client.get(&endpoint);
+                            for (key, value) in &headers {
+                                request = request.header(key, value);
+                            }
+                            match request.send().await {
+                                Ok(response) => {
+                                    let status = response.status();
+                                    if doctor_http_status_is_reachable(status) {
+                                        println!("OK (HTTP {status})");
+                                    } else {
+                                        println!("FAILED (HTTP {status})");
+                                        has_failures = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("FAILED: {e}");
+                                    has_failures = true;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            println!("FAILED (header resolution: {err})");
+                            has_failures = true;
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("FAILED (endpoint resolution: {err})");
                     has_failures = true;
                 }
             }
@@ -488,5 +582,69 @@ mod tests {
             active_provider_auth_requirement("anthropic", &provider_with_key(None)),
             ActiveProviderAuthRequirement::AnthropicCanUseClaudeCode
         );
+    }
+
+    #[test]
+    fn doctor_model_for_provider_prefers_configured_model() {
+        let mut provider = provider_with_key(None);
+        provider.model = Some("custom-model".to_string());
+        assert_eq!(
+            doctor_model_for_provider("openai", &provider),
+            "custom-model"
+        );
+    }
+
+    #[test]
+    fn doctor_model_for_provider_uses_shared_target_default() {
+        assert_eq!(
+            doctor_model_for_provider("google", &provider_with_key(None)),
+            "gemini-3.5-flash"
+        );
+        assert_eq!(
+            doctor_model_for_provider("unknown-target", &provider_with_key(None)),
+            openclaudia::providers::DEFAULT_MODEL_FALLBACK
+        );
+    }
+
+    #[test]
+    fn resolve_doctor_endpoint_uses_adapter_endpoint() {
+        let provider = provider_with_key(None);
+        let endpoint = resolve_doctor_endpoint("google", &provider, None).expect("google endpoint");
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/v1beta/models/gemini-3.5-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn resolve_doctor_endpoint_uses_oauth_endpoint_when_token_present() {
+        let mut provider = provider_with_key(None);
+        provider.model = Some("claude-opus-4-8".to_string());
+        let endpoint =
+            resolve_doctor_endpoint("anthropic", &provider, Some("token")).expect("oauth endpoint");
+        assert_eq!(endpoint, "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn doctor_http_status_classification_matches_endpoint_probe_contract() {
+        assert!(doctor_http_status_is_reachable(reqwest::StatusCode::OK));
+        assert!(doctor_http_status_is_reachable(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ));
+        assert!(doctor_http_status_is_reachable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!doctor_http_status_is_reachable(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!doctor_http_status_is_reachable(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!doctor_http_status_is_reachable(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(!doctor_http_status_is_reachable(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
     }
 }
