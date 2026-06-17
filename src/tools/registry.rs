@@ -1048,6 +1048,14 @@ impl ToolHandler for CronCreateHandler {
                         "prompt": {
                             "type": "string",
                             "description": "The prompt or command to execute on each trigger"
+                        },
+                        "recurring": {
+                            "type": "boolean",
+                            "description": "Whether downstream schedulers should recur after each trigger (default: true)"
+                        },
+                        "durable": {
+                            "type": "boolean",
+                            "description": "Whether downstream schedulers should treat this as durable schedule metadata (default: true)"
                         }
                     },
                     "required": ["name", "schedule", "prompt"]

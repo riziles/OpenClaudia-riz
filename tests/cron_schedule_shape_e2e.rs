@@ -82,6 +82,31 @@ fn newly_created_schedule_has_run_count_zero_and_no_last_run() {
             s["enabled"], true,
             "fresh schedule MUST default to enabled = true"
         );
+        assert_eq!(
+            s["recurring"], true,
+            "fresh schedule MUST default to recurring = true"
+        );
+        assert_eq!(
+            s["durable"], true,
+            "fresh schedule MUST default to durable = true"
+        );
+    });
+}
+
+#[test]
+fn cron_create_persists_false_recurring_and_durable_flags() {
+    let _lock = cwd_lock();
+    run_in_tempdir(|| {
+        let mut args = cron_args("one-shot", "0 9 * * *", "do thing");
+        args.insert("recurring".to_string(), json!(false));
+        args.insert("durable".to_string(), json!(false));
+
+        let (out, err) = execute_cron_create(&args);
+        assert!(!err, "create MUST succeed; got {out:?}");
+        let store = read_store();
+        let s = &store["schedules"][0];
+        assert_eq!(s["recurring"], false);
+        assert_eq!(s["durable"], false);
     });
 }
 
@@ -262,6 +287,8 @@ fn store_persists_multiple_schedules_each_with_full_shape() {
             assert!(s["id"].is_string());
             assert!(s["created_at"].is_string());
             assert!(s["last_run"].is_null());
+            assert_eq!(s["recurring"], true);
+            assert_eq!(s["durable"], true);
         }
     });
 }

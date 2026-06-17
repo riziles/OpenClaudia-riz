@@ -34,6 +34,11 @@ use crate::tools::args::ToolArgs as _;
 const SCHEDULES_FILE: &str = ".openclaudia/schedules.json";
 const LOCK_SUFFIX: &str = ".lock";
 const TMP_SUFFIX: &str = ".tmp";
+const MAX_SCHEDULES: usize = 50;
+
+const fn default_true() -> bool {
+    true
+}
 
 /// Advisory exclusive file lock guarding the schedule store.
 ///
@@ -103,6 +108,10 @@ pub struct Schedule {
     pub cron_expression: String,
     pub prompt: String,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub recurring: bool,
+    #[serde(default = "default_true")]
+    pub durable: bool,
     pub created_at: String,
     pub last_run: Option<String>,
     pub run_count: u32,
@@ -393,6 +402,8 @@ fn execute_cron_create_at<S: BuildHasher>(
         Ok(p) => p,
         Err(e) => return e.into_tool_error(),
     };
+    let recurring = args.arg_bool_or("recurring", true);
+    let durable = args.arg_bool_or("durable", true);
 
     if let Err(e) = validate_cron(&cron_expression) {
         return (format!("Invalid cron expression: {e}"), true);
@@ -422,6 +433,14 @@ fn execute_cron_create_at<S: BuildHasher>(
             true,
         );
     }
+    if store.schedules.len() >= MAX_SCHEDULES {
+        return (
+            format!(
+                "Maximum scheduled task limit ({MAX_SCHEDULES}) reached. Delete an existing schedule before creating another."
+            ),
+            true,
+        );
+    }
 
     // Crosslink #907: previously truncated to 8 hex chars (32 bits of
     // entropy → 50% collision at ~77k schedules). Use 16 hex chars
@@ -448,6 +467,8 @@ fn execute_cron_create_at<S: BuildHasher>(
         cron_expression: cron_expression.clone(),
         prompt,
         enabled: true,
+        recurring,
+        durable,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_run: None,
         run_count: 0,
@@ -583,7 +604,7 @@ fn execute_cron_list_at<S: BuildHasher>(
     for s in &store.schedules {
         let _ = write!(
             output,
-            "  {} [{}] {}\n    Cron: {}\n    Prompt: {}\n    Runs: {} | Last: {}\n\n",
+            "  {} [{}] {}\n    Cron: {}\n    Prompt: {}\n    Recurring: {} | Durable: {}\n    Runs: {} | Last: {}\n\n",
             if s.enabled { "\u{25cf}" } else { "\u{25cb}" },
             s.id,
             s.name,
@@ -593,6 +614,8 @@ fn execute_cron_list_at<S: BuildHasher>(
             } else {
                 s.prompt.clone()
             },
+            s.recurring,
+            s.durable,
             s.run_count,
             s.last_run.as_deref().unwrap_or("never"),
         );
@@ -828,11 +851,9 @@ mod tests {
         );
     }
 
-    /// Pin gap #621: OC has no `recurring` or `durable` fields in the input
-    /// schema.  This test documents that passing these CC-side fields is silently
-    /// ignored (not an error).
+    /// Regression #621: `recurring` and `durable` are accepted and persisted.
     #[test]
-    fn cron_create_ignores_recurring_and_durable_fields_gap621() {
+    fn cron_create_persists_recurring_and_durable_fields() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let path = temp_schedules_path(&tmp);
@@ -847,26 +868,45 @@ mod tests {
             "prompt".to_string(),
             Value::String("noon check".to_string()),
         );
-        // CC fields that OC does not recognise
         args.insert("recurring".to_string(), Value::Bool(false));
         args.insert("durable".to_string(), Value::Bool(false));
 
         let (msg, is_err) = execute_cron_create_at(&args, &path);
-        assert!(
-            !is_err,
-            "gap #621: unknown CC fields must not cause an error; got: {msg}"
-        );
+        assert!(!is_err, "create must accept recurring/durable; got: {msg}");
+
+        let store = ScheduleStore::load_locked(&path).expect("created store should load");
+        let schedule = store
+            .schedules
+            .iter()
+            .find(|s| s.name == "gap621job")
+            .expect("created schedule missing");
+        assert!(!schedule.recurring);
+        assert!(!schedule.durable);
     }
 
-    /// Pin gap #621: OC has no max-jobs cap (CC enforces ≤50).
-    /// Documented via the absence of a max-jobs check in the source — we pin
-    /// that creating a schedule when <50 jobs exist never fails with a
-    /// max-jobs message.
+    /// Regression #621: creation is capped at 50 scheduled jobs.
     #[test]
-    fn cron_create_has_no_max_jobs_cap_gap621() {
+    fn cron_create_rejects_when_max_jobs_cap_reached() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let path = temp_schedules_path(&tmp);
+
+        let mut store = ScheduleStore::default();
+        for i in 0..MAX_SCHEDULES {
+            store.schedules.push(Schedule {
+                id: format!("id-{i}"),
+                name: format!("existing-{i}"),
+                cron_expression: "* * * * *".to_string(),
+                prompt: "ping".to_string(),
+                enabled: true,
+                recurring: true,
+                durable: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_run: None,
+                run_count: 0,
+            });
+        }
+        store.save_locked(&path).expect("seed store");
 
         let mut args = HashMap::new();
         args.insert("name".to_string(), Value::String("captest".to_string()));
@@ -878,13 +918,10 @@ mod tests {
 
         let (msg, is_err) = execute_cron_create_at(&args, &path);
         assert!(
-            !is_err,
-            "gap #621: must not reject with a max-jobs message; got: {msg}"
+            is_err,
+            "create must reject when max schedule cap is reached; got: {msg}"
         );
-        assert!(
-            !msg.contains("too many") && !msg.contains("max"),
-            "gap #621: no max-jobs guard present; got: {msg}"
-        );
+        assert!(msg.contains("Maximum scheduled task limit"), "{msg}");
     }
 
     /// Contract: invalid cron expression (wrong field count) is rejected.
@@ -1151,6 +1188,8 @@ mod tests {
             cron_expression: "0 * * * *".to_string(),
             prompt: "p".to_string(),
             enabled: true,
+            recurring: true,
+            durable: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_run: None,
             run_count: 0,
@@ -1165,6 +1204,8 @@ mod tests {
             cron_expression: "*/5 * * * *".to_string(),
             prompt: "p2".to_string(),
             enabled: true,
+            recurring: true,
+            durable: true,
             created_at: "2026-01-01T00:00:01Z".to_string(),
             last_run: None,
             run_count: 0,
@@ -1256,6 +1297,8 @@ mod tests {
                 cron_expression: "0 * * * *".to_string(),
                 prompt: "p".to_string(),
                 enabled: true,
+                recurring: true,
+                durable: true,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 last_run: None,
                 run_count: 0,
