@@ -129,6 +129,8 @@ fn classify_then_name_round_trips_for_each_provider() {
     let cases = [
         ("claude-3-5-sonnet", "anthropic"),
         ("gpt-4o", "openai"),
+        ("chat-latest", "openai"),
+        ("codex-mini-latest", "openai"),
         ("o1-preview", "openai"),
         ("gemini-2.0-flash", "google"),
         ("deepseek-coder-v2", "deepseek"),

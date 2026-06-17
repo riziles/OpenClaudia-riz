@@ -72,6 +72,18 @@ fn classify_gpt_dash_prefix_as_openai() {
 }
 
 #[test]
+fn classify_openai_chat_and_codex_aliases_as_openai() {
+    assert_eq!(
+        ProviderKind::from_model("chat-latest"),
+        ProviderKind::OpenAI
+    );
+    assert_eq!(
+        ProviderKind::from_model("codex-mini-latest"),
+        ProviderKind::OpenAI
+    );
+}
+
+#[test]
 fn classify_bare_gpt_string_as_openai() {
     // PINS DOC: bare "gpt" alone is accepted (no dash).
     assert_eq!(ProviderKind::from_model("gpt"), ProviderKind::OpenAI);
@@ -280,6 +292,10 @@ fn classification_is_case_insensitive_for_openai_o_series() {
     assert_eq!(ProviderKind::from_model("O1-MINI"), ProviderKind::OpenAI);
     assert_eq!(ProviderKind::from_model("O3"), ProviderKind::OpenAI);
     assert_eq!(ProviderKind::from_model("GPT-4O"), ProviderKind::OpenAI);
+    assert_eq!(
+        ProviderKind::from_model("CODEX-MINI-LATEST"),
+        ProviderKind::OpenAI
+    );
 }
 
 #[test]
@@ -351,6 +367,8 @@ fn from_model_then_name_yields_canonical_provider_name() {
     let pairs = [
         ("claude-sonnet-4-5", "anthropic"),
         ("gpt-4o", "openai"),
+        ("chat-latest", "openai"),
+        ("codex-mini-latest", "openai"),
         ("o1-mini", "openai"),
         ("gemini-2.5-pro", "google"),
         ("deepseek-chat", "deepseek"),

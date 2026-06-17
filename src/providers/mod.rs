@@ -288,6 +288,9 @@ impl ProviderKind {
         if m.starts_with("gpt-") || m == "gpt" {
             return Self::OpenAI;
         }
+        if m.starts_with("codex-") || m == "codex" || m == "chat-latest" {
+            return Self::OpenAI;
+        }
         for prefix in ["o1-", "o3-", "o4-"] {
             if m.starts_with(prefix) {
                 return Self::OpenAI;
@@ -1036,6 +1039,14 @@ mod tests {
         assert_eq!(ProviderKind::from_model("gpt-5.5"), ProviderKind::OpenAI);
         assert_eq!(
             ProviderKind::from_model("gpt-5.4-mini"),
+            ProviderKind::OpenAI
+        );
+        assert_eq!(
+            ProviderKind::from_model("chat-latest"),
+            ProviderKind::OpenAI
+        );
+        assert_eq!(
+            ProviderKind::from_model("codex-mini-latest"),
             ProviderKind::OpenAI
         );
         assert_eq!(ProviderKind::from_model("o1-preview"), ProviderKind::OpenAI);

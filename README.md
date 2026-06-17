@@ -352,17 +352,18 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 ### Anthropic
 - `claude-fable-5`, `claude-mythos-5`, `claude-mythos-preview` — Latest/highest-capability Claude 5 family
 - `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6` — Claude 4 family
-- `claude-haiku-4-5-20251001` — Fast, near-frontier
-- `claude-sonnet-4-5-20250929`, `claude-opus-4-5-20251101`, `claude-opus-4-1-20250805` — Legacy
+- `claude-haiku-4-5-20251001`, `claude-haiku-4-5` — Fast, near-frontier
+- `claude-sonnet-4-5-20250929`, `claude-sonnet-4-5`, `claude-opus-4-5-20251101`, `claude-opus-4-5`, `claude-opus-4-1-20250805` — Legacy
 - `claude-sonnet-4-20250514`, `claude-opus-4-20250514` — Legacy
 
 ### OpenAI
 - `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.5-2026-04-23` — Latest frontier family
 - `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-mini-2026-03-17`, `gpt-5.4-nano` — Current GPT-5.4 family
-- `gpt-5.3-codex`, `gpt-5.2`, `gpt-5.2-pro`, `gpt-5.2-codex` — Codex/previous frontier family
-- `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini` — GPT-5.1 family
-- `gpt-5`, `gpt-5-pro`, `gpt-5-mini`, `gpt-5-nano` — GPT-5 family
-- `gpt-4.1`, `gpt-4.1-mini`, `o3-pro`, `o3`, `o4-mini`, `chat-latest`, `gpt-4o-mini` — Legacy chat/reasoning models
+- `gpt-5.3-codex`, `gpt-5.3-chat-latest`, `gpt-5.2`, `gpt-5.2-pro`, `gpt-5.2-codex`, `gpt-5.2-chat-latest` — Codex/previous frontier family
+- `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5.1-chat-latest` — GPT-5.1 family
+- `gpt-5`, `gpt-5-pro`, `gpt-5-codex`, `gpt-5-chat-latest`, `gpt-5-mini`, `gpt-5-nano` — GPT-5 family
+- `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3-pro`, `o3`, `o3-mini`, `o4-mini`, `o1-pro`, `o1`, `o1-mini`, `o1-preview` — Legacy chat/reasoning models
+- `chat-latest`, `gpt-4o-search-preview`, `gpt-4o-mini`, `gpt-4o-mini-search-preview`, `gpt-4o`, `gpt-4.5-preview`, `gpt-4-turbo`, `gpt-4-turbo-preview`, `gpt-4`, `gpt-3.5-turbo`, `codex-mini-latest` — Compatibility and deprecated chat models
 
 ### Google Gemini
 - `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview` — Gemini 3 family

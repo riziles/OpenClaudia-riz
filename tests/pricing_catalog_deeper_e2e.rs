@@ -107,6 +107,48 @@ fn get_pricing_for_current_openai_gpt5_models_returns_documented_rates() {
     let gpt52_pro = get_pricing("gpt-5.2-pro").expect("gpt-5.2-pro");
     assert_eq!(gpt52_pro.input_per_million, 21.0);
     assert_eq!(gpt52_pro.output_per_million, 168.0);
+
+    let gpt53_chat = get_pricing("gpt-5.3-chat-latest").expect("gpt-5.3-chat-latest");
+    assert_eq!(gpt53_chat.input_per_million, 1.75);
+    assert_eq!(gpt53_chat.output_per_million, 14.0);
+
+    let chat_latest = get_pricing("chat-latest").expect("chat-latest");
+    assert_eq!(chat_latest.input_per_million, 5.0);
+    assert_eq!(chat_latest.output_per_million, 30.0);
+}
+
+#[test]
+fn get_pricing_for_current_openai_compatibility_models_returns_documented_rates() {
+    let codex_mini = get_pricing("codex-mini-latest").expect("codex-mini-latest");
+    assert_eq!(codex_mini.input_per_million, 1.5);
+    assert_eq!(codex_mini.output_per_million, 6.0);
+
+    let gpt45 = get_pricing("gpt-4.5-preview").expect("gpt-4.5-preview");
+    assert_eq!(gpt45.input_per_million, 75.0);
+    assert_eq!(gpt45.output_per_million, 150.0);
+
+    let gpt35 = get_pricing("gpt-3.5-turbo").expect("gpt-3.5-turbo");
+    assert_eq!(gpt35.input_per_million, 0.5);
+    assert_eq!(gpt35.output_per_million, 1.5);
+}
+
+#[test]
+fn get_pricing_for_current_openai_o_series_returns_documented_rates() {
+    let o3_pro = get_pricing("o3-pro").expect("o3-pro");
+    assert_eq!(o3_pro.input_per_million, 20.0);
+    assert_eq!(o3_pro.output_per_million, 80.0);
+
+    let o3 = get_pricing("o3").expect("o3");
+    assert_eq!(o3.input_per_million, 2.0);
+    assert_eq!(o3.output_per_million, 8.0);
+
+    let o1_pro = get_pricing("o1-pro").expect("o1-pro");
+    assert_eq!(o1_pro.input_per_million, 150.0);
+    assert_eq!(o1_pro.output_per_million, 600.0);
+
+    let o1_mini = get_pricing("o1-mini").expect("o1-mini");
+    assert_eq!(o1_mini.input_per_million, 1.10);
+    assert_eq!(o1_mini.output_per_million, 4.40);
 }
 
 #[test]

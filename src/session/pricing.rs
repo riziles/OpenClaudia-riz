@@ -310,17 +310,26 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // OpenAI
     //
     // Note the `gpt-5.5-pro` → `gpt-5.5`, `gpt-5.4-pro` → `gpt-5.4`,
-    // `gpt-5.2-pro` → `gpt-5.2`, and `gpt-4.1-nano` → `gpt-4.1-mini` →
-    // `gpt-4.1` ordering: each shorter prefix must follow its longer
-    // siblings or the longer ones become unreachable.
+    // `gpt-5.2-pro` → `gpt-5.2`, `gpt-4.1-nano` → `gpt-4.1-mini` →
+    // `gpt-4.1`, and `o3-pro`/`o3-mini` → `o3` ordering: each shorter
+    // prefix must follow its longer siblings or the longer ones become
+    // unreachable.
     // ---------------------------------------------------------------------
+    (
+        "gpt-4o-mini-search-preview",
+        ModelPricing::other(0.15, 0.60),
+    ),
     ("gpt-4o-mini", ModelPricing::other(0.15, 0.60)),
+    ("gpt-4o-search-preview", ModelPricing::other(2.5, 10.0)),
     ("gpt-4o", ModelPricing::other(2.5, 10.0)),
+    ("gpt-4.5-preview", ModelPricing::other(75.0, 150.0)),
     ("gpt-4.1-nano", ModelPricing::other(0.10, 0.40)),
     ("gpt-4.1-mini", ModelPricing::other(0.40, 1.60)),
     ("gpt-4.1", ModelPricing::other(2.0, 8.0)),
     ("gpt-4-turbo", ModelPricing::other(10.0, 30.0)),
     ("gpt-4", ModelPricing::other(30.0, 60.0)),
+    ("gpt-3.5-turbo", ModelPricing::other(0.50, 1.50)),
+    ("chat-latest", ModelPricing::other(5.0, 30.0)),
     ("gpt-5.5-pro", ModelPricing::other(30.0, 180.0)),
     ("gpt-5.5", ModelPricing::other(5.0, 30.0)),
     ("gpt-5.4-pro", ModelPricing::other(30.0, 180.0)),
@@ -328,20 +337,29 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("gpt-5.4-nano", ModelPricing::other(0.20, 1.25)),
     ("gpt-5.4", ModelPricing::other(2.50, 15.0)),
     ("gpt-5.3-codex", ModelPricing::other(1.75, 14.0)),
+    ("gpt-5.3-chat-latest", ModelPricing::other(1.75, 14.0)),
     ("gpt-5.2-pro", ModelPricing::other(21.0, 168.0)),
+    ("gpt-5.2-codex", ModelPricing::other(1.75, 14.0)),
+    ("gpt-5.2-chat-latest", ModelPricing::other(1.75, 14.0)),
     ("gpt-5.2", ModelPricing::other(1.75, 14.0)),
     ("gpt-5.1-codex-mini", ModelPricing::other(0.25, 2.0)),
     ("gpt-5.1-codex", ModelPricing::other(1.25, 10.0)),
+    ("gpt-5.1-chat-latest", ModelPricing::other(1.25, 10.0)),
     ("gpt-5.1", ModelPricing::other(1.25, 10.0)),
     ("gpt-5-pro", ModelPricing::other(15.0, 120.0)),
+    ("gpt-5-codex", ModelPricing::other(1.25, 10.0)),
+    ("gpt-5-chat-latest", ModelPricing::other(1.25, 10.0)),
     ("gpt-5-nano", ModelPricing::other(0.05, 0.40)),
     ("gpt-5-mini", ModelPricing::other(0.25, 2.0)),
     ("gpt-5", ModelPricing::other(1.25, 10.0)),
-    ("o1-mini", ModelPricing::other(3.0, 12.0)),
+    ("codex-mini-latest", ModelPricing::other(1.50, 6.0)),
+    ("o1-pro", ModelPricing::other(150.0, 600.0)),
+    ("o1-mini", ModelPricing::other(1.10, 4.40)),
     ("o1-preview", ModelPricing::other(15.0, 60.0)),
     ("o1", ModelPricing::other(15.0, 60.0)),
+    ("o3-pro", ModelPricing::other(20.0, 80.0)),
     ("o3-mini", ModelPricing::other(1.10, 4.40)),
-    ("o3", ModelPricing::other(10.0, 40.0)),
+    ("o3", ModelPricing::other(2.0, 8.0)),
     ("o4-mini", ModelPricing::other(1.10, 4.40)),
     ("o4-pro", ModelPricing::other(10.0, 40.0)),
     ("o4", ModelPricing::other(10.0, 40.0)),
@@ -688,12 +706,18 @@ mod tests {
             "gpt-5.4-nano",
             "gpt-5.4",
             "gpt-5.3-codex",
+            "gpt-5.3-chat-latest",
             "gpt-5.2-pro",
+            "gpt-5.2-codex",
+            "gpt-5.2-chat-latest",
             "gpt-5.2",
             "gpt-5.1-codex-mini",
             "gpt-5.1-codex",
+            "gpt-5.1-chat-latest",
             "gpt-5.1",
             "gpt-5-pro",
+            "gpt-5-codex",
+            "gpt-5-chat-latest",
             "gpt-5-nano",
             "gpt-5-mini",
         ] {
@@ -851,8 +875,10 @@ mod tests {
             "gpt-5.1-codex-mini",
             "gpt-5.2",
             "gpt-5.2-codex",
+            "gpt-5.2-chat-latest",
             "gpt-5.2-pro",
             "gpt-5.3-codex",
+            "gpt-5.3-chat-latest",
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.4-nano",
@@ -860,10 +886,25 @@ mod tests {
             "gpt-5.5",
             "gpt-5.5-2026-04-23",
             "gpt-5.5-pro",
+            "chat-latest",
+            "codex-mini-latest",
+            "gpt-3.5-turbo",
+            "gpt-4.1-nano",
+            "gpt-4.5-preview",
+            "gpt-4-turbo",
+            "gpt-4-turbo-preview",
+            "gpt-4o-search-preview",
+            "gpt-4o-mini-search-preview",
+            "gpt-5.1-chat-latest",
+            "gpt-5-codex",
+            "gpt-5-chat-latest",
             "o1",
+            "o1-mini",
             "o1-preview",
+            "o1-pro",
             "o3",
             "o3-mini",
+            "o3-pro",
             "o4",
             "o4-pro",
             // Google provider
@@ -948,6 +989,30 @@ mod tests {
         let p = get_pricing("gpt-5.4-mini").expect("gpt-5.4-mini must be known");
         assert!((p.input_per_million - 0.75).abs() < f64::EPSILON);
         assert!((p.output_per_million - 4.50).abs() < f64::EPSILON);
+
+        let p = get_pricing("gpt-5.3-chat-latest").expect("gpt-5.3-chat-latest must be known");
+        assert!((p.input_per_million - 1.75).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 14.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("codex-mini-latest").expect("codex-mini-latest must be known");
+        assert!((p.input_per_million - 1.50).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 6.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("o3").expect("o3 must be known");
+        assert!((p.input_per_million - 2.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 8.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("o3-pro").expect("o3-pro must be known");
+        assert!((p.input_per_million - 20.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 80.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("o1-pro").expect("o1-pro must be known");
+        assert!((p.input_per_million - 150.0).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 600.0).abs() < f64::EPSILON);
+
+        let p = get_pricing("o1-mini").expect("o1-mini must be known");
+        assert!((p.input_per_million - 1.10).abs() < f64::EPSILON);
+        assert!((p.output_per_million - 4.40).abs() < f64::EPSILON);
     }
 
     /// Case-insensitive lookup on the input.
