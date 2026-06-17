@@ -63,7 +63,15 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
         }
     };
 
-    let (program, argv_rest) = tokens.split_first().expect("non-empty by match above");
+    let Some((program, argv_rest)) = tokens.split_first() else {
+        return StaticAnalysisResult {
+            command: command.to_string(),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "Empty command".to_string(),
+            passed: false,
+        };
+    };
     let result = tokio::time::timeout(
         timeout,
         tokio::process::Command::new(program)
@@ -158,4 +166,27 @@ pub(crate) async fn create_crosslink_issue(
     })
     .await
     .map_err(|e| VddError::CrosslinkError(format!("blocking task panicked: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_shell_command_rejects_empty_command() {
+        let result = run_shell_command("   ", Duration::from_secs(1)).await;
+
+        assert_eq!(result.exit_code, -1);
+        assert_eq!(result.stderr, "Empty command");
+        assert!(!result.passed);
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_rejects_unbalanced_quotes() {
+        let result = run_shell_command("echo 'unterminated", Duration::from_secs(1)).await;
+
+        assert_eq!(result.exit_code, -1);
+        assert!(result.stderr.contains("Could not parse command"));
+        assert!(!result.passed);
+    }
 }
