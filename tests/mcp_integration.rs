@@ -30,8 +30,14 @@
 use openclaudia::mcp::{
     HttpTransport, McpError, McpManager, McpServer, McpServerConfig, StdioTransport,
 };
+use openclaudia::plugins::PluginManager;
+use openclaudia::proxy::connect_mcp_servers;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
+use tokio::sync::RwLock;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -236,6 +242,74 @@ async fn tool_refresh_skips_list_without_tools_cap() {
     assert!(
         server.tools().is_empty(),
         "server without tools capability must not populate tools via tools/list"
+    );
+}
+
+/// Plugin-declared stdio MCP environment variables must reach the child
+/// process. The fixture omits `capabilities.tools` when this env var is set,
+/// so an empty `OpenAI` function list proves the env map survived spawn.
+#[tokio::test]
+async fn manager_stdio_connection_passes_env_to_child_process() {
+    let path = fixture_path();
+    let path_str = path.to_str().expect("fixture path must be UTF-8");
+    let manager = McpManager::new();
+    let env = HashMap::from([("MCP_NO_TOOLS_CAP".to_string(), "1".to_string())]);
+
+    manager
+        .connect_stdio_with_env("env-test", "python3", &[path_str], &env)
+        .await
+        .expect("connect stdio fixture with env");
+
+    assert!(manager.is_live("env-test").await);
+    assert!(
+        manager.tools_as_openai_functions().await.is_empty(),
+        "env var must suppress fixture tools; non-empty tools means child env was dropped"
+    );
+}
+
+/// Plugin-declared MCP env vars must survive the whole discovery/connect path
+/// used by proxy and TUI startup, not only the lower-level manager API.
+#[tokio::test]
+async fn plugin_mcp_stdio_env_reaches_child_process() {
+    let root = TempDir::new().expect("tempdir");
+    let plugin_dir = root.path().join("env-plugin");
+    std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+    let fixture = fixture_path();
+    let fixture_json = serde_json::to_string(fixture.to_str().expect("fixture path utf-8"))
+        .expect("fixture path json");
+    let manifest = format!(
+        r#"{{
+            "name": "env-plugin",
+            "mcpServers": {{
+                "env-server": {{
+                    "transport": "stdio",
+                    "command": "python3",
+                    "args": [{fixture_json}],
+                    "env": {{"MCP_NO_TOOLS_CAP": "1"}}
+                }}
+            }}
+        }}"#
+    );
+    std::fs::write(plugin_dir.join("plugin.json"), manifest).expect("manifest");
+
+    let mut plugins = PluginManager::with_paths(vec![root.path().to_path_buf()]);
+    let errors = plugins.discover();
+    assert!(errors.is_empty(), "plugin discovery errors: {errors:?}");
+    let plugins = Arc::new(plugins);
+    let manager = Arc::new(RwLock::new(McpManager::new()));
+
+    connect_mcp_servers(&manager, &plugins).await;
+
+    let functions = {
+        let mcp = manager.read().await;
+        assert!(mcp.is_live("env-server").await);
+        let functions = mcp.tools_as_openai_functions().await;
+        drop(mcp);
+        functions
+    };
+    assert!(
+        functions.is_empty(),
+        "plugin MCP env var must suppress fixture tools; non-empty tools means env was dropped"
     );
 }
 

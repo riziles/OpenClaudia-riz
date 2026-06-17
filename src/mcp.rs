@@ -328,13 +328,38 @@ impl StdioTransport {
     /// Returns `McpError::Transport` if the process cannot be spawned, or if
     /// stdout/stderr cannot be taken from the child.
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, McpError> {
-        info!(command = %command, args = ?args, "Spawning MCP server");
+        Self::spawn_with_env(command, args, &HashMap::new())
+    }
 
-        let mut child = Command::new(command)
-            .args(args)
+    /// Spawn a new MCP server process with extra environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `McpError::Transport` if the process cannot be spawned, or if
+    /// stdout/stderr cannot be taken from the child.
+    pub fn spawn_with_env(
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, McpError> {
+        info!(
+            command = %command,
+            args = ?args,
+            env_vars = env.len(),
+            "Spawning MCP server"
+        );
+
+        let mut cmd = Command::new(command);
+        cmd.args(args)
+            .envs(
+                env.iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| McpError::Transport(format!("Failed to spawn process: {e}")))?;
 
@@ -1355,16 +1380,24 @@ impl McpTransportKind {
 /// after a disconnect (fix #629).
 #[derive(Debug, Clone)]
 enum ConnectionSpec {
-    Stdio { command: String, args: Vec<String> },
-    Http { url: String },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    },
+    Http {
+        url: String,
+    },
 }
 
 impl ConnectionSpec {
     fn build_transport(&self) -> Result<Box<dyn McpTransport>, McpError> {
         match self {
-            Self::Stdio { command, args } => {
+            Self::Stdio { command, args, env } => {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                Ok(Box::new(StdioTransport::spawn(command, &argv)?))
+                Ok(Box::new(StdioTransport::spawn_with_env(
+                    command, &argv, env,
+                )?))
             }
             Self::Http { url } => Ok(Box::new(HttpTransport::new(url)?)),
         }
@@ -1483,9 +1516,26 @@ impl McpManager {
         command: &str,
         args: &[&str],
     ) -> Result<(), McpError> {
+        self.connect_stdio_with_env(name, command, args, &HashMap::new())
+            .await
+    }
+
+    /// Connect to an MCP server via stdio with extra child environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` if spawning or initializing the server fails.
+    pub async fn connect_stdio_with_env(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<(), McpError> {
         let spec = ConnectionSpec::Stdio {
             command: command.to_string(),
             args: args.iter().map(|s| (*s).to_string()).collect(),
+            env: env.clone(),
         };
         let transport = spec.build_transport()?;
         let server = McpServer::new(name, transport).await?;
@@ -2808,6 +2858,7 @@ mod tests {
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
+            env: HashMap::new(),
         };
         let entry = ServerEntry::new(spec, server);
         manager
@@ -2847,6 +2898,7 @@ mod tests {
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
+            env: HashMap::new(),
         };
         let entry = ServerEntry {
             spec,
@@ -2883,6 +2935,7 @@ mod tests {
         let spec = ConnectionSpec::Stdio {
             command: "/nonexistent/cmd".to_string(),
             args: vec![],
+            env: HashMap::new(),
         };
         // Freshly disconnected (failed_attempts = 0), last_failure
         // = now ⇒ BACKOFF[0] = 1 s has NOT elapsed.
@@ -2946,6 +2999,7 @@ mod tests {
         let spec = ConnectionSpec::Stdio {
             command: "/this/path/definitely/does/not/exist/__fix629__".to_string(),
             args: vec![],
+            env: HashMap::new(),
         };
         let entry = ServerEntry {
             spec,
@@ -2997,6 +3051,7 @@ mod tests {
         let spec2 = ConnectionSpec::Stdio {
             command: "/bin/true".to_string(),
             args: vec![],
+            env: HashMap::new(),
         };
         manager
             .servers

@@ -2130,7 +2130,10 @@ pub async fn connect_mcp_servers(
                         .iter()
                         .map(std::string::String::as_str)
                         .collect();
-                    match mcp.connect_stdio(&server.name, command, &args).await {
+                    match mcp
+                        .connect_stdio_with_env(&server.name, command, &args, &server.env)
+                        .await
+                    {
                         Ok(()) => {
                             info!(server = %server.name, plugin = %plugin.name(), "Connected MCP (stdio)");
                         }
