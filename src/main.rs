@@ -366,7 +366,7 @@ async fn tui_launch(
     use openclaudia::rules::RulesEngine;
 
     let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let memory_db: Option<memory::MemoryDb> = memory::MemoryDb::open_for_project(&cwd_path).ok();
+    let memory_db: Option<memory::MemoryDb> = open_project_memory_db(&cwd_path);
 
     let cwd = cwd_path.to_string_lossy().to_string();
     let tui_prompt_blocks = prompt::build_system_prompt_blocks(
@@ -698,34 +698,44 @@ fn maybe_resume_session(chat_session: &mut ChatSession, resume: bool, session_id
 /// still starts). Extracted from `cmd_chat` per crosslink #262.
 fn init_memory_with_banner() -> Option<memory::MemoryDb> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    match memory::MemoryDb::open_for_project(&cwd) {
+    let db = open_project_memory_db(&cwd)?;
+
+    let recent_count = db.get_recent_sessions(10).map_or(0, |s| s.len());
+    if recent_count > 0 {
+        println!("\x1b[90m📝 {recent_count} recent session(s) loaded from memory\x1b[0m");
+    }
+
+    if let Ok(stats) = db.auto_learn_stats() {
+        let total = stats.coding_patterns
+            + stats.error_patterns
+            + stats.learned_preferences
+            + stats.file_relationships;
+        if total > 0 {
+            println!(
+                "\x1b[90m🧠 Auto-learned: {} patterns, {} error fixes, {} preferences, {} file relationships\x1b[0m",
+                stats.coding_patterns,
+                stats.errors_resolved,
+                stats.learned_preferences,
+                stats.file_relationships
+            );
+        }
+    }
+
+    Some(db)
+}
+
+fn open_project_memory_db(project_dir: &Path) -> Option<memory::MemoryDb> {
+    match memory::MemoryDb::open_for_project(project_dir) {
         Ok(db) => {
-            let recent_count = db.get_recent_sessions(10).map_or(0, |s| s.len());
-            if recent_count > 0 {
-                println!("\x1b[90m📝 {recent_count} recent session(s) loaded from memory\x1b[0m");
-            }
-
-            if let Ok(stats) = db.auto_learn_stats() {
-                let total = stats.coding_patterns
-                    + stats.error_patterns
-                    + stats.learned_preferences
-                    + stats.file_relationships;
-                if total > 0 {
-                    println!(
-                        "\x1b[90m🧠 Auto-learned: {} patterns, {} error fixes, {} preferences, {} file relationships\x1b[0m",
-                        stats.coding_patterns,
-                        stats.errors_resolved,
-                        stats.learned_preferences,
-                        stats.file_relationships
-                    );
-                }
-            }
-
             tracing::debug!("Memory database: {}", db.path().display());
             Some(db)
         }
         Err(e) => {
-            tracing::warn!("Failed to initialize memory database: {}", e);
+            tracing::warn!(
+                error = %e,
+                path = %project_dir.display(),
+                "Failed to initialize memory database"
+            );
             None
         }
     }
@@ -1270,6 +1280,15 @@ mod tests {
                 n = idx + 1,
             );
         }
+    }
+
+    #[test]
+    fn open_project_memory_db_returns_none_when_openclaudia_path_is_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".openclaudia"), b"not a directory")
+            .expect("write .openclaudia file");
+
+        assert!(open_project_memory_db(dir.path()).is_none());
     }
 
     #[test]
