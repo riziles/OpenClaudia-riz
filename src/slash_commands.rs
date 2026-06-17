@@ -181,8 +181,8 @@ const MANAGEMENT: &[SlashCommand] = &[
         "/mcp reconnect <name>",
         "Force-reconnect a stalled MCP server",
     ),
-    cmd("/permissions", "Open the permission rules overlay"),
-    cmd("/hooks", "Open the lifecycle hooks overlay"),
+    cmd("/permissions", "Show permission rules and MCP allowlists"),
+    cmd("/hooks", "Show configured lifecycle hooks"),
 ];
 
 const TUI_CORE: &[SlashCommand] = &[

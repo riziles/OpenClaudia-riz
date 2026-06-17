@@ -1,7 +1,9 @@
 use super::models::get_available_models;
 use super::{get_data_dir, get_history_path, get_sessions_dir, list_chat_sessions};
 use crate::cli::commands::init::init_project_rules;
+use openclaudia::config::{Hook, HookEntry, HooksConfig, PermissionsConfig, SandboxMode};
 use openclaudia::memory;
+use openclaudia::permissions::{PermissionDecision, PermissionRule};
 use openclaudia::plugins;
 use openclaudia::skills;
 use openclaudia::tools::file_index::FileIndex;
@@ -116,6 +118,7 @@ pub enum SlashCommandResult {
 /// descriptions line up. Wide enough for the longest invocation in the
 /// shared table (`/commit-push-pr` = 15 chars) plus a little slack.
 const SLASH_INVOCATION_WIDTH: usize = 19;
+const STATUS_ITEM_LIMIT: usize = 6;
 
 /// Absolute, PATH-independent location of `git` for slash-command helpers.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
@@ -297,6 +300,314 @@ pub fn slash_config(args: &str) {
         }
         _ => println!("\nUsage: /config [show|path]\n"),
     }
+}
+
+pub fn slash_permissions() -> SlashCommandResult {
+    println!("\nPermissions:\n");
+    match openclaudia::config::load_config() {
+        Ok(cfg) => {
+            let persisted_path = Path::new(".openclaudia/permissions.json");
+            match load_persisted_permission_rules(persisted_path) {
+                Ok(rules) => {
+                    for line in permission_status_lines(&cfg.permissions, rules.as_deref(), None) {
+                        println!("  {line}");
+                    }
+                }
+                Err(err) => {
+                    for line in permission_status_lines(&cfg.permissions, None, Some(&err)) {
+                        println!("  {line}");
+                    }
+                }
+            }
+        }
+        Err(e) => println!("  Config: failed to load ({e})"),
+    }
+    println!();
+    SlashCommandResult::Handled
+}
+
+pub fn slash_hooks() -> SlashCommandResult {
+    println!("\nHooks:\n");
+    match openclaudia::config::load_config() {
+        Ok(cfg) => {
+            let claude_hooks = openclaudia::hooks::load_claude_code_hooks();
+            let hooks = openclaudia::hooks::merge_hooks_config(cfg.hooks, claude_hooks);
+            for line in hook_status_lines(&hooks) {
+                println!("  {line}");
+            }
+        }
+        Err(e) => println!("  Config: failed to load ({e})"),
+    }
+    println!();
+    SlashCommandResult::Handled
+}
+
+fn load_persisted_permission_rules(path: &Path) -> Result<Option<Vec<PermissionRule>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let rules = serde_json::from_str::<Vec<PermissionRule>>(&content)
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(rules))
+}
+
+fn permission_status_lines(
+    config: &PermissionsConfig,
+    persisted_rules: Option<&[PermissionRule]>,
+    persisted_error: Option<&str>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("Enabled: {}", yes_no(config.enabled)),
+        format!(
+            "Default allow: {}",
+            summarize_strings(&config.default_allow, "none")
+        ),
+    ];
+
+    if config.mcp.is_empty() {
+        lines.push("MCP allowlists: none configured".to_string());
+    } else {
+        lines.push(format!("MCP allowlists: {} server(s)", config.mcp.len()));
+        let mut servers: Vec<(&String, &Vec<String>)> = config.mcp.iter().collect();
+        servers.sort_by_key(|(server, _)| *server);
+        for (server, tools) in servers.into_iter().take(STATUS_ITEM_LIMIT) {
+            if tools.is_empty() {
+                lines.push(format!("  {server}: deny all tools"));
+            } else {
+                lines.push(format!(
+                    "  {server}: {}",
+                    summarize_strings(tools, "no tools")
+                ));
+            }
+        }
+        if config.mcp.len() > STATUS_ITEM_LIMIT {
+            lines.push(format!(
+                "  ... {} more server(s)",
+                config.mcp.len() - STATUS_ITEM_LIMIT
+            ));
+        }
+    }
+
+    match (persisted_rules, persisted_error) {
+        (Some(rules), _) => {
+            let always_allow = rules
+                .iter()
+                .filter(|rule| rule.decision == PermissionDecision::AlwaysAllow)
+                .count();
+            let deny = rules
+                .iter()
+                .filter(|rule| rule.decision == PermissionDecision::Deny)
+                .count();
+            lines.push(format!(
+                "Persisted rules: {} total ({} always allow, {} deny)",
+                rules.len(),
+                always_allow,
+                deny
+            ));
+            for rule in rules.iter().take(STATUS_ITEM_LIMIT) {
+                lines.push(format!(
+                    "  {} {} -> {}",
+                    rule.tool,
+                    rule.pattern,
+                    permission_decision_label(&rule.decision)
+                ));
+            }
+            if rules.len() > STATUS_ITEM_LIMIT {
+                lines.push(format!(
+                    "  ... {} more rule(s)",
+                    rules.len() - STATUS_ITEM_LIMIT
+                ));
+            }
+        }
+        (None, Some(err)) => {
+            lines.push(format!("Persisted rules: unavailable ({err})"));
+        }
+        (None, None) => {
+            lines.push(
+                "Persisted rules: none (.openclaudia/permissions.json not found)".to_string(),
+            );
+        }
+    }
+
+    lines
+}
+
+fn hook_status_lines(config: &HooksConfig) -> Vec<String> {
+    let slots = hook_slots(config);
+    let active_slots = slots
+        .iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .count();
+    let entry_count: usize = slots.iter().map(|(_, entries)| entries.len()).sum();
+    let hook_count: usize = slots
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .map(|entry| entry.hooks.len())
+        .sum();
+
+    let mut lines = vec![
+        "Sources: .openclaudia/config.yaml plus Claude Code settings when present".to_string(),
+        format!(
+            "Configured: {}, {}, {}",
+            count_label(active_slots, "active event", "active events"),
+            count_label(entry_count, "entry", "entries"),
+            count_label(hook_count, "hook action", "hook actions")
+        ),
+        format!("Policy: {}", hook_policy_label(config)),
+    ];
+
+    if entry_count == 0 {
+        lines.push("No lifecycle hooks configured".to_string());
+        return lines;
+    }
+
+    for (name, entries) in slots {
+        if entries.is_empty() {
+            continue;
+        }
+        lines.push(hook_slot_line(name, entries));
+    }
+
+    lines
+}
+
+fn hook_slots(config: &HooksConfig) -> [(&'static str, &[HookEntry]); 16] {
+    [
+        ("session_start", &config.session_start),
+        ("session_end", &config.session_end),
+        ("pre_tool_use", &config.pre_tool_use),
+        ("post_tool_use", &config.post_tool_use),
+        ("post_tool_use_failure", &config.post_tool_use_failure),
+        ("user_prompt_submit", &config.user_prompt_submit),
+        ("stop", &config.stop),
+        ("subagent_start", &config.subagent_start),
+        ("subagent_stop", &config.subagent_stop),
+        ("pre_compact", &config.pre_compact),
+        ("permission_request", &config.permission_request),
+        ("notification", &config.notification),
+        ("pre_adversary_review", &config.pre_adversary_review),
+        ("post_adversary_review", &config.post_adversary_review),
+        ("vdd_conflict", &config.vdd_conflict),
+        ("vdd_converged", &config.vdd_converged),
+    ]
+}
+
+fn hook_slot_line(name: &str, entries: &[HookEntry]) -> String {
+    let hook_count: usize = entries.iter().map(|entry| entry.hooks.len()).sum();
+    let previews: Vec<String> = entries
+        .iter()
+        .take(STATUS_ITEM_LIMIT)
+        .map(hook_entry_preview)
+        .collect();
+    let suffix = if entries.len() > STATUS_ITEM_LIMIT {
+        format!(
+            "; {}; ... {} more",
+            previews.join("; "),
+            entries.len() - STATUS_ITEM_LIMIT
+        )
+    } else {
+        format!("; {}", previews.join("; "))
+    };
+
+    format!(
+        "{name}: {}, {}{suffix}",
+        count_label(entries.len(), "entry", "entries"),
+        count_label(hook_count, "hook action", "hook actions")
+    )
+}
+
+fn hook_entry_preview(entry: &HookEntry) -> String {
+    let matcher = entry.matcher.as_deref().unwrap_or("*");
+    let hooks: Vec<&str> = entry.hooks.iter().map(hook_kind_label).collect();
+    format!("{matcher} -> {}", hooks.join(", "))
+}
+
+const fn hook_kind_label(hook: &Hook) -> &'static str {
+    match hook {
+        Hook::Command { shell: true, .. } => "shell command",
+        Hook::Command { shell: false, .. } => "command",
+        Hook::Prompt { .. } => "prompt",
+        Hook::Model { .. } => "model",
+    }
+}
+
+fn hook_policy_label(config: &HooksConfig) -> String {
+    let Some(policy) = config.policy.as_ref() else {
+        return "not set (legacy allow-all command policy with env scrub)".to_string();
+    };
+
+    let allowed = match policy.allowed_commands.as_ref() {
+        None => "all command executables allowed".to_string(),
+        Some(commands) if commands.is_empty() => "all command hooks denied".to_string(),
+        Some(commands) => {
+            let mut sorted: Vec<&String> = commands.iter().collect();
+            sorted.sort();
+            format!(
+                "allowed commands {}",
+                summarize_string_refs(&sorted, "none")
+            )
+        }
+    };
+
+    format!("{allowed}; sandbox {}", sandbox_label(&policy.sandbox))
+}
+
+fn summarize_strings(items: &[String], empty_label: &str) -> String {
+    let refs: Vec<&String> = items.iter().collect();
+    summarize_string_refs(&refs, empty_label)
+}
+
+fn summarize_string_refs(items: &[&String], empty_label: &str) -> String {
+    if items.is_empty() {
+        return empty_label.to_string();
+    }
+
+    let shown: Vec<&str> = items
+        .iter()
+        .take(STATUS_ITEM_LIMIT)
+        .map(|item| item.as_str())
+        .collect();
+    if items.len() > STATUS_ITEM_LIMIT {
+        format!(
+            "{} (+{} more)",
+            shown.join(", "),
+            items.len() - STATUS_ITEM_LIMIT
+        )
+    } else {
+        shown.join(", ")
+    }
+}
+
+const fn permission_decision_label(decision: &PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "allow",
+        PermissionDecision::Deny => "deny",
+        PermissionDecision::AlwaysAllow => "always allow",
+    }
+}
+
+const fn sandbox_label(sandbox: &SandboxMode) -> &'static str {
+    match sandbox {
+        SandboxMode::None => "none",
+        SandboxMode::EnvScrub => "env_scrub",
+        SandboxMode::FullSandbox => "full_sandbox",
+    }
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{count} {noun}")
 }
 
 pub fn slash_debug(provider: &str, current_model: &str, msg_count: usize) {
@@ -2233,8 +2544,12 @@ fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        gh_bin, git_bin, handle_slash_command, plugin_install_dir_for_name, SlashCommandResult,
+        gh_bin, git_bin, handle_slash_command, hook_status_lines, permission_status_lines,
+        plugin_install_dir_for_name, SlashCommandResult,
     };
+    use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
+    use openclaudia::permissions::{PermissionDecision, PermissionRule};
+    use std::collections::{HashMap, HashSet};
 
     /// Convenience: empty message vec, dummy provider + model.
     fn ctx() -> Vec<serde_json::Value> {
@@ -2880,24 +3195,111 @@ mod tests {
         );
     }
 
-    /// Gap F (#666): `/hooks` does not exist in OC → unknown-command path.
+    /// Gap F (#666): `/hooks` now reports configured lifecycle hooks.
     #[test]
-    fn gap_missing_hooks_returns_handled() {
+    fn hooks_command_is_registered_and_returns_handled() {
+        assert!(
+            super::super::command_registry::registry()
+                .get("hooks")
+                .is_some(),
+            "/hooks must be registered, not unknown-command fallback"
+        );
         let result = handle_slash_command("/hooks", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
-            "/hooks must return Handled — command not yet implemented (gap #666)"
+            "/hooks must print status and return Handled"
         );
     }
 
-    /// Gap F (#666): `/permissions` does not exist in OC → unknown-command path.
+    /// Gap F (#666): `/permissions` now reports rules and MCP allowlists.
     #[test]
-    fn gap_missing_permissions_returns_handled() {
+    fn permissions_command_is_registered_and_returns_handled() {
+        assert!(
+            super::super::command_registry::registry()
+                .get("permissions")
+                .is_some(),
+            "/permissions must be registered, not unknown-command fallback"
+        );
         let result = handle_slash_command("/permissions", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
             matches!(result, Some(SlashCommandResult::Handled)),
-            "/permissions must return Handled — command not yet implemented (gap #666)"
+            "/permissions must print status and return Handled"
         );
+    }
+
+    #[test]
+    fn permission_status_summarizes_config_mcp_and_persisted_rules() {
+        let mut mcp = HashMap::new();
+        mcp.insert(
+            "github".to_string(),
+            vec!["search".to_string(), "fetch".to_string()],
+        );
+        mcp.insert("blocked".to_string(), Vec::new());
+        let config = PermissionsConfig {
+            enabled: true,
+            default_allow: vec!["git status".to_string()],
+            mcp,
+        };
+        let persisted = vec![
+            PermissionRule {
+                tool: "Bash".to_string(),
+                pattern: "cargo test *".to_string(),
+                decision: PermissionDecision::AlwaysAllow,
+            },
+            PermissionRule {
+                tool: "Write".to_string(),
+                pattern: ".claude/settings.json".to_string(),
+                decision: PermissionDecision::Deny,
+            },
+        ];
+
+        let lines = permission_status_lines(&config, Some(&persisted), None);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("Enabled: yes"));
+        assert!(joined.contains("Default allow: git status"));
+        assert!(joined.contains("MCP allowlists: 2 server(s)"));
+        assert!(joined.contains("blocked: deny all tools"));
+        assert!(joined.contains("github: search, fetch"));
+        assert!(joined.contains("2 total (1 always allow, 1 deny)"));
+    }
+
+    #[test]
+    fn hook_status_summarizes_policy_and_all_slots() {
+        let mut allowed = HashSet::new();
+        allowed.insert("python".to_string());
+        let mut hooks = HooksConfig {
+            policy: Some(HookPolicy {
+                allowed_commands: Some(allowed),
+                sandbox: openclaudia::config::SandboxMode::EnvScrub,
+            }),
+            ..HooksConfig::default()
+        };
+        hooks.permission_request.push(HookEntry {
+            matcher: Some("Bash".to_string()),
+            hooks: vec![Hook::Command {
+                command: "python guard.py".to_string(),
+                shell: false,
+                timeout: 60,
+            }],
+        });
+        hooks.notification.push(HookEntry {
+            matcher: None,
+            hooks: vec![Hook::Prompt {
+                prompt: "Summarize notification".to_string(),
+                timeout: 30,
+            }],
+        });
+
+        let lines = hook_status_lines(&hooks);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("2 active events"));
+        assert!(joined.contains("Policy: allowed commands python; sandbox env_scrub"));
+        assert!(joined.contains("permission_request: 1 entry, 1 hook action"));
+        assert!(joined.contains("Bash -> command"));
+        assert!(joined.contains("notification: 1 entry, 1 hook action"));
+        assert!(joined.contains("* -> prompt"));
     }
 
     // ── Input-parsing invariants ──────────────────────────────────────────────

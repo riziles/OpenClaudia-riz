@@ -103,6 +103,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - permissions: auto-allow scoring now gives dangerous Bash constructs a zero score and treats zero as a veto, so safe-looking prefixes such as `echo ... | sh` cannot be auto-approved.
 - repl: `/rewind [N]` and `/checkpoint [N]` now work in the legacy line REPL, listing turns with no count and rewinding multiple turns through the existing undo stack when a count is supplied.
 - repl: `/fast` now works in the legacy line REPL, setting effort to `low` and switching to a known fast model for the active provider when the static model list has one.
+- repl: `/permissions` and `/hooks` now work in the legacy line REPL as read-only status commands for permission rules, MCP allowlists, and configured lifecycle hooks.
 - hooks: merged hook configs now include every lifecycle slot plus explicit later-layer hook policy overrides, so Claude Code-compatible hooks are not dropped for newer events.
 - tui/messages: thinking deltas now render as a collapsed `∴ Thinking… (Xs)` indicator (live) replaced by `∴ Thought for X.Xs` once regular text streams in, matching Claude Code. Raw reasoning tokens are hidden (accumulated in `MessageList::thinking_buffer` for session persistence) rather than inlined into the assistant message
 - deps: bumped rustls-webpki 0.103.10 → 0.103.12 (GHSA-965h-392x-2mh5, GHSA on wildcard name constraints), rand 0.9.2 → 0.9.4 and rand 0.10.0 → 0.10.1 (GHSA on `rand::rng()` unsoundness). Closes 6 open dependabot alerts in both Cargo.lock and fuzz/Cargo.lock
