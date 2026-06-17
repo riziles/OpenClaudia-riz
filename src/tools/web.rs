@@ -61,7 +61,7 @@ static SHARED_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
 ///
 /// Centralising the dispatch makes it impossible for a future web
 /// tool to regress and `Runtime::new()` again.
-fn run_blocking<F>(fut: F) -> F::Output
+fn run_blocking<F>(fut: F) -> Result<F::Output, String>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -73,10 +73,12 @@ where
         // panicking from inside the runtime.
         let _ = tx.send(fut.await);
     });
-    rx.recv().expect(
-        "SHARED_RUNTIME web-tool task panicked or the runtime was \
-         shut down before delivering a result",
-    )
+    rx.recv().map_err(|e| {
+        format!(
+            "SHARED_RUNTIME web-tool task panicked or the runtime was shut down before delivering \
+             a result: {e}"
+        )
+    })
 }
 
 /// Hard cap on the agent-facing fetched-page output string, in bytes.
@@ -151,7 +153,10 @@ pub fn execute_web_fetch(args: &HashMap<String, Value>) -> (String, bool) {
     // The spawned future is `'static` — capture an owned `String` so
     // the future doesn't borrow `url` across thread boundaries.
     let url_owned = url.to_string();
-    let result = run_blocking(async move { web::fetch_url(&url_owned).await });
+    let result = match run_blocking(async move { web::fetch_url(&url_owned).await }) {
+        Ok(result) => result,
+        Err(e) => return (format!("Failed to fetch URL: {e}"), true),
+    };
 
     match result {
         Ok(fetch_result) => (
@@ -240,7 +245,11 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
     // The spawned future is `'static` — own all captured inputs so the
     // future doesn't borrow `query` / `config` across thread boundaries.
     let query_owned = query.to_string();
-    let result = run_blocking(async move { web::search_web(&query_owned, &config, limit).await });
+    let result =
+        match run_blocking(async move { web::search_web(&query_owned, &config, limit).await }) {
+            Ok(result) => result,
+            Err(e) => return (format!("Search failed: {e}"), true),
+        };
 
     match result {
         Ok(mut results) => {
@@ -358,9 +367,11 @@ mod tests {
     /// (or the executor swap below), this test catches it.
     #[test]
     fn shared_runtime_is_reused_across_back_to_back_calls() {
-        let first = run_blocking(async { Handle::current().id() });
+        let first = run_blocking(async { Handle::current().id() })
+            .expect("shared runtime dispatch must succeed");
         for _ in 0..50 {
-            let id = run_blocking(async { Handle::current().id() });
+            let id = run_blocking(async { Handle::current().id() })
+                .expect("shared runtime dispatch must succeed");
             assert_eq!(
                 id, first,
                 "run_blocking constructed a new runtime on a sync-context call \
@@ -395,11 +406,27 @@ mod tests {
             tokio::task::spawn_blocking(move || run_blocking(async { Handle::current().id() }))
                 .await
                 .unwrap()
+                .expect("shared runtime dispatch must succeed")
         });
         assert_ne!(
             inside_id, caller_id,
             "run_blocking now always uses SHARED_RUNTIME; expected the inside \
              runtime id to differ from the caller's"
+        );
+    }
+
+    #[test]
+    fn run_blocking_task_panic_returns_error_instead_of_panicking() {
+        let result = run_blocking(async {
+            panic!("intentional web-tool task panic for regression test");
+            #[allow(unreachable_code)]
+            1usize
+        });
+
+        let err = result.expect_err("task panic must be reported as an error");
+        assert!(
+            err.contains("panicked") || err.contains("delivering a result"),
+            "error must explain the failed dispatch: {err}"
         );
     }
 
