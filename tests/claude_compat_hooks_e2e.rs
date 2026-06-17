@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::config::Hook;
 use openclaudia::hooks::{
     load_claude_code_hooks, load_claude_settings, ClaudeCodeHook, ClaudeCodeHookEntry,
     ClaudeCodeSettings,
@@ -35,6 +36,51 @@ fn run_in_tempdir<F: FnOnce() -> R, R>(f: F) -> R {
     let result = f();
     std::env::set_current_dir(&original).expect("restore");
     result
+}
+
+struct EnvCwdGuard {
+    cwd: std::path::PathBuf,
+    home: Option<String>,
+    userprofile: Option<String>,
+}
+
+impl EnvCwdGuard {
+    fn enter(cwd: &std::path::Path, home: &std::path::Path) -> Self {
+        let guard = Self {
+            cwd: std::env::current_dir().expect("cwd"),
+            home: std::env::var("HOME").ok(),
+            userprofile: std::env::var("USERPROFILE").ok(),
+        };
+        std::env::set_current_dir(cwd).expect("chdir");
+        std::env::set_var("HOME", home);
+        std::env::set_var("USERPROFILE", home);
+        guard
+    }
+}
+
+impl Drop for EnvCwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        match &self.home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match &self.userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+fn command_names(hooks: &[openclaudia::config::HookEntry]) -> Vec<String> {
+    hooks
+        .iter()
+        .flat_map(|entry| &entry.hooks)
+        .map(|hook| match hook {
+            Hook::Command { command, .. } => command.clone(),
+            other => panic!("expected command hook, got {other:?}"),
+        })
+        .collect()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -229,4 +275,62 @@ fn load_claude_code_hooks_handles_missing_dot_claude_dir_gracefully() {
     // Run twice in different tempdirs — both MUST succeed.
     let _ = run_in_tempdir(load_claude_code_hooks);
     let _ = run_in_tempdir(load_claude_code_hooks);
+}
+
+#[test]
+fn load_claude_code_hooks_uses_layered_user_project_and_local_settings() {
+    let _g = cwd_lock();
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let home = tempfile::TempDir::new().expect("home tempdir");
+    let _guard = EnvCwdGuard::enter(project.path(), home.path());
+
+    let user_claude = home.path().join(".claude");
+    let project_claude = project.path().join(".claude");
+    std::fs::create_dir_all(&user_claude).expect("mkdir user .claude");
+    std::fs::create_dir_all(&project_claude).expect("mkdir project .claude");
+
+    std::fs::write(
+        user_claude.join("settings.json"),
+        r#"{
+          "hooks": {
+            "PreToolUse": [
+              {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-hook"}]}
+            ]
+          }
+        }"#,
+    )
+    .expect("write user settings");
+    std::fs::write(
+        project_claude.join("settings.json"),
+        r#"{
+          "hooks": {
+            "PreToolUse": [
+              {"matcher": "Write", "hooks": [{"type": "command", "command": "project-hook"}]}
+            ]
+          }
+        }"#,
+    )
+    .expect("write project settings");
+    std::fs::write(
+        project_claude.join("settings.local.json"),
+        r#"{
+          "hooks": {
+            "PreToolUse": [
+              {"matcher": "Edit", "hooks": [{"type": "command", "command": "local-hook"}]}
+            ]
+          }
+        }"#,
+    )
+    .expect("write local settings");
+
+    let config = load_claude_code_hooks();
+    let commands = command_names(&config.pre_tool_use);
+    assert!(
+        commands.starts_with(&[
+            "user-hook".to_string(),
+            "project-hook".to_string(),
+            "local-hook".to_string()
+        ]),
+        "runtime hook loader MUST use the layered Claude settings path"
+    );
 }

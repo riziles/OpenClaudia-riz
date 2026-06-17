@@ -7,7 +7,6 @@ use crate::config::HooksConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -46,38 +45,15 @@ const fn default_claude_timeout() -> Option<u64> {
     Some(60)
 }
 
-/// Load hooks from Claude Code's .claude/settings.json
+/// Load hooks from Claude Code-compatible settings layers.
 ///
-/// Looks for settings.json in:
-/// 1. .claude/settings.json (project-level)
-/// 2. ~/.claude/settings.json (user-level, lower priority)
-///
-/// Returns merged `HooksConfig` with Claude Code hooks converted to `OpenClaudia` format
+/// This is the runtime-facing helper used by the CLI, ACP, and proxy paths.
+/// It intentionally routes through [`load_claude_code_hooks_layered`] so all
+/// call sites honor the same user, project, project-local, and managed
+/// settings precedence.
+#[must_use]
 pub fn load_claude_code_hooks() -> HooksConfig {
-    let mut config = HooksConfig::default();
-
-    // Check project-level first
-    let project_settings = Path::new(".claude/settings.json");
-    if project_settings.exists() {
-        if let Some(settings) = load_claude_settings_file(project_settings) {
-            merge_claude_hooks(&mut config, &settings);
-            info!(path = ?project_settings, "Loaded Claude Code hooks from project");
-        }
-    }
-
-    // Then check user-level (only if no project-level)
-    if config.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let user_settings = home.join(".claude/settings.json");
-            if user_settings.exists() {
-                if let Some(settings) = load_claude_settings_file(&user_settings) {
-                    merge_claude_hooks(&mut config, &settings);
-                    info!(path = ?user_settings, "Loaded Claude Code hooks from user directory");
-                }
-            }
-        }
-    }
-
+    let (config, _) = load_claude_code_hooks_layered();
     config
 }
 
@@ -215,21 +191,4 @@ pub fn load_claude_code_hooks_layered() -> (HooksConfig, LayeredSettings) {
     }
 
     (config, layered)
-}
-
-/// Load and parse a Claude Code settings.json file
-pub(crate) fn load_claude_settings_file(path: &Path) -> Option<ClaudeCodeSettings> {
-    match fs::read_to_string(path) {
-        Ok(content) => match serde_json::from_str::<ClaudeCodeSettings>(&content) {
-            Ok(settings) => Some(settings),
-            Err(e) => {
-                warn!(path = ?path, error = %e, "Failed to parse Claude Code settings");
-                None
-            }
-        },
-        Err(e) => {
-            debug!(path = ?path, error = %e, "Could not read Claude Code settings");
-            None
-        }
-    }
 }
