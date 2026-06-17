@@ -209,8 +209,10 @@ impl ChildGuard {
     }
 
     /// Return a mutable reference to the wrapped child.
-    const fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("child already taken")
+    fn child_mut(&mut self) -> Result<&mut Child, String> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| "LSP child process handle was already taken".to_string())
     }
 }
 
@@ -864,7 +866,7 @@ fn run_lsp_request(
                  // we still avoid a zombie, but the request thread would be wedged
                  // until then). Bounded poll: if the server hasn't reaped in 2s,
                  // fall through to Drop, which kills + waits.
-    wait_with_timeout(guard.child_mut(), std::time::Duration::from_secs(2));
+    wait_with_timeout(guard.child_mut()?, std::time::Duration::from_secs(2));
 
     // Parse response into our types
     Ok(parse_lsp_response(action, file_path, &response))
@@ -1626,6 +1628,18 @@ mod tests {
                 n = idx + 1,
             );
         }
+    }
+
+    #[test]
+    fn child_guard_missing_child_returns_error_not_panic() {
+        let mut guard = ChildGuard { child: None };
+        let err = guard
+            .child_mut()
+            .expect_err("missing child handle should be a normal LSP error");
+        assert!(
+            err.contains("already taken"),
+            "error must explain the invalid child state: {err}"
+        );
     }
 
     #[test]
