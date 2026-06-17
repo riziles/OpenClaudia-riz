@@ -46,6 +46,7 @@ pub use validate::{
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
@@ -404,6 +405,143 @@ pub struct PluginMcpServer {
     pub timeout: Option<u64>,
     /// Whether Claude Code should eagerly load this server's tools
     pub always_load: Option<bool>,
+}
+
+fn process_env_lookup(name: &str) -> Result<Option<String>, String> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("environment variable {name} is not valid UTF-8"))
+        }
+    }
+}
+
+fn validate_mcp_env_var_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        Some(_) => {
+            return Err(format!(
+                "environment variable name {name:?} must start with a letter or underscore"
+            ));
+        }
+        None => return Err("environment variable name cannot be empty".to_string()),
+    }
+
+    if chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "environment variable name {name:?} may only contain letters, digits, and underscores"
+        ))
+    }
+}
+
+fn expand_mcp_env_vars_with<F>(value: &str, lookup: &F) -> Result<String, String>
+where
+    F: Fn(&str) -> Result<Option<String>, String>,
+{
+    let mut expanded = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find('}') else {
+            return Err("unterminated environment expansion".to_string());
+        };
+
+        let expression = &after_marker[..end];
+        let (name, default_value) = match expression.split_once(":-") {
+            Some((name, default_value)) => (name, Some(default_value)),
+            None => (expression, None),
+        };
+        validate_mcp_env_var_name(name)?;
+
+        match lookup(name)? {
+            Some(value) => expanded.push_str(&value),
+            None => match default_value {
+                Some(value) => expanded.push_str(value),
+                None => return Err(format!("required environment variable {name} is not set")),
+            },
+        }
+
+        rest = &after_marker[end + 1..];
+    }
+
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
+fn expand_mcp_config_value_with<F>(field: &str, value: &str, lookup: &F) -> Result<String, String>
+where
+    F: Fn(&str) -> Result<Option<String>, String>,
+{
+    expand_mcp_env_vars_with(value, lookup).map_err(|err| format!("{field}: {err}"))
+}
+
+fn expand_mcp_config_map_with<F>(
+    field: &str,
+    values: &HashMap<String, String>,
+    lookup: &F,
+) -> Result<HashMap<String, String>, String>
+where
+    F: Fn(&str) -> Result<Option<String>, String>,
+{
+    let expand_entry = |key: &String, value: &String| {
+        expand_mcp_config_value_with(&format!("{field}.{key}"), value, lookup)
+            .map(|expanded| (key.clone(), expanded))
+    };
+
+    values
+        .iter()
+        .map(|(key, value)| expand_entry(key, value))
+        .collect()
+}
+
+fn resolved_mcp_server_from_config_with<F>(
+    name: &str,
+    config: &McpServerConfig,
+    lookup: &F,
+) -> Result<PluginMcpServer, String>
+where
+    F: Fn(&str) -> Result<Option<String>, String>,
+{
+    Ok(PluginMcpServer {
+        name: name.to_string(),
+        transport: config.transport.clone(),
+        command: config
+            .command
+            .as_deref()
+            .map(|value| expand_mcp_config_value_with("command", value, lookup))
+            .transpose()?,
+        args: config
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                expand_mcp_config_value_with(&format!("args[{index}]"), value, lookup)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        url: config
+            .url
+            .as_deref()
+            .map(|value| expand_mcp_config_value_with("url", value, lookup))
+            .transpose()?,
+        env: expand_mcp_config_map_with("env", &config.env, lookup)?,
+        headers: expand_mcp_config_map_with("headers", &config.headers, lookup)?,
+        headers_helper: config.headers_helper.clone(),
+        timeout: config.timeout,
+        always_load: config.always_load,
+    })
+}
+
+fn resolved_mcp_server_from_config(
+    name: &str,
+    config: &McpServerConfig,
+) -> Result<PluginMcpServer, String> {
+    resolved_mcp_server_from_config_with(name, config, &process_env_lookup)
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,18 +1366,20 @@ impl Plugin {
     pub fn resolved_mcp_servers(&self) -> Vec<PluginMcpServer> {
         self.mcp_configs
             .iter()
-            .map(|(name, config)| PluginMcpServer {
-                name: name.clone(),
-                transport: config.transport.clone(),
-                command: config.command.clone(),
-                args: config.args.clone(),
-                url: config.url.clone(),
-                env: config.env.clone(),
-                headers: config.headers.clone(),
-                headers_helper: config.headers_helper.clone(),
-                timeout: config.timeout,
-                always_load: config.always_load,
-            })
+            .filter_map(
+                |(name, config)| match resolved_mcp_server_from_config(name, config) {
+                    Ok(server) => Some(server),
+                    Err(error) => {
+                        warn!(
+                            plugin = %self.id,
+                            server = %name,
+                            error = %error,
+                            "Skipping plugin MCP server because environment expansion failed"
+                        );
+                        None
+                    }
+                },
+            )
             .collect()
     }
 }
@@ -1252,6 +1392,22 @@ impl Plugin {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn mcp_env_ref(name: &str) -> String {
+        let mut value = String::from("${");
+        value.push_str(name);
+        value.push('}');
+        value
+    }
+
+    fn mcp_env_default(name: &str, default_value: &str) -> String {
+        let mut value = String::from("${");
+        value.push_str(name);
+        value.push_str(":-");
+        value.push_str(default_value);
+        value.push('}');
+        value
+    }
 
     /// Create a Claude Code-style plugin in a temp directory
     fn create_cc_plugin(dir: &Path, name: &str) {
@@ -1719,6 +1875,112 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "my-server");
         assert_eq!(servers[0].command.as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn mcp_env_expansion_supports_required_vars_defaults_and_repeats() {
+        let lookup = |name: &str| -> Result<Option<String>, String> {
+            Ok(match name {
+                "TOKEN" => Some("secret".to_string()),
+                "EMPTY" => Some(String::new()),
+                _ => None,
+            })
+        };
+
+        let template = [
+            mcp_env_ref("TOKEN"),
+            mcp_env_default("MISSING", "fallback"),
+            mcp_env_ref("TOKEN"),
+            mcp_env_ref("EMPTY"),
+        ]
+        .join(":");
+        let expanded = expand_mcp_env_vars_with(&template, &lookup).unwrap();
+
+        assert_eq!(expanded, "secret:fallback:secret:");
+    }
+
+    #[test]
+    fn mcp_env_expansion_rejects_unset_required_vars() {
+        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+
+        let template = format!("Bearer {}", mcp_env_ref("MISSING_TOKEN"));
+        let err = expand_mcp_env_vars_with(&template, &lookup).unwrap_err();
+
+        assert!(
+            err.contains("MISSING_TOKEN"),
+            "error should name the missing variable; got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_env_expansion_rejects_malformed_expressions() {
+        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+
+        let unterminated = expand_mcp_env_vars_with("${TOKEN", &lookup).unwrap_err();
+        assert!(
+            unterminated.contains("unterminated"),
+            "unterminated expression should be explicit; got: {unterminated}"
+        );
+
+        let invalid_name = expand_mcp_env_vars_with("${TOKEN-NAME}", &lookup).unwrap_err();
+        assert!(
+            invalid_name.contains("may only contain"),
+            "invalid variable name should be explicit; got: {invalid_name}"
+        );
+    }
+
+    #[test]
+    fn resolved_mcp_server_expands_documented_fields_only() {
+        let lookup = |name: &str| -> Result<Option<String>, String> {
+            Ok(match name {
+                "HOST" => Some("mcp.example.test".to_string()),
+                "TOKEN" => Some("secret".to_string()),
+                _ => None,
+            })
+        };
+
+        let mut env = HashMap::new();
+        env.insert("AUTH_TOKEN".to_string(), mcp_env_ref("TOKEN"));
+        env.insert("MODE".to_string(), mcp_env_default("MODE", "production"));
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", mcp_env_ref("TOKEN")),
+        );
+
+        let config = McpServerConfig {
+            command: Some(mcp_env_default("BIN", "node")),
+            args: vec![format!("--token={}", mcp_env_ref("TOKEN"))],
+            env,
+            transport: "http".to_string(),
+            url: Some(format!("https://{}/mcp", mcp_env_ref("HOST"))),
+            headers,
+            headers_helper: Some(format!("printf '%s' '{}'", mcp_env_ref("TOKEN"))),
+            timeout: Some(250),
+            always_load: Some(true),
+        };
+
+        let server = resolved_mcp_server_from_config_with("remote", &config, &lookup).unwrap();
+
+        assert_eq!(server.command.as_deref(), Some("node"));
+        assert_eq!(server.args, vec!["--token=secret"]);
+        assert_eq!(server.url.as_deref(), Some("https://mcp.example.test/mcp"));
+        assert_eq!(
+            server.env.get("AUTH_TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            server.env.get("MODE").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+        assert_eq!(server.headers_helper, config.headers_helper);
+        assert_eq!(server.timeout, Some(250));
+        assert_eq!(server.always_load, Some(true));
     }
 
     #[test]
