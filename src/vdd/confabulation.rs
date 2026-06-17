@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
 use regex::Regex;
+use tracing::error;
 
 use crate::vdd::finding::{Finding, Severity};
 
@@ -19,8 +20,8 @@ use crate::vdd::finding::{Finding, Severity};
 // Previously these were `regex::Regex::new(pattern)` calls inside
 // `is_common_false_positive`, executed once per finding per iteration.
 // Promoting to module-level `LazyLock<Vec<Regex>>` makes compilation a
-// one-time cost. Failure to compile is a constant-data bug, so we panic
-// at first access rather than silently treat the match as `false`.
+// one-time cost. Failure to compile is logged and the bad pattern is skipped,
+// keeping VDD triage available even if a future built-in pattern regresses.
 // ==========================================================================
 
 const FALSE_POSITIVE_REGEX_PATTERNS: &[&str] = &[
@@ -28,12 +29,25 @@ const FALSE_POSITIVE_REGEX_PATTERNS: &[&str] = &[
     r"admin[\-\s]configured\s+(endpoint|url|path)",
 ];
 
-static FALSE_POSITIVE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    FALSE_POSITIVE_REGEX_PATTERNS
+static FALSE_POSITIVE_REGEXES: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| compile_false_positive_regexes(FALSE_POSITIVE_REGEX_PATTERNS));
+
+fn compile_false_positive_regexes(patterns: &[&str]) -> Vec<Regex> {
+    patterns
         .iter()
-        .map(|p| Regex::new(p).unwrap_or_else(|e| panic!("invalid FP regex {p:?}: {e}")))
+        .filter_map(|pattern| match Regex::new(pattern) {
+            Ok(regex) => Some(regex),
+            Err(error) => {
+                error!(
+                    pattern,
+                    error = %error,
+                    "Invalid built-in false-positive regex; skipping pattern",
+                );
+                None
+            }
+        })
         .collect()
-});
+}
 
 // ==========================================================================
 // ConfabulationTracker
@@ -162,8 +176,7 @@ pub(crate) fn is_common_false_positive(description: &str, reasoning: &str) -> bo
         }
     }
 
-    // Pre-compiled regex patterns (crosslink #346); compilation failure is
-    // a startup panic, not a silent miss.
+    // Pre-compiled regex patterns (crosslink #346).
     for re in FALSE_POSITIVE_REGEXES.iter() {
         if re.is_match(&combined) {
             return true;
@@ -582,5 +595,14 @@ mod tests {
             "sql injection in user input handler",
             "string concatenation used for query"
         ));
+    }
+
+    #[test]
+    fn invalid_false_positive_regex_is_skipped() {
+        let regexes = compile_false_positive_regexes(&[r"valid\s+pattern", "[", r"other"]);
+
+        assert_eq!(regexes.len(), 2);
+        assert!(regexes.iter().any(|regex| regex.is_match("valid pattern")));
+        assert!(regexes.iter().any(|regex| regex.is_match("other")));
     }
 }
