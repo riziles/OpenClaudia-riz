@@ -709,6 +709,71 @@ fn deepseek_thinking_config_injects_current_thinking_shape() {
 }
 
 #[test]
+fn zai_thinking_config_uses_nested_preserve_and_glm52_effort() {
+    let req = minimal_request("glm-5.2");
+    let thinking = ThinkingConfig {
+        enabled: true,
+        preserve_across_turns: true,
+        reasoning_effort: Some("low".to_string()),
+        ..Default::default()
+    };
+    let adapter = ZaiAdapter::new();
+    let with = adapter
+        .transform_request_with_thinking(&req, &thinking)
+        .expect("with");
+
+    assert_eq!(with["thinking"]["type"], "enabled");
+    assert_eq!(
+        with["thinking"]["clear_thinking"], false,
+        "Z.AI preserved thinking flag must be nested under thinking: {with}"
+    );
+    assert!(
+        with.get("clear_thinking").is_none(),
+        "Z.AI must not emit legacy top-level clear_thinking: {with}"
+    );
+    assert_eq!(
+        with["reasoning_effort"], "high",
+        "GLM-5.2 low/medium effort must map to high: {with}"
+    );
+}
+
+#[test]
+fn minimax_m3_thinking_config_injects_documented_shape() {
+    let req = minimal_request("MiniMax-M3");
+    let adapter = MiniMaxAdapter::new();
+    let with_on = adapter
+        .transform_request_with_thinking(
+            &req,
+            &ThinkingConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("with-on");
+    let with_off = adapter
+        .transform_request_with_thinking(
+            &req,
+            &ThinkingConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .expect("with-off");
+
+    assert_eq!(with_on["thinking"]["type"], "adaptive");
+    assert_eq!(with_on["reasoning_split"], true);
+    assert!(
+        with_on.get("reasoning_effort").is_none(),
+        "MiniMax must not receive OpenAI reasoning_effort: {with_on}"
+    );
+    assert_eq!(with_off["thinking"]["type"], "disabled");
+    assert!(
+        with_off.get("reasoning_split").is_none(),
+        "MiniMax disabled thinking should not request reasoning split: {with_off}"
+    );
+}
+
+#[test]
 fn openai_default_drops_thinking_config_silently_but_safely() {
     // OpenAI proper has no `enable_thinking` field — the default trait
     // impl drops `thinking` and produces the same body as a no-thinking

@@ -12,9 +12,11 @@
 //!     plus `reasoning_effort: "high"|"max"` when enabled.
 //!   - **`Qwen`**: `enable_thinking` ALWAYS written (true OR false).
 //!   - **`Z.AI`/GLM**: `thinking: {type: "enabled"|"disabled"}`,
-//!     plus `clear_thinking: false` when
-//!     `preserve_across_turns=true`.
-//!   - **Kimi/MiniMax**: no generic thinking field emitted.
+//!     plus `thinking.clear_thinking: false` when
+//!     `preserve_across_turns=true`, and `GLM-5.2`
+//!     `reasoning_effort`.
+//!   - **Kimi**: no generic thinking field emitted for `kimi-k2.7-code`.
+//!   - **`MiniMax-M3`**: `thinking: {type: "adaptive"|"disabled"}`.
 //!
 //! This file pins each branch of the dispatch with positive +
 //! negative cases.
@@ -238,7 +240,7 @@ fn qwen_thinking_disabled_writes_enable_thinking_false() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — Z.AI / GLM: thinking object + clear_thinking
+// Section D — Z.AI / GLM: thinking object + clear_thinking + GLM-5.2 effort
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -256,7 +258,7 @@ fn zai_thinking_enabled_writes_thinking_object_enabled() {
     // preserve_across_turns=false (the default) means
     // clear_thinking is NOT emitted.
     assert!(
-        body.get("clear_thinking").is_none(),
+        body["thinking"].get("clear_thinking").is_none(),
         "Z.AI without preserve_across_turns MUST omit clear_thinking; got {body}"
     );
 }
@@ -290,8 +292,39 @@ fn zai_preserve_across_turns_emits_clear_thinking_false() {
         .transform_request_with_thinking(&req, &thinking)
         .expect("transform");
     assert_eq!(
-        body["clear_thinking"], false,
-        "Z.AI with preserve_across_turns MUST emit clear_thinking=false; got {body}"
+        body["thinking"]["clear_thinking"], false,
+        "Z.AI with preserve_across_turns MUST emit thinking.clear_thinking=false; got {body}"
+    );
+    assert!(
+        body.get("clear_thinking").is_none(),
+        "Z.AI clear_thinking must be nested inside thinking; got {body}"
+    );
+}
+
+#[test]
+fn zai_glm52_thinking_maps_reasoning_effort() {
+    let adapter = get_adapter("zai").expect("zai adapter");
+    let req = minimal_request("glm-5.2");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("max")))
+        .expect("transform");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(
+        body["reasoning_effort"], "max",
+        "GLM-5.2 must receive supported reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn zai_non_glm52_does_not_emit_reasoning_effort() {
+    let adapter = get_adapter("zai").expect("zai adapter");
+    let req = minimal_request("glm-4.7");
+    let body = adapter
+        .transform_request_with_thinking(&req, &enabled_thinking(Some("max")))
+        .expect("transform");
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "non-GLM-5.2 Z.AI models must not receive reasoning_effort; got {body}"
     );
 }
 
@@ -370,7 +403,7 @@ fn each_provider_uses_a_distinct_thinking_field() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — Kimi / MiniMax: unsupported generic thinking is a no-op
+// Section G — Kimi / MiniMax
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -386,6 +419,7 @@ fn kimi_thinking_does_not_emit_openai_or_provider_specific_fields() {
         "enable_thinking",
         "thinking",
         "clear_thinking",
+        "reasoning_split",
     ] {
         assert!(
             body.get(field).is_none(),
@@ -395,22 +429,32 @@ fn kimi_thinking_does_not_emit_openai_or_provider_specific_fields() {
 }
 
 #[test]
-fn minimax_thinking_does_not_emit_openai_or_provider_specific_fields() {
+fn minimax_m3_thinking_enabled_writes_adaptive_split_reasoning() {
     let adapter = get_adapter("minimax").expect("minimax adapter");
     let req = minimal_request("MiniMax-M3");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_thinking(Some("high")))
         .expect("transform");
 
-    for field in [
-        "reasoning_effort",
-        "enable_thinking",
-        "thinking",
-        "clear_thinking",
-    ] {
-        assert!(
-            body.get(field).is_none(),
-            "MiniMax MUST NOT receive unsupported thinking field {field:?}; got {body}"
-        );
-    }
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["reasoning_split"], true);
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "MiniMax must not receive OpenAI reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn minimax_m3_thinking_disabled_writes_disabled() {
+    let adapter = get_adapter("minimax").expect("minimax adapter");
+    let req = minimal_request("MiniMax-M3");
+    let body = adapter
+        .transform_request_with_thinking(&req, &disabled_thinking())
+        .expect("transform");
+
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(
+        body.get("reasoning_split").is_none(),
+        "MiniMax disabled thinking should not request reasoning split; got {body}"
+    );
 }

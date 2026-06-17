@@ -2284,20 +2284,30 @@ mod tests {
         let zai = build_request("zai", "glm-5.2", &messages, "high", None, None)
             .expect("zai request should build");
         assert_eq!(zai["thinking"]["type"], "enabled");
+        assert_eq!(zai["reasoning_effort"], "high");
+
+        let zai_legacy = build_request("zai", "glm-4.7", &messages, "max", None, None)
+            .expect("zai legacy request should build");
+        assert_eq!(zai_legacy["thinking"]["type"], "enabled");
         assert!(
-            zai.get("reasoning_effort").is_none(),
-            "Z.AI must not receive OpenAI reasoning_effort: {zai}"
+            zai_legacy.get("reasoning_effort").is_none(),
+            "non-GLM-5.2 Z.AI models must not receive reasoning_effort: {zai_legacy}"
+        );
+
+        let minimax = build_request("minimax", "MiniMax-M3", &messages, "high", None, None)
+            .expect("minimax request should build");
+        assert_eq!(minimax["thinking"]["type"], "adaptive");
+        assert_eq!(minimax["reasoning_split"], true);
+        assert!(
+            minimax.get("reasoning_effort").is_none(),
+            "MiniMax must not receive OpenAI reasoning_effort: {minimax}"
         );
     }
 
     #[test]
     fn build_request_omits_unsupported_generic_thinking_fields() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        for (provider, model) in [
-            ("kimi", "kimi-k2.7-code"),
-            ("moonshot", "kimi-k2.7-code"),
-            ("minimax", "MiniMax-M3"),
-        ] {
+        for (provider, model) in [("kimi", "kimi-k2.7-code"), ("moonshot", "kimi-k2.7-code")] {
             let body = build_request(provider, model, &messages, "high", None, None)
                 .expect("request should build");
             for field in [

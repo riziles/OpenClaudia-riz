@@ -63,13 +63,18 @@ pub(super) enum ThinkingInjector {
     /// (i.e. `false` is explicitly written, unlike `DeepSeek`). This
     /// matches prior `QwenAdapter` behaviour.
     QwenEnableThinking,
-    /// Z.AI / GLM-4.7.
+    /// Z.AI / GLM.
     ///
     /// Sets the `thinking` object to `{type:"enabled"}` or
     /// `{type:"disabled"}`. When enabled and `preserve_across_turns` is
-    /// set, also emits `clear_thinking: false`. Matches prior
-    /// `ZaiAdapter` behaviour.
+    /// set, also emits `thinking.clear_thinking: false`. For `GLM-5.2`,
+    /// also forwards `reasoning_effort`.
     GlmThinking,
+    /// `MiniMax-M3` thinking controls.
+    ///
+    /// Sets `thinking: {type:"adaptive"|"disabled"}` for `MiniMax-M3` and
+    /// requests split reasoning output when thinking is enabled.
+    MiniMaxThinking,
 }
 
 impl ThinkingInjector {
@@ -127,7 +132,11 @@ impl ThinkingInjector {
                 if thinking.enabled {
                     body["thinking"] = json!({ "type": "enabled" });
                     if thinking.preserve_across_turns {
-                        body["clear_thinking"] = json!(false);
+                        body["thinking"]["clear_thinking"] = json!(false);
+                    }
+                    if is_zai_reasoning_effort_model(model) {
+                        let effort = zai_reasoning_effort(thinking.reasoning_effort.as_deref());
+                        body["reasoning_effort"] = json!(effort);
                     }
                     debug!(
                         "Added GLM thinking params: enabled=true, preserve={}",
@@ -135,6 +144,22 @@ impl ThinkingInjector {
                     );
                 } else {
                     body["thinking"] = json!({ "type": "disabled" });
+                }
+            }
+            Self::MiniMaxThinking => {
+                if is_minimax_m3_model(model) {
+                    if thinking.enabled {
+                        body["thinking"] = json!({ "type": "adaptive" });
+                        body["reasoning_split"] = json!(true);
+                    } else {
+                        body["thinking"] = json!({ "type": "disabled" });
+                    }
+                } else if !thinking.enabled {
+                    warn!(
+                        model = %model,
+                        "MiniMax thinking disable requested for a model whose OpenAI-compatible \
+                         API keeps thinking enabled",
+                    );
                 }
             }
         }
@@ -161,6 +186,23 @@ fn deepseek_reasoning_effort(effort: Option<&str>) -> &'static str {
         Some("max" | "xhigh") => "max",
         _ => "high",
     }
+}
+
+fn zai_reasoning_effort(effort: Option<&str>) -> &'static str {
+    match effort {
+        Some("none") => "none",
+        Some("minimal") => "minimal",
+        Some("low" | "medium" | "high") => "high",
+        _ => "max",
+    }
+}
+
+const fn is_zai_reasoning_effort_model(model: &str) -> bool {
+    model.eq_ignore_ascii_case("glm-5.2")
+}
+
+const fn is_minimax_m3_model(model: &str) -> bool {
+    model.eq_ignore_ascii_case("MiniMax-M3")
 }
 
 fn is_model_family(model: &str, family: &str) -> bool {
@@ -490,7 +532,7 @@ mod tests {
         ThinkingInjector::GlmThinking.inject(&mut on, &thinking_on(), "glm-4.7");
         assert_eq!(on["thinking"]["type"], "enabled");
         // No preserve flag by default.
-        assert!(on.get("clear_thinking").is_none());
+        assert!(on["thinking"].get("clear_thinking").is_none());
 
         let mut off = serde_json::to_value(req("glm-4.7")).unwrap();
         ThinkingInjector::GlmThinking.inject(&mut off, &thinking_off(), "glm-4.7");
@@ -504,7 +546,38 @@ mod tests {
         let mut body = serde_json::to_value(req("glm-4.7")).unwrap();
         ThinkingInjector::GlmThinking.inject(&mut body, &t, "glm-4.7");
         assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["clear_thinking"], false);
+        assert_eq!(body["thinking"]["clear_thinking"], false);
+        assert!(body.get("clear_thinking").is_none());
+    }
+
+    #[test]
+    fn glm52_thinking_emits_reasoning_effort() {
+        let mut max = thinking_on();
+        max.reasoning_effort = Some("max".to_string());
+        let mut body = serde_json::to_value(req("glm-5.2")).unwrap();
+        ThinkingInjector::GlmThinking.inject(&mut body, &max, "glm-5.2");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "max");
+
+        let mut low = thinking_on();
+        low.reasoning_effort = Some("low".to_string());
+        let mut low_body = serde_json::to_value(req("glm-5.2")).unwrap();
+        ThinkingInjector::GlmThinking.inject(&mut low_body, &low, "glm-5.2");
+        assert_eq!(low_body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn minimax_m3_thinking_uses_adaptive_or_disabled_shape() {
+        let mut on = serde_json::to_value(req("MiniMax-M3")).unwrap();
+        ThinkingInjector::MiniMaxThinking.inject(&mut on, &thinking_on(), "MiniMax-M3");
+        assert_eq!(on["thinking"]["type"], "adaptive");
+        assert_eq!(on["reasoning_split"], true);
+        assert!(on.get("reasoning_effort").is_none());
+
+        let mut off = serde_json::to_value(req("MiniMax-M3")).unwrap();
+        ThinkingInjector::MiniMaxThinking.inject(&mut off, &thinking_off(), "MiniMax-M3");
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("reasoning_split").is_none());
     }
 
     #[test]

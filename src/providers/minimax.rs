@@ -1,7 +1,8 @@
 //! `MiniMax` API adapter.
 //!
-//! `MiniMax` exposes an `OpenAI`-compatible Chat Completions surface. Its thinking
-//! controls use provider-specific fields, so this adapter does not map
+//! `MiniMax` exposes an `OpenAI`-compatible Chat Completions surface. Its
+//! `MiniMax-M3` thinking controls use provider-specific fields, so this
+//! adapter maps only the documented `thinking` object and never maps
 //! `OpenAI`-style `reasoning_effort` into `MiniMax` requests.
 
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ impl MiniMaxAdapter {
         Self(OpenAiCompatibleAdapter::new(
             "minimax",
             "/v1/chat/completions",
-            ThinkingInjector::None,
+            ThinkingInjector::MiniMaxThinking,
             true,
         ))
     }

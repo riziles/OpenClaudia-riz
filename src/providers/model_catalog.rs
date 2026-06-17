@@ -80,9 +80,12 @@ pub const ZAI_MODELS: &[&str] = &[
     "glm-4.7-flashx",
     "glm-4.7-flash",
     "glm-4.6",
+    "glm-4.5",
     "glm-4.5-air",
+    "glm-4.5-x",
     "glm-4.5-airx",
     "glm-4.5-flash",
+    "glm-4-32b-0414-128k",
 ];
 
 pub const DEEPSEEK_MODELS: &[&str] = &[
@@ -132,6 +135,7 @@ pub const MINIMAX_MODELS: &[&str] = &[
     "MiniMax-M2.1",
     "MiniMax-M2.1-highspeed",
     "MiniMax-M2",
+    "M2-her",
 ];
 
 pub const FALLBACK_MODELS: &[&str] = &[super::DEFAULT_MODEL_FALLBACK];

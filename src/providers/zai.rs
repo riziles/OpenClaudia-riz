@@ -7,7 +7,8 @@
 //!   already encodes the API version;
 //! - thinking mode is keyed as a structured object
 //!   (`thinking: {type: enabled|disabled}`) rather than a bare bool, and
-//!   `preserve_across_turns` emits an extra `clear_thinking: false`.
+//!   `preserve_across_turns` emits `thinking.clear_thinking: false`;
+//! - `GLM-5.2` supports an additional top-level `reasoning_effort`.
 //!
 //! See crosslink #281.
 

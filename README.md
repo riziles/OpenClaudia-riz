@@ -383,7 +383,7 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 ### Z.AI (GLM)
 - `glm-5.2`, `glm-5.1`, `glm-5`, `glm-5-turbo` — GLM-5 family
 - `glm-4.7`, `glm-4.7-flashx`, `glm-4.7-flash` — GLM-4.7 family
-- `glm-4.6`, `glm-4.5-air`, `glm-4.5-airx`, `glm-4.5-flash` — Previous generation
+- `glm-4.6`, `glm-4.5`, `glm-4.5-air`, `glm-4.5-x`, `glm-4.5-airx`, `glm-4.5-flash`, `glm-4-32b-0414-128k` — Previous generation
 
 ### Kimi
 - `kimi-k2.7-code`, `kimi-k2.7-code-highspeed` — Coding-focused Kimi K2.7 models
@@ -397,6 +397,7 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 - `MiniMax-M2.5`, `MiniMax-M2.5-highspeed` — M2.5 family
 - `MiniMax-M2.1`, `MiniMax-M2.1-highspeed` — M2.1 family
 - `MiniMax-M2` — Earlier agentic reasoning model
+- `M2-her` — Dialogue-focused chat model
 
 ### Ollama (Local)
 - Popular: `llama3.1`, `deepseek-r1`, `gemma3`, `qwen3`, `mistral`, `phi4`, `llava`
