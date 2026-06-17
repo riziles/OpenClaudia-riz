@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
@@ -68,6 +68,18 @@ fn git_bin() -> Result<&'static Path, String> {
 fn active_worktrees() -> &'static Mutex<HashSet<PathBuf>> {
     static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn active_worktrees_guard(
+    operation: &'static str,
+) -> Option<MutexGuard<'static, HashSet<PathBuf>>> {
+    match active_worktrees().lock() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::error!(operation, error = %err, "Active worktree set lock poisoned");
+            None
+        }
+    }
 }
 
 /// Best-effort canonicalisation that falls back to the original path. Used
@@ -111,9 +123,8 @@ fn bump_cwd_cache_generation() {
 /// the `false` return, but it keeps the helper total.
 fn register_active_worktree(worktree_dir: &Path) -> bool {
     let key = canonical_or_self(worktree_dir);
-    let inserted = active_worktrees()
-        .lock()
-        .is_ok_and(|mut set| set.insert(key));
+    let inserted =
+        active_worktrees_guard("register_active_worktree").is_some_and(|mut set| set.insert(key));
     if inserted {
         bump_cwd_cache_generation();
     }
@@ -125,9 +136,8 @@ fn register_active_worktree(worktree_dir: &Path) -> bool {
 /// happened. Called by [`execute_exit_worktree`] on successful teardown.
 fn unregister_active_worktree(worktree_dir: &Path) {
     let key = canonical_or_self(worktree_dir);
-    let removed = active_worktrees()
-        .lock()
-        .is_ok_and(|mut set| set.remove(&key));
+    let removed = active_worktrees_guard("unregister_active_worktree")
+        .is_some_and(|mut set| set.remove(&key));
     if removed {
         bump_cwd_cache_generation();
     }
@@ -342,7 +352,7 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
     // above is deterministic, so two callers asking for the same branch
     // both land here.
     let dup_key = canonical_or_self(&worktree_dir);
-    if let Ok(set) = active_worktrees().lock() {
+    if let Some(set) = active_worktrees_guard("execute_enter_worktree.duplicate_check") {
         if set.contains(&dup_key) {
             return (
                 format!(
