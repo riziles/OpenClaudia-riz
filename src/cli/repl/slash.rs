@@ -877,6 +877,7 @@ pub fn slash_model(
     provider: &str,
     current_model: &str,
 ) -> SlashCommandResult {
+    let args = args.trim();
     if args.is_empty() && cmd == "model" {
         println!("\nCurrent model: \x1b[36m{current_model}\x1b[0m");
         println!("Provider: {provider}");
@@ -923,7 +924,12 @@ pub fn slash_model(
         println!("\nUse /model <name> to switch.\n");
         return SlashCommandResult::Handled;
     }
-    let new_model = args.trim().to_string();
+    if args.eq_ignore_ascii_case("default") {
+        let default_model = openclaudia::providers::default_model_for_target(provider).to_string();
+        println!("\nSwitching to default model: \x1b[36m{default_model}\x1b[0m\n");
+        return SlashCommandResult::SwitchModel(default_model);
+    }
+    let new_model = args.to_string();
     println!("\nSwitching to model: \x1b[36m{new_model}\x1b[0m\n");
     SlashCommandResult::SwitchModel(new_model)
 }
@@ -2967,23 +2973,28 @@ mod tests {
         );
     }
 
-    /// OC: `/model default` is treated as a model name (not a reset).
-    /// CC: `/model default` resets to the default model.  Pinned divergence.
+    /// `/model default` resets to the canonical provider default instead of
+    /// treating `default` as a literal upstream model ID.
     #[test]
-    fn spec_model_default_treated_as_name_not_reset() {
+    fn spec_model_default_resets_to_provider_default() {
         let result = handle_slash_command(
             "/model default",
             &mut ctx(),
             "anthropic",
             "claude-sonnet-4-5",
         );
-        // OC routes `/model default` to the switch-model branch, not a reset.
         assert!(
-            matches!(
-                result,
-                Some(SlashCommandResult::SwitchModel(_) | SlashCommandResult::Handled)
-            ),
-            "/model default must not return None (OC treats it as a name, not a reset)"
+            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if model == openclaudia::providers::default_model_for_target("anthropic")),
+            "/model default must switch to the provider default model"
+        );
+    }
+
+    #[test]
+    fn spec_model_default_reset_is_case_insensitive() {
+        let result = handle_slash_command("/model DEFAULT", &mut ctx(), "qwen", "qwen3.7-coder");
+        assert!(
+            matches!(result, Some(SlashCommandResult::SwitchModel(model)) if model == openclaudia::providers::default_model_for_target("qwen")),
+            "/model DEFAULT must reset using the provider default table"
         );
     }
 
