@@ -414,6 +414,7 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     let prompt_tools = include_str!("../prompts/base/tools.md");
     let claude_code_features = include_str!("../CLAUDE_CODE_FEATURES.md");
     let architecture = include_str!("../ARCHITECTURE.md");
+    let cargo_toml = include_str!("../Cargo.toml");
     let changelog = include_str!("../CHANGELOG.md");
 
     assert!(
@@ -457,6 +458,22 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
                 && !doc.contains(concat!("Ta", "vily"))
                 && !doc.contains(concat!("Bra", "ve")),
             "docs must not advertise paid web-search API backends"
+        );
+    }
+
+    for doc in [
+        readme,
+        comparison,
+        prompt_tools,
+        claude_code_features,
+        architecture,
+        cargo_toml,
+    ] {
+        assert!(
+            !doc.contains(concat!("Ji", "na"))
+                && !doc.contains(concat!("j", "ina"))
+                && !doc.contains("hosted converter"),
+            "current web-search/fetch surface must not reference retired hosted-converter backends"
         );
     }
 }
