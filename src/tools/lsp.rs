@@ -8,13 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 /// Maximum file size (10 MiB) accepted for LSP analysis.
 ///
@@ -23,6 +26,9 @@ use std::thread;
 /// circuits with a clear error before even spawning the server.  See issue
 /// #648.
 pub const LSP_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+const LSP_RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const LSP_READINESS_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+const LSP_SHUTDOWN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Absolute, PATH-independent location of `git` for LSP gitignore filtering.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
@@ -227,6 +233,129 @@ impl Drop for ChildGuard {
     }
 }
 
+enum LspReadEvent {
+    Chunk(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct LspReadTimeout {
+    timeout: Arc<Mutex<Duration>>,
+}
+
+impl LspReadTimeout {
+    fn set(&self, timeout: Duration) {
+        let mut guard = self
+            .timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = timeout;
+    }
+}
+
+struct LspDeadlineReader {
+    rx: Receiver<LspReadEvent>,
+    pending: VecDeque<u8>,
+    timeout: Arc<Mutex<Duration>>,
+    ended: bool,
+}
+
+impl LspDeadlineReader {
+    fn spawn<R>(mut reader: R, timeout: Duration) -> (Self, LspReadTimeout)
+    where
+        R: Read + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => {
+                        let _ = tx.send(LspReadEvent::Eof);
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(LspReadEvent::Chunk(chunk[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(LspReadEvent::Error(err.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let timeout = Arc::new(Mutex::new(timeout));
+        let handle = LspReadTimeout {
+            timeout: Arc::clone(&timeout),
+        };
+        (
+            Self {
+                rx,
+                pending: VecDeque::new(),
+                timeout,
+                ended: false,
+            },
+            handle,
+        )
+    }
+
+    fn current_timeout(&self) -> Duration {
+        *self
+            .timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Read for LspDeadlineReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if !self.pending.is_empty() {
+                let n = out.len().min(self.pending.len());
+                for slot in &mut out[..n] {
+                    *slot = self.pending.pop_front().expect("pending length checked");
+                }
+                return Ok(n);
+            }
+
+            if self.ended {
+                return Ok(0);
+            }
+
+            let timeout = self.current_timeout();
+            match self.rx.recv_timeout(timeout) {
+                Ok(LspReadEvent::Chunk(bytes)) => self.pending.extend(bytes),
+                Ok(LspReadEvent::Eof) => {
+                    self.ended = true;
+                    return Ok(0);
+                }
+                Ok(LspReadEvent::Error(message)) => {
+                    self.ended = true;
+                    return Err(io::Error::new(ErrorKind::BrokenPipe, message));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!("timed out waiting for LSP stdout after {timeout:?}"),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.ended = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
 /// Wait up to `timeout` for `child` to exit, polling with `try_wait`.
 ///
 /// Returns `true` when the child reaped within the budget. On timeout,
@@ -275,17 +404,20 @@ fn wait_for_readiness(
             );
         }
 
-        // Read one message from the server.  `read_line` blocks; we rely on
-        // the overall deadline check above to bound total wait time.
+        // Read one message from the server. Production child stdout is wrapped
+        // in `LspDeadlineReader`; no-data timeouts are treated as readiness
+        // polling ticks until the real wall-clock deadline expires.
         let mut content_length: usize = 0;
         loop {
             if std::time::Instant::now() >= deadline {
                 return Err("LSP server readiness timeout (10 s) during header read".to_string());
             }
             let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| format!("Readiness read error: {e}"))?;
+            let n = match reader.read_line(&mut line) {
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::TimedOut => continue,
+                Err(err) => return Err(format!("Readiness read error: {err}")),
+            };
             if n == 0 {
                 return Err("LSP server closed stdout before sending readiness reply".to_string());
             }
@@ -767,6 +899,7 @@ fn run_lsp_request(
     // original zombie-leak paths (former lines 174 and 224) — will trigger Drop
     // which kills and reaps the process (fix #355 point 3).
     let mut guard = ChildGuard::new(raw_child);
+    let (stdout, stdout_timeout) = LspDeadlineReader::spawn(stdout, LSP_RESPONSE_READ_TIMEOUT);
     let mut reader = BufReader::new(stdout);
 
     // Send initialize
@@ -827,10 +960,12 @@ fn run_lsp_request(
         readiness_params,
     )?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    stdout_timeout.set(LSP_READINESS_POLL_TIMEOUT);
     wait_for_readiness(&mut reader, deadline).map_err(|e| {
         let snip = stderr_snippet(&stderr_buf);
         format!("{e}{snip}")
     })?;
+    stdout_timeout.set(LSP_RESPONSE_READ_TIMEOUT);
 
     // Send the actual request
     let (method, params) = build_action_request(action, &file_uri, line, character, extras);
@@ -869,6 +1004,7 @@ fn run_lsp_request(
     // dropped because we only care about the protocol sequencing, not the
     // payload, and any read failure is non-fatal (Drop still kills+waits).
     let _ = send_lsp_message(&mut stdin, "shutdown", 3, json!(null));
+    stdout_timeout.set(LSP_SHUTDOWN_READ_TIMEOUT);
     let _ = read_lsp_response(&mut reader, 3);
     let _ = send_lsp_notification(&mut stdin, "exit", json!(null));
     drop(stdin); // EOF signals server to exit
@@ -2424,8 +2560,8 @@ mod tests {
     /// B6b — `read_lsp_response` returns `Err` when the underlying reader
     /// returns zero bytes (simulates a server process that has exited/crashed).
     /// OC has no health-check before send; crash is detected only during read.
-    /// Gap #636: CC's server pool detects crashes via process exit handler
-    /// and throws immediately from sendRequest; OC blocks until I/O error.
+    /// Gap #636 closed: OC now errors on EOF and separately bounds silent
+    /// open-pipe reads with `LspDeadlineReader`.
     #[test]
     fn spec_b6_read_lsp_response_errors_on_empty_stream_gap636() {
         use std::io::Cursor;
@@ -2437,9 +2573,44 @@ mod tests {
         let result = read_lsp_response(&mut reader, 1);
         // OC: read_line on empty stream returns 0 bytes → content_length stays 0
         // → Err("No content-length in response") or similar.
+        assert!(result.is_err(), "empty stream should produce an error");
+    }
+
+    /// B6c — Production child stdout reads are deadline-bounded even when the
+    /// server keeps stdout open but never writes a byte. This is the actual hang
+    /// mode that `Cursor::new(Vec::new())` cannot model because an empty cursor
+    /// returns EOF immediately.
+    #[cfg(unix)]
+    #[test]
+    fn spec_b6_lsp_deadline_reader_times_out_on_silent_open_stdout() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn silent child");
+        let stdout = child.stdout.take().expect("child stdout should be piped");
+        let (stdout, _timeout) =
+            LspDeadlineReader::spawn(stdout, std::time::Duration::from_millis(50));
+        let mut reader = BufReader::new(stdout);
+
+        let started = std::time::Instant::now();
+        let result = read_lsp_response(&mut reader, 1);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result.is_err(), "silent stdout should time out");
+        let elapsed = started.elapsed();
         assert!(
-            result.is_err(),
-            "empty stream should produce an error; OC has no hang-guard (gap #636)"
+            elapsed < std::time::Duration::from_secs(2),
+            "deadline reader should fail quickly, elapsed={elapsed:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("timed out waiting for LSP stdout"),
+            "error should name the stdout timeout; got: {msg}"
         );
     }
 
