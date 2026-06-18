@@ -76,11 +76,20 @@ pub fn validate_final_answer(
     if summary_claims_test_success(summary)
         && !hydrated_evidence.iter().any(|obs| {
             matches!(obs.kind, ObservationKind::CommandRun { .. })
-                && command_observation_is_test_command(obs)
+                && command_observation_is_passing_test_command(obs)
         })
     {
         return Err(Denial::new(
-            "final test success claims require a test command observation",
+            "final test success claims require a successful test command observation",
+        ));
+    }
+    if summary_claims_verification_success(summary)
+        && !hydrated_evidence
+            .iter()
+            .any(|obs| command_observation_exit_code(obs) == Some(0))
+    {
+        return Err(Denial::new(
+            "final successful verification claims require a successful command observation",
         ));
     }
 
@@ -181,12 +190,21 @@ fn summary_claims_test_success(summary: &str) -> bool {
     lower.contains("test") && summary_claims_verification_success(summary)
 }
 
-fn command_observation_is_test_command(observation: &crate::ledger::Observation) -> bool {
-    let ObservationKind::CommandRun { argv, .. } = &observation.kind else {
+fn command_observation_exit_code(observation: &crate::ledger::Observation) -> Option<i32> {
+    let ObservationKind::CommandRun { exit_code, .. } = &observation.kind else {
+        return None;
+    };
+    Some(*exit_code)
+}
+
+fn command_observation_is_passing_test_command(observation: &crate::ledger::Observation) -> bool {
+    let ObservationKind::CommandRun {
+        argv, exit_code, ..
+    } = &observation.kind
+    else {
         return false;
     };
-    let command = argv.join(" ").to_ascii_lowercase();
-    is_test_command_text(&command)
+    *exit_code == 0 && is_test_command_text(&argv.join(" ").to_ascii_lowercase())
 }
 
 fn is_test_command_text(command: &str) -> bool {
@@ -454,6 +472,38 @@ mod tests {
     }
 
     #[test]
+    fn final_success_claim_rejects_failed_command_observation() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run(
+                "/tmp",
+                vec!["cargo".into(), "check".into()],
+                1,
+                "",
+                "failed",
+            )
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary = format!("cargo check passed cleanly [{command}] [{verification}].");
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final successful verification claims require a successful command observation"
+        );
+    }
+
+    #[test]
     fn final_failed_verification_summary_accepts_failed_verifier_observation() {
         let mut ledger = RealityLedger::new();
         let command = ledger
@@ -503,7 +553,33 @@ mod tests {
 
         assert_eq!(
             denial.reason(),
-            "final test success claims require a test command observation"
+            "final test success claims require a successful test command observation"
+        );
+    }
+
+    #[test]
+    fn final_test_success_claim_rejects_failed_test_command_observation() {
+        let mut ledger = RealityLedger::new();
+        let test = ledger
+            .observe_command_run("/tmp", vec!["cargo".into(), "test".into()], 1, "", "failed")
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo test".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary = format!("Tests passed cleanly [{test}] [{verification}].");
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final test success claims require a successful test command observation"
         );
     }
 
