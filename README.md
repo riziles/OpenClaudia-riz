@@ -319,7 +319,7 @@ The `keybindings:` config map customizes the legacy line-oriented REPL (`opencla
 
 | Tool | Description |
 |------|-------------|
-| `lsp` | Language Server Protocol operations (goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, call hierarchy) |
+| `lsp` | Language Server Protocol operations (goToDefinition, findReferences, hover, documentSymbols, workspaceSymbol, goToImplementation, call hierarchy) |
 
 ### Planning and Task Tools
 

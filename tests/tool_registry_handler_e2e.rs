@@ -66,6 +66,23 @@ fn readme_available_tool_names() -> BTreeSet<String> {
         .collect()
 }
 
+fn readme_available_tool_row(tool_name: &str) -> String {
+    let readme = include_str!("../README.md");
+    let available_tools = readme
+        .split_once("## Available Tools")
+        .expect("README must document available tools")
+        .1
+        .split_once("## Supported Models")
+        .expect("README available-tools section must end before supported models")
+        .0;
+
+    available_tools
+        .lines()
+        .find(|line| line.trim_start().starts_with(&format!("| `{tool_name}` |")))
+        .unwrap_or_else(|| panic!("README Available Tools must document {tool_name:?}"))
+        .to_string()
+}
+
 fn registered_tool_description(tool_name: &str) -> String {
     let defs = openclaudia::tools::get_tool_definitions();
     defs.as_array()
@@ -371,6 +388,32 @@ fn readme_available_tools_match_registered_tool_names() {
     assert!(
         !readme.contains("Chainlink") && !readme.contains("chainlink"),
         "README must not advertise the removed Chainlink CLI dependency"
+    );
+}
+
+#[test]
+fn readme_lsp_row_uses_registered_action_names() {
+    let row = readme_available_tool_row("lsp");
+    let lsp_definition = registry()
+        .get("lsp")
+        .expect("lsp handler must be registered")
+        .definition();
+    let action_enum = lsp_definition["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("lsp action enum");
+    let action_names: BTreeSet<&str> = action_enum
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    assert!(action_names.contains("documentSymbols"));
+    assert!(
+        row.contains("documentSymbols"),
+        "README LSP row must use the registered documentSymbols action name; got {row:?}"
+    );
+    assert!(
+        !row.contains("documentSymbol,"),
+        "README LSP row must not use the singular non-schema action name; got {row:?}"
     );
 }
 

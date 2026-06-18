@@ -5,6 +5,9 @@
 //! - `findReferences`: Find all references to a symbol
 //! - hover: Get type/documentation info for a symbol
 //! - `documentSymbols`: List symbols in a file
+//! - `workspaceSymbol`: Search symbols across the workspace
+//! - `goToImplementation`: Find implementations of an interface/trait symbol
+//! - `prepareCallHierarchy`, `incomingCalls`, `outgoingCalls`: Traverse call hierarchy
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
