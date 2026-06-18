@@ -106,6 +106,15 @@ fn select_multi_tool_csv_returns_each_function() {
 }
 
 #[test]
+fn select_tool_names_are_case_insensitive() {
+    let args = args_with(&[("query", json!("select:Bash,Read_File"))]);
+    let (text, is_err) = dispatch_tool_search(&args);
+    assert!(!is_err);
+    assert!(text.contains("\"name\":\"bash\""));
+    assert!(text.contains("\"name\":\"read_file\""));
+}
+
+#[test]
 fn select_preserves_order_in_envelope() {
     // PINS DOC: order from query is preserved in output.
     let args = args_with(&[("query", json!("select:bash,read_file"))]);

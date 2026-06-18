@@ -75,7 +75,12 @@ fn resolve_select(spec: &str) -> Vec<&'static dyn ToolHandler> {
     spec.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter_map(|name| reg.get(name))
+        .filter_map(|name| {
+            reg.get(name).or_else(|| {
+                super::registry::iter_handlers()
+                    .find(|handler| handler.name().eq_ignore_ascii_case(name))
+            })
+        })
         .collect()
 }
 
