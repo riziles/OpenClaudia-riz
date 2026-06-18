@@ -20,6 +20,10 @@ fn restore_previous_mode(plan_state: Option<&openclaudia::session::PlanModeState
         .map_or(AgentMode::Build, AgentMode::from_token)
 }
 
+fn plan_mode_allowed_tools_display() -> String {
+    openclaudia::session::PLAN_MODE_ALLOWED_TOOLS.join(", ")
+}
+
 /// Handle entering plan mode. Creates plan file and sets up state.
 pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
     let plans_dir = std::path::PathBuf::from(".openclaudia/plans");
@@ -96,10 +100,11 @@ pub fn handle_enter_plan_mode(chat_session: &mut ChatSession) -> String {
 
     format!(
         "Plan mode activated. Plan file: {}. \
-         Only read-only tools, ask_user_question, and task are available. \
+         Available tools: {}. \
          Use write_file ONLY to write to the plan file at the path shown above. \
          Call exit_plan_mode when you are ready to present the plan for approval.",
-        plan_file.display()
+        plan_file.display(),
+        plan_mode_allowed_tools_display()
     )
 }
 
@@ -298,10 +303,10 @@ pub fn check_plan_mode_restriction(
     } else {
         Some(format!(
             "Tool '{}' is not available in plan mode. \
-             Only read-only tools (read_file, grounding_context, list_files, grep, web_fetch, web_search), \
-             ask_user_question, and task are allowed. \
+             Available tools: {}. \
              You can use write_file ONLY to write to the plan file at: {}",
             tool_name,
+            plan_mode_allowed_tools_display(),
             plan_state.plan_file.display()
         ))
     }
@@ -421,6 +426,34 @@ mod tests {
         assert_eq!(
             check_plan_mode_restriction(&session, "read_file", "{}"),
             None
+        );
+    }
+
+    #[test]
+    fn check_plan_mode_restriction_message_lists_compiled_allowed_tools() {
+        let session = chat_session_in_plan_mode();
+        let msg = check_plan_mode_restriction(&session, "bash", "{}")
+            .expect("mutating tool must be blocked in plan mode");
+
+        for tool in openclaudia::session::PLAN_MODE_ALLOWED_TOOLS {
+            assert!(
+                msg.contains(tool),
+                "plan-mode denial must mention allowed tool {tool:?}; got {msg:?}"
+            );
+        }
+        assert_eq!(
+            msg.contains("web_search"),
+            cfg!(feature = "browser"),
+            "plan-mode denial must match browser-feature web_search availability"
+        );
+        assert_eq!(
+            msg.contains("web_browser"),
+            cfg!(feature = "browser"),
+            "plan-mode denial must match browser-feature web_browser availability"
+        );
+        assert!(
+            msg.contains("write_file ONLY"),
+            "plan-mode denial must keep the plan-file write exception visible: {msg:?}"
         );
     }
 
