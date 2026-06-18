@@ -2004,7 +2004,7 @@ impl App {
 
     /// Handle slash commands. Returns true if the command was recognized.
     ///
-    /// Six no-argument branches (`/quit`, `/exit`, `/help`, `?`, `/resume`,
+    /// No-argument branches (`/quit`, `/exit`, `/help`, `?`, `/resume`,
     /// `/continue`, `/clear`, `/status`, `/mode`, `/skill`, `/skills`) are
     /// dispatched via the [`TUI_SLASH_TABLE`] lookup — the same OCP-clean
     /// dispatch pattern the CLI's [`command_registry::registry`] uses
@@ -2023,10 +2023,9 @@ impl App {
     /// * `/sessions`, `/list` — would fit the table once helpers exist.
     /// * `/export`, `/effort` / `/effort <lvl>` — prefix dispatch.
     /// * `/rename <title>` — prefix dispatch.
-    /// * `/diff`, `/files [dir]`, `/doctor`, `/cost`, `/cwd`, `/copy`,
-    ///   `/init`, `/login`, `/agents`, `/model`, `/effort` peers in
-    ///   `handle_diagnostic_slash` and `handle_info_slash` — would fit
-    ///   the table once helpers exist.
+    /// * `/provider [name]`, `/model`, `/models`, `/cost`, `/files [dir]`,
+    ///   `/diff`, `/context`, `/doctor`, `/review`, and `/init` peers in
+    ///   `handle_diagnostic_slash` — would fit the table once helpers exist.
     ///
     /// The next person to touch this file should hoist these remaining
     /// branches into the table; each is a 3-line entry once a sibling
@@ -3807,10 +3806,11 @@ mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
         current_exe_command, format_api_retry_delay, format_api_retry_message,
-        format_stream_timeout_message, git_bin, handle_turn_result, resolve_provider_switch_auth,
-        save_session, ApiClient, App, AppEvent, EffortLevel, ProviderSwitch, SpawnTarget,
-        TuiSession, TurnContext, TEST_SESSIONS_DIR,
+        format_stream_timeout_message, git_bin, handle_turn_result, lookup_tui_slash,
+        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, EffortLevel,
+        ProviderSwitch, SpawnTarget, TuiSession, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
+    use crate::slash_commands::all_tui_commands;
     use crate::tui::events::ApiRetryKind;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -3865,6 +3865,71 @@ mod tests {
                     && !code.contains("std::process::Command::new(\"openclaudia\")"),
                 "production TUI app code must not invoke bare openclaudia; line {n}: {raw_line}",
                 n = idx + 1,
+            );
+        }
+    }
+
+    fn advertised_tui_invocation_roots(invocation: &str) -> Vec<String> {
+        invocation
+            .split(',')
+            .map(str::trim)
+            .filter(|form| !form.is_empty())
+            .map(|form| form.split_whitespace().next().unwrap_or(form).to_string())
+            .collect()
+    }
+
+    fn tui_runtime_command_roots() -> Vec<&'static str> {
+        let mut roots = TUI_SLASH_TABLE
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        roots.extend([
+            "/sessions",
+            "/list",
+            "/load",
+            "/continue",
+            "/rewind",
+            "/undo",
+            "/redo",
+            "/export",
+            "/effort",
+            "/rename",
+            "/provider",
+            "/model",
+            "/models",
+            "/cost",
+            "/files",
+            "/diff",
+            "/context",
+            "/doctor",
+            "/review",
+            "/init",
+            "/skill",
+            "/skills",
+            "/<skill-name>",
+        ]);
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    }
+
+    #[test]
+    fn advertised_tui_slash_commands_have_runtime_roots() {
+        let runtime_roots = tui_runtime_command_roots();
+        for command in all_tui_commands() {
+            for root in advertised_tui_invocation_roots(command.invocation) {
+                assert!(
+                    runtime_roots.contains(&root.as_str()),
+                    "TUI help advertises `{}` but the default TUI runtime has no handler root for `{root}`",
+                    command.invocation
+                );
+            }
+        }
+
+        for (exact, _) in TUI_SLASH_TABLE {
+            assert!(
+                lookup_tui_slash(exact).is_some(),
+                "exact TUI slash root {exact} must resolve through lookup_tui_slash"
             );
         }
     }
