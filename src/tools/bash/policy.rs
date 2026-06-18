@@ -98,8 +98,6 @@ pub fn is_sensitive_env(key: &str) -> bool {
             | "MOONSHOT_API_KEY"
             | "MINIMAX_API_KEY"
             | "OLLAMA_API_KEY"
-            | "TAVILY_API_KEY"
-            | "BRAVE_API_KEY"
             | "SERPER_API_KEY"
             | "PERPLEXITY_API_KEY"
             | "HUGGINGFACE_API_KEY"
@@ -842,8 +840,6 @@ mod tests {
             "MOONSHOT_API_KEY",
             "MINIMAX_API_KEY",
             "OLLAMA_API_KEY",
-            "TAVILY_API_KEY",
-            "BRAVE_API_KEY",
             "SERPER_API_KEY",
             "PERPLEXITY_API_KEY",
             "HUGGINGFACE_API_KEY",

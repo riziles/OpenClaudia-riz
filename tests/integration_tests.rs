@@ -1340,8 +1340,8 @@ mod web_tools {
         assert!(result.is_error, "Invalid URL should fail");
     }
 
-    // DuckDuckGo search uses the browser feature (enabled by default)
-    // Falls back to Tavily/Brave APIs if configured
+    // DuckDuckGo/Bing search uses the browser feature (enabled by default)
+    // and does not require a search API key.
     #[test]
     #[ignore = "requires network access; run with `cargo test -- --ignored`"]
     fn test_web_search_duckduckgo() {

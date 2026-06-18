@@ -1,134 +1,20 @@
-//! End-to-end tests for `web::WebConfig::from_env`,
-//! `format_search_results` per-result rendering, `SearchResult`
-//! serde round-trip, and `FetchResult` shape.
+//! End-to-end tests for `format_search_results` per-result rendering,
+//! `SearchResult` serde round-trip, and `FetchResult` shape.
 //!
 //! Sprint 81 of the verification effort. Sprint 41
 //! (`web_content_extraction_e2e`) covered `format_fetch_output`
 //! and `safe_truncate`; sprint 9 (`web_ssrf_e2e`) covered SSRF
-//! refusals; this file fills gaps in `WebConfig` env parsing
-//! and `format_search_results` per-result rendering.
+//! refusals; this file fills gaps in `format_search_results`
+//! per-result rendering.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::web::{format_search_results, FetchResult, SearchResult, WebConfig};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use openclaudia::web::{format_search_results, FetchResult, SearchResult};
 
 // ───────────────────────────────────────────────────────────────────────────
-// Env-mutation lock
-// ───────────────────────────────────────────────────────────────────────────
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-struct EnvGuard {
-    key: String,
-    previous: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self {
-            key: key.to_string(),
-            previous,
-        }
-    }
-    fn remove(key: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self {
-            key: key.to_string(),
-            previous,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section A — WebConfig::from_env
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn web_config_default_has_no_keys() {
-    let config = WebConfig::default();
-    assert!(config.tavily_api_key.is_none());
-    assert!(config.brave_api_key.is_none());
-}
-
-#[test]
-fn web_config_from_env_picks_up_tavily_api_key() {
-    let _l = env_lock();
-    let _g_tav = EnvGuard::set("TAVILY_API_KEY", "tav-test-key-123");
-    let _g_brave = EnvGuard::remove("BRAVE_API_KEY");
-    let config = WebConfig::from_env();
-    assert_eq!(config.tavily_api_key.as_deref(), Some("tav-test-key-123"));
-    assert!(config.brave_api_key.is_none());
-}
-
-#[test]
-fn web_config_from_env_picks_up_brave_api_key() {
-    let _l = env_lock();
-    let _g_tav = EnvGuard::remove("TAVILY_API_KEY");
-    let _g_brave = EnvGuard::set("BRAVE_API_KEY", "brave-test-key-456");
-    let config = WebConfig::from_env();
-    assert!(config.tavily_api_key.is_none());
-    assert_eq!(config.brave_api_key.as_deref(), Some("brave-test-key-456"));
-}
-
-#[test]
-fn web_config_from_env_picks_up_both_keys() {
-    let _l = env_lock();
-    let _g_tav = EnvGuard::set("TAVILY_API_KEY", "tav-key");
-    let _g_brave = EnvGuard::set("BRAVE_API_KEY", "brave-key");
-    let config = WebConfig::from_env();
-    assert_eq!(config.tavily_api_key.as_deref(), Some("tav-key"));
-    assert_eq!(config.brave_api_key.as_deref(), Some("brave-key"));
-}
-
-#[test]
-fn web_config_from_env_absent_keys_yield_none() {
-    let _l = env_lock();
-    let _g_tav = EnvGuard::remove("TAVILY_API_KEY");
-    let _g_brave = EnvGuard::remove("BRAVE_API_KEY");
-    let config = WebConfig::from_env();
-    assert!(config.tavily_api_key.is_none());
-    assert!(config.brave_api_key.is_none());
-}
-
-#[test]
-fn web_config_clone_preserves_keys() {
-    let original = WebConfig {
-        tavily_api_key: Some("tav".to_string()),
-        brave_api_key: Some("brave".to_string()),
-    };
-    let cloned = original.clone();
-    assert_eq!(cloned.tavily_api_key, original.tavily_api_key);
-    assert_eq!(cloned.brave_api_key, original.brave_api_key);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — format_search_results
+// Section A — format_search_results
 // ───────────────────────────────────────────────────────────────────────────
 
 fn result(title: &str, url: &str, snippet: &str) -> SearchResult {

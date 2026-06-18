@@ -602,10 +602,10 @@ const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return 
 const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return it as markdown using direct HTTP. This build does not include JavaScript rendering or headless-browser challenge handling; rebuild with the default `browser` feature for that fallback.";
 
 #[cfg(feature = "browser")]
-const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results. Uses DuckDuckGo/Bing browser scraping by default (free, no API key), then falls back to Tavily or Brave APIs if configured. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
+const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results using free DuckDuckGo/Bing browser scraping. No search API key is required. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
 
 #[cfg(not(feature = "browser"))]
-const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results via Tavily or Brave APIs when configured. This build does not include DuckDuckGo/Bing headless-browser scraping, so free no-key search requires rebuilding with the default `browser` feature. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
+const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results using free DuckDuckGo/Bing browser scraping. This build does not include the browser feature, so web_search cannot run until rebuilt with the default `browser` feature. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
 
 struct WebFetchHandler;
 impl ToolHandler for WebFetchHandler {

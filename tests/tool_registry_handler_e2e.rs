@@ -390,9 +390,9 @@ fn web_tool_descriptions_match_browser_feature_set() {
             "no-browser web_fetch description must not imply browser fallback; got {fetch_description:?}"
         );
         assert!(
-            search_description.contains("Tavily or Brave APIs")
-                && search_description.contains("does not include DuckDuckGo/Bing"),
-            "no-browser web_search description must point at API backends; got {search_description:?}"
+            search_description.contains("cannot run until rebuilt")
+                && search_description.contains("default `browser` feature"),
+            "no-browser web_search description must explain that free browser search is unavailable; got {search_description:?}"
         );
         assert!(
             !fetch_description.contains("headless Chromium fallback"),
@@ -406,16 +406,17 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     let readme = include_str!("../README.md");
 
     assert!(
-        readme.contains("no-key DuckDuckGo/Bing scraping"),
-        "README must explain that no-key web search is browser-backed"
+        readme.contains("Free DuckDuckGo/Bing browser scraping"),
+        "README must explain that web search is free and browser-backed"
     );
     assert!(
-        readme.contains("web_search requires Tavily or Brave API keys"),
-        "README no-default-features build note must explain web_search's API-key requirement"
+        readme.contains("web_search is unavailable"),
+        "README no-default-features build note must explain web_search's browser-feature requirement"
     );
     assert!(
-        !readme.contains("DuckDuckGo (free, no API key), Tavily, or Brave APIs")
-            && !readme.contains("DuckDuckGo free, or Tavily/Brave APIs"),
-        "README must not imply every build has no-key DuckDuckGo search"
+        !readme.contains("API keys work in all builds")
+            && !readme.contains("web_search requires")
+            && !readme.contains("APIs work in all builds"),
+        "README must not advertise paid web-search API backends"
     );
 }

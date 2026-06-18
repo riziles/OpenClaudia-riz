@@ -1,6 +1,6 @@
 use crate::tools::args::ToolArgs as _;
 use crate::tools::safe_truncate;
-use crate::web::{self, WebConfig};
+use crate::web;
 use crate::{
     config::{is_local_provider_name, AppConfig, WebFetchConfig},
     pipeline,
@@ -473,7 +473,7 @@ fn domain_list(args: &HashMap<String, Value>, key: &str) -> Vec<String> {
 }
 
 /// Search the web using browser-backed DuckDuckGo/Bing when compiled
-/// with the `browser` feature, then Tavily or Brave API backends.
+/// with the `browser` feature.
 ///
 /// Supports Claude Code-compatible `allowed_domains` / `blocked_domains`
 /// filtering: results from domains matching `blocked_domains` are
@@ -495,20 +495,14 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
     let allowed = domain_list(args, "allowed_domains");
     let blocked = domain_list(args, "blocked_domains");
 
-    // Load web config from environment. Browser-feature builds try
-    // DuckDuckGo/Bing browser scraping before configured API backends;
-    // no-browser builds fall through to the API backends.
-    let config = WebConfig::from_env();
-
     // Shared runtime; never construct a fresh one per call (crosslink #368).
     // The spawned future is `'static` — own all captured inputs so the
-    // future doesn't borrow `query` / `config` across thread boundaries.
+    // future doesn't borrow `query` across thread boundaries.
     let query_owned = query.to_string();
-    let result =
-        match run_blocking(async move { web::search_web(&query_owned, &config, limit).await }) {
-            Ok(result) => result,
-            Err(e) => return (format!("Search failed: {e}"), true),
-        };
+    let result = match run_blocking(async move { web::search_web(&query_owned, limit).await }) {
+        Ok(result) => result,
+        Err(e) => return (format!("Search failed: {e}"), true),
+    };
 
     match result {
         Ok(mut results) => {

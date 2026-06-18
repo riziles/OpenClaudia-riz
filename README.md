@@ -14,7 +14,7 @@ OpenClaudia is a Rust-based CLI that transforms any LLM into an agentic coding a
 - **Auto-Detect Provider** — Pass `-m gemini-3.5-flash` and the provider is detected automatically
 - **30+ Agentic Tools** — Bash, file ops, LSP, web search, notebooks, task tracking, plan mode, worktrees, cron scheduling, MCP resources
 - **Tool Execution Loop** — Multi-turn tool calling with automatic result feedback (works across all providers)
-- **Web Search** — Browser-feature builds support no-key DuckDuckGo/Bing scraping; Tavily or Brave APIs work in all builds
+- **Web Search** — Free DuckDuckGo/Bing browser scraping in default builds; no search API key required
 - **Auto-Learning Memory** — Automatically captures coding patterns, error resolutions, file relationships, and user preferences across sessions
 - **Background Shells** — Run long-running processes, check output, and kill them on demand
 - **Thinking Mode** — Extended reasoning for Anthropic, OpenAI GPT-5/o1/o3/o4, Gemini 3.x/2.5, DeepSeek V4, Qwen QwQ, Z.AI/GLM, and MiniMax-M3
@@ -103,8 +103,6 @@ openclaudia --mode debug      # Investigation-first debugging
 | `ZAI_API_KEY` | Z.AI (GLM) | For Z.AI |
 | `KIMI_API_KEY` or `MOONSHOT_API_KEY` | Kimi/Moonshot | For Kimi |
 | `MINIMAX_API_KEY` | MiniMax | For MiniMax |
-| `TAVILY_API_KEY` | Web search | Optional |
-| `BRAVE_API_KEY` | Web search (alt) | Optional |
 
 ### Config File
 
@@ -311,7 +309,7 @@ The `keybindings:` config map customizes the legacy line-oriented REPL (`opencla
 | `grep` | Search file contents by regex |
 | `notebook_edit` | Edit Jupyter notebook cells (replace, insert, delete) |
 | `web_fetch` | Fetch web pages as markdown |
-| `web_search` | Search the web; browser builds include no-key DuckDuckGo/Bing scraping, and Tavily/Brave APIs work in all builds |
+| `web_search` | Search the web through free DuckDuckGo/Bing browser scraping; no search API key required |
 | `web_browser` | Full headless browser for JavaScript-heavy pages (default `browser` feature) |
 | `crosslink` | Issue tracking and cross-session work memory via the embedded Crosslink library |
 
@@ -569,7 +567,7 @@ cargo build
 # Release build
 cargo build --release
 
-# Without browser feature (smaller binary; web_search requires Tavily or Brave API keys)
+# Without browser feature (smaller binary; web_search is unavailable)
 cargo build --release --no-default-features
 
 # Run all tests

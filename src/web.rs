@@ -5,8 +5,8 @@
 //!   Chromium for JS-heavy or Cloudflare-fronted pages when the
 //!   `browser` feature is compiled. HTML responses are converted to
 //!   Markdown locally via `htmd` (no third-party render service).
-//! - `web_search`: Search the web via Tavily, Brave API, or browser
-//!   scraping (`DuckDuckGo`/Bing) when the `browser` feature is compiled.
+//! - `web_search`: Search the web via browser scraping (`DuckDuckGo`/Bing)
+//!   when the `browser` feature is compiled. No search API keys are required.
 //! - `web_browser`: Full browser automation via headless Chromium in
 //!   `browser` builds.
 
@@ -31,8 +31,8 @@ pub(crate) const SSRF_REDIRECT_LIMIT: usize = 10;
 /// Maximum bytes accepted from any remote HTTP response body (crosslink #745).
 ///
 /// Without this cap, a malicious or compromised upstream — the direct
-/// HTTP target, the headless-browser DOM, Tavily, Brave, or a
-/// redirected target — can stream gigabytes into a `String` before
+/// HTTP target, the headless-browser DOM, or a redirected target can
+/// stream gigabytes into a `String` before
 /// the per-tool truncate (`src/tools/web.rs`) ever runs. 10 MiB is
 /// generous for markdown-converted articles and JSON search
 /// responses while keeping per-call memory bounded.
@@ -499,33 +499,9 @@ pub fn html_to_markdown(html: &str) -> String {
     }
 }
 
-/// Tavily API endpoint
-const TAVILY_API_URL: &str = "https://api.tavily.com/search";
-
-/// Brave Search API endpoint
-const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
-
 /// `DuckDuckGo` HTML search endpoint (no API key required)
 #[cfg(feature = "browser")]
 const DUCKDUCKGO_HTML_URL: &str = "https://html.duckduckgo.com/html/";
-
-/// Web configuration for API keys
-#[derive(Debug, Clone, Default)]
-pub struct WebConfig {
-    pub tavily_api_key: Option<String>,
-    pub brave_api_key: Option<String>,
-}
-
-impl WebConfig {
-    /// Load web config from environment variables
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self {
-            tavily_api_key: std::env::var("TAVILY_API_KEY").ok(),
-            brave_api_key: std::env::var("BRAVE_API_KEY").ok(),
-        }
-    }
-}
 
 /// Result from `web_fetch`
 #[derive(Debug, Clone)]
@@ -671,91 +647,42 @@ fn extract_html_title(html: &str) -> Option<String> {
     }
 }
 
-/// Tavily API response structure
-#[derive(Debug, Deserialize)]
-struct TavilyResponse {
-    results: Vec<TavilyResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TavilyResult {
-    title: String,
-    url: String,
-    content: String,
-}
-
-/// Brave Search API response structure
-#[derive(Debug, Deserialize)]
-struct BraveResponse {
-    web: Option<BraveWebResults>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BraveWebResults {
-    results: Vec<BraveResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BraveResult {
-    title: String,
-    url: String,
-    description: String,
-}
-
 /// Search the web using browser-backed `DuckDuckGo`/Bing when compiled
-/// with the `browser` feature, then configured API providers.
+/// with the `browser` feature.
 ///
 /// # Errors
 ///
 /// Returns an error string if all search backends fail.
-pub async fn search_web(
-    query: &str,
-    config: &WebConfig,
-    limit: usize,
-) -> Result<Vec<SearchResult>, String> {
+pub async fn search_web(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+    let mut backend_errors = Vec::new();
+
     // Tier 1 — DuckDuckGo via headless Chromium in browser builds
-    // (free, no API key). No-browser builds return a feature-gated
-    // error and fall through to the API tiers.
-    let ddg_error = match search_duckduckgo(query, limit) {
+    // (free, no API key).
+    match search_duckduckgo(query, limit) {
         Ok(results) => return Ok(results),
         Err(e) => {
             tracing::warn!("DuckDuckGo search failed: {e}");
-            e
+            backend_errors.push(format!("DuckDuckGo: {e}"));
         }
     };
 
     // Tier 2 — Bing HTML scrape via headless Chromium in browser
-    // builds. No-browser builds return a feature-gated error and
-    // fall through to the API tiers.
-    let bing_error = match search_bing(query, limit) {
+    // builds.
+    match search_bing(query, limit) {
         Ok(results) if !results.is_empty() => return Ok(results),
-        Ok(_) => "Bing returned zero results (likely bot-challenged)".to_string(),
+        Ok(_) => {
+            backend_errors.push("Bing: returned zero results (likely bot-challenged)".to_string())
+        }
         Err(e) => {
             tracing::warn!("Bing search failed: {e}");
-            e
+            backend_errors.push(format!("Bing: {e}"));
         }
     };
 
-    // Tier 3 — Tavily API (requires TAVILY_API_KEY).
-    if let Some(api_key) = &config.tavily_api_key {
-        return search_tavily(query, api_key, limit).await;
-    }
-
-    // Tier 4 — Brave API (requires BRAVE_API_KEY).
-    if let Some(api_key) = &config.brave_api_key {
-        return search_brave(query, api_key, limit).await;
-    }
-
-    // All free scrape tiers were bot-blocked AND no paid API key is
-    // configured. Surface a specific, actionable error chain so the
-    // agent can tell the user what to do next.
     Err(format!(
-        "Web search failed: every free scrape backend was bot-blocked AND \
-         no API key is configured.\n  \
-         DuckDuckGo: {ddg_error}\n  \
-         Bing: {bing_error}\n\
-         To enable reliable search, set one of: TAVILY_API_KEY (https://tavily.com) \
-         or BRAVE_API_KEY (https://api.search.brave.com)."
+        "Web search failed: no free browser-backed backend returned usable results.\n  {}\n\
+         Install Chromium or rebuild with the default `browser` feature to enable free search.",
+        backend_errors.join("\n  ")
     ))
 }
 
@@ -897,111 +824,10 @@ pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, Strin
 ///
 /// # Errors
 ///
-/// Always returns an error; the caller falls through to the API tiers.
+/// Always returns an error.
 #[cfg(not(feature = "browser"))]
 pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
     Err("Bing search requires the browser feature".to_string())
-}
-
-/// Search using Tavily API
-async fn search_tavily(
-    query: &str,
-    api_key: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>, String> {
-    #[derive(Serialize)]
-    struct TavilyRequest<'a> {
-        api_key: &'a str,
-        query: &'a str,
-        max_results: usize,
-        include_answer: bool,
-    }
-
-    let request = TavilyRequest {
-        api_key,
-        query,
-        max_results: limit,
-        include_answer: false,
-    };
-
-    // Shared client + per-request timeout (crosslink #368).
-    let response = shared_http_client()?
-        .post(TAVILY_API_URL)
-        .timeout(Duration::from_secs(15))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Tavily API request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, TAVILY_API_URL)
-            .await
-            .unwrap_or_default();
-        return Err(format!("Tavily API error {status}: {body}"));
-    }
-
-    // Size-cap the JSON body before deserialization (crosslink #745). Without
-    // this, a compromised Tavily endpoint can stream a multi-GB payload that
-    // reqwest's `.json()` would happily buffer.
-    let raw = read_bounded_text(response, MAX_WEB_FETCH_BYTES, TAVILY_API_URL).await?;
-    let tavily_response: TavilyResponse =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse Tavily response: {e}"))?;
-
-    Ok(tavily_response
-        .results
-        .into_iter()
-        .map(|r| SearchResult {
-            title: r.title,
-            url: r.url,
-            snippet: r.content,
-        })
-        .collect())
-}
-
-/// Search using Brave Search API
-async fn search_brave(
-    query: &str,
-    api_key: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>, String> {
-    // Shared client + per-request timeout (crosslink #368).
-    let response = shared_http_client()?
-        .get(BRAVE_SEARCH_URL)
-        .timeout(Duration::from_secs(15))
-        .header("X-Subscription-Token", api_key)
-        .header("Accept", "application/json")
-        .query(&[("q", query), ("count", &limit.to_string())])
-        .send()
-        .await
-        .map_err(|e| format!("Brave Search API request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES, BRAVE_SEARCH_URL)
-            .await
-            .unwrap_or_default();
-        return Err(format!("Brave Search API error {status}: {body}"));
-    }
-
-    // Size-cap the JSON body before deserialization (crosslink #745).
-    let raw = read_bounded_text(response, MAX_WEB_FETCH_BYTES, BRAVE_SEARCH_URL).await?;
-    let brave_response: BraveResponse =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse Brave response: {e}"))?;
-
-    Ok(brave_response
-        .web
-        .map(|w| {
-            w.results
-                .into_iter()
-                .map(|r| SearchResult {
-                    title: r.title,
-                    url: r.url,
-                    snippet: r.description,
-                })
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 /// Search `DuckDuckGo` using headless Chrome browser
@@ -1214,7 +1040,7 @@ pub fn parse_duckduckgo_results_from_html(
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
 pub fn search_duckduckgo(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
-    Err("DuckDuckGo search requires the browser feature. Rebuild with `cargo build --features browser` or set TAVILY_API_KEY/BRAVE_API_KEY.".to_string())
+    Err("DuckDuckGo search requires the browser feature. Rebuild with the default `browser` feature to enable free search.".to_string())
 }
 
 /// Fetch a URL using a headless Chromium browser, JS-rendered, then
@@ -1324,12 +1150,6 @@ pub fn format_search_results(results: &[SearchResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_web_config_from_env() {
-        // Just test that it doesn't panic
-        let _config = WebConfig::from_env();
-    }
 
     #[test]
     fn shared_http_client_builder_succeeds() {
