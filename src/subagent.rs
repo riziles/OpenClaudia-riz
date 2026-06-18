@@ -1267,6 +1267,13 @@ pub async fn run_subagent(
     run_subagent_inner(config, app_config, client, None).await
 }
 
+fn validate_subagent_final_response(agent_id: &str, final_output: &str) -> Result<(), String> {
+    if final_output.trim().is_empty() {
+        return Ok(());
+    }
+    crate::grounded_loop::validate_agentic_final_response(agent_id, final_output)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_inner(
     config: &SubagentConfig,
@@ -1426,7 +1433,6 @@ async fn run_subagent_inner(
     // Run the agent loop
     let mut final_output = String::new();
     let mut turns: u64;
-    let mut used_tools = false;
 
     // Library-layer permission gate — consulted by every
     // `execute_tool_with_memory` call inside this subagent's tool loop.
@@ -1573,26 +1579,21 @@ async fn run_subagent_inner(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            if used_tools {
-                if let Err(reason) =
-                    crate::grounded_loop::validate_agentic_final_response(&agent_id, &final_output)
-                {
-                    BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
-                    store_transcript(&agent_id, messages, config.agent_type);
-                    return SubagentResult {
-                        agent_id,
-                        success: false,
-                        output: format!("Final answer failed grounding gate: {reason}"),
-                        turns_used: turns,
-                        is_background: config.run_in_background,
-                        worktree: worktree.clone(),
-                    };
-                }
+            if let Err(reason) = validate_subagent_final_response(&agent_id, &final_output) {
+                BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
+                store_transcript(&agent_id, messages, config.agent_type);
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: format!("Final answer failed grounding gate: {reason}"),
+                    turns_used: turns,
+                    is_background: config.run_in_background,
+                    worktree: worktree.clone(),
+                };
             }
             // No tool calls means agent is done
             break;
         }
-        used_tools = true;
 
         // Add assistant message to history
         messages.push(assistant_message.clone());
@@ -2273,6 +2274,8 @@ pub fn execute_task_stop_tool<S: BuildHasher>(args: &HashMap<String, Value, S>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -2326,6 +2329,154 @@ mod tests {
                         && result["is_error"] == false
             )
         }));
+    }
+
+    fn spawn_openai_no_tool_final_server() -> (std::thread::JoinHandle<Result<(), String>>, String)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+        listener
+            .set_nonblocking(true)
+            .expect("mock provider nonblocking");
+        let addr = listener.local_addr().expect("mock provider local addr");
+        let base_url = format!("http://{addr}/v1");
+
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Err("mock provider timed out waiting for request".to_string());
+                    }
+                    Err(err) => return Err(format!("mock provider accept failed: {err}")),
+                }
+            };
+
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|err| format!("set read timeout failed: {err}"))?;
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let header_end = loop {
+                let n = stream
+                    .read(&mut buf)
+                    .map_err(|err| format!("read request failed: {err}"))?;
+                if n == 0 {
+                    return Err("mock provider connection closed before headers".to_string());
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos;
+                }
+            };
+
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            if !headers.starts_with("POST /v1/chat/completions ") {
+                return Err(format!("unexpected request line: {headers:?}"));
+            }
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let total_len = header_end + 4 + content_len;
+            while request.len() < total_len {
+                let n = stream
+                    .read(&mut buf)
+                    .map_err(|err| format!("read request body failed: {err}"))?;
+                if n == 0 {
+                    return Err("mock provider connection closed before body".to_string());
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+
+            let body = r#"{"id":"chatcmpl-subagent-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Ungrounded no-tool final."},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|err| format!("write response failed: {err}"))?;
+            Ok(())
+        });
+
+        (handle, base_url)
+    }
+
+    fn local_subagent_app_config(base_url: String) -> AppConfig {
+        use crate::config::{ProviderConfig, ThinkingConfig};
+
+        let mut app_config = issue719_app_config();
+        app_config.proxy.target = "local".to_string();
+        app_config.providers.clear();
+        app_config.providers.insert(
+            "local".to_string(),
+            ProviderConfig {
+                base_url,
+                api_key: None,
+                model: Some("gpt-5.5".to_string()),
+                headers: HashMap::new(),
+                thinking: ThinkingConfig::default(),
+            },
+        );
+        app_config
+    }
+
+    #[tokio::test]
+    async fn subagent_no_tool_final_is_rejected_by_grounding_gate() {
+        let agent_id = "subagent-no-tool-final-denied";
+        let ledger_path =
+            crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
+        let _ = std::fs::remove_file(&ledger_path);
+        let _ = BACKGROUND_AGENTS.remove(agent_id);
+
+        let (server, base_url) = spawn_openai_no_tool_final_server();
+        let app_config = local_subagent_app_config(base_url);
+        let config = SubagentConfig {
+            agent_type: AgentType::GeneralPurpose,
+            task: "Return a direct answer".to_string(),
+            prompt: "Do not call tools; just answer.".to_string(),
+            run_in_background: false,
+            model_override: Some("gpt-5.5".to_string()),
+            resume_agent_id: None,
+            isolation: None,
+        };
+        let client = Client::new();
+
+        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let server_result = server.join().expect("mock provider thread joined");
+
+        assert!(
+            server_result.is_ok(),
+            "mock provider failed: {:?}",
+            server_result.err()
+        );
+        assert!(
+            !result.success,
+            "ungrounded no-tool final must fail; output={}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("Final answer failed grounding gate: final answer requires evidence"),
+            "unexpected output: {}",
+            result.output
+        );
+
+        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
