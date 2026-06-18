@@ -535,6 +535,7 @@ fn write_notebook(
         })?;
 
     crate::guardrails::record_file_modification(&handle.canonical_path, new_lines, old_lines);
+    super::record_active_diff_observation(&handle.canonical_path, original_content, &pretty);
     Ok(())
 }
 
@@ -757,6 +758,30 @@ mod tests {
             _ => panic!("unexpected source type"),
         };
         assert_eq!(src, "new source");
+    }
+
+    #[test]
+    fn notebook_edit_invalidates_prior_read_marker() {
+        let _lock = super::super::shared_tracker_lock();
+        let nb = make_notebook(&json!([
+            {"id": "cell-a", "cell_type": "code", "source": "old", "metadata": {}, "outputs": [], "execution_count": null},
+            {"id": "cell-b", "cell_type": "code", "source": "second", "metadata": {}, "outputs": [], "execution_count": null}
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+        let args = args_replace_by_id(&path, "cell-a", "new");
+        let (msg, is_err) = execute_notebook_edit(&args);
+        assert!(!is_err, "first notebook edit must succeed: {msg}");
+
+        let args2 = args_replace_by_id(&path, "cell-b", "changed");
+        let (msg2, is_err2) = execute_notebook_edit(&args2);
+        assert!(
+            is_err2,
+            "second notebook edit without a fresh read must fail: {msg2}"
+        );
+        assert!(
+            msg2.contains("must read") || msg2.contains("Use read_file"),
+            "{msg2}"
+        );
     }
 
     #[test]

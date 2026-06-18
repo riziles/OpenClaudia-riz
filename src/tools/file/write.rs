@@ -209,6 +209,30 @@ mod tests {
         assert_eq!(content, "new content");
     }
 
+    #[test]
+    fn successful_overwrite_invalidates_prior_read_marker() {
+        let _lock = tracker_lock();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("stale_after_write.txt");
+        std::fs::write(&path, "old").expect("setup");
+        super::READ_TRACKER.mark_read(&path);
+
+        let args = make_args(&path.to_string_lossy(), "new");
+        let (msg, is_err) = super::execute_write_file(&args);
+        assert!(!is_err, "overwrite must succeed: {msg}");
+
+        let args2 = make_args(&path.to_string_lossy(), "newer");
+        let (msg2, is_err2) = super::execute_write_file(&args2);
+        assert!(
+            is_err2,
+            "second overwrite without a fresh read must fail: {msg2}"
+        );
+        assert!(
+            msg2.contains("must read") || msg2.contains("Use read_file"),
+            "{msg2}"
+        );
+    }
+
     /// crosslink #968: overwriting an existing file without first calling
     /// `read_file` must fail, matching the read-before-edit invariant.
     #[test]

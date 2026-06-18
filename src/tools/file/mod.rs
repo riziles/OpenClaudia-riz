@@ -178,6 +178,29 @@ impl ReadFileTracker {
             .is_some_and(|f| f.contains_key(&check_path))
     }
 
+    /// Invalidate the current session's read marker for a file after mutation.
+    ///
+    /// A successful write/edit makes the previous file observation stale. The
+    /// ledger records that for prompt grounding; this keeps the live
+    /// read-before-edit gate in sync so a second mutation must be preceded by a
+    /// fresh read.
+    pub(crate) fn mark_stale(&self, path: &Path) {
+        let Ok(check_path) = std::fs::canonicalize(path) else {
+            tracing::warn!(
+                path = %path.display(),
+                "READ_TRACKER.mark_stale: canonicalize failed; skipping removal"
+            );
+            return;
+        };
+        let key = super::todo::current_session_key();
+        let Some(mut buckets) = self.buckets_guard("mark_stale") else {
+            return;
+        };
+        if let Some(files) = buckets.get_mut(&key) {
+            files.remove(&check_path);
+        }
+    }
+
     /// Clear every session's bucket. Used by tests and at
     /// session-start by `crate::tools::reset_read_tracker`. A
     /// per-session `clear()` is intentionally deferred to phase 2
@@ -546,6 +569,7 @@ pub(super) fn record_active_diff_observation(path: &str, before: &str, after: &s
     if before == after {
         return;
     }
+    READ_TRACKER.mark_stale(Path::new(path));
     let session_key = super::todo::current_session_key();
     let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
         return;
@@ -666,6 +690,32 @@ mod tests {
         );
         READ_TRACKER.mark_read(&path_a);
         assert!(READ_TRACKER.has_been_read(&path_a), "re-mark stays visible");
+    }
+
+    #[test]
+    fn read_tracker_mark_stale_only_clears_current_session() {
+        let _lock = tracker_lock();
+        READ_TRACKER.clear_all();
+        let (_keep_a, _keep_b, path_a, _path_b) = two_temp_paths();
+        {
+            let _g = crate::tools::SessionIdGuard::set("session-stale-a");
+            READ_TRACKER.mark_read(&path_a);
+            assert!(READ_TRACKER.has_been_read(&path_a));
+        }
+        {
+            let _g = crate::tools::SessionIdGuard::set("session-stale-b");
+            READ_TRACKER.mark_read(&path_a);
+            assert!(READ_TRACKER.has_been_read(&path_a));
+        }
+        {
+            let _g = crate::tools::SessionIdGuard::set("session-stale-a");
+            READ_TRACKER.mark_stale(&path_a);
+            assert!(!READ_TRACKER.has_been_read(&path_a));
+        }
+        {
+            let _g = crate::tools::SessionIdGuard::set("session-stale-b");
+            assert!(READ_TRACKER.has_been_read(&path_a));
+        }
     }
 
     /// crosslink #440 phase 1: `clear_all()` wipes every session's bucket.

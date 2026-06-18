@@ -475,6 +475,26 @@ mod tests {
     }
 
     #[test]
+    fn successful_edit_invalidates_prior_read_marker() {
+        let _lock = super::super::shared_tracker_lock();
+        let (_f, path) = tmp_readable("first\nsecond\n");
+        let args = make_args(&path, "first", "one");
+        let (msg, is_err) = super::execute_edit_file(&args);
+        assert!(!is_err, "first edit must succeed: {msg}");
+
+        let args2 = make_args(&path, "second", "two");
+        let (msg2, is_err2) = super::execute_edit_file(&args2);
+        assert!(
+            is_err2,
+            "second edit without a fresh read must be rejected: {msg2}"
+        );
+        assert!(
+            msg2.contains("must read") || msg2.contains("Use read_file"),
+            "{msg2}"
+        );
+    }
+
+    #[test]
     fn edit_multi_occurrence_without_replace_all_errors() {
         // Behavior 5: N>1 occurrences without replace_all → error in both CC and OC
         let (_f, path) = tmp_readable("dog cat dog\n");
