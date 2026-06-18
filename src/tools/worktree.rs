@@ -32,7 +32,6 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
@@ -239,13 +238,23 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
     // empty path segments, etc.) to git itself. We pin the cwd to the system
     // temp dir so this check never depends on being inside a git repo.
     let tmp = std::env::temp_dir();
-    let output = Command::new(git_bin()?)
-        .args(["check-ref-format", "--branch", name])
-        .current_dir(&tmp)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to spawn git check-ref-format: {e}"))?;
+    let output = crate::tools::command::run_with_timeout(
+        git_bin()?,
+        &["check-ref-format", "--branch", name],
+        Some(tmp.as_path()),
+        std::time::Duration::from_secs(GIT_TIMEOUT_SECS),
+    )
+    .map_err(|err| match err {
+        crate::tools::command::CommandError::SpawnFailed { source, .. } => {
+            format!("failed to spawn git check-ref-format: {source}")
+        }
+        crate::tools::command::CommandError::TimedOut { .. } => {
+            format!("git check-ref-format timed out after {GIT_TIMEOUT_SECS}s")
+        }
+        crate::tools::command::CommandError::WaitFailed { source, .. } => {
+            format!("git check-ref-format wait failed: {source}")
+        }
+    })?;
 
     if output.status.success() {
         Ok(())
@@ -1506,6 +1515,12 @@ mod tests {
             assert!(
                 !code.contains("run_with_timeout(\"git\""),
                 "production worktree code must not pass bare git to run_with_timeout; \
+                 line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains("Command::new("),
+                "production worktree subprocesses must use run_with_timeout; \
                  line {n}: {raw_line}",
                 n = idx + 1,
             );
