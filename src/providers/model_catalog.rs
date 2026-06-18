@@ -303,11 +303,24 @@ mod tests {
     use super::static_models_for_provider;
 
     #[test]
-    fn anthropic_catalog_includes_claude_opus_4_7() {
-        assert!(
-            static_models_for_provider("anthropic").contains(&"claude-opus-4-7"),
-            "Anthropic static catalog must include claude-opus-4-7"
-        );
+    fn anthropic_catalog_includes_current_documented_models() {
+        let models = static_models_for_provider("anthropic");
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                models.contains(&model),
+                "Anthropic static catalog must include {model}"
+            );
+        }
     }
 
     #[test]
