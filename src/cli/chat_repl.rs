@@ -543,7 +543,18 @@ impl ChatRepl {
                     self.clear_transient_prompt_options();
                     return Ok(Some(false));
                 }
-                execute_shell_command_with_permission(cmd, &mut self.permissions);
+                if let Some(execution) =
+                    execute_shell_command_with_permission(cmd, &mut self.permissions)
+                {
+                    openclaudia::grounded_loop::observe_shell_command_for_session(
+                        &self.chat_session.id,
+                        &execution.cwd,
+                        &execution.command,
+                        execution.exit_code,
+                        &execution.stdout,
+                        &execution.stderr,
+                    );
+                }
                 self.clear_transient_prompt_options();
                 return Ok(Some(false));
             }

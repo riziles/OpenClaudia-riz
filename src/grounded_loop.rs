@@ -12,6 +12,7 @@ use crate::ledger::{ObsId, ObservationIndexEntry};
 use crate::task_spec::TaskSpec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use std::path::Path;
 
 pub const DEFAULT_GROUNDING_INDEX_LIMIT: usize = 64;
 pub const TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES: usize = 16 * 1024;
@@ -194,6 +195,19 @@ pub fn observe_tool_result_for_session(
             None
         }
     }
+}
+
+pub fn observe_shell_command_for_session(
+    session_id: &str,
+    cwd: &Path,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
+    crate::tools::record_command_observation_for_session(
+        session_id, cwd, command, exit_code, stdout, stderr,
+    );
 }
 
 pub fn append_tool_result_observation(
@@ -435,6 +449,7 @@ fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::ledger::Authority;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn prompt_packet_orders_authoritative_context_before_navigation() {
@@ -495,5 +510,57 @@ mod tests {
         assert!(rendered.contains(&format!("TaskSpec [{task}]")));
         assert!(rendered.contains("navigation aids"));
         assert!(rendered.contains("Cite observation IDs"));
+    }
+
+    #[test]
+    fn shell_command_shortcut_records_command_and_verification() {
+        let session_id = "legacy-repl-shell-shortcut-ledger-test";
+        let ledger = Arc::new(Mutex::new(RealityLedger::new()));
+        let _guard = crate::ledger::install_active_ledger_for_session(session_id, ledger.clone());
+
+        observe_shell_command_for_session(
+            session_id,
+            Path::new("/tmp/project"),
+            "cargo check --all-targets",
+            0,
+            "finished",
+            "",
+        );
+
+        let ledger = ledger.lock().expect("ledger lock");
+        let observations = ledger.observations_chronological();
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().any(|obs| {
+            matches!(
+                &obs.kind,
+                ObservationKind::CommandRun {
+                    cwd,
+                    argv,
+                    exit_code,
+                    stdout,
+                    stderr,
+                } if cwd == "/tmp/project"
+                    && argv == &vec![
+                        "bash".to_string(),
+                        "-c".to_string(),
+                        "cargo check --all-targets".to_string(),
+                    ]
+                    && *exit_code == 0
+                    && stdout == "finished"
+                    && stderr.is_empty()
+            )
+        }));
+        assert!(observations.iter().any(|obs| {
+            matches!(
+                &obs.kind,
+                ObservationKind::Verification {
+                    passed,
+                    command,
+                    findings,
+                } if *passed
+                    && command.as_deref() == Some("cargo check --all-targets")
+                    && findings.iter().any(|finding| finding.contains("exited with code 0"))
+            )
+        }));
     }
 }

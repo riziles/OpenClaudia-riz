@@ -51,11 +51,20 @@ pub fn prompt_permission(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellCommandExecution {
+    pub cwd: std::path::PathBuf,
+    pub command: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Execute a shell command and print output (with permission check)
 pub fn execute_shell_command_with_permission(
     cmd: &str,
     permissions: &mut std::collections::HashSet<String>,
-) {
+) -> Option<ShellCommandExecution> {
     let dangerous_patterns = [
         // Destructive file operations
         "rm -rf",
@@ -96,10 +105,10 @@ pub fn execute_shell_command_with_permission(
 
     if is_dangerous && !prompt_permission("Dangerous Shell Command", cmd, permissions) {
         println!("Command blocked.\n");
-        return;
+        return None;
     }
 
-    execute_shell_command_internal(cmd);
+    execute_shell_command_internal(cmd)
 }
 
 fn resolved_process_command(binary: &str) -> Result<std::process::Command, String> {
@@ -109,8 +118,15 @@ fn resolved_process_command(binary: &str) -> Result<std::process::Command, Strin
 }
 
 /// Execute a shell command and print output
-pub fn execute_shell_command_internal(cmd: &str) {
+pub fn execute_shell_command_internal(cmd: &str) -> Option<ShellCommandExecution> {
     println!();
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("Failed to determine current directory: {err}");
+            return None;
+        }
+    };
 
     #[cfg(windows)]
     let output = resolved_process_command("cmd").and_then(|mut command| {
@@ -128,7 +144,7 @@ pub fn execute_shell_command_internal(cmd: &str) {
             .map_err(|e| e.to_string())
     });
 
-    match output {
+    match &output {
         Ok(output) => {
             if !output.stdout.is_empty() {
                 print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -147,10 +163,20 @@ pub fn execute_shell_command_internal(cmd: &str) {
         }
     }
     println!();
+
+    output.ok().map(|output| ShellCommandExecution {
+        cwd,
+        command: cmd.to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn repl_permission_shells_use_resolved_binaries() {
         let source = include_str!("permissions.rs");
@@ -173,5 +199,17 @@ mod tests {
             production.contains("which::which(binary)"),
             "permission shell runner must resolve shell binaries through the Rust resolver"
         );
+    }
+
+    #[test]
+    fn shell_command_internal_returns_execution_metadata() {
+        let execution = execute_shell_command_internal("printf openclaudia-ledger")
+            .expect("shell command should run");
+
+        assert_eq!(execution.command, "printf openclaudia-ledger");
+        assert_eq!(execution.exit_code, 0);
+        assert_eq!(execution.stdout, "openclaudia-ledger");
+        assert!(execution.stderr.is_empty());
+        assert!(execution.cwd.is_absolute());
     }
 }
