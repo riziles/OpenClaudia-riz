@@ -39,17 +39,17 @@ fn get_tool_definitions_returns_array_of_function_objects() {
 }
 
 #[test]
-fn get_tool_definitions_matches_documented_35_tool_count() {
-    // PINS CATALOG SIZE: 35 base tools (matches sprint 160 plus later
+fn get_tool_definitions_matches_documented_base_tool_count() {
+    // PINS CATALOG SIZE: 36 base tools (matches sprint 160 plus later
     // production tools). `web_browser`
     // is only registered when the `browser` feature is compiled in.
-    let expected = if cfg!(feature = "browser") { 35 } else { 34 };
+    let expected = if cfg!(feature = "browser") { 36 } else { 35 };
     let defs = get_tool_definitions();
     let arr = defs.as_array().expect("array");
     assert_eq!(
         arr.len(),
         expected,
-        "PINS: 35 base tools w/ browser feature (adding tools requires bumping this)"
+        "PINS: 36 base tools w/ browser feature (adding tools requires bumping this)"
     );
 }
 
@@ -82,11 +82,11 @@ fn get_all_with_subagents_true_adds_3_tools() {
 }
 
 #[test]
-fn get_all_with_subagents_true_count_is_38() {
-    // PINS: 35 base + 3 subagent = 38 total. The `web_browser` handler is
+fn get_all_with_subagents_true_count_matches_documented_total() {
+    // PINS: 36 base + 3 subagent = 39 total. The `web_browser` handler is
     // only registered when the `browser` feature is compiled in, so
     // feature-less builds pin one fewer.
-    let expected = if cfg!(feature = "browser") { 38 } else { 37 };
+    let expected = if cfg!(feature = "browser") { 39 } else { 38 };
     let defs = get_all_tool_definitions(true);
     let arr = defs.as_array().expect("array");
     assert_eq!(arr.len(), expected);

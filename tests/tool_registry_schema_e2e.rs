@@ -31,7 +31,10 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::{get_tool_definitions, registry::registry, ToolHandler};
+use openclaudia::{
+    session::PLAN_MODE_ALLOWED_TOOLS,
+    tools::{get_tool_definitions, registry::registry, ToolHandler},
+};
 use serde_json::Value;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -361,6 +364,29 @@ fn every_tool_description_is_non_trivial() {
         "{} tools have thin (<20 char) descriptions:\n  {}",
         thin.len(),
         thin.join("\n  ")
+    );
+}
+
+#[test]
+fn enter_plan_mode_description_names_allowed_tool_surface() {
+    let def = registry()
+        .get("enter_plan_mode")
+        .expect("enter_plan_mode registered")
+        .definition();
+    let desc = def
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .expect("enter_plan_mode description");
+
+    for tool in PLAN_MODE_ALLOWED_TOOLS {
+        assert!(
+            desc.contains(tool),
+            "enter_plan_mode description must mention plan-mode allowed tool {tool:?}; got {desc:?}"
+        );
+    }
+    assert!(
+        desc.contains("write_file may write only to the plan file"),
+        "enter_plan_mode description must explain the write_file plan-file exception; got {desc:?}"
     );
 }
 

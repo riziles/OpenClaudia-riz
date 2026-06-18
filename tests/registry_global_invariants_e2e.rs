@@ -15,49 +15,62 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::{
+    get_tool_definitions,
+    registry::{registry, ToolContext},
+};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-/// Documented core tool catalog as of sprint 160.
+/// Documented core tool catalog.
 /// Lock-step: adding a tool here is paired with an entry in
 /// HANDLERS in src/tools/registry.rs.
-const DOCUMENTED_TOOL_NAMES: &[&str] = &[
-    "bash",
-    "bash_output",
-    "kill_shell",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_files",
-    "glob",
-    "grep",
-    "crosslink",
-    "web_fetch",
-    "web_search",
-    "web_browser",
-    "todo_write",
-    "todo_read",
-    "notebook_edit",
-    "task_create",
-    "ask_user_question",
-    "task_update",
-    "task_get",
-    "task_list",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "list_mcp_resources",
-    "read_mcp_resource",
-    "lsp",
-    "enter_worktree",
-    "exit_worktree",
-    "list_worktrees",
-    "cron_create",
-    "cron_delete",
-    "cron_list",
-    "skill",
-    "tool_search",
-];
+fn documented_tool_names() -> Vec<&'static str> {
+    let mut names = vec![
+        "bash",
+        "bash_output",
+        "kill_shell",
+        "kill_shells_for_agent",
+        "read_file",
+        "grounding_context",
+        "write_file",
+        "edit_file",
+        "list_files",
+        "glob",
+        "grep",
+        "crosslink",
+        "web_fetch",
+        "web_search",
+        "web_browser",
+        "todo_write",
+        "todo_read",
+        "notebook_edit",
+        "task_create",
+        "ask_user_question",
+        "task_update",
+        "task_get",
+        "task_list",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "lsp",
+        "enter_worktree",
+        "exit_worktree",
+        "list_worktrees",
+        "cron_create",
+        "cron_delete",
+        "cron_list",
+        "skill",
+        "tool_search",
+    ];
+
+    if !cfg!(feature = "browser") {
+        names.retain(|name| *name != "web_browser");
+    }
+
+    names
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Registry size + completeness
@@ -66,7 +79,7 @@ const DOCUMENTED_TOOL_NAMES: &[&str] = &[
 #[test]
 fn registry_contains_all_documented_tool_names() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         assert!(
             reg.get(name).is_some(),
             "registry MUST contain documented tool {name:?}"
@@ -75,19 +88,42 @@ fn registry_contains_all_documented_tool_names() {
 }
 
 #[test]
-fn registry_documented_tool_count_is_34() {
-    // PINS CATALOG SIZE: 34 documented tools as of sprint 160.
-    // Adding a tool: append a line to HANDLERS and bump this number.
+fn documented_tool_names_match_emitted_tool_definitions() {
+    let documented: BTreeSet<_> = documented_tool_names().into_iter().collect();
+    let emitted: BTreeSet<String> = get_tool_definitions()
+        .as_array()
+        .expect("tool definitions array")
+        .iter()
+        .map(|def| {
+            def.pointer("/function/name")
+                .and_then(Value::as_str)
+                .expect("tool definition name")
+                .to_string()
+        })
+        .collect();
+    let emitted_refs: BTreeSet<_> = emitted.iter().map(String::as_str).collect();
+
     assert_eq!(
-        DOCUMENTED_TOOL_NAMES.len(),
-        34,
+        documented, emitted_refs,
+        "documented tool names must exactly match get_tool_definitions()"
+    );
+}
+
+#[test]
+fn registry_documented_tool_count_is_current() {
+    // PINS CATALOG SIZE: 36 with the browser feature, 35 without it.
+    // Adding a tool: append a line to HANDLERS and bump this number.
+    let expected = if cfg!(feature = "browser") { 36 } else { 35 };
+    assert_eq!(
+        documented_tool_names().len(),
+        expected,
         "DOCUMENTED_TOOL_NAMES MUST match HANDLERS catalog"
     );
 }
 
 #[test]
 fn every_documented_name_is_unique_in_list() {
-    let mut sorted: Vec<&str> = DOCUMENTED_TOOL_NAMES.to_vec();
+    let mut sorted = documented_tool_names();
     let n = sorted.len();
     sorted.sort_unstable();
     sorted.dedup();
@@ -105,7 +141,7 @@ fn every_documented_name_is_unique_in_list() {
 #[test]
 fn every_handler_name_matches_its_definition_function_name() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         // handler.name() and definition()["function"]["name"]
         // MUST agree (otherwise the model sees a different
@@ -124,7 +160,7 @@ fn every_handler_name_matches_its_definition_function_name() {
 #[test]
 fn every_handler_definition_is_a_function_envelope() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         assert_eq!(def["type"], "function", "{name} MUST be type=function");
@@ -146,7 +182,7 @@ fn every_handler_definition_is_a_function_envelope() {
 #[test]
 fn every_handler_parameters_type_is_object() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         assert_eq!(
@@ -159,7 +195,7 @@ fn every_handler_parameters_type_is_object() {
 #[test]
 fn every_handler_required_fields_are_in_properties() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         let Some(required) = def["function"]["parameters"]["required"].as_array() else {
@@ -193,7 +229,7 @@ fn exactly_5_handlers_declare_permission_target() {
     // AND in src/tools/registry.rs's permission_target impl.
     let reg = registry();
     let mut with_target: Vec<&str> = Vec::new();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         if handler.permission_target().is_some() {
             with_target.push(name);
@@ -275,7 +311,7 @@ fn every_documented_tool_dispatches_to_some_result() {
         task_mgr: None,
     };
     let empty_args: HashMap<String, Value> = HashMap::new();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let outcome = reg.dispatch(name, &empty_args, &mut ctx);
         assert!(
             outcome.is_some(),
@@ -291,7 +327,7 @@ fn every_documented_tool_dispatches_to_some_result() {
 #[test]
 fn every_handler_description_is_non_empty() {
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         let desc = def["function"]["description"].as_str().expect("string");
@@ -304,7 +340,7 @@ fn no_handler_description_exceeds_2000_bytes() {
     // PINS COMPACTNESS: tool descriptions are inlined into the
     // model's prompt — over-long ones bloat context.
     let reg = registry();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         let desc = def["function"]["description"].as_str().expect("string");
@@ -324,7 +360,7 @@ fn no_handler_description_exceeds_2000_bytes() {
 fn no_two_handlers_share_the_same_definition_name() {
     let reg = registry();
     let mut seen: HashMap<String, &str> = HashMap::new();
-    for name in DOCUMENTED_TOOL_NAMES {
+    for name in documented_tool_names() {
         let handler = reg.get(name).expect(name);
         let def = handler.definition();
         let def_name = def["function"]["name"]
