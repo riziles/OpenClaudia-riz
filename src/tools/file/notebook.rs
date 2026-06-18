@@ -253,6 +253,12 @@ fn preflight_and_open(raw_path: &str) -> Result<NotebookHandle, ToolFailure> {
             )
         })?;
 
+    super::require_fresh_file_observation_if_ledger_active(
+        Path::new(&canonical_path),
+        "editing it",
+    )
+    .map_err(|msg| (msg, true))?;
+
     crate::guardrails::check_file_access(&canonical_path).map_err(|msg| (msg, true))?;
 
     // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path. All
@@ -782,6 +788,39 @@ mod tests {
             msg2.contains("must read") || msg2.contains("Use read_file"),
             "{msg2}"
         );
+    }
+
+    #[test]
+    fn active_ledger_notebook_edit_requires_fresh_file_read_observation() {
+        let _lock = super::super::shared_tracker_lock();
+        READ_TRACKER.clear_all();
+        let _session_guard = crate::tools::SessionIdGuard::set("notebook-ledger-read-required");
+        let ledger =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ledger::RealityLedger::new()));
+        let _ledger_guard = crate::ledger::install_active_ledger_for_session(
+            "notebook-ledger-read-required",
+            ledger,
+        );
+        let nb = make_notebook(&json!([
+            {"id": "cell-a", "cell_type": "code", "source": "old", "metadata": {}, "outputs": [], "execution_count": null}
+        ]));
+        let (_f, path) = tmp_notebook(&nb);
+
+        let args = args_replace_by_id(&path, "cell-a", "new");
+        let (msg, is_err) = execute_notebook_edit(&args);
+
+        assert!(is_err, "notebook edit without ledger read must fail: {msg}");
+        assert!(
+            msg.contains("active reality ledger has no fresh file read observation"),
+            "{msg}"
+        );
+        let cells = read_cells(&path);
+        let src: String = match &cells[0]["source"] {
+            Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+            Value::String(s) => s.clone(),
+            _ => panic!("unexpected source type"),
+        };
+        assert_eq!(src, "old");
     }
 
     #[test]
