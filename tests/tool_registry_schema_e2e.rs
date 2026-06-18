@@ -494,6 +494,23 @@ fn read_file_window_schema_advertises_positive_bounds() {
 }
 
 #[test]
+fn grep_context_schema_advertises_non_negative_bound() {
+    let def = registry()
+        .get("grep")
+        .expect("grep registered")
+        .definition();
+    let context_schema = def
+        .pointer("/function/parameters/properties/context_lines")
+        .expect("grep context_lines schema");
+
+    assert_eq!(
+        context_schema.get("minimum").and_then(Value::as_u64),
+        Some(0),
+        "grep context_lines schema must advertise the enforced non-negative lower bound"
+    );
+}
+
+#[test]
 fn file_tool_path_descriptions_match_relative_path_support() {
     for (tool_name, path_property) in [
         ("read_file", "path"),

@@ -19,7 +19,6 @@
 //! | [`ToolArgs::arg_str_opt`]            | optional string, no error                 |
 //! | [`ToolArgs::arg_str_or`]             | string with default                       |
 //! | [`ToolArgs::arg_bool_or`]            | bool with default                         |
-//! | [`ToolArgs::arg_u64_or`]             | u64 with default (unsigned integers)      |
 //! | [`ToolArgs::arg_array`]              | optional JSON array borrow                |
 //!
 //! `ToolArgError`'s `Display` produces the canonical phrasing
@@ -275,10 +274,6 @@ pub trait ToolArgs {
     /// (`run_in_background`), worktree (`apply_changes`).
     fn arg_bool_or(&self, key: &str, default: bool) -> bool;
 
-    /// Unsigned-integer argument with a fallback default. Used by web
-    /// (`limit`), LSP (`line`, `character`), notebook (`cell_number`).
-    fn arg_u64_or(&self, key: &str, default: u64) -> u64;
-
     /// Optional JSON-array borrow. Drop-in replacement for
     /// `args.get(k).and_then(|v| v.as_array())`.
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
@@ -304,10 +299,6 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
         self.get(key).and_then(Value::as_bool).unwrap_or(default)
     }
 
-    fn arg_u64_or(&self, key: &str, default: u64) -> u64 {
-        self.get(key).and_then(Value::as_u64).unwrap_or(default)
-    }
-
     #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     fn arg_array(&self, key: &str) -> Option<&Vec<Value>> {
         self.get(key).and_then(Value::as_array)
@@ -324,7 +315,6 @@ mod tests {
         m.insert("name".into(), json!("alice"));
         m.insert("enabled".into(), json!(true));
         m.insert("count".into(), json!(7));
-        m.insert("negative".into(), json!(-3));
         m.insert("items".into(), json!(["a", "b"]));
         m.insert("number_as_string".into(), json!("12"));
         m.insert("null_value".into(), Value::Null);
@@ -435,27 +425,6 @@ mod tests {
         // A string "true" is NOT coerced — match prior `as_bool` behaviour.
         let m = make();
         assert!(!m.arg_bool_or("name", false));
-    }
-
-    // ── arg_u64_or ──────────────────────────────────────────────────────
-
-    #[test]
-    fn arg_u64_or_returns_value_when_present_and_unsigned() {
-        let m = make();
-        assert_eq!(m.arg_u64_or("count", 0), 7);
-    }
-
-    #[test]
-    fn arg_u64_or_returns_default_for_negative_value() {
-        // A negative i64 is NOT a valid u64; must fall through to default.
-        let m = make();
-        assert_eq!(m.arg_u64_or("negative", 999), 999);
-    }
-
-    #[test]
-    fn arg_u64_or_returns_default_when_missing() {
-        let m = make();
-        assert_eq!(m.arg_u64_or("absent", 5), 5);
     }
 
     // ── arg_array ───────────────────────────────────────────────────────

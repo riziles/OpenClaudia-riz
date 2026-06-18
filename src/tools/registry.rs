@@ -581,6 +581,7 @@ impl ToolHandler for GrepHandler {
                         },
                         "context_lines": {
                             "type": "integer",
+                            "minimum": 0,
                             "description": "Number of ±N context lines to include around each match (default 0)."
                         },
                         "case_insensitive": {

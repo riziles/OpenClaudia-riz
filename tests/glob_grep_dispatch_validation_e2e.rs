@@ -264,7 +264,7 @@ fn grep_path_with_parent_dir_traversal_rejected() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section H — context_lines coercion
+// Section H — context_lines validation
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -282,7 +282,7 @@ fn grep_context_lines_above_u64_max_no_panic() {
 }
 
 #[test]
-fn grep_negative_context_lines_defaults_to_zero() {
+fn grep_negative_context_lines_returns_validation_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("ctx2.txt"), "match\n").expect("write");
 
@@ -291,8 +291,12 @@ fn grep_negative_context_lines_defaults_to_zero() {
         ("path", json!(dir.path().to_str().unwrap())),
         ("context_lines", json!(-1)),
     ]);
-    let (_text, _is_err) = dispatch("grep", &args);
-    // arg_u64_or(-1) → None → default 0 → no panic.
+    let (text, is_err) = dispatch("grep", &args);
+    assert!(is_err);
+    assert!(
+        text.contains("context_lines") && text.contains("non-negative"),
+        "negative context_lines must fail clearly; got {text:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

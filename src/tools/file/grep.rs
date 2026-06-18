@@ -10,7 +10,7 @@
 //! ────
 //! * `pattern` (required): regex string. Compiled with the `regex` crate.
 //! * `path` (optional, default `.`): root directory to search.
-//! * `context_lines` (optional, default `0`): integer ±N context window.
+//! * `context_lines` (optional, default `0`): non-negative integer ±N context window.
 //! * `case_insensitive` (optional, default `false`): toggles `(?i)`.
 //!
 //! Output is `file:line:match` for every match, with optional
@@ -62,7 +62,10 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    let context: usize = usize::try_from(args.arg_u64_or("context_lines", 0)).unwrap_or(0);
+    let context = match parse_context_lines_arg(args.get("context_lines")) {
+        Ok(context) => context,
+        Err(msg) => return (msg, true),
+    };
     let case_insensitive = args.arg_bool_or("case_insensitive", false);
 
     let effective_pattern = if case_insensitive {
@@ -143,6 +146,16 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         format!("{header}\n{body}")
     };
     (out, false)
+}
+
+fn parse_context_lines_arg(value: Option<&Value>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Some(context) = value.as_u64() else {
+        return Err("Error: context_lines must be a non-negative integer".to_string());
+    };
+    Ok(usize::try_from(context).unwrap_or(usize::MAX))
 }
 
 struct Hit {
