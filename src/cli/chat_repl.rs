@@ -1206,10 +1206,7 @@ impl ChatRepl {
 
     fn record_failed_turn(&mut self, reason: &str) {
         session::append_failed_turn_message(&mut self.chat_session.messages, reason);
-        self.chat_session.touch();
-        if let Err(e) = save_chat_session(&self.chat_session) {
-            tracing::warn!("Failed to save failed turn marker: {}", e);
-        }
+        persist_chat_session_update(&mut self.chat_session, "failed turn marker");
     }
 
     /// Extract file extensions from recent messages and inject combined
@@ -1625,17 +1622,18 @@ impl ChatRepl {
             if !self.final_response_allowed(full_content.trim(), false) {
                 return;
             }
-            self.chat_session.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": full_content.trim()
-            }));
-            self.chat_session.touch();
-            if let Err(e) = save_chat_session(&self.chat_session) {
-                tracing::warn!("Failed to save session: {}", e);
-            }
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": full_content.trim()
+                }),
+                "gemini final assistant response",
+            );
         }
 
         if let Some(ref engine) = self.vdd_engine {
+            let before_len = self.chat_session.messages.len();
             run_vdd_review(
                 engine,
                 full_content,
@@ -1644,6 +1642,9 @@ impl ChatRepl {
                 self.api_key.as_ref(),
             )
             .await;
+            if self.chat_session.messages.len() != before_len {
+                persist_chat_session_update(&mut self.chat_session, "gemini VDD context injection");
+            }
         }
 
         let tokens = estimate_session_tokens(&self.chat_session) + full_content.len() / 4;
@@ -1715,11 +1716,15 @@ impl ChatRepl {
                 })
             })
             .collect();
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": serde_json::Value::String(full_content.to_string()),
-            "tool_calls": tool_calls_json
-        }));
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            serde_json::json!({
+                "role": "assistant",
+                "content": serde_json::Value::String(full_content.to_string()),
+                "tool_calls": tool_calls_json
+            }),
+            "gemini tool-call assistant turn",
+        );
     }
 
     /// Execute each tool call from a Gemini turn and produce the
@@ -1771,12 +1776,7 @@ impl ChatRepl {
             "\n\x1b[33m⚠ Blocked in plan mode: {}\x1b[0m",
             tool_call.function.name
         );
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": format!("[ERROR] {}", block_msg),
-            "is_error": true
-        }));
+        self.push_tool_result_message(&tool_call.id, &block_msg, true);
         Some(serde_json::json!({
             "functionResponse": {
                 "name": tool_call.function.name,
@@ -1893,12 +1893,16 @@ impl ChatRepl {
         } else {
             final_content
         };
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": result.tool_call_id,
-            "content": result_content,
-            "is_error": final_is_error
-        }));
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": result.tool_call_id,
+                "content": result_content,
+                "is_error": final_is_error
+            }),
+            "gemini tool result",
+        );
         response
     }
 
@@ -2143,6 +2147,7 @@ impl ChatRepl {
                 println!();
                 return;
             }
+            let before_len = self.chat_session.messages.len();
             run_vdd_review(
                 engine,
                 &final_content,
@@ -2151,6 +2156,12 @@ impl ChatRepl {
                 self.api_key.as_ref(),
             )
             .await;
+            if self.chat_session.messages.len() != before_len {
+                persist_chat_session_update(
+                    &mut self.chat_session,
+                    "anthropic VDD context injection",
+                );
+            }
         }
         println!();
     }
@@ -2440,10 +2451,14 @@ impl ChatRepl {
             if !self.final_response_allowed(full_content.trim(), false) {
                 return String::new();
             }
-            self.chat_session.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": full_content.trim()
-            }));
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": full_content.trim()
+                }),
+                "anthropic final assistant response",
+            );
         }
         full_content
     }
@@ -2468,11 +2483,15 @@ impl ChatRepl {
             executed_tool_sigs.insert(tool_call_signature(tc));
         }
 
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": serde_json::Value::String(text),
-            "tool_calls": tool_calls_json
-        }));
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            serde_json::json!({
+                "role": "assistant",
+                "content": serde_json::Value::String(text),
+                "tool_calls": tool_calls_json
+            }),
+            "anthropic tool-call assistant turn",
+        );
         Some(tool_calls)
     }
 
@@ -2563,12 +2582,7 @@ impl ChatRepl {
             "\n\x1b[33m⚠ Blocked in plan mode: {}\x1b[0m",
             tool_call.function.name
         );
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": format!("[ERROR] {}", block_msg),
-            "is_error": true
-        }));
+        self.push_tool_result_message(&tool_call.id, &block_msg, true);
         true
     }
 
@@ -2596,12 +2610,7 @@ impl ChatRepl {
         };
         match result {
             ToolPermissionResult::Denied(msg) => {
-                self.chat_session.messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": format!("[ERROR] {}", msg),
-                    "is_error": true
-                }));
+                self.push_tool_result_message(&tool_call.id, &msg, true);
                 None
             }
             ToolPermissionResult::Allowed { checked } => Some(checked),
@@ -2657,12 +2666,16 @@ impl ChatRepl {
         } else {
             final_content.to_string()
         };
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": result_content,
-            "is_error": final_is_error
-        }));
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result_content,
+                "is_error": final_is_error
+            }),
+            "tool result",
+        );
     }
 
     /// Build the next Anthropic follow-up request body reusing the
@@ -2836,10 +2849,14 @@ impl ChatRepl {
             if !self.final_response_allowed(full_content.trim(), false) {
                 return String::new();
             }
-            self.chat_session.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": full_content.trim()
-            }));
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": full_content.trim()
+                }),
+                "anthropic XML final assistant response",
+            );
         }
         full_content
     }
@@ -2878,10 +2895,14 @@ impl ChatRepl {
     fn push_xml_assistant_text(&mut self, text_parts: &[String]) {
         let combined_text = text_parts.join("\n\n");
         if !combined_text.is_empty() {
-            self.chat_session.messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": combined_text
-            }));
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": combined_text
+                }),
+                "anthropic XML assistant text",
+            );
         }
     }
 
@@ -2905,10 +2926,14 @@ impl ChatRepl {
                     check_plan_mode_restriction(&self.chat_session, &tool.name, &args_json)
                 {
                     println!("\n\x1b[33m⚠ Blocked in plan mode: {}\x1b[0m", tool.name);
-                    self.chat_session.messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!("[ERROR] {}", block_msg)
-                    }));
+                    push_chat_session_message_and_persist(
+                        &mut self.chat_session,
+                        serde_json::json!({
+                            "role": "user",
+                            "content": format!("[ERROR] {}", block_msg)
+                        }),
+                        "anthropic XML plan-mode block",
+                    );
                     false
                 } else {
                     true
@@ -2932,10 +2957,14 @@ impl ChatRepl {
             Some(&self.chat_session.id),
         );
         let results_xml = tool_intercept::format_execution_results_xml(&results);
-        self.chat_session.messages.push(serde_json::json!({
-            "role": "user",
-            "content": results_xml
-        }));
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            serde_json::json!({
+                "role": "user",
+                "content": results_xml
+            }),
+            "anthropic XML tool results",
+        );
         println!(
             "\n\x1b[90m(Sending {} tool result{} to Claude...)\x1b[0m",
             results.len(),
@@ -3146,7 +3175,11 @@ impl ChatRepl {
             "tool_calls": tool_calls_json
         });
         attach_reasoning_content(&mut message, reasoning_content);
-        self.chat_session.messages.push(message);
+        push_chat_session_message_and_persist(
+            &mut self.chat_session,
+            message,
+            "openai tool-call assistant turn",
+        );
     }
 
     /// Execute every tool from one `OpenAI` iteration, run quality
@@ -3187,17 +3220,14 @@ impl ChatRepl {
                 "content": current_content
             });
             attach_reasoning_content(&mut message, reasoning_content);
-            self.chat_session.messages.push(message);
-            self.chat_session.touch();
-            if let Err(e) = save_chat_session(&self.chat_session) {
-                tracing::warn!("Failed to save session: {}", e);
-            }
+            push_chat_session_message_and_persist(
+                &mut self.chat_session,
+                message,
+                "openai final assistant response",
+            );
             true
         } else if iteration > 0 {
-            self.chat_session.touch();
-            if let Err(e) = save_chat_session(&self.chat_session) {
-                tracing::warn!("Failed to save session: {}", e);
-            }
+            persist_chat_session_update(&mut self.chat_session, "openai tool loop");
             true
         } else if current_content.is_empty()
             && reasoning_content.is_empty()
@@ -3221,6 +3251,7 @@ impl ChatRepl {
         if current_content.trim().is_empty() {
             return;
         }
+        let before_len = self.chat_session.messages.len();
         run_vdd_review(
             engine,
             current_content,
@@ -3229,6 +3260,9 @@ impl ChatRepl {
             self.api_key.as_ref(),
         )
         .await;
+        if self.chat_session.messages.len() != before_len {
+            persist_chat_session_update(&mut self.chat_session, "openai VDD context injection");
+        }
     }
 
     /// Build the OpenAI-compatible follow-up request body (handles both
@@ -3475,6 +3509,7 @@ impl ChatRepl {
     fn run_quality_gates_and_inject(&mut self) {
         let qg_results = guardrails::run_quality_gates();
         self.record_quality_gate_verifications(&qg_results);
+        let mut injected_failure = false;
         for qg in &qg_results {
             if qg.passed {
                 tracing::debug!(name = %qg.name, "Quality gate passed");
@@ -3498,6 +3533,10 @@ impl ChatRepl {
                     if qg.stderr.len() > 500 { safe_truncate(&qg.stderr, 500) } else { &qg.stderr }
                 )
             }));
+            injected_failure = true;
+        }
+        if injected_failure {
+            persist_chat_session_update(&mut self.chat_session, "quality gate injection");
         }
     }
 
@@ -3633,6 +3672,26 @@ fn attach_reasoning_content(message: &mut serde_json::Value, reasoning_content: 
     if !reasoning_content.is_empty() {
         message["reasoning_content"] = serde_json::Value::String(reasoning_content.to_string());
     }
+}
+
+fn persist_chat_session_update(session: &mut ChatSession, reason: &str) {
+    session.touch();
+    if let Err(e) = save_chat_session(session) {
+        tracing::warn!(
+            save_reason = reason,
+            "Failed to save session after transcript update: {}",
+            e
+        );
+    }
+}
+
+fn push_chat_session_message_and_persist(
+    session: &mut ChatSession,
+    message: serde_json::Value,
+    reason: &str,
+) {
+    session.messages.push(message);
+    persist_chat_session_update(session, reason);
 }
 
 fn parse_tool_args(func: &tools::FunctionCall) -> Result<serde_json::Value, String> {
@@ -3899,6 +3958,40 @@ fn new_rustyline_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test module serializes environment mutation with
+            // ENV_LOCK and restores the original value in Drop.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see EnvGuard::set_path.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn active_provider_for_turn_returns_configured_provider() {
@@ -4370,6 +4463,35 @@ providers: {}
         ChatRepl::handle_stream_timeout(&content);
 
         assert_eq!(content, "partial provider text");
+    }
+
+    #[test]
+    fn transcript_persist_helper_writes_reloadable_session_file() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvGuard::set_path("XDG_DATA_HOME", tmp.path());
+        let mut session = ChatSession::new(
+            "claude-sonnet",
+            "anthropic",
+            openclaudia::modes::BehaviorMode::default(),
+        );
+        let id = session.id.clone();
+
+        push_chat_session_message_and_persist(
+            &mut session,
+            serde_json::json!({
+                "role": "assistant",
+                "content": "partial provider text"
+            }),
+            "test transcript persistence",
+        );
+
+        let loaded = load_chat_session(&id)
+            .expect("session load must not fail")
+            .expect("session file must exist");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0]["role"], "assistant");
+        assert_eq!(loaded.messages[0]["content"], "partial provider text");
     }
 
     /// Regression guard for the Vim toggle panic path: editor construction is
