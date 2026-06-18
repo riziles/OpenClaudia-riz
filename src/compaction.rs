@@ -19,6 +19,8 @@ const CLAUDE_1M_CONTEXT: usize = 1_000_000;
 const CLAUDE_OPUS_CONTEXT: usize = 200_000;
 const CLAUDE_SONNET_CONTEXT: usize = 200_000;
 const CLAUDE_HAIKU_CONTEXT: usize = 200_000;
+const GPT5_LONG_CONTEXT: usize = 1_000_000;
+const GPT5_PRO_LONG_CONTEXT: usize = 1_050_000;
 const GPT5_CONTEXT: usize = 400_000;
 const GPT4_CONTEXT: usize = 128_000;
 const GPT4O_CONTEXT: usize = 128_000;
@@ -344,6 +346,30 @@ const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
     // OpenAI GPT family — gpt-4.1 / gpt-4o must precede bare gpt-4
     // because `"gpt-4o".contains("gpt-4")` would otherwise win
     // accidentally. The 4.1 / 4o / 4 ordering is the contract.
+    ContextWindowRow {
+        needle: "gpt-5.5-pro",
+        tokens: GPT5_PRO_LONG_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-5.5",
+        tokens: GPT5_LONG_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-5.4-pro",
+        tokens: GPT5_PRO_LONG_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-5.4-mini",
+        tokens: GPT5_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-5.4-nano",
+        tokens: GPT5_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "gpt-5.4",
+        tokens: GPT5_LONG_CONTEXT,
+    },
     ContextWindowRow {
         needle: "gpt-5",
         tokens: GPT5_CONTEXT,
@@ -2390,6 +2416,12 @@ mod tests {
     fn b3_context_window_gpt41_and_gpt5() {
         assert_eq!(get_context_window("gpt-4.1"), GPT41_CONTEXT);
         assert_eq!(get_context_window("gpt-4.1-mini"), GPT41_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.5-pro"), GPT5_PRO_LONG_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.5"), GPT5_LONG_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.4-pro"), GPT5_PRO_LONG_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.4"), GPT5_LONG_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.4-mini"), GPT5_CONTEXT);
+        assert_eq!(get_context_window("gpt-5.4-nano"), GPT5_CONTEXT);
         assert_eq!(get_context_window("gpt-5"), GPT5_CONTEXT);
     }
 

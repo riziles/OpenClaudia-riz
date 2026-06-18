@@ -1,7 +1,8 @@
 //! End-to-end tests for `compaction::get_context_window` —
 //! exact per-model constants pinned (current Claude long-context
-//! models at 1M, older Claude family at 200k, GPT-4o at 128k,
-//! GPT-4.1 at 1M, GPT-5 at 400k, Gemini Pro at 1M),
+//! models at 1M, older Claude family at 200k, GPT-5.5/5.4 at
+//! 1M/1.05M, GPT-4o at 128k, GPT-4.1 at 1M, GPT-5 at 400k,
+//! Gemini Pro at 1M),
 //! the substring-precedence rule (gpt-4o matches
 //! BEFORE generic gpt-4), the unknown-model fallback, and
 //! case-insensitivity.
@@ -65,6 +66,24 @@ fn bare_claude_falls_through_to_claude_generic_200k() {
 // ───────────────────────────────────────────────────────────────────────────
 // Section B — GPT family + substring precedence (#DOC)
 // ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn current_gpt_5_5_and_5_4_long_context_models_return_documented_windows() {
+    assert_eq!(get_context_window("gpt-5.5-pro"), 1_050_000);
+    assert_eq!(get_context_window("gpt-5.5"), 1_000_000);
+    assert_eq!(get_context_window("gpt-5.5-2026-04-23"), 1_000_000);
+    assert_eq!(get_context_window("gpt-5.4-pro"), 1_050_000);
+    assert_eq!(get_context_window("gpt-5.4"), 1_000_000);
+    assert_eq!(get_context_window("gpt-5.4-2026-03-05"), 1_000_000);
+}
+
+#[test]
+fn current_gpt_5_4_small_models_remain_400k() {
+    assert_eq!(get_context_window("gpt-5.4-mini"), 400_000);
+    assert_eq!(get_context_window("gpt-5.4-mini-2026-03-17"), 400_000);
+    assert_eq!(get_context_window("gpt-5.4-nano"), 400_000);
+    assert_eq!(get_context_window("gpt-5.4-nano-2026-03-17"), 400_000);
+}
 
 #[test]
 fn gpt_5_returns_400k() {
@@ -220,13 +239,17 @@ fn every_documented_model_returns_at_least_16k_tokens() {
 }
 
 #[test]
-fn every_documented_model_returns_at_most_1m_tokens() {
-    // PINS UPPER BOUND: largest documented is 1M (GPT-4.1
-    // and Gemini Pro). No table entry exceeds this.
+fn every_documented_model_returns_at_most_1_05m_tokens() {
+    // PINS UPPER BOUND: largest documented text window here is
+    // 1.05M for GPT-5.5 Pro / GPT-5.4 Pro.
     let models = [
         "claude-opus",
         "claude-sonnet",
         "claude-haiku",
+        "gpt-5.5-pro",
+        "gpt-5.5",
+        "gpt-5.4-pro",
+        "gpt-5.4",
         "gpt-5",
         "gpt-4.1",
         "gpt-4o",
@@ -236,7 +259,7 @@ fn every_documented_model_returns_at_most_1m_tokens() {
     ];
     for m in models {
         let cw = get_context_window(m);
-        assert!(cw <= 1_000_000, "{m}: context {cw} MUST NOT exceed 1M");
+        assert!(cw <= 1_050_000, "{m}: context {cw} MUST NOT exceed 1.05M");
     }
 }
 
