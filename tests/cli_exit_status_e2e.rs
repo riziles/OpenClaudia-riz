@@ -1270,6 +1270,10 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         "README default-TUI slash docs must advertise the implemented provider switch command"
     );
     assert!(
+        readme.contains("| `/model <name>` | Switch to a different model |"),
+        "README default-TUI slash docs must advertise the implemented model switch command"
+    );
+    assert!(
         readme.contains("The `keybindings:` config map customizes the legacy line-oriented REPL"),
         "README must explain that configurable keybindings apply to the legacy REPL"
     );
@@ -1286,7 +1290,6 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
     for stale_tui_claim in [
         "| `/connect`, `/auth` | Configure API keys |",
         "| `/config path` | Show config file locations |",
-        "| `/model <name>` | Switch to different model mid-session |",
         "| `/continue <n>`, `/load <n>`, `/resume <n>` | Load session by number |",
     ] {
         assert!(

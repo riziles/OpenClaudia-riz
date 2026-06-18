@@ -343,6 +343,10 @@ mod tests {
             "rendered overlay missing a representative TUI command"
         );
         assert!(
+            rendered.contains("/model <name>"),
+            "rendered overlay missing the default-TUI model switch command"
+        );
+        assert!(
             !rendered.contains("/connect"),
             "rendered overlay must not advertise legacy REPL-only commands"
         );

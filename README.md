@@ -232,6 +232,9 @@ The default full-screen TUI intentionally exposes a focused slash-command set. T
 | `/exit`, `/quit` | Exit the TUI |
 | `/status` | Show model, provider, effort, and token estimate |
 | `/provider [name]` | Show or switch provider |
+| `/model` | Show current model and provider |
+| `/model list`, `/models` | List fallback models for the current provider |
+| `/model <name>` | Switch to a different model |
 | `/mode` | Toggle between Build and Plan modes |
 | `/effort [low\|medium\|high\|max\|auto]` | Set or cycle effort level |
 

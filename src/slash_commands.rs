@@ -191,6 +191,9 @@ const TUI_CORE: &[SlashCommand] = &[
         "Show model, provider, effort, and token estimate",
     ),
     cmd("/provider [name]", "Show or switch provider"),
+    cmd("/model", "Show current model and provider"),
+    cmd("/model list, /models", "List fallback models"),
+    cmd("/model <name>", "Switch to a different model"),
     cmd("/mode", "Toggle between Build and Plan modes"),
     cmd(
         "/effort [low|medium|high|max|auto]",
@@ -268,8 +271,8 @@ pub const SLASH_SECTIONS: &[SlashSection] = &[
 /// Slash commands implemented by the default full-screen TUI.
 ///
 /// This table intentionally excludes legacy REPL-only commands such as
-/// `/connect`, `/model`, `/config path`, `/login`, `/plugin`, and the
-/// management-overlay stubs until `tui::app::App` implements them.
+/// `/connect`, `/config path`, `/login`, `/plugin`, and the management-overlay
+/// stubs until `tui::app::App` implements them.
 pub const TUI_SLASH_SECTIONS: &[SlashSection] = &[
     SlashSection {
         title: "TUI Slash Commands",
@@ -383,7 +386,6 @@ mod tests {
         let invocations: Vec<&str> = all_tui_commands().map(|c| c.invocation).collect();
         for legacy_only in [
             "/connect",
-            "/model",
             "/config path",
             "/login",
             "/plugin",
@@ -399,6 +401,8 @@ mod tests {
         for tui_command in [
             "/help, ?",
             "/provider [name]",
+            "/model",
+            "/model <name>",
             "/load <id>",
             "/doctor",
             "/skill, /skills",

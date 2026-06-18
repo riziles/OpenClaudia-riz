@@ -2221,6 +2221,70 @@ impl App {
         true
     }
 
+    fn handle_slash_model(&mut self, text: &str) -> bool {
+        if text != "/model" && text != "/models" && !text.starts_with("/model ") {
+            return false;
+        }
+
+        let args = if text == "/models" {
+            "list"
+        } else {
+            text.strip_prefix("/model").unwrap_or("").trim()
+        };
+
+        if args.is_empty() {
+            self.messages.add(DisplayMessage::system(format!(
+                "Model: {}\nProvider: {}\nUse /model list to see fallback models, /model <name> to switch.",
+                self.model, self.provider
+            )));
+            return true;
+        }
+
+        if args.eq_ignore_ascii_case("list") {
+            let models = crate::providers::static_models_for_provider(&self.provider);
+            let body = models
+                .iter()
+                .map(|model| {
+                    let marker = if *model == self.model {
+                        " <- current"
+                    } else {
+                        ""
+                    };
+                    format!("  {model}{marker}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.messages.add(DisplayMessage::system(format!(
+                "Available models for {}:\n{body}\n\nUse /model <name> to switch. Model names are not limited to this fallback list.",
+                self.provider
+            )));
+            return true;
+        }
+
+        if self.is_waiting {
+            self.messages.add(DisplayMessage::error(
+                "Cannot switch model while a response is in flight.",
+            ));
+            return true;
+        }
+
+        let model = if args.eq_ignore_ascii_case("default") {
+            crate::providers::default_model_for_target(&self.provider).to_string()
+        } else {
+            args.to_string()
+        };
+        self.model = model;
+        self.chat_session.model.clone_from(&self.model);
+        self.chat_session.touch();
+        let _ = save_session(&self.chat_session);
+        self.persist_transcript_tail();
+        self.messages.add(DisplayMessage::system(format!(
+            "Model switched to {}",
+            self.model
+        )));
+        true
+    }
+
     /// Handle the `/cost` slash command.
     fn handle_slash_cost(&mut self) {
         let tokens = self.chat_session.estimate_tokens();
@@ -2350,6 +2414,9 @@ impl App {
     /// Handle diagnostic/info slash commands. Returns true if handled.
     fn handle_diagnostic_slash(&mut self, text: &str) -> bool {
         if self.handle_slash_provider(text) {
+            return true;
+        }
+        if self.handle_slash_model(text) {
             return true;
         }
         if text == "/cost" {
@@ -3644,6 +3711,97 @@ mod tests {
         // Sanity: model/provider stay on App (not migrated into ApiClient).
         assert_eq!(app.model, "test-model");
         assert_eq!(app.provider, "anthropic");
+    }
+
+    fn last_display_content(app: &App) -> &str {
+        app.messages
+            .messages
+            .last()
+            .expect("expected a display message")
+            .content
+            .as_str()
+    }
+
+    #[test]
+    fn tui_model_slash_reports_current_model() {
+        let mut app = App::new("claude-sonnet-4-6", "anthropic");
+
+        assert!(app.handle_slash_model("/model"));
+
+        let content = last_display_content(&app);
+        assert!(content.contains("claude-sonnet-4-6"));
+        assert!(content.contains("anthropic"));
+        assert!(content.contains("/model <name>"));
+    }
+
+    #[test]
+    fn tui_model_list_uses_static_provider_catalog() {
+        let mut app = App::new("claude-opus-4-7", "anthropic");
+
+        assert!(app.handle_slash_model("/model list"));
+
+        let content = last_display_content(&app);
+        assert!(content.contains("Available models for anthropic"));
+        assert!(content.contains("claude-opus-4-7 <- current"));
+        assert!(content.contains("not limited to this fallback list"));
+    }
+
+    #[test]
+    fn tui_model_list_accepts_extra_spaces_and_case() {
+        let mut app = App::new("claude-opus-4-7", "anthropic");
+
+        assert!(app.handle_slash_model("/model    LIST"));
+
+        let content = last_display_content(&app);
+        assert!(content.contains("Available models for anthropic"));
+        assert_eq!(app.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn tui_models_alias_lists_catalog() {
+        let mut app = App::new("MiniMax-M3", "minimax");
+
+        assert!(app.handle_slash_model("/models"));
+
+        let content = last_display_content(&app);
+        assert!(content.contains("Available models for minimax"));
+        assert!(content.contains("MiniMax-M3 <- current"));
+    }
+
+    #[test]
+    fn tui_model_slash_switches_to_arbitrary_model_id() {
+        let mut app = App::new("claude-sonnet-4-6", "anthropic");
+
+        assert!(app.handle_slash_model("/model claude-opus-4-99-future"));
+
+        assert_eq!(app.model, "claude-opus-4-99-future");
+        assert_eq!(app.chat_session.model, "claude-opus-4-99-future");
+        assert!(last_display_content(&app).contains("Model switched"));
+    }
+
+    #[test]
+    fn tui_model_default_uses_provider_default() {
+        let mut app = App::new("claude-sonnet-4-6", "anthropic");
+
+        assert!(app.handle_slash_model("/model default"));
+
+        assert_eq!(
+            app.model,
+            crate::providers::default_model_for_target("anthropic")
+        );
+        assert_eq!(app.chat_session.model, app.model);
+    }
+
+    #[test]
+    fn tui_model_slash_rejects_switch_while_waiting() {
+        let mut app = App::new("claude-sonnet-4-6", "anthropic");
+        app.is_waiting = true;
+
+        assert!(app.handle_slash_model("/model claude-opus-4-7"));
+
+        assert_eq!(app.model, "claude-sonnet-4-6");
+        assert_eq!(app.chat_session.model, "claude-sonnet-4-6");
+        assert!(last_display_content(&app).contains("in flight"));
     }
 
     fn skill_fixture(
