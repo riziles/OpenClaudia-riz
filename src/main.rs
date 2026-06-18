@@ -17,6 +17,7 @@ use openclaudia::{
     permissions::{CheckResult, PermissionManager, PermissionRule},
     plugins, prompt,
     proxy::normalize_base_url,
+    tools::safe_truncate,
     tui, vdd,
 };
 
@@ -894,7 +895,11 @@ fn maybe_resume_session(chat_session: &mut ChatSession, resume: bool, session_id
         sessions.into_iter().next()
     };
     if let Some(loaded) = target {
-        eprintln!("Resuming session: {} ({})", loaded.title, &loaded.id[..8]);
+        eprintln!(
+            "Resuming session: {} ({})",
+            loaded.title,
+            safe_truncate(&loaded.id, 8)
+        );
         *chat_session = loaded;
     } else {
         eprintln!("No session found to resume. Starting new session.");

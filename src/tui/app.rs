@@ -391,6 +391,10 @@ fn iso_of_systemtime(t: std::time::SystemTime) -> String {
 
 fn save_session(session: &TuiSession) -> Result<(), FileError> {
     let dir = sessions_dir();
+    validate_tui_session_id(&session.id).map_err(|reason| FileError::Invalid {
+        path: dir.clone(),
+        reason,
+    })?;
     file_error::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
     match file_error::write_json_pretty(&path, session) {
@@ -442,6 +446,31 @@ fn save_session_with_recovery(
     file_error::write_json_pretty(path, &salvaged)
 }
 
+fn validate_tui_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("TUI session id must not be empty".to_string());
+    }
+
+    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        Ok(())
+    } else {
+        Err(format!(
+            "TUI session id contains invalid characters: {id:?}"
+        ))
+    }
+}
+
+fn read_tui_session_file(path: &Path) -> Result<TuiSession, FileError> {
+    let json = file_error::read_file(path)?;
+    let session: TuiSession =
+        serde_json::from_str(&json).map_err(file_error::FileError::json_with_path(path))?;
+    validate_tui_session_id(&session.id).map_err(|reason| FileError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    })?;
+    Ok(session)
+}
+
 fn list_sessions() -> Vec<TuiSession> {
     let dir = sessions_dir();
     let mut sessions = Vec::new();
@@ -449,10 +478,13 @@ fn list_sessions() -> Vec<TuiSession> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
-                if let Ok(json) = std::fs::read_to_string(&path) {
-                    if let Ok(session) = serde_json::from_str::<TuiSession>(&json) {
-                        sessions.push(session);
-                    }
+                match read_tui_session_file(&path) {
+                    Ok(session) => sessions.push(session),
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Skipped unreadable TUI session"
+                    ),
                 }
             }
         }
@@ -1903,7 +1935,7 @@ impl App {
                     .map(|s| {
                         format!(
                             "  {} — {} ({})",
-                            &s.id[..8],
+                            crate::tools::safe_truncate(&s.id, 8),
                             s.title,
                             s.updated_at.format("%Y-%m-%d %H:%M")
                         )
@@ -2040,7 +2072,10 @@ impl App {
                 }
                 let _ = write!(md, "**{role}:**\n{content}\n\n");
             }
-            let export_path = format!("conversation-{}.md", &self.chat_session.id[..8]);
+            let export_path = format!(
+                "conversation-{}.md",
+                crate::tools::safe_truncate(&self.chat_session.id, 8)
+            );
             let path_for_render = export_path.clone();
             self.spawn_fs(SpawnTarget::Files, move || {
                 std::fs::write(&export_path, md.as_bytes())
@@ -3857,9 +3892,9 @@ mod tests {
     use super::{
         current_exe_command, format_api_retry_delay, format_api_retry_message,
         format_init_command_output, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, lookup_tui_slash, resolve_provider_switch_auth, save_session,
-        ApiClient, App, AppEvent, EffortLevel, ProviderSwitch, SpawnTarget, TuiSession,
-        TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, resolve_provider_switch_auth,
+        save_session, ApiClient, App, AppEvent, EffortLevel, ProviderSwitch, SpawnTarget,
+        TuiSession, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
     };
     use crate::slash_commands::all_tui_commands;
     use crate::tui::events::ApiRetryKind;
@@ -5082,6 +5117,50 @@ mod tests {
 
         assert_eq!(app.chat_session.id, "older-session");
         assert_eq!(app.model, "old-model");
+    }
+
+    #[test]
+    fn save_session_rejects_invalid_session_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
+
+        let mut session = TuiSession::new("model", "provider");
+        session.id = "../outside".to_string();
+
+        let err = save_session(&session).expect_err("path traversal id must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid file state")
+                && err.to_string().contains("invalid characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_skips_invalid_stored_session_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_dir = tmp.path().join("chat_sessions");
+        let _guard = SessionDirGuard::set(session_dir.clone());
+
+        let mut valid = TuiSession::new("valid-model", "provider");
+        valid.id = "abc".to_string();
+        valid.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        save_session(&valid).expect("short valid id should save");
+
+        let mut invalid = TuiSession::new("invalid-model", "provider");
+        invalid.id = "../outside".to_string();
+        std::fs::write(
+            session_dir.join("invalid.json"),
+            serde_json::to_string(&invalid).expect("serialize invalid fixture"),
+        )
+        .expect("write invalid fixture");
+
+        let sessions = list_sessions();
+
+        assert_eq!(sessions.len(), 1, "invalid stored session must be skipped");
+        assert_eq!(sessions[0].id, "abc");
     }
 
     #[test]

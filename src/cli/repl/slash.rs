@@ -1403,7 +1403,7 @@ pub fn slash_sessions() -> SlashCommandResult {
         for (i, session) in sessions.iter().take(10).enumerate() {
             let date = session.updated_at.format("%Y-%m-%d %H:%M");
             let msg_count = session.messages.len();
-            let id_prefix = &session.id[..8.min(session.id.len())];
+            let id_prefix = safe_truncate(&session.id, 8);
             println!(
                 "  {}. \x1b[36m{}\x1b[0m  \x1b[90m{} · {} · {} msgs\x1b[0m",
                 i + 1,

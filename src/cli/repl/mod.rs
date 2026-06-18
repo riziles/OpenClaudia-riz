@@ -275,8 +275,11 @@ fn chat_session_path(id: &str) -> anyhow::Result<PathBuf> {
 fn read_chat_session_file(path: &Path) -> anyhow::Result<ChatSession> {
     let json = fs::read_to_string(path)
         .with_context(|| format!("failed to read chat session {}", path.display()))?;
-    serde_json::from_str(&json)
-        .with_context(|| format!("failed to parse chat session {}", path.display()))
+    let session: ChatSession = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse chat session {}", path.display()))?;
+    validate_chat_session_id(&session.id)
+        .with_context(|| format!("invalid chat session id in {}", path.display()))?;
+    Ok(session)
 }
 
 /// Load a chat session by ID
@@ -291,9 +294,11 @@ pub fn load_chat_session(id: &str) -> anyhow::Result<Option<ChatSession>> {
         }
     };
 
-    serde_json::from_str(&json)
-        .map(Some)
-        .with_context(|| format!("failed to parse chat session {}", path.display()))
+    let session: ChatSession = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse chat session {}", path.display()))?;
+    validate_chat_session_id(&session.id)
+        .with_context(|| format!("invalid chat session id in {}", path.display()))?;
+    Ok(Some(session))
 }
 
 fn list_chat_sessions_in_dir(dir: &Path) -> ChatSessionList {
@@ -412,6 +417,22 @@ mod tests {
 
         assert!(
             err.to_string().contains("failed to parse chat session"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_chat_session_file_reports_invalid_stored_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("invalid-id.json");
+        let mut session = test_session();
+        session.id = "../outside".to_string();
+        fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
+
+        let err = read_chat_session_file(&path).expect_err("invalid stored id must be an error");
+
+        assert!(
+            err.to_string().contains("invalid chat session id"),
             "unexpected error: {err}"
         );
     }
