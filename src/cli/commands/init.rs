@@ -45,7 +45,7 @@ providers:
   openai:
     base_url: https://api.openai.com
     # api_key: ${OPENAI_API_KEY}
-  # Google Gemini - Models: gemini-3.5-flash, gemini-3.1-pro-preview
+  # Google Gemini - Models: gemini-3.5-flash, gemini-3.1-pro-preview-customtools
   google:
     base_url: https://generativelanguage.googleapis.com
     # api_key: ${GOOGLE_API_KEY}

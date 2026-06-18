@@ -1354,6 +1354,7 @@ fn init_template_marks_keybindings_as_legacy_repl_specific() {
         "claude-opus-4-7",
         "gpt-5.5",
         "gemini-3.5-flash",
+        "gemini-3.1-pro-preview-customtools",
         "MiniMax-M3",
     ] {
         assert!(

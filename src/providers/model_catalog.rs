@@ -91,6 +91,7 @@ pub const OPENAI_MODELS: &[&str] = &[
 pub const GOOGLE_MODELS: &[&str] = &[
     "gemini-3.5-flash",
     "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview-customtools",
     "gemini-3.1-flash-lite",
     "gemini-3-flash-preview",
     "gemini-2.5-pro",
@@ -239,6 +240,26 @@ mod tests {
             assert!(
                 models.contains(&model),
                 "OpenAI static catalog must include documented snapshot {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn google_catalog_includes_current_documented_chat_models() {
+        let models = static_models_for_provider("google");
+        for model in [
+            "gemini-3.5-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-pro-preview-customtools",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ] {
+            assert!(
+                models.contains(&model),
+                "Google static catalog must include documented chat model {model}"
             );
         }
     }

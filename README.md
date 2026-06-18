@@ -380,7 +380,7 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 - `chat-latest`, `gpt-4o-search-preview`, `gpt-4o-mini`, `gpt-4o-mini-search-preview`, `gpt-4o`, `gpt-4.5-preview`, `gpt-4-turbo`, `gpt-4-turbo-preview`, `gpt-4`, `gpt-3.5-turbo`, `codex-mini-latest` — Compatibility and deprecated chat models
 
 ### Google Gemini
-- `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview` — Gemini 3 family
+- `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-customtools`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview` — Gemini 3 family
 - `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` — Stable GA
 
 ### DeepSeek
