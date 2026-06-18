@@ -199,6 +199,7 @@ const CORE_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "web_fetch",
+    #[cfg(feature = "browser")]
     "web_search",
     "todo_write",
     "todo_read",
@@ -392,6 +393,14 @@ fn enter_plan_mode_description_names_allowed_tool_surface() {
 
 #[test]
 fn web_search_description_pins_free_browser_backends() {
+    if cfg!(not(feature = "browser")) {
+        assert!(
+            registry().get("web_search").is_none(),
+            "no-browser builds must not register web_search because the only supported backend is browser scraping"
+        );
+        return;
+    }
+
     let def = registry()
         .get("web_search")
         .expect("web_search registered")

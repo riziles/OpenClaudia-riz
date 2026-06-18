@@ -159,6 +159,11 @@ fn explore_agent_does_not_have_write_or_edit_tools() {
         !tools.contains(&"edit_file"),
         "Explore MUST NOT have edit_file; got {tools:?}"
     );
+    assert_eq!(
+        tools.contains(&"web_search"),
+        cfg!(feature = "browser"),
+        "Explore should only advertise web_search when browser-backed search is compiled"
+    );
 }
 
 #[test]
@@ -179,6 +184,11 @@ fn guide_agent_does_not_have_bash() {
     assert!(
         !tools.contains(&"bash"),
         "Guide MUST NOT have bash; got {tools:?}"
+    );
+    assert_eq!(
+        tools.contains(&"web_search"),
+        cfg!(feature = "browser"),
+        "Guide should only advertise web_search when browser-backed search is compiled"
     );
 }
 
@@ -207,6 +217,11 @@ fn general_purpose_has_read_and_write_tools() {
     assert!(tools.contains(&"edit_file"));
     assert!(tools.contains(&"bash"));
     assert!(tools.contains(&"kill_shells_for_agent"));
+    assert_eq!(
+        tools.contains(&"web_search"),
+        cfg!(feature = "browser"),
+        "GeneralPurpose should only advertise web_search when browser-backed search is compiled"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -366,7 +366,10 @@ fn readme_available_tools_match_registered_tool_names() {
 
     let extra_in_readme: Vec<_> = documented
         .difference(&registered)
-        .filter(|name| !(cfg!(not(feature = "browser")) && name.as_str() == "web_browser"))
+        .filter(|name| {
+            !(cfg!(not(feature = "browser"))
+                && matches!(name.as_str(), "web_browser" | "web_search"))
+        })
         .cloned()
         .collect();
     assert!(
@@ -420,9 +423,9 @@ fn readme_lsp_row_uses_registered_action_names() {
 #[test]
 fn web_tool_descriptions_match_browser_feature_set() {
     let fetch_description = registered_tool_description("web_fetch");
-    let search_description = registered_tool_description("web_search");
 
     if cfg!(feature = "browser") {
+        let search_description = registered_tool_description("web_search");
         assert!(
             fetch_description.contains("headless Chromium fallback")
                 && fetch_description.contains("JavaScript-rendered"),
@@ -439,9 +442,8 @@ fn web_tool_descriptions_match_browser_feature_set() {
             "no-browser web_fetch description must not imply browser fallback; got {fetch_description:?}"
         );
         assert!(
-            search_description.contains("cannot run until rebuilt")
-                && search_description.contains("default `browser` feature"),
-            "no-browser web_search description must explain that free browser search is unavailable; got {search_description:?}"
+            registry().get("web_search").is_none(),
+            "no-browser builds must not register web_search because browser-backed free search is unavailable"
         );
         assert!(
             !fetch_description.contains("headless Chromium fallback"),

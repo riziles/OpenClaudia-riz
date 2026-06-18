@@ -383,6 +383,7 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
 // CC: query < 2 chars → validateInput errorCode 1
 // ===========================================================================
 
+#[cfg(feature = "browser")]
 #[test]
 fn execute_web_search_short_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
@@ -409,6 +410,7 @@ fn execute_web_search_short_query_returns_error() {
     }
 }
 
+#[cfg(feature = "browser")]
 #[test]
 fn execute_web_search_missing_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};

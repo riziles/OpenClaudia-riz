@@ -946,7 +946,6 @@ mod tests {
             "grep",
             "crosslink",
             "web_fetch",
-            "web_search",
             "todo_write",
             "todo_read",
             "notebook_edit",
@@ -958,6 +957,12 @@ mod tests {
             "task_get",
             "task_list",
         ];
+        #[cfg(feature = "browser")]
+        let required = {
+            let mut required = required;
+            required.push("web_search");
+            required
+        };
         for name in &required {
             assert!(
                 tool_names.contains(name),

@@ -122,7 +122,7 @@ fn dispatch_tuple_message_non_empty_for_every_known_tool_with_empty_args() {
     // required fields, success on tools without.  Either way
     // the message MUST be non-empty so the model has
     // diagnostic feedback.
-    let known = [
+    let known = vec![
         "bash",
         "bash_output",
         "kill_shell",
@@ -135,7 +135,6 @@ fn dispatch_tuple_message_non_empty_for_every_known_tool_with_empty_args() {
         "grep",
         "crosslink",
         "web_fetch",
-        "web_search",
         "todo_write",
         "todo_read",
         "notebook_edit",
@@ -158,6 +157,12 @@ fn dispatch_tuple_message_non_empty_for_every_known_tool_with_empty_args() {
         "list_mcp_resources",
         "read_mcp_resource",
     ];
+    #[cfg(feature = "browser")]
+    let known = {
+        let mut known = known;
+        known.push("web_search");
+        known
+    };
     let mut c = ctx();
     for tool in known {
         let (msg, _) = registry()

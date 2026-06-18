@@ -642,9 +642,6 @@ const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return 
 #[cfg(feature = "browser")]
 const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results using free DuckDuckGo/Bing browser scraping. No search API key is required. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
 
-#[cfg(not(feature = "browser"))]
-const WEB_SEARCH_DESCRIPTION: &str = "Search the web and return relevant results using free DuckDuckGo/Bing browser scraping. This build does not include the browser feature, so web_search cannot run until rebuilt with the default `browser` feature. Returns titles, snippets, and URLs. `allowed_domains` / `blocked_domains` mirror Claude Code's WebSearchTool — results are filtered to domains that match (or don't match) the respective list.";
-
 struct WebFetchHandler;
 impl ToolHandler for WebFetchHandler {
     fn name(&self) -> &'static str {
@@ -684,7 +681,9 @@ impl ToolHandler for WebFetchHandler {
     }
 }
 
+#[cfg(feature = "browser")]
 struct WebSearchHandler;
+#[cfg(feature = "browser")]
 impl ToolHandler for WebSearchHandler {
     fn name(&self) -> &'static str {
         "web_search"
@@ -1188,6 +1187,12 @@ impl ToolHandler for CronListHandler {
 
 // ── plan_mode ────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "browser")]
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+
+#[cfg(not(feature = "browser"))]
+const ENTER_PLAN_MODE_DESCRIPTION: &str = "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, bash_output, todo_read, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. Browser-backed web_search and web_browser are unavailable in this build. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.";
+
 struct EnterPlanModeHandler;
 impl ToolHandler for EnterPlanModeHandler {
     fn name(&self) -> &'static str {
@@ -1198,7 +1203,7 @@ impl ToolHandler for EnterPlanModeHandler {
             "type": "function",
             "function": {
                 "name": "enter_plan_mode",
-                "description": "Switch to plan mode. In plan mode, only read-only/navigation tools (read_file, grounding_context, list_files, grep, web_fetch, web_search, web_browser, bash_output, todo_read, crosslink), ask_user_question, and subagent tools (task, agent_output) are available. Write/Edit/Bash are blocked except write_file may write only to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.",
+                "description": ENTER_PLAN_MODE_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -1687,6 +1692,7 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     &CrosslinkHandler,
     // web
     &WebFetchHandler,
+    #[cfg(feature = "browser")]
     &WebSearchHandler,
     #[cfg(feature = "browser")]
     &WebBrowserHandler,

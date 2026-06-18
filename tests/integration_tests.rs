@@ -1342,6 +1342,7 @@ mod web_tools {
 
     // DuckDuckGo/Bing search uses the browser feature (enabled by default)
     // and does not require a search API key.
+    #[cfg(feature = "browser")]
     #[test]
     #[ignore = "requires network access; run with `cargo test -- --ignored`"]
     fn test_web_search_duckduckgo() {
@@ -1632,10 +1633,15 @@ mod tool_definitions {
             "kill_shell",
             "kill_shells_for_agent",
             "web_fetch",
-            "web_search",
             "todo_write",
             "todo_read",
         ];
+        #[cfg(feature = "browser")]
+        let required_tools = {
+            let mut required_tools = required_tools;
+            required_tools.push("web_search");
+            required_tools
+        };
 
         for required in required_tools {
             assert!(
@@ -2265,6 +2271,11 @@ mod subagent_tools {
         assert!(explore_tools.contains(&"read_file"));
         assert!(!explore_tools.contains(&"write_file"));
         assert!(!explore_tools.contains(&"edit_file"));
+        assert_eq!(
+            explore_tools.contains(&"web_search"),
+            cfg!(feature = "browser"),
+            "web_search should only be allowed when browser-backed search is compiled"
+        );
 
         // Plan should be read-only and must not be able to shell out.
         let plan_tools = AgentType::Plan.allowed_tools();
@@ -2279,6 +2290,11 @@ mod subagent_tools {
         assert!(guide_tools.contains(&"read_file"));
         assert!(!guide_tools.contains(&"bash")); // No bash for guide
         assert!(!guide_tools.contains(&"kill_shells_for_agent"));
+        assert_eq!(
+            guide_tools.contains(&"web_search"),
+            cfg!(feature = "browser"),
+            "web_search should only be allowed when browser-backed search is compiled"
+        );
     }
 }
 

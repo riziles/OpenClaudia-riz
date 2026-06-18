@@ -437,6 +437,7 @@ fn default_distillation_model_for_provider(provider: &str) -> &'static str {
 /// and treated `://no-scheme` as host `no-scheme`. Now delegates to
 /// `url::Url`, which is already a dependency, so authority / userinfo /
 /// IPv6 handling is correct by construction.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn host_of(url: &str) -> Option<String> {
     let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
     let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
@@ -450,6 +451,7 @@ fn host_of(url: &str) -> Option<String> {
 /// True when `host` is equal to `needle` or is a subdomain of it.
 /// Matches Claude Code's behavior where `"docs.python.org"` covers
 /// both the exact host and `foo.docs.python.org`.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn domain_matches(host: &str, needle: &str) -> bool {
     let needle = needle.trim_start_matches("www.").to_ascii_lowercase();
     if needle.is_empty() {
@@ -461,6 +463,7 @@ fn domain_matches(host: &str, needle: &str) -> bool {
 /// Extract the `allowed_domains` / `blocked_domains` JSON-array args
 /// as owned `Vec<String>`s. Non-string entries are silently dropped,
 /// which matches Claude Code's Zod schema behavior (strict parse).
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn domain_list(args: &HashMap<String, Value>, key: &str) -> Vec<String> {
     // crosslink #675: typed accessor.
     args.arg_array(key)
@@ -480,6 +483,7 @@ fn domain_list(args: &HashMap<String, Value>, key: &str) -> Vec<String> {
 /// dropped; if `allowed_domains` is non-empty, only results matching
 /// that list are kept. Blocked list takes precedence when both lists
 /// name the same domain.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessors.
     let query = match args.arg_str("query") {

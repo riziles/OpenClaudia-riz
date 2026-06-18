@@ -294,7 +294,9 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "list_files",
     "grep",
     "web_fetch",
+    #[cfg(feature = "browser")]
     "web_search",
+    #[cfg(feature = "browser")]
     "web_browser",
     "ask_user_question",
     "task",

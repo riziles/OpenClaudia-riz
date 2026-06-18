@@ -66,6 +66,7 @@ fn documented_tool_names() -> Vec<&'static str> {
     ];
 
     if !cfg!(feature = "browser") {
+        names.retain(|name| *name != "web_search");
         names.retain(|name| *name != "web_browser");
     }
 
@@ -111,9 +112,9 @@ fn documented_tool_names_match_emitted_tool_definitions() {
 
 #[test]
 fn registry_documented_tool_count_is_current() {
-    // PINS CATALOG SIZE: 36 with the browser feature, 35 without it.
+    // PINS CATALOG SIZE: 36 with the browser feature, 34 without it.
     // Adding a tool: append a line to HANDLERS and bump this number.
-    let expected = if cfg!(feature = "browser") { 36 } else { 35 };
+    let expected = if cfg!(feature = "browser") { 36 } else { 34 };
     assert_eq!(
         documented_tool_names().len(),
         expected,

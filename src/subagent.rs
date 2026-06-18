@@ -181,38 +181,44 @@ impl AgentType {
     #[must_use]
     pub fn allowed_tools(&self) -> Vec<&'static str> {
         match self {
-            Self::GeneralPurpose => vec![
-                "bash",
-                "bash_output",
-                "kill_shell",
-                "kill_shells_for_agent",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "list_files",
-                "web_fetch",
-                "web_search",
-            ],
+            Self::GeneralPurpose => {
+                let tools = vec![
+                    "bash",
+                    "bash_output",
+                    "kill_shell",
+                    "kill_shells_for_agent",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "list_files",
+                    "web_fetch",
+                ];
+                add_browser_search_tool(tools)
+            }
             Self::Explore => {
-                vec!["bash", "read_file", "list_files", "web_fetch", "web_search"]
+                let tools = vec!["bash", "read_file", "list_files", "web_fetch"];
+                add_browser_search_tool(tools)
             }
             Self::Plan | Self::Guide => {
-                vec!["read_file", "list_files", "web_fetch", "web_search"]
+                let tools = vec!["read_file", "list_files", "web_fetch"];
+                add_browser_search_tool(tools)
             }
-            Self::Coordinator => vec![
-                "task",
-                "agent_output",
-                "task_stop",
-                "task_create",
-                "task_update",
-                "task_get",
-                "task_list",
-                "ask_user_question",
-                "read_file",
-                "list_files",
-                "web_search",
-                "web_fetch",
-            ],
+            Self::Coordinator => {
+                let tools = vec![
+                    "task",
+                    "agent_output",
+                    "task_stop",
+                    "task_create",
+                    "task_update",
+                    "task_get",
+                    "task_list",
+                    "ask_user_question",
+                    "read_file",
+                    "list_files",
+                    "web_fetch",
+                ];
+                add_browser_search_tool(tools)
+            }
         }
     }
 
@@ -223,6 +229,19 @@ impl AgentType {
             Self::Explore | Self::Guide => Some("haiku"),
             Self::Coordinator | Self::GeneralPurpose | Self::Plan => None,
         }
+    }
+}
+
+fn add_browser_search_tool(tools: Vec<&'static str>) -> Vec<&'static str> {
+    #[cfg(feature = "browser")]
+    {
+        let mut tools = tools;
+        tools.push("web_search");
+        tools
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        tools
     }
 }
 
@@ -284,7 +303,7 @@ Your goal is to find and summarize relevant documentation for the user's questio
 
 Guidelines:
 - Search for relevant documentation files
-- Use web search to find official documentation
+- Use available web tools to find official documentation
 - Provide clear, accurate information
 - Include relevant code examples when helpful
 
@@ -296,7 +315,7 @@ You break down complex tasks into smaller units of work and delegate them to spe
 
 ## Workflow
 
-1. **Research**: Use read_file, list_files, web_search, and web_fetch to understand the problem space, codebase structure, and requirements before delegating.
+1. **Research**: Use read_file, list_files, and available web tools to understand the problem space, codebase structure, and requirements before delegating.
 2. **Planning**: Decompose the task into discrete sub-tasks. Use task_create to track each one. Identify dependencies and ordering constraints.
 3. **Delegation**: Spawn worker agents via the `task` tool to execute each sub-task. Each worker prompt must be fully self-contained \u{2014} include all file paths, context, and acceptance criteria the worker needs. Never assume workers share your context.
 4. **Monitoring**: Use agent_output to check on background workers. Use task_update to record progress. Re-delegate or adjust the plan if a worker fails or produces unexpected results.

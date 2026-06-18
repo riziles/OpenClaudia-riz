@@ -120,12 +120,22 @@ fn plan_mode_allowed_tools_includes_documented_read_only_tools() {
     // Read-only inspection tools that plan mode permits.
     // (Authoring discovery: catalog includes read_file/list_files/grep/web_*
     // plus task/crosslink/bash_output/todo_read — but NOT glob.)
-    for tool in &["read_file", "list_files", "grep", "web_fetch", "web_search"] {
+    for tool in &["read_file", "list_files", "grep", "web_fetch"] {
         assert!(
             PLAN_MODE_ALLOWED_TOOLS.contains(tool),
             "{tool:?} MUST be in PLAN_MODE_ALLOWED_TOOLS"
         );
     }
+    assert_eq!(
+        PLAN_MODE_ALLOWED_TOOLS.contains(&"web_search"),
+        cfg!(feature = "browser"),
+        "web_search is plan-mode safe only when browser-backed search is compiled"
+    );
+    assert_eq!(
+        PLAN_MODE_ALLOWED_TOOLS.contains(&"web_browser"),
+        cfg!(feature = "browser"),
+        "web_browser is plan-mode safe only when the browser feature is compiled"
+    );
 }
 
 #[test]

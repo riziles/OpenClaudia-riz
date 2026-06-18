@@ -22,6 +22,8 @@
 use crate::memory::MemoryDb;
 use crate::modes::fragments::{BASE_COMMS, BASE_IDENTITY, BASE_PRINCIPLES, BASE_TOOLS};
 use crate::modes::BehaviorMode;
+#[cfg(not(feature = "browser"))]
+use std::sync::LazyLock;
 
 /// Initial allocation for the stable system-prompt prefix
 /// (identity + behavioral axes + tools + principles + comms).
@@ -40,6 +42,29 @@ const PREFIX_CAPACITY_BYTES: usize = 12 * 1024;
 /// 4 KiB also matches one page on most platforms, reducing allocator churn.
 /// Documents the magic capacity from crosslink #372.
 const SUFFIX_CAPACITY_BYTES: usize = 4 * 1024;
+
+#[cfg(feature = "browser")]
+fn base_tools_prompt() -> &'static str {
+    BASE_TOOLS
+}
+
+#[cfg(not(feature = "browser"))]
+fn base_tools_prompt() -> &'static str {
+    static BASE_TOOLS_NO_BROWSER: LazyLock<String> = LazyLock::new(|| {
+        let start = BASE_TOOLS
+            .find("### `web_search` - Search the Web")
+            .expect("base tools prompt must contain web_search section");
+        let end = BASE_TOOLS[start..]
+            .find("\n### `chainlink`")
+            .map_or(BASE_TOOLS.len(), |relative| start + relative);
+        let mut prompt = String::new();
+        prompt.push_str(BASE_TOOLS[..start].trim_end());
+        prompt.push_str("\n\n");
+        prompt.push_str(BASE_TOOLS[end..].trim_start_matches('\n'));
+        prompt
+    });
+    &BASE_TOOLS_NO_BROWSER
+}
 
 /// Two system prompt blocks optimised for Anthropic prompt caching.
 ///
@@ -162,7 +187,7 @@ pub fn build_system_prompt_blocks(
 
     // 3. Tool definitions
     prefix.push_str("\n\n");
-    prefix.push_str(BASE_TOOLS);
+    prefix.push_str(base_tools_prompt());
 
     // 4. Working principles
     prefix.push_str("\n\n");
@@ -331,6 +356,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn base_prompt_advertises_web_search_only_when_registered() {
+        let prompt = build_system_prompt_with_mode(
+            &BehaviorMode::from_preset(Preset::Create),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            prompt.contains("### `web_search` - Search the Web"),
+            cfg!(feature = "browser"),
+            "base prompt must not advertise browser-backed web_search in no-browser builds"
+        );
     }
 
     /// Hook instructions and custom instructions must appear AFTER all

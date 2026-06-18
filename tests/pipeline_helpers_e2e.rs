@@ -102,7 +102,6 @@ fn safe_read_only_tools_do_not_need_permission() {
         "list_files",
         "grep",
         "glob",
-        "web_search",
         "ask_user_question",
         "todo_read",
         "task",
@@ -116,6 +115,11 @@ fn safe_read_only_tools_do_not_need_permission() {
             "safe tool {t:?} MUST NOT need permission"
         );
     }
+    #[cfg(feature = "browser")]
+    assert!(
+        !tool_needs_permission("web_search"),
+        "registered browser-backed web_search MUST NOT need permission"
+    );
 }
 
 #[test]

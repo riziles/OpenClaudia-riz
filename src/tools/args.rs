@@ -281,6 +281,7 @@ pub trait ToolArgs {
 
     /// Optional JSON-array borrow. Drop-in replacement for
     /// `args.get(k).and_then(|v| v.as_array())`.
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     fn arg_array(&self, key: &str) -> Option<&Vec<Value>>;
 }
 
@@ -307,6 +308,7 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
         self.get(key).and_then(Value::as_u64).unwrap_or(default)
     }
 
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
     fn arg_array(&self, key: &str) -> Option<&Vec<Value>> {
         self.get(key).and_then(Value::as_array)
     }
