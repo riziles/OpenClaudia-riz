@@ -734,8 +734,6 @@ fn decode_bing_ck_url(href: &str) -> String {
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
 pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-    use scraper::{Html, Selector};
-
     let browser = launch_browser_for_scraping()?;
 
     let tab = browser
@@ -767,6 +765,23 @@ pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, Strin
         ));
     }
 
+    parse_bing_results_from_html(&html, limit)
+}
+
+/// Parse rendered Bing HTML results and drop unsafe result URLs.
+///
+/// This is separated from browser navigation so limit-after-filtering behavior
+/// can be tested without launching Chrome or making a live search request.
+///
+/// # Errors
+///
+/// Returns a descriptive message if selector construction fails or Bing serves
+/// its Cloudflare Turnstile challenge.
+#[doc(hidden)]
+#[cfg(feature = "browser")]
+pub fn parse_bing_results_from_html(html: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+    use scraper::{Html, Selector};
+
     // Detect Cloudflare Turnstile / Bing CAPTCHA wall. The result
     // page won't have `b_algo` anchors when challenged; surface a
     // specific error so the chain knows we're bot-blocked vs.
@@ -777,7 +792,7 @@ pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, Strin
         );
     }
 
-    let document = Html::parse_document(&html);
+    let document = Html::parse_document(html);
     let result_selector =
         Selector::parse("li.b_algo").map_err(|e| format!("Invalid selector: {e:?}"))?;
     let title_selector = Selector::parse("h2 a").map_err(|e| format!("Invalid selector: {e:?}"))?;
@@ -785,7 +800,10 @@ pub fn search_bing(query: &str, limit: usize) -> Result<Vec<SearchResult>, Strin
         Selector::parse("p, .b_caption p").map_err(|e| format!("Invalid selector: {e:?}"))?;
 
     let mut results = Vec::new();
-    for el in document.select(&result_selector).take(limit) {
+    for el in document.select(&result_selector) {
+        if results.len() >= limit {
+            break;
+        }
         let Some(a) = el.select(&title_selector).next() else {
             continue;
         };
@@ -957,7 +975,10 @@ pub fn parse_duckduckgo_results_from_html(
 
     let mut results = Vec::new();
 
-    for result_element in document.select(&result_selector).take(limit) {
+    for result_element in document.select(&result_selector) {
+        if results.len() >= limit {
+            break;
+        }
         // Get title and URL from the link
         if let Some(title_element) = result_element.select(&title_selector).next() {
             let title = title_element.text().collect::<String>().trim().to_string();

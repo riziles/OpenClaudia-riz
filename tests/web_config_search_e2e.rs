@@ -12,6 +12,8 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::web::{format_search_results, FetchResult, SearchResult};
+#[cfg(feature = "browser")]
+use openclaudia::web::{parse_bing_results_from_html, parse_duckduckgo_results_from_html};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — format_search_results
@@ -165,6 +167,64 @@ fn search_result_deserializes_from_external_json_shape() {
     assert_eq!(r.title, "External Title");
     assert_eq!(r.url, "https://ext.example");
     assert_eq!(r.snippet, "External snippet");
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn duckduckgo_parser_applies_limit_after_dropping_unsafe_results() {
+    let html = r#"
+        <html><body>
+          <div class="result">
+            <a class="result__a" href="http://127.0.0.1/private">Unsafe</a>
+            <a class="result__snippet">blocked loopback</a>
+          </div>
+          <div class="result">
+            <a class="result__a" href="https://1.1.1.1/one">First Safe</a>
+            <a class="result__snippet">first safe result</a>
+          </div>
+          <div class="result">
+            <a class="result__a" href="https://8.8.8.8/two">Second Safe</a>
+            <a class="result__snippet">second safe result</a>
+          </div>
+        </body></html>
+    "#;
+
+    let results = parse_duckduckgo_results_from_html(html, 2)
+        .expect("unsafe leading result should not starve valid DDG results");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].title, "First Safe");
+    assert_eq!(results[1].title, "Second Safe");
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn bing_parser_applies_limit_after_dropping_unsafe_results() {
+    let html = r#"
+        <html><body>
+          <ol>
+            <li class="b_algo">
+              <h2><a href="http://127.0.0.1/private">Unsafe</a></h2>
+              <p>blocked loopback</p>
+            </li>
+            <li class="b_algo">
+              <h2><a href="https://1.1.1.1/one">First Safe</a></h2>
+              <p>first safe result</p>
+            </li>
+            <li class="b_algo">
+              <h2><a href="https://8.8.8.8/two">Second Safe</a></h2>
+              <p>second safe result</p>
+            </li>
+          </ol>
+        </body></html>
+    "#;
+
+    let results = parse_bing_results_from_html(html, 2)
+        .expect("unsafe leading result should not starve valid Bing results");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].title, "First Safe");
+    assert_eq!(results[1].title, "Second Safe");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
