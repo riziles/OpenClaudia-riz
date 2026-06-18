@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -71,11 +72,54 @@ pub fn run_with_timeout_with_env(
     timeout: Duration,
     env: &HashMap<String, String>,
 ) -> Result<Output, CommandError> {
+    run_with_timeout_inner(program, args, cwd, timeout, env, None)
+}
+
+/// Run `program` under `timeout`, writing `stdin_input` to the child before
+/// waiting for completion.
+///
+/// The child's stdout/stderr are captured exactly like [`run_with_timeout`].
+/// The stdin pipe is closed after the bytes are written so tools that read
+/// until EOF can complete.
+///
+/// # Errors
+///
+/// Returns the same structured [`CommandError`] variants as
+/// [`run_with_timeout`]. A stdin write failure is reported as
+/// [`CommandError::WaitFailed`] after killing and reaping the child.
+pub fn run_with_timeout_with_input(
+    program: &(impl AsRef<OsStr> + ?Sized),
+    args: &[impl AsRef<OsStr>],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    stdin_input: &[u8],
+) -> Result<Output, CommandError> {
+    run_with_timeout_inner(
+        program,
+        args,
+        cwd,
+        timeout,
+        &HashMap::new(),
+        Some(stdin_input),
+    )
+}
+
+fn run_with_timeout_inner(
+    program: &(impl AsRef<OsStr> + ?Sized),
+    args: &[impl AsRef<OsStr>],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    stdin_input: Option<&[u8]>,
+) -> Result<Output, CommandError> {
     let program_str = program.as_ref().to_string_lossy().into_owned();
     let mut cmd = Command::new(program);
     cmd.args(args.iter().map(AsRef::as_ref))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if stdin_input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     cmd.envs(env);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -85,6 +129,29 @@ pub fn run_with_timeout_with_env(
         program: program_str.clone(),
         source: e.to_string(),
     })?;
+
+    if let Some(input) = stdin_input {
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| CommandError::WaitFailed {
+                program: program_str.clone(),
+                source: "stdin pipe unavailable".to_string(),
+            })
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(input)
+                    .map_err(|e| CommandError::WaitFailed {
+                        program: program_str.clone(),
+                        source: format!("stdin write failed: {e}"),
+                    })
+            });
+        if let Err(err) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    }
 
     let deadline = Instant::now() + timeout;
     let mut step = 0usize;
@@ -221,5 +288,22 @@ mod tests {
             }
             other => panic!("expected SpawnFailed, got {other:?}"),
         }
+    }
+
+    /// Tools such as `git check-ignore --stdin` need both stdin input and a
+    /// deadline. The helper must close stdin after writing so the child can
+    /// observe EOF and produce captured output.
+    #[test]
+    fn run_with_timeout_with_input_writes_stdin_and_captures_stdout() {
+        let out = run_with_timeout_with_input(
+            "cat",
+            &Vec::<&str>::new(),
+            None,
+            Duration::from_secs(5),
+            b"alpha\nbeta\n",
+        )
+        .expect("cat must echo stdin");
+        assert!(out.status.success(), "cat exit status must be 0");
+        assert_eq!(out.stdout, b"alpha\nbeta\n");
     }
 }

@@ -32,6 +32,7 @@ pub const LSP_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const LSP_RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const LSP_READINESS_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const LSP_SHUTDOWN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const LSP_GITIGNORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Absolute, PATH-independent location of `git` for LSP gitignore filtering.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
@@ -42,10 +43,6 @@ fn git_bin() -> Result<&'static Path, String> {
         Ok(path) => Ok(path.as_path()),
         Err(msg) => Err(msg.clone()),
     }
-}
-
-fn git_command() -> Result<Command, String> {
-    Ok(Command::new(git_bin()?))
 }
 
 /// Process-wide registry of open files per LSP server binary.
@@ -1539,26 +1536,25 @@ fn filter_gitignored(locations: Vec<LspLocation>) -> Vec<LspLocation> {
     // `git check-ignore --stdin` reads NUL- or newline-separated paths and
     // prints back only the ones that ARE ignored. Exit status 0 = at least one
     // ignored; 1 = none ignored; 128 = error (not a repo etc).
-    let out = git_command().and_then(|mut cmd| {
-        cmd.args(["check-ignore", "--stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())
-    });
-
-    let Ok(mut child) = out else {
-        return locations;
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(path_strings.join("\n").as_bytes());
-        let _ = stdin.write_all(b"\n");
-    }
-    let Ok(output) = child.wait_with_output() else {
-        return locations;
+    let input = format!("{}\n", path_strings.join("\n"));
+    let output = match git_bin().and_then(|git| {
+        crate::tools::command::run_with_timeout_with_input(
+            git,
+            &["check-ignore", "--stdin"],
+            None,
+            LSP_GITIGNORE_TIMEOUT,
+            input.as_bytes(),
+        )
+        .map_err(|e| e.to_string())
+    }) {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "LSP gitignore filter failed; keeping all candidate locations"
+            );
+            return locations;
+        }
     };
 
     // Status 128 means "not a git repo" or other error — keep everything.
@@ -1780,6 +1776,12 @@ mod tests {
                 !code.contains("Command::new(\"which\")")
                     && !code.contains("std::process::Command::new(\"which\")"),
                 "production lsp code must not invoke bare which; line {n}: {raw_line}",
+                n = idx + 1,
+            );
+            assert!(
+                !code.contains("wait_with_output("),
+                "production lsp subprocess waits must be deadline-bounded; \
+                 line {n}: {raw_line}",
                 n = idx + 1,
             );
         }
