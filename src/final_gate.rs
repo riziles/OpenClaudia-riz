@@ -57,6 +57,21 @@ pub fn validate_final_answer(
         ));
     }
 
+    let file_claims = extract_file_claims(summary);
+    for claim in file_claims {
+        let backed_by_file_observation = hydrated_evidence.iter().any(|obs| {
+            obs.kind
+                .touched_files()
+                .iter()
+                .any(|observed| observed_path_matches_claim(observed, &claim))
+        });
+        if !backed_by_file_observation {
+            return Err(Denial::new(format!(
+                "final file claim requires fresh file or diff observation: {claim}"
+            )));
+        }
+    }
+
     Ok(FinalGateReport {
         evidence: evidence.to_vec(),
         verification: verification.to_vec(),
@@ -105,6 +120,90 @@ fn summary_mentions_tests(summary: &str) -> bool {
     lower.contains("test") || lower.contains("cargo check") || lower.contains("verified")
 }
 
+fn extract_file_claims(summary: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut claims = Vec::new();
+
+    for raw in summary.split_whitespace() {
+        let Some(candidate) = normalize_claim_token(raw) else {
+            continue;
+        };
+        if !looks_like_file_path(&candidate) {
+            continue;
+        }
+        if seen.insert(candidate.clone()) {
+            claims.push(candidate);
+        }
+    }
+
+    claims
+}
+
+fn normalize_claim_token(raw: &str) -> Option<String> {
+    let mut token = raw.trim_matches(|c: char| {
+        c.is_ascii_whitespace()
+            || matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+            )
+    });
+    token = token.trim_end_matches('.');
+    if token.is_empty() || token.contains("://") {
+        return None;
+    }
+
+    loop {
+        let Some((prefix, suffix)) = token.rsplit_once(':') else {
+            break;
+        };
+        if !suffix.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        token = prefix;
+    }
+
+    let token = token.trim_start_matches("./");
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+fn looks_like_file_path(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    const KNOWN_NAMES: &[&str] = &[
+        "cargo.toml",
+        "cargo.lock",
+        "readme.md",
+        "license",
+        "makefile",
+        "dockerfile",
+    ];
+    if KNOWN_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+
+    const EXTENSIONS: &[&str] = &[
+        ".rs", ".toml", ".lock", ".md", ".json", ".yaml", ".yml", ".ts", ".tsx", ".js", ".jsx",
+        ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".swift", ".zig", ".c", ".h", ".cpp", ".hpp",
+        ".sh", ".sql", ".html", ".css", ".scss", ".xml",
+    ];
+    if EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+        return true;
+    }
+
+    lower.contains('/')
+        && lower
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.contains('.') || KNOWN_NAMES.contains(&last))
+}
+
+fn observed_path_matches_claim(observed: &str, claim: &str) -> bool {
+    let observed = observed.trim_start_matches("./");
+    let claim = claim.trim_start_matches("./");
+    observed == claim
+        || observed.ends_with(&format!("/{claim}"))
+        || claim.ends_with(&format!("/{observed}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +247,62 @@ mod tests {
         let denial =
             validate_cited_final_answer("Verified with cargo check.", &ledger).expect_err("denied");
         assert_eq!(denial.reason(), "final answer requires evidence");
+    }
+
+    #[test]
+    fn final_file_claim_requires_file_or_diff_evidence() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary = format!(
+            "Updated src/pipeline.rs and verified with cargo check [{command}] [{verification}]."
+        );
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("file denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final file claim requires fresh file or diff observation: src/pipeline.rs"
+        );
+    }
+
+    #[test]
+    fn final_file_claim_accepts_fresh_diff_evidence() {
+        let mut ledger = RealityLedger::new();
+        let diff = ledger
+            .observe_diff(
+                vec!["src/pipeline.rs".to_string()],
+                "diff --git a/src/pipeline.rs b/src/pipeline.rs",
+            )
+            .expect("diff");
+        let command = ledger
+            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary = format!(
+            "Updated src/pipeline.rs:12 and verified with cargo check [{diff}] [{command}] [{verification}]."
+        );
+
+        validate_cited_final_answer(&summary, &ledger).expect("fresh diff grounds file claim");
     }
 }
