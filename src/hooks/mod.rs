@@ -27,7 +27,7 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -892,6 +892,18 @@ impl HookEngine {
         cmd.env("CLAUDE_PROJECT_DIR", project_dir);
     }
 
+    fn resolved_hook_shell() -> Result<(PathBuf, &'static str), HookError> {
+        let (shell, shell_arg) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let shell_path = which::which(shell).map_err(|e| {
+            HookError::CommandFailed(format!("{shell} binary not found on PATH: {e}"))
+        })?;
+        Ok((shell_path, shell_arg))
+    }
+
     async fn write_hook_stdin<W>(stdin: &mut W, input_json: &str) -> Result<(), HookError>
     where
         W: AsyncWrite + Unpin,
@@ -953,12 +965,8 @@ impl HookEngine {
                 "Hook is running with shell:true — shell injection risk. \
                  Consider converting to a direct-spawn hook."
             );
-            let (shell, shell_arg) = if cfg!(windows) {
-                ("cmd", "/C")
-            } else {
-                ("sh", "-c")
-            };
-            let mut cmd = Command::new(shell);
+            let (shell_path, shell_arg) = Self::resolved_hook_shell()?;
+            let mut cmd = Command::new(shell_path);
             cmd.arg(shell_arg).arg(command);
             cmd
         } else {
@@ -1965,6 +1973,31 @@ mod tests {
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert!(result.errors.is_empty(), "shell pipeline must succeed");
         assert!(result.allowed);
+    }
+
+    #[test]
+    fn shell_mode_resolves_platform_shell_binary() {
+        let (shell_path, shell_arg) = HookEngine::resolved_hook_shell().expect("platform shell");
+        assert!(
+            shell_path.is_absolute(),
+            "hook shell must resolve to an absolute path, got {}",
+            shell_path.display()
+        );
+        assert_eq!(shell_arg, if cfg!(windows) { "/C" } else { "-c" });
+
+        let source = include_str!("mod.rs");
+        let cfg_test = source
+            .find("#[cfg(test)]")
+            .expect("test marker must be present");
+        let production = &source[..cfg_test];
+        assert!(
+            !production.contains("Command::new(shell)"),
+            "hook shell mode must not spawn an unresolved shell binary"
+        );
+        assert!(
+            production.contains("which::which(shell)"),
+            "hook shell mode must resolve the platform shell through which"
+        );
     }
 
     /// Env scrub: sensitive vars must not be present in the child's environment.
