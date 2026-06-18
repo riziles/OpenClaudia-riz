@@ -3074,28 +3074,7 @@ fn observe_turn_user_task(
     messages: &[serde_json::Value],
 ) -> Option<crate::ledger::ObsId> {
     let content = latest_user_message_content(messages)?;
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for user task"
-            );
-            return None;
-        }
-    };
-    match ledger.observe_user_task(content.to_string()) {
-        Ok(id) => Some(id),
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to append user task observation to reality ledger"
-            );
-            None
-        }
-    }
+    crate::grounded_loop::observe_session_user_task(session_id, content)
 }
 
 fn request_messages_with_grounding(
@@ -3103,100 +3082,11 @@ fn request_messages_with_grounding(
     task_obs: Option<crate::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
-    let mut request_messages = session_messages.to_vec();
-    let Some(task_obs) = task_obs else {
-        return request_messages;
-    };
-    let ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for grounding packet"
-            );
-            return request_messages;
-        }
-    };
-    let packet = match crate::grounded_loop::build_prompt_packet(
-        &ledger,
-        task_obs,
-        crate::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT,
-        Vec::new(),
-    ) {
-        Ok(packet) => packet,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                reason = %err.reason(),
-                "failed to build grounding packet"
-            );
-            return request_messages;
-        }
-    };
-    let content = crate::grounded_loop::render_grounding_system_message(&packet);
-    let insert_at = request_messages
-        .iter()
-        .position(|message| message.get("role").and_then(|role| role.as_str()) != Some("system"))
-        .unwrap_or(request_messages.len());
-    request_messages.insert(
-        insert_at,
-        serde_json::json!({
-            "role": "system",
-            "content": content,
-        }),
-    );
-    request_messages
+    crate::grounded_loop::request_messages_with_grounding(session_id, task_obs, session_messages)
 }
 
 fn validate_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
-    if content.trim().is_empty() {
-        return Ok(());
-    }
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for final gate"
-            );
-            return Ok(());
-        }
-    };
-
-    match crate::final_gate::validate_cited_final_answer(content, &ledger) {
-        Ok(_) => {
-            append_final_policy_decision(&mut ledger, true, "final answer grounded");
-            Ok(())
-        }
-        Err(denial) => {
-            let reason = denial.reason().to_string();
-            append_final_policy_decision(&mut ledger, false, &reason);
-            Err(reason)
-        }
-    }
-}
-
-fn append_final_policy_decision(
-    ledger: &mut crate::ledger::RealityLedger,
-    allowed: bool,
-    reason: &str,
-) {
-    if let Err(err) = ledger.append(
-        crate::ledger::Authority::Policy,
-        crate::ledger::ObservationKind::PolicyDecision {
-            allowed,
-            reason: reason.to_string(),
-        },
-    ) {
-        tracing::warn!(
-            allowed,
-            reason,
-            error = %err,
-            "failed to append final-gate policy decision to reality ledger"
-        );
-    }
+    crate::grounded_loop::validate_agentic_final_response(session_id, content)
 }
 
 /// Run the pre-turn `UserPromptSubmit` hook. Returns `false` and sends an

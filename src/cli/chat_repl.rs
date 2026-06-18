@@ -206,28 +206,7 @@ fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
 }
 
 fn observe_cli_user_task(session_id: &str, content: &str) -> Option<openclaudia::ledger::ObsId> {
-    let mut ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for CLI user task"
-            );
-            return None;
-        }
-    };
-    match ledger.observe_user_task(content.to_string()) {
-        Ok(id) => Some(id),
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to append CLI user task observation to reality ledger"
-            );
-            None
-        }
-    }
+    openclaudia::grounded_loop::observe_session_user_task(session_id, content)
 }
 
 fn request_messages_with_cli_grounding(
@@ -235,25 +214,11 @@ fn request_messages_with_cli_grounding(
     task_obs: Option<openclaudia::ledger::ObsId>,
     session_messages: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
-    let mut request_messages = session_messages.to_vec();
-    let Some(task_obs) = task_obs else {
-        return request_messages;
-    };
-    let Some(content) = cli_grounding_system_content(session_id, task_obs) else {
-        return request_messages;
-    };
-    let insert_at = request_messages
-        .iter()
-        .position(|message| message.get("role").and_then(|role| role.as_str()) != Some("system"))
-        .unwrap_or(request_messages.len());
-    request_messages.insert(
-        insert_at,
-        serde_json::json!({
-            "role": "system",
-            "content": content,
-        }),
-    );
-    request_messages
+    openclaudia::grounded_loop::request_messages_with_grounding(
+        session_id,
+        task_obs,
+        session_messages,
+    )
 }
 
 fn append_gemini_system_instruction_text(request: &mut serde_json::Value, content: &str) {
@@ -274,92 +239,11 @@ fn cli_grounding_system_content(
     session_id: &str,
     task_obs: openclaudia::ledger::ObsId,
 ) -> Option<String> {
-    let ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for CLI grounding packet"
-            );
-            return None;
-        }
-    };
-    let packet = match openclaudia::grounded_loop::build_prompt_packet(
-        &ledger,
-        task_obs,
-        openclaudia::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT,
-        Vec::new(),
-    ) {
-        Ok(packet) => packet,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                reason = %err.reason(),
-                "failed to build CLI grounding packet"
-            );
-            return None;
-        }
-    };
-    Some(openclaudia::grounded_loop::render_grounding_system_message(
-        &packet,
-    ))
+    openclaudia::grounded_loop::session_grounding_system_content(session_id, task_obs)
 }
 
 fn validate_cli_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
-    if content.trim().is_empty() {
-        return Ok(());
-    }
-    let mut ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for CLI final gate"
-            );
-            return Ok(());
-        }
-    };
-    validate_cli_final_against_ledger(&mut ledger, content)
-}
-
-fn validate_cli_final_against_ledger(
-    ledger: &mut openclaudia::ledger::RealityLedger,
-    content: &str,
-) -> Result<(), String> {
-    match openclaudia::final_gate::validate_cited_final_answer(content, ledger) {
-        Ok(_) => {
-            append_cli_final_policy_decision(ledger, true, "final answer grounded");
-            Ok(())
-        }
-        Err(denial) => {
-            let reason = denial.reason().to_string();
-            append_cli_final_policy_decision(ledger, false, &reason);
-            Err(reason)
-        }
-    }
-}
-
-fn append_cli_final_policy_decision(
-    ledger: &mut openclaudia::ledger::RealityLedger,
-    allowed: bool,
-    reason: &str,
-) {
-    if let Err(err) = ledger.append(
-        openclaudia::ledger::Authority::Policy,
-        openclaudia::ledger::ObservationKind::PolicyDecision {
-            allowed,
-            reason: reason.to_string(),
-        },
-    ) {
-        tracing::warn!(
-            allowed,
-            reason,
-            error = %err,
-            "failed to append CLI final-gate policy decision to reality ledger"
-        );
-    }
+    openclaudia::grounded_loop::validate_agentic_final_response(session_id, content)
 }
 
 fn append_cli_quality_gate_verification(
@@ -4071,7 +3955,8 @@ providers: {}
         let content =
             format!("Verified the CLI loop with evidence [{task}] [{command}] [{verification}].");
 
-        validate_cli_final_against_ledger(&mut ledger, &content).expect("cited final should pass");
+        openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, &content)
+            .expect("cited final should pass");
 
         assert!(ledger
             .observations_chronological()
@@ -4086,8 +3971,11 @@ providers: {}
     fn cli_final_gate_rejects_uncited_agentic_final() {
         let mut ledger = openclaudia::ledger::RealityLedger::new();
 
-        let err = validate_cli_final_against_ledger(&mut ledger, "Verified with cargo test.")
-            .expect_err("uncited final must be denied");
+        let err = openclaudia::grounded_loop::validate_final_against_ledger(
+            &mut ledger,
+            "Verified with cargo test.",
+        )
+        .expect_err("uncited final must be denied");
 
         assert_eq!(err, "final answer requires evidence");
         assert!(ledger

@@ -5,8 +5,8 @@
 //! ledger entries first, lower-authority navigation aids later.
 
 use crate::evidence::Denial;
+use crate::ledger::{Authority, ObservationKind, RealityLedger};
 use crate::ledger::{ObsId, ObservationIndexEntry};
-use crate::ledger::{ObservationKind, RealityLedger};
 use crate::task_spec::TaskSpec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -91,6 +91,136 @@ pub fn build_prompt_packet(
     packet.summaries.reverse();
 
     Ok(packet)
+}
+
+pub fn observe_session_user_task(session_id: &str, content: &str) -> Option<ObsId> {
+    let mut ledger = match RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for user task"
+            );
+            return None;
+        }
+    };
+    match ledger.observe_user_task(content.to_string()) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to append user task observation to reality ledger"
+            );
+            None
+        }
+    }
+}
+
+pub fn session_grounding_system_content(session_id: &str, task_obs: ObsId) -> Option<String> {
+    let ledger = match RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for grounding packet"
+            );
+            return None;
+        }
+    };
+    let packet =
+        match build_prompt_packet(&ledger, task_obs, DEFAULT_GROUNDING_INDEX_LIMIT, Vec::new()) {
+            Ok(packet) => packet,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    reason = %err.reason(),
+                    "failed to build grounding packet"
+                );
+                return None;
+            }
+        };
+    Some(render_grounding_system_message(&packet))
+}
+
+pub fn request_messages_with_grounding(
+    session_id: &str,
+    task_obs: Option<ObsId>,
+    session_messages: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut request_messages = session_messages.to_vec();
+    let Some(task_obs) = task_obs else {
+        return request_messages;
+    };
+    let Some(content) = session_grounding_system_content(session_id, task_obs) else {
+        return request_messages;
+    };
+    let insert_at = request_messages
+        .iter()
+        .position(|message| message.get("role").and_then(|role| role.as_str()) != Some("system"))
+        .unwrap_or(request_messages.len());
+    request_messages.insert(
+        insert_at,
+        serde_json::json!({
+            "role": "system",
+            "content": content,
+        }),
+    );
+    request_messages
+}
+
+pub fn validate_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut ledger = match RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for final gate"
+            );
+            return Ok(());
+        }
+    };
+    validate_final_against_ledger(&mut ledger, content)
+}
+
+pub fn validate_final_against_ledger(
+    ledger: &mut RealityLedger,
+    content: &str,
+) -> Result<(), String> {
+    match crate::final_gate::validate_cited_final_answer(content, ledger) {
+        Ok(_) => {
+            append_final_policy_decision(ledger, true, "final answer grounded");
+            Ok(())
+        }
+        Err(denial) => {
+            let reason = denial.reason().to_string();
+            append_final_policy_decision(ledger, false, &reason);
+            Err(reason)
+        }
+    }
+}
+
+pub fn append_final_policy_decision(ledger: &mut RealityLedger, allowed: bool, reason: &str) {
+    if let Err(err) = ledger.append(
+        Authority::Policy,
+        ObservationKind::PolicyDecision {
+            allowed,
+            reason: reason.to_string(),
+        },
+    ) {
+        tracing::warn!(
+            allowed,
+            reason,
+            error = %err,
+            "failed to append final-gate policy decision to reality ledger"
+        );
+    }
 }
 
 #[must_use]
