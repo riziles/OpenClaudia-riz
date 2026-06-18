@@ -3149,6 +3149,56 @@ fn request_messages_with_grounding(
     request_messages
 }
 
+fn validate_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for final gate"
+            );
+            return Ok(());
+        }
+    };
+
+    match crate::final_gate::validate_cited_final_answer(content, &ledger) {
+        Ok(_) => {
+            append_final_policy_decision(&mut ledger, true, "final answer grounded");
+            Ok(())
+        }
+        Err(denial) => {
+            let reason = denial.reason().to_string();
+            append_final_policy_decision(&mut ledger, false, &reason);
+            Err(reason)
+        }
+    }
+}
+
+fn append_final_policy_decision(
+    ledger: &mut crate::ledger::RealityLedger,
+    allowed: bool,
+    reason: &str,
+) {
+    if let Err(err) = ledger.append(
+        crate::ledger::Authority::Policy,
+        crate::ledger::ObservationKind::PolicyDecision {
+            allowed,
+            reason: reason.to_string(),
+        },
+    ) {
+        tracing::warn!(
+            allowed,
+            reason,
+            error = %err,
+            "failed to append final-gate policy decision to reality ledger"
+        );
+    }
+}
+
 /// Run the pre-turn `UserPromptSubmit` hook. Returns `false` and sends an
 /// `ApiError` event if the hook denies the request; injects any system
 /// messages from hook outputs and returns `true` on success.
@@ -3490,6 +3540,23 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                         .as_deref()
                         .filter(|text| !text.is_empty());
                     if !followup.content.is_empty() || reasoning.is_some() {
+                        if let Err(reason) =
+                            validate_agentic_final_response(ctx.session_id, &followup.content)
+                        {
+                            tracing::warn!(
+                                session_id = ctx.session_id,
+                                reason,
+                                "agentic final answer rejected by grounding gate"
+                            );
+                            send_or_warn(
+                                ctx.tx,
+                                super::events::AppEvent::ApiError(format!(
+                                    "Final answer failed grounding gate: {reason}"
+                                )),
+                                ctx.session_id,
+                            );
+                            break;
+                        }
                         let mut message =
                             serde_json::json!({ "role": "assistant", "content": followup.content });
                         if let Some(reasoning) = reasoning {
