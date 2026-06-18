@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         if cli.command.is_some() {
             anyhow::bail!("--print cannot be used with subcommands");
         }
+        reject_ignored_root_flags_for_print(&cli)?;
         return cli::print_mode::cmd_print(cli::print_mode::PrintOptions {
             model_override: cli.model.clone(),
             target_override: cli.target.clone(),
@@ -320,6 +321,29 @@ async fn main() -> anyhow::Result<()> {
             target,
         }) => cli::commands::loop_cmd::cmd_loop(max_iterations, port, target.or(cli.target)).await,
     }
+}
+
+fn reject_ignored_root_flags_for_print(cli: &Cli) -> anyhow::Result<()> {
+    if cli.resume {
+        anyhow::bail!("--resume/--continue cannot be used with --print");
+    }
+    if cli.session_id.is_some() {
+        anyhow::bail!("--session-id cannot be used with --print");
+    }
+    if cli.coordinator {
+        anyhow::bail!("--coordinator cannot be used with --print");
+    }
+    if cli.dangerously_skip_permissions {
+        anyhow::bail!("--dangerously-skip-permissions cannot be used with --print");
+    }
+    if cli.tui_mode {
+        anyhow::bail!("--tui-mode cannot be used with --print");
+    }
+    if cli.mode.is_some() {
+        anyhow::bail!("--mode cannot be used with --print");
+    }
+
+    Ok(())
 }
 
 fn reject_ignored_root_flags_for_subcommand(cli: &Cli) -> anyhow::Result<()> {

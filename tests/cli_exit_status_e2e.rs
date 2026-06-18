@@ -782,6 +782,63 @@ fn print_rejects_keyless_remote_provider_before_request() {
 }
 
 #[test]
+fn print_rejects_interactive_only_root_flags_instead_of_ignoring_them() {
+    for (args, expected) in [
+        (
+            vec!["--print", "hello", "--resume"],
+            "--resume/--continue cannot be used with --print",
+        ),
+        (
+            vec!["--print", "hello", "--session-id", "abc123"],
+            "--session-id cannot be used with --print",
+        ),
+        (
+            vec!["--print", "hello", "--coordinator"],
+            "--coordinator cannot be used with --print",
+        ),
+        (
+            vec!["--print", "hello", "--dangerously-skip-permissions"],
+            "--dangerously-skip-permissions cannot be used with --print",
+        ),
+        (
+            vec!["--print", "hello", "--tui-mode"],
+            "--tui-mode cannot be used with --print",
+        ),
+        (
+            vec!["--print", "hello", "--mode", "debug"],
+            "--mode cannot be used with --print",
+        ),
+    ] {
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let output = isolated_command(&cwd, &home)
+            .args(&args)
+            .output()
+            .expect("openclaudia --print must run");
+
+        assert!(
+            !output.status.success(),
+            "print with {args:?} must fail instead of ignoring the flag; stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains(expected),
+            "print with {args:?} should reject with {expected:?}; got {combined:?}"
+        );
+        assert!(
+            !combined.contains("No configuration found"),
+            "print with {args:?} should fail before config loading; got {combined:?}"
+        );
+    }
+}
+
+#[test]
 fn doctor_without_config_exits_nonzero() {
     assert_missing_config_is_failure(&["doctor"]);
 }
