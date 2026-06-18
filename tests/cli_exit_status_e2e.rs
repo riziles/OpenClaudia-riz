@@ -1470,6 +1470,63 @@ fn auth_logout_describes_native_session_scope() {
 }
 
 #[test]
+fn auth_logout_removes_native_session_store_without_deleting_shared_credentials() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let xdg_data = home.path().join(".local/share");
+    let store_dir = xdg_data.join("openclaudia");
+    fs::create_dir_all(&store_dir).expect("oauth store dir");
+    let native_store = store_dir.join("oauth_sessions.json");
+    fs::write(
+        &native_store,
+        r#"{"native-session":{"access_token":"tok"}}"#,
+    )
+    .expect("native oauth store fixture");
+
+    let claude_config = home.path().join("claude-config");
+    write_claude_oauth_credentials(&claude_config);
+    let credentials_path = claude_config.join(".credentials.json");
+    let credentials_before =
+        fs::read_to_string(&credentials_path).expect("credentials fixture should be readable");
+
+    let output = isolated_command(&cwd, &home)
+        .args(["auth", "--logout"])
+        .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
+        .output()
+        .expect("openclaudia auth --logout must run");
+
+    assert!(
+        output.status.success(),
+        "auth --logout should succeed with both native and shared stores; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Native OAuth sessions cleared")
+            && combined.contains("Shared Claude credentials were not deleted"),
+        "logout output must distinguish native sessions from shared credentials; got {combined:?}"
+    );
+    assert!(
+        !native_store.exists(),
+        "auth --logout must remove the native OAuth session cache"
+    );
+    assert!(
+        credentials_path.exists(),
+        "auth --logout must not delete shared Claude credentials"
+    );
+    assert_eq!(
+        fs::read_to_string(&credentials_path).expect("credentials should remain readable"),
+        credentials_before,
+        "auth --logout must not rewrite shared Claude credentials"
+    );
+}
+
+#[test]
 fn start_rejects_model_flag_instead_of_ignoring_it() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
