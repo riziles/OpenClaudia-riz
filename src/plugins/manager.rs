@@ -591,24 +591,7 @@ impl PluginManager {
             let marketplace_dir = Self::marketplaces_dir().join(marketplace_name);
             let (manifest_bytes, manifest_sig) = match &mp_plugin.source {
                 super::marketplace::PluginSource::Path(rel_path) => {
-                    let plugin_dir = marketplace_dir.join(rel_path);
-                    // Try loading the plugin manifest to get its signature field.
-                    let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
-                    let root_path = plugin_dir.join("plugin.json");
-                    let manifest_path = if cc_path.exists() { cc_path } else { root_path };
-                    let raw = std::fs::read(&manifest_path).map_err(|e| {
-                        PluginError::IoError(format!(
-                            "Cannot read manifest for signature check: {e}"
-                        ))
-                    })?;
-                    let parsed: crate::plugins::manifest::PluginManifest =
-                        serde_json::from_slice(&raw).map_err(|e| {
-                            PluginError::InvalidManifest(format!(
-                                "Cannot parse manifest for signature check: {e}"
-                            ))
-                        })?;
-                    let sig = parsed.signature;
-                    (raw, sig)
+                    Self::path_source_manifest_for_signature(&marketplace_dir, rel_path)?
                 }
                 super::marketplace::PluginSource::Structured(_) => {
                     // For git/GitHub sources the content is not yet local.
@@ -995,6 +978,73 @@ impl PluginManager {
         Ok((mp_plugin, plugins_dir, dest))
     }
 
+    /// Resolve a path-based marketplace plugin source, enforcing that the
+    /// source is a relative path that exists inside the marketplace root.
+    ///
+    /// This is shared by the normal fetch path and the signature preflight so
+    /// no marketplace-local read can bypass the containment checks.
+    fn resolve_marketplace_plugin_path(
+        marketplace_dir: &Path,
+        rel_path: &str,
+    ) -> Result<(PathBuf, PathBuf), PluginError> {
+        let full = super::validate_plugin_path(marketplace_dir, rel_path)?;
+        if !full.exists() {
+            return Err(PluginError::IoError(format!(
+                "Plugin source path not found: {}",
+                full.display()
+            )));
+        }
+
+        let canonical_marketplace = marketplace_dir.canonicalize().map_err(|e| {
+            PluginError::IoError(format!(
+                "Failed to canonicalize marketplace dir {}: {}",
+                marketplace_dir.display(),
+                e
+            ))
+        })?;
+        let canonical_plugin = full.canonicalize().map_err(|e| {
+            PluginError::IoError(format!(
+                "Failed to canonicalize plugin path {}: {}",
+                full.display(),
+                e
+            ))
+        })?;
+        if !canonical_plugin.starts_with(&canonical_marketplace) {
+            return Err(PluginError::IoError(format!(
+                "Plugin path traversal detected: {} escapes marketplace directory {}",
+                full.display(),
+                marketplace_dir.display()
+            )));
+        }
+
+        Ok((canonical_plugin, canonical_marketplace))
+    }
+
+    /// Load the raw plugin manifest and inline signature for a path-based
+    /// marketplace source. The path is resolved through
+    /// [`Self::resolve_marketplace_plugin_path`] before any manifest read.
+    fn path_source_manifest_for_signature(
+        marketplace_dir: &Path,
+        rel_path: &str,
+    ) -> Result<(Vec<u8>, Option<crate::plugins::validate::PluginSignature>), PluginError> {
+        let (plugin_dir, _canonical_marketplace) =
+            Self::resolve_marketplace_plugin_path(marketplace_dir, rel_path)?;
+        let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
+        let root_path = plugin_dir.join("plugin.json");
+        let manifest_path = if cc_path.exists() { cc_path } else { root_path };
+        let raw = fs::read(&manifest_path).map_err(|e| {
+            PluginError::IoError(format!("Cannot read manifest for signature check: {e}"))
+        })?;
+        let parsed: crate::plugins::manifest::PluginManifest = serde_json::from_slice(&raw)
+            .map_err(|e| {
+                PluginError::InvalidManifest(format!(
+                    "Cannot parse manifest for signature check: {e}"
+                ))
+            })?;
+        let sig = parsed.signature;
+        Ok((raw, sig))
+    }
+
     /// Materialize the plugin's upstream content. Two strategies:
     ///
     /// - **`PluginSource::Path`**: canonicalize the source path,
@@ -1027,45 +1077,11 @@ impl PluginManager {
         dest: &Path,
     ) -> Result<FetchedSource, PluginError> {
         let marketplace_dir = Self::marketplaces_dir().join(marketplace_name);
-        // Canonicalize the marketplace root once. This canonical path is
-        // the immutable containment boundary used both for the top-level
-        // `starts_with` pre-flight and for the per-entry guard inside
-        // `copy_dir_recursive_within` (crosslink #258).
-        let canonical_marketplace = marketplace_dir.canonicalize().map_err(|e| {
-            PluginError::IoError(format!(
-                "Failed to canonicalize marketplace dir {}: {}",
-                marketplace_dir.display(),
-                e
-            ))
-        })?;
 
         match &mp_plugin.source {
             PluginSource::Path(rel_path) => {
-                let full = marketplace_dir.join(rel_path);
-                if !full.exists() {
-                    return Err(PluginError::IoError(format!(
-                        "Plugin source path not found: {}",
-                        full.display()
-                    )));
-                }
-                // Top-level containment pre-flight: canonicalize the full
-                // path and verify it sits inside canonical_marketplace. The
-                // per-entry check inside copy_dir_recursive_within provides
-                // the definitive per-node guard (crosslink #258).
-                let canonical_plugin = full.canonicalize().map_err(|e| {
-                    PluginError::IoError(format!(
-                        "Failed to canonicalize plugin path {}: {}",
-                        full.display(),
-                        e
-                    ))
-                })?;
-                if !canonical_plugin.starts_with(&canonical_marketplace) {
-                    return Err(PluginError::IoError(format!(
-                        "Plugin path traversal detected: {} escapes marketplace directory {}",
-                        full.display(),
-                        marketplace_dir.display()
-                    )));
-                }
+                let (canonical_plugin, canonical_marketplace) =
+                    Self::resolve_marketplace_plugin_path(&marketplace_dir, rel_path)?;
                 Ok(FetchedSource::LocalCopy {
                     source: canonical_plugin,
                     marketplace_root: canonical_marketplace,
@@ -1808,6 +1824,54 @@ mod install_decomp_tests {
         };
         assert!(local.commit_sha().is_none());
         assert!(!local.is_git());
+    }
+
+    /// Signature preflight must use the same marketplace containment guard as
+    /// the copy path. A traversal source with a perfectly readable manifest
+    /// outside the marketplace must be rejected before that manifest is read.
+    #[test]
+    fn signature_manifest_path_rejects_marketplace_traversal_before_read() {
+        let tmp = TempDir::new().unwrap();
+        let marketplace = tmp.path().join("marketplace");
+        let outside = tmp.path().join("outside-plugin");
+        fs::create_dir_all(&marketplace).unwrap();
+        fs::create_dir_all(outside.join(".claude-plugin")).unwrap();
+        fs::write(
+            outside.join(".claude-plugin").join("plugin.json"),
+            br#"{"name":"outside-plugin"}"#,
+        )
+        .unwrap();
+
+        let err =
+            PluginManager::path_source_manifest_for_signature(&marketplace, "../outside-plugin")
+                .expect_err("traversal source must be rejected before manifest read");
+        match err {
+            PluginError::InvalidManifest(msg) => {
+                assert!(
+                    msg.contains("traversal"),
+                    "error must name traversal rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidManifest traversal rejection, got {other:?}"),
+        }
+    }
+
+    /// In-bounds path sources still load their raw manifest bytes and optional
+    /// signature for policy enforcement.
+    #[test]
+    fn signature_manifest_path_loads_in_bounds_manifest() {
+        let marketplace = TempDir::new().unwrap();
+        let plugin = marketplace.path().join("local-plugin");
+        let manifest_dir = plugin.join(".claude-plugin");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        let raw = br#"{"name":"local-plugin"}"#;
+        fs::write(manifest_dir.join("plugin.json"), raw).unwrap();
+
+        let (bytes, sig) =
+            PluginManager::path_source_manifest_for_signature(marketplace.path(), "local-plugin")
+                .expect("in-bounds plugin manifest must load");
+        assert_eq!(bytes.as_slice(), raw);
+        assert!(sig.is_none());
     }
 
     /// `validate_marketplace_entry` rejects names containing path
