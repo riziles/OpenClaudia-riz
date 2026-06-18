@@ -8,7 +8,7 @@
 //! | 2. `web_fetch` SSRF hostname denylist   | `fetch_url_blocks_localhost_hostname`, `fetch_url_blocks_gcp_metadata`, `fetch_url_blocks_k8s_endpoint` |
 //! | 3. `web_fetch` private-IP SSRF guard    | `fetch_url_blocks_loopback_ipv4`, `fetch_url_blocks_private_network_10`, `fetch_url_blocks_aws_metadata_ip`, `fetch_url_blocks_ipv6_loopback`, `fetch_url_blocks_decimal_encoded_loopback` |
 //! | 4. `web_fetch` success output format    | `fetch_url_success_output_contains_url_line`, `fetch_url_success_truncates_at_50k` |
-//! | 5. `web_fetch` HTTP error path          | `fetch_url_http_404_returns_error`, `fetch_url_http_500_returns_error` |
+//! | 5. `web_fetch` validation layering      | `execute_web_fetch_prefix_check_catches_non_http`, `fetch_url_rejects_loopback_mock_before_status_handling` |
 //!
 //! ### Fixed regressions pinned
 //!
@@ -206,18 +206,13 @@ async fn fetch_url_blocks_decimal_encoded_loopback() {
 // Behavior 4 — `web_fetch` success output format
 //
 // Spec §1 output: plain string, optional "# title" line, then "URL: <url>",
-// then raw Jina Reader markdown. Truncated at 50,000 chars (OC-specific;
+// then markdown/plaintext content. Truncated at 50,000 chars (OC-specific;
 // CC truncates at 100,000 chars). No structured {bytes,code,codeText,...}.
 //
-// We use wiremock to serve a local HTTP response instead of hitting Jina Reader
-// (which would require a live network and remote service).
-//
-// NOTE: fetch_url prepends the Jina Reader base URL (https://r.jina.ai/<url>).
-// The server URL from wiremock cannot be directly fetched via Jina Reader in a
-// unit test. We test the output-format contract through execute_web_fetch (the
-// tool entry point), which also wraps fetch_url, by verifying that a valid
-// public URL (when given in isolation) produces the expected structure. These
-// tests validate the formatting logic rather than the live fetch path.
+// Public `fetch_url` performs SSRF validation before network access, so local
+// wiremock URLs are intentionally rejected at the integration layer. These
+// tests validate the tool output-format contract without making live network
+// requests.
 // ===========================================================================
 
 #[test]
@@ -307,58 +302,21 @@ fn fetch_output_truncates_at_50k_chars() {
 }
 
 // ===========================================================================
-// Behavior 5 — `web_fetch` HTTP non-200 error path
+// Behavior 5 — `web_fetch` validation layering
 //
-// Spec §1: OC returns `Err("HTTP error: <status> - <url>")` on non-200.
-// CC returns a structured object with `code`/`codeText`.
-//
-// We use wiremock to simulate a real HTTP server returning 404 / 500.
-// fetch_url hits Jina Reader (`r.jina.ai/<url>`), so we cannot intercept it
-// cleanly with wiremock unless we bypass Jina. Instead, we invoke fetch_url
-// directly with the wiremock URL (a valid http:// URL that passes validate_url)
-// and observe how the non-200 response is handled.
+// Public `fetch_url` validates URLs before any HTTP request. That means local
+// wiremock URLs never reach status handling through this integration path.
+// The direct HTTP tier's non-2xx behavior is pinned in `src/web.rs` unit tests.
 // ===========================================================================
 
 #[tokio::test]
-async fn fetch_url_http_404_returns_error() {
-    // Spec §1 error path: HTTP 404 → Err("HTTP error: 404 Not Found - <url>")
-    //
-    // fetch_url first calls validate_url(url), then prepends JINA_READER_URL.
-    // Because we cannot intercept the Jina reader proxy, we test by passing a
-    // URL whose scheme/host passes validate_url but whose HTTP response from
-    // Jina Reader will (in practice) return an error.
-    //
-    // For a pure unit test, we call into the validate path and verify the
-    // public-URL check passes, confirming this behavior is only reached after
-    // validate_url succeeds. The actual non-200 behavior is exercised
-    // via the execute_web_fetch wrapper path in fetch_output_format_contains_url_header.
-    //
-    // This test documents the OC contract and marks the gap vs CC structured output.
-    // GAP vs CC (#529 §1): OC returns plain "HTTP error: <status> - <url>", not
-    // { bytes, code, codeText, result, durationMs, url }.
+async fn fetch_url_rejects_loopback_mock_before_status_handling() {
     let server = serve_body(404, "Not found").await;
-    let url = server.uri();
-    // validate_url will succeed (valid http:// with a real loopback port from wiremock).
-    // fetch_url then sends to Jina Reader, not our mock — so we verify the contract
-    // at the validate_url level only here. A full end-to-end fetch against a mock
-    // requires intercepting Jina Reader, which is a live proxy (tracked as a future
-    // improvement in the test suite).
-    //
-    // DOCUMENTED DIVERGENCE: fetch_url wraps the URL in the Jina Reader proxy;
-    // our wiremock server cannot be reached via that proxy in unit tests.
-    // The non-200 contract (Err string with status code) is pinned via the
-    // formatting unit tests above and confirmed by reading src/web.rs:280-281.
-    let _ = url; // suppress unused warning — server kept alive for documentation
-                 // Pin: non-200 from Jina Reader → Err(format!("HTTP error: {} - {}", status, url))
-                 // (src/web.rs:281) — plain string, no structured code field.
-}
-
-#[tokio::test]
-async fn fetch_url_http_500_returns_error() {
-    // Same contract as 404 but for 500. Pinned here to make the test-spec
-    // mapping explicit. See fetch_url_http_404_returns_error for full rationale.
-    let server = serve_body(500, "Internal error").await;
-    let _ = server.uri();
+    let err = fetch_url(&server.uri()).await.unwrap_err();
+    assert!(
+        err.contains("reserved/internal") || err.contains("metadata endpoint"),
+        "loopback mock must be rejected before HTTP status handling; got {err}"
+    );
 }
 
 // ===========================================================================

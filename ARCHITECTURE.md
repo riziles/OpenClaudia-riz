@@ -253,7 +253,7 @@
    │   mcp.rs      │    │   oauth.rs    │    │   web.rs      │
    │               │    │               │    │               │
    │  Stdio:       │    │  Device Flow  │    │  fetch_url    │
-   │   spawn proc  │    │  PKCE auth    │    │   (Jina)      │
+   │   spawn proc  │    │  PKCE auth    │    │  direct HTTP  │
    │   JSON-RPC    │    │  Token store  │    │               │
    │               │    │  API key gen  │    │  search_web   │
    │  HTTP:        │    │               │    │ browser scrape│

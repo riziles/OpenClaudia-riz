@@ -1610,6 +1610,22 @@ mod tests {
         assert_eq!(out, body, "small body must be returned verbatim");
     }
 
+    #[tokio::test]
+    async fn direct_fetch_non_success_status_returns_status_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let err = fetch_url_direct(&server.uri())
+            .await
+            .expect_err("direct HTTP tier must reject non-2xx status");
+        assert!(
+            err.contains("HTTP 404 Not Found from upstream"),
+            "non-2xx error should name upstream status; got {err}"
+        );
+    }
+
     /// 11 MiB body must trip the production cap (10 MiB) and error out with a
     /// message naming the cap. Exercises the streaming overflow branch.
     #[tokio::test]
