@@ -31,6 +31,7 @@ use crate::config::AppConfig;
 use crate::hooks::{
     load_claude_code_hooks, merge_hooks_config, HookEngine, HookError, HookEvent, HookInput,
 };
+use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
 use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
 use crate::session::SessionManager;
@@ -372,6 +373,64 @@ async fn pre_tool_use_gate(
     }
 
     None
+}
+
+/// Run the ACP dispatch through the same permission manager used by
+/// local tool execution, but project unmatched rules as a headless deny
+/// instead of an interactive prompt.
+fn acp_permission_gate(
+    permission_mgr: &PermissionManager,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Option<AcpToolResult> {
+    let permission_input = normalize_acp_permission_input(tool_name, tool_input);
+    match permission_mgr.check_with_context(
+        tool_name,
+        &permission_input,
+        PermissionContext::Coordinator,
+    ) {
+        CheckResult::Allowed => None,
+        CheckResult::Denied(reason) => {
+            warn!(
+                tool = %tool_name,
+                reason = %reason,
+                "ACP permission gate denied tool dispatch"
+            );
+            Some(AcpToolResult {
+                content: format!("Permission denied: {reason}"),
+                is_error: true,
+            })
+        }
+        CheckResult::NeedsPrompt { tool, target } => {
+            warn!(
+                tool = %tool,
+                target = %target,
+                "ACP permission gate refused interactive prompt"
+            );
+            Some(AcpToolResult {
+                content: format!(
+                    "Permission denied: ACP mode cannot prompt for {tool} on '{target}'"
+                ),
+                is_error: true,
+            })
+        }
+    }
+}
+
+fn normalize_acp_permission_input(tool_name: &str, tool_input: &Value) -> Value {
+    if !matches!(tool_name, "write_file" | "edit_file") {
+        return tool_input.clone();
+    }
+
+    let mut normalized = tool_input.clone();
+    if let Value::Object(map) = &mut normalized {
+        if !map.contains_key("path") {
+            if let Some(file_path) = map.get("file_path").cloned() {
+                map.insert("path".to_string(), file_path);
+            }
+        }
+    }
+    normalized
 }
 
 fn parse_acp_tool_arguments(
@@ -1466,8 +1525,11 @@ impl AcpServer {
     /// 1. Run `PreToolUse` hooks. On denial, surface the block reason as
     ///    the tool result instead of dispatching — no ACP fs/terminal
     ///    call is made and no `execute_tool_with_memory` runs.
-    /// 2. Dispatch to the appropriate ACP / local handler.
-    /// 3. Fire `PostToolUse` (or `PostToolUseFailure`) after dispatch so
+    /// 2. Run a non-interactive permission check. ACP stdio cannot show
+    ///    the TUI prompt, so unmatched write/bash/web-fetch decisions
+    ///    become default-deny results.
+    /// 3. Dispatch to the appropriate ACP / local handler.
+    /// 4. Fire `PostToolUse` (or `PostToolUseFailure`) after dispatch so
     ///    post-tool side effects (logging, audit, learn hooks) observe
     ///    ACP-driven calls the same way they observe proxy-driven calls.
     async fn execute_tool_via_acp(&self, tool_name: &str, arguments_json: &str) -> AcpToolResult {
@@ -1478,6 +1540,11 @@ impl AcpServer {
 
         // ── PreToolUse gate ─────────────────────────────────────────────
         if let Some(blocked) = pre_tool_use_gate(&self.hook_engine, tool_name, &tool_input).await {
+            return blocked;
+        }
+
+        // ── Headless permission gate ───────────────────────────────────
+        if let Some(blocked) = acp_permission_gate(&self.permission_mgr, tool_name, &tool_input) {
             return blocked;
         }
 
@@ -1939,12 +2006,18 @@ impl AcpServer {
 
     async fn acp_list_files(&self, args: &HashMap<String, Value>) -> AcpToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let command = match acp_list_files_command(path) {
+            Ok(command) => command,
+            Err(content) => {
+                return AcpToolResult {
+                    content,
+                    is_error: true,
+                };
+            }
+        };
         // Delegate as a terminal command
         let mut ls_args = HashMap::new();
-        ls_args.insert(
-            "command".to_string(),
-            Value::String(format!("ls -la {path}")),
-        );
+        ls_args.insert("command".to_string(), Value::String(command));
         self.acp_bash(&ls_args).await
     }
 
@@ -1976,6 +2049,11 @@ impl AcpServer {
 /// `| head -N` pipeline, which only worked because the command was being
 /// shell-interpreted.
 const SEARCH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
+
+fn acp_list_files_command(path: &str) -> Result<String, String> {
+    let quoted = shlex::try_quote(path).map_err(|err| format!("Invalid list_files path: {err}"))?;
+    Ok(format!("ls -la -- {quoted}"))
+}
 
 /// Resolve a program name to an absolute path by walking `PATH`.
 ///
@@ -2931,6 +3009,91 @@ mod tool_argument_tests {
                 .get("command")
                 .and_then(serde_json::Value::as_str),
             Some("pwd")
+        );
+    }
+}
+
+#[cfg(test)]
+mod acp_permission_gate_tests {
+    use super::{acp_list_files_command, acp_permission_gate};
+    use crate::permissions::PermissionManager;
+    use serde_json::json;
+
+    fn enabled(default_allow: Vec<&str>) -> (PermissionManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = PermissionManager::new(
+            tmp.path().join("permissions.json"),
+            true,
+            default_allow.into_iter().map(str::to_string).collect(),
+        );
+        (mgr, tmp)
+    }
+
+    #[test]
+    fn headless_gate_denies_unmatched_bash_instead_of_prompting() {
+        let (mgr, _tmp) = enabled(vec![]);
+
+        let blocked = acp_permission_gate(&mgr, "bash", &json!({"command": "cargo test"}))
+            .expect("unmatched ACP bash must default-deny");
+
+        assert!(blocked.is_error);
+        assert!(
+            blocked.content.contains("Permission denied"),
+            "denial should be surfaced as a normal tool error: {}",
+            blocked.content
+        );
+        assert!(
+            blocked.content.contains("Default-deny"),
+            "denial should come from the headless permission context: {}",
+            blocked.content
+        );
+    }
+
+    #[test]
+    fn headless_gate_allows_matching_default_allow_rule() {
+        let (mgr, _tmp) = enabled(vec!["git status *"]);
+
+        let outcome = acp_permission_gate(&mgr, "bash", &json!({"command": "git status --short"}));
+
+        assert!(
+            outcome.is_none(),
+            "explicit default_allow rule must still allow ACP bash; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn headless_gate_normalizes_file_path_alias_for_write_rules() {
+        let allowed_path = "/tmp/openclaudia-acp-allowed.txt";
+        let (mgr, _tmp) = enabled(vec![allowed_path]);
+
+        let outcome = acp_permission_gate(
+            &mgr,
+            "write_file",
+            &json!({"file_path": allowed_path, "content": "ok"}),
+        );
+
+        assert!(
+            outcome.is_none(),
+            "ACP write_file file_path alias must be checked as the registry path target; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn list_files_command_quotes_path_as_one_shell_argument() {
+        let path = "dir ' ; touch /tmp/openclaudia-acp-owned ; '";
+
+        let command = acp_list_files_command(path).expect("path should be quoteable");
+        let argv = shlex::split(&command).expect("quoted command should parse");
+
+        assert_eq!(
+            argv,
+            vec![
+                "ls".to_string(),
+                "-la".to_string(),
+                "--".to_string(),
+                path.to_string()
+            ],
+            "list_files path must survive as one argv entry; command was {command:?}"
         );
     }
 }
