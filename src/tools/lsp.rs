@@ -703,14 +703,14 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
         );
     }
 
-    let line = args
-        .get("line")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(1, |v| u32::try_from(v).unwrap_or(u32::MAX));
-    let character = args
-        .get("character")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX));
+    let line = match parse_lsp_line_arg(args.get("line")) {
+        Ok(line) => line,
+        Err(msg) => return (msg, true),
+    };
+    let character = match parse_lsp_character_arg(args.get("character")) {
+        Ok(character) => character,
+        Err(msg) => return (msg, true),
+    };
 
     // Detect language server
     let Some((server_cmd, server_args)) = detect_language_server(file_path) else {
@@ -799,6 +799,29 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
 struct LspRequestExtras {
     query: Option<String>,
     hierarchy_item: Option<Value>,
+}
+
+fn parse_lsp_line_arg(value: Option<&Value>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(1);
+    };
+    let Some(line) = value.as_u64() else {
+        return Err("Error: line must be a 1-indexed positive integer".to_string());
+    };
+    if line == 0 {
+        return Err("Error: line must be a 1-indexed positive integer".to_string());
+    }
+    Ok(u64_to_u32_saturating(line))
+}
+
+fn parse_lsp_character_arg(value: Option<&Value>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Some(character) = value.as_u64() else {
+        return Err("Error: character must be a 0-indexed non-negative integer".to_string());
+    };
+    Ok(u64_to_u32_saturating(character))
 }
 
 /// Map an [`LspAction`] to its `(method, params)` JSON-RPC pair. Extracted

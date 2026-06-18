@@ -799,10 +799,12 @@ impl ToolHandler for LspHandler {
                         },
                         "line": {
                             "type": "integer",
+                            "minimum": 1,
                             "description": "1-indexed line number of the symbol (required for position-pointing ops)"
                         },
                         "character": {
                             "type": "integer",
+                            "minimum": 0,
                             "description": "0-indexed character offset within the line (required for position-pointing ops)"
                         },
                         "query": {

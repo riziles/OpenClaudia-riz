@@ -306,6 +306,17 @@ fn line_arg_above_u32_max_clamps_to_u32_max_no_panic() {
 }
 
 #[test]
+fn line_arg_zero_returns_validation_error() {
+    let args = args_with(&[("file_path", json!("/x.rs")), ("line", json!(0))]);
+    let (msg, is_err) = dispatch_lsp(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("1-indexed"),
+        "line=0 must fail before LSP server lookup; got {msg:?}"
+    );
+}
+
+#[test]
 fn character_arg_above_u32_max_clamps_no_panic() {
     let args = args_with(&[
         ("file_path", json!("/x.rs")),
@@ -316,12 +327,14 @@ fn character_arg_above_u32_max_clamps_no_panic() {
 }
 
 #[test]
-fn negative_line_arg_treated_as_default_no_panic() {
-    // u64::as_u64() returns None for negative numbers →
-    // map_or(1, ...) — line defaults to 1.
+fn negative_line_arg_returns_validation_error() {
     let args = args_with(&[("file_path", json!("/x.rs")), ("line", json!(-1))]);
-    let (_msg, is_err) = dispatch_lsp(&args);
+    let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
+    assert!(
+        msg.contains("1-indexed"),
+        "negative line must fail before LSP server lookup; got {msg:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -447,6 +447,28 @@ fn web_search_description_pins_free_browser_backends() {
 }
 
 #[test]
+fn lsp_position_schema_advertises_indexing_bounds() {
+    let def = registry().get("lsp").expect("lsp registered").definition();
+    let line_schema = def
+        .pointer("/function/parameters/properties/line")
+        .expect("lsp line schema");
+    let character_schema = def
+        .pointer("/function/parameters/properties/character")
+        .expect("lsp character schema");
+
+    assert_eq!(
+        line_schema.get("minimum").and_then(Value::as_u64),
+        Some(1),
+        "lsp line schema must advertise the enforced 1-indexed lower bound"
+    );
+    assert_eq!(
+        character_schema.get("minimum").and_then(Value::as_u64),
+        Some(0),
+        "lsp character schema must advertise the enforced zero-indexed lower bound"
+    );
+}
+
+#[test]
 fn file_tool_path_descriptions_match_relative_path_support() {
     for (tool_name, path_property) in [
         ("read_file", "path"),
