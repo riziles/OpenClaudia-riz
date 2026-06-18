@@ -301,6 +301,29 @@ fn exit_worktree_with_arbitrary_args_never_panics() {
     let (_msg, _is_err) = dispatch("exit_worktree", &args);
 }
 
+#[test]
+fn exit_worktree_schema_exposes_discard_changes_gate() {
+    let def = registry()
+        .get("exit_worktree")
+        .expect("exit_worktree registered")
+        .definition();
+    let params = def
+        .pointer("/function/parameters")
+        .expect("exit_worktree parameters");
+    assert!(
+        params.pointer("/properties/discard_changes").is_some(),
+        "exit_worktree schema must expose discard_changes for dirty worktree removal"
+    );
+    let apply_desc = params
+        .pointer("/properties/apply_changes/description")
+        .and_then(Value::as_str)
+        .expect("apply_changes description");
+    assert!(
+        apply_desc.contains("discard_changes=true"),
+        "apply_changes description must tell callers how to explicitly discard dirty work; got {apply_desc:?}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section I — Cross-tool consistency
 // ───────────────────────────────────────────────────────────────────────────

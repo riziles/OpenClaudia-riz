@@ -1024,7 +1024,7 @@ impl ToolHandler for ExitWorktreeHandler {
             "type": "function",
             "function": {
                 "name": "exit_worktree",
-                "description": "Remove an isolated git worktree previously created by enter_worktree. Optionally commits and merges changes back, or discards them. Does NOT change the process working directory.",
+                "description": "Remove an isolated git worktree previously created by enter_worktree. Optionally commits and merges changes back, or explicitly discards dirty work. Does NOT change the process working directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1034,7 +1034,11 @@ impl ToolHandler for ExitWorktreeHandler {
                         },
                         "apply_changes": {
                             "type": "boolean",
-                            "description": "If true, commit any uncommitted changes and merge the worktree branch into the main branch. If false (default), discard the worktree."
+                            "description": "If true, commit any uncommitted changes and merge the worktree branch into the main branch before removal. If false (default), removal succeeds only when the worktree is clean unless discard_changes=true is also passed."
+                        },
+                        "discard_changes": {
+                            "type": "boolean",
+                            "description": "If true with apply_changes=false, explicitly discard uncommitted work and remove the worktree. Defaults to false to prevent accidental data loss."
                         }
                     },
                     "required": ["path"]
