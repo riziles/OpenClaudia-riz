@@ -197,10 +197,9 @@ impl ToolHandler for BashOutputHandler {
                     "properties": {
                         "shell_id": {
                             "type": "string",
-                            "description": "The shell ID returned from a bash command with run_in_background=true"
+                            "description": "The shell ID returned from a bash command with run_in_background=true. Omit this field to list all background shells."
                         }
-                    },
-                    "required": ["shell_id"]
+                    }
                 }
             }
         })

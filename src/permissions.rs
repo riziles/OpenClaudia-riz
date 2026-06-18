@@ -2774,8 +2774,8 @@ mod phase2_spec_pins {
             "task_list",             // session task state
             "enter_plan_mode",       // mode flag
             "exit_plan_mode",        // mode flag
-            "list_mcp_resources",    // MCP read (stub today)
-            "read_mcp_resource",     // MCP read (stub today)
+            "list_mcp_resources",    // MCP read
+            "read_mcp_resource",     // MCP read
             "lsp",                   // LSP read
             "enter_worktree",        // git worktree create (gated separately)
             "exit_worktree",         // git worktree remove (gated separately)

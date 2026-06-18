@@ -225,6 +225,25 @@ fn documented_core_tools_all_registered() {
     );
 }
 
+#[test]
+fn bash_output_schema_allows_no_shell_id_list_mode() {
+    let handler = registry().get("bash_output").expect("registered");
+    let def = handler.definition();
+
+    assert!(
+        def.pointer("/function/parameters/required").is_none(),
+        "bash_output must not require shell_id because omitted shell_id lists all background shells"
+    );
+    let shell_id_description = def
+        .pointer("/function/parameters/properties/shell_id/description")
+        .and_then(Value::as_str)
+        .expect("shell_id description");
+    assert!(
+        shell_id_description.contains("Omit"),
+        "bash_output shell_id description must document no-arg list mode; got {shell_id_description:?}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section C — registry handler dispatch
 // ───────────────────────────────────────────────────────────────────────────
