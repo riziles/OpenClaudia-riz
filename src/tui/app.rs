@@ -20,7 +20,7 @@ use ratatui::{
 };
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -45,6 +45,32 @@ fn current_exe_command() -> Result<Command, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("failed to resolve current executable: {e}"))?;
     Ok(Command::new(exe))
+}
+
+fn format_init_command_output(out: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut parts = Vec::new();
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    if !stdout.is_empty() {
+        parts.push(stdout);
+    }
+    if !stderr.is_empty() {
+        parts.push(stderr);
+    }
+    let details = parts.join("\n");
+    if out.status.success() {
+        if details.is_empty() {
+            "Initialized OpenClaudia configuration in .openclaudia/".to_string()
+        } else {
+            details
+        }
+    } else if details.is_empty() {
+        format!("Init failed: {}", out.status)
+    } else {
+        format!("Init failed: {details}")
+    }
 }
 
 /// Process-wide shutdown flag for the TUI event loop.
@@ -2436,7 +2462,7 @@ impl App {
             let content = match current_exe_command()
                 .and_then(|mut cmd| cmd.arg("init").output().map_err(|e| e.to_string()))
             {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+                Ok(out) => format_init_command_output(&out),
                 Err(e) => format!("Init failed: {e}"),
             };
             self.messages.add(DisplayMessage::system(content));
@@ -3809,9 +3835,10 @@ mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
         current_exe_command, format_api_retry_delay, format_api_retry_message,
-        format_stream_timeout_message, git_bin, handle_turn_result, lookup_tui_slash,
-        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, EffortLevel,
-        ProviderSwitch, SpawnTarget, TuiSession, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        format_init_command_output, format_stream_timeout_message, git_bin, handle_turn_result,
+        lookup_tui_slash, resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent,
+        EffortLevel, ProviderSwitch, SpawnTarget, TuiSession, TurnContext, TEST_SESSIONS_DIR,
+        TUI_SLASH_TABLE,
     };
     use crate::slash_commands::all_tui_commands;
     use crate::tui::events::ApiRetryKind;
@@ -3870,6 +3897,60 @@ mod tests {
                 n = idx + 1,
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn output_with_status(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_init_output_uses_stderr_on_success() {
+        let output = output_with_status(
+            0,
+            "",
+            "Initialized OpenClaudia configuration in .openclaudia/\nSet your API key",
+        );
+
+        let rendered = format_init_command_output(&output);
+
+        assert!(rendered.contains("Initialized OpenClaudia configuration"));
+        assert!(rendered.contains("Set your API key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_init_output_reports_nonzero_status() {
+        let output = output_with_status(
+            1,
+            "",
+            "Configuration already exists. Use --force to overwrite.",
+        );
+
+        let rendered = format_init_command_output(&output);
+
+        assert!(rendered.starts_with("Init failed:"));
+        assert!(rendered.contains("Configuration already exists"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_init_output_never_renders_blank_on_silent_success() {
+        let output = output_with_status(0, "", "");
+
+        let rendered = format_init_command_output(&output);
+
+        assert_eq!(
+            rendered,
+            "Initialized OpenClaudia configuration in .openclaudia/"
+        );
     }
 
     #[test]
