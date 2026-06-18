@@ -174,9 +174,11 @@ fn is_openai_reasoning_model(model: &str) -> bool {
 }
 
 fn openai_reasoning_effort(effort: Option<&str>) -> &'static str {
-    match effort {
+    match effort.map(str::to_ascii_lowercase).as_deref() {
+        Some("none") => "none",
         Some("low") => "low",
-        Some("high" | "max" | "xhigh") => "high",
+        Some("high") => "high",
+        Some("max" | "xhigh") => "xhigh",
         _ => "medium",
     }
 }
@@ -454,12 +456,27 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_effort_clamps_max_to_high() {
+    fn openai_reasoning_effort_maps_max_alias_to_xhigh() {
         let mut t = thinking_on();
         t.reasoning_effort = Some("max".to_string());
         let mut body = serde_json::to_value(req("gpt-5.5")).unwrap();
         ThinkingInjector::OpenAiReasoningEffort.inject(&mut body, &t, "gpt-5.5");
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_accepts_current_extremes() {
+        let mut none = thinking_on();
+        none.reasoning_effort = Some("none".to_string());
+        let mut none_body = serde_json::to_value(req("gpt-5.5")).unwrap();
+        ThinkingInjector::OpenAiReasoningEffort.inject(&mut none_body, &none, "gpt-5.5");
+        assert_eq!(none_body["reasoning_effort"], "none");
+
+        let mut xhigh = thinking_on();
+        xhigh.reasoning_effort = Some("xhigh".to_string());
+        let mut xhigh_body = serde_json::to_value(req("gpt-5.5")).unwrap();
+        ThinkingInjector::OpenAiReasoningEffort.inject(&mut xhigh_body, &xhigh, "gpt-5.5");
+        assert_eq!(xhigh_body["reasoning_effort"], "xhigh");
     }
 
     #[test]

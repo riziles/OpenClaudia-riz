@@ -152,10 +152,9 @@ pub fn build_anthropic_request(
 
 /// Build an OpenAI-compatible request body (used by `OpenAI`, `DeepSeek`, Qwen, Z.AI).
 ///
-/// `effort_level` propagates as `reasoning_effort` for `high`/`max`;
-/// `max` downgrades to `high` because the API only accepts the level on
-/// a subset of models (matches Claude Code's `modelSupportsMaxEffort`
-/// clamp).
+/// `effort_level` propagates as `reasoning_effort` for supported OpenAI
+/// reasoning levels. `max` is kept as a user-facing alias for OpenAI's
+/// `xhigh` tier.
 #[must_use]
 pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str) -> Value {
     let mut req = serde_json::json!({
@@ -165,8 +164,14 @@ pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str)
         "stream": true,
         "tools": tools::get_all_tool_definitions(true)
     });
-    if matches!(effort_level, "high" | "max") {
-        req["reasoning_effort"] = serde_json::json!("high");
+    match effort_level {
+        "none" | "low" | "high" | "xhigh" => {
+            req["reasoning_effort"] = serde_json::json!(effort_level);
+        }
+        "max" => {
+            req["reasoning_effort"] = serde_json::json!("xhigh");
+        }
+        _ => {}
     }
     req
 }
@@ -201,12 +206,21 @@ fn build_chat_completion_request(
     })
 }
 
-fn thinking_config_for_pipeline_effort(effort_level: &str) -> Option<ThinkingConfig> {
-    matches!(effort_level, "high" | "max").then(|| ThinkingConfig {
+fn thinking_config_for_pipeline_effort(
+    provider: &str,
+    effort_level: &str,
+) -> Option<ThinkingConfig> {
+    let effort = match effort_level {
+        "high" | "max" | "xhigh" => Some(effort_level),
+        "low" | "none" if provider.eq_ignore_ascii_case("openai") => Some(effort_level),
+        _ => None,
+    }?;
+
+    Some(ThinkingConfig {
         enabled: true,
         budget_tokens: None,
         preserve_across_turns: false,
-        reasoning_effort: Some(if effort_level == "max" { "max" } else { "high" }.to_string()),
+        reasoning_effort: Some(effort.to_string()),
         adaptive: true,
     })
 }
@@ -219,7 +233,7 @@ fn build_adapter_request(
 ) -> Result<Value, String> {
     let request = build_chat_completion_request(model, messages)?;
     let adapter = get_adapter(provider).map_err(|e| e.to_string())?;
-    let body = thinking_config_for_pipeline_effort(effort_level).map_or_else(
+    let body = thinking_config_for_pipeline_effort(provider, effort_level).map_or_else(
         || adapter.transform_request(&request),
         |thinking| adapter.transform_request_with_thinking(&request, &thinking),
     );
@@ -2552,6 +2566,9 @@ mod tests {
 
         let high = build_openai_request("gpt-4", &messages, "high");
         assert_eq!(high["reasoning_effort"], "high");
+
+        let max = build_openai_request("gpt-4", &messages, "max");
+        assert_eq!(max["reasoning_effort"], "xhigh");
     }
 
     #[test]
@@ -2647,6 +2664,14 @@ mod tests {
         let gpt5 = build_request("openai", "gpt-5.5", &messages, "high", None, None)
             .expect("gpt-5 request should build");
         assert_eq!(gpt5["reasoning_effort"], "high");
+
+        let low = build_request("openai", "gpt-5.5", &messages, "low", None, None)
+            .expect("gpt-5 low-effort request should build");
+        assert_eq!(low["reasoning_effort"], "low");
+
+        let max = build_request("openai", "gpt-5.5", &messages, "max", None, None)
+            .expect("gpt-5 max-effort request should build");
+        assert_eq!(max["reasoning_effort"], "xhigh");
 
         let gpt4 = build_request("openai", "gpt-4o", &messages, "high", None, None)
             .expect("gpt-4o request should build");

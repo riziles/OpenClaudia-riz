@@ -296,7 +296,7 @@ impl EffortLevel {
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
-            "max" | "x" => Some(Self::Max),
+            "max" | "x" | "xhigh" => Some(Self::Max),
             "auto" | "unset" => Some(Self::Auto),
             _ => None,
         }
@@ -413,6 +413,7 @@ mod tests {
         assert_eq!(EffortLevel::parse("High"), Some(EffortLevel::High));
         assert_eq!(EffortLevel::parse("max"), Some(EffortLevel::Max));
         assert_eq!(EffortLevel::parse("x"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::parse("xhigh"), Some(EffortLevel::Max));
         assert_eq!(EffortLevel::parse("auto"), Some(EffortLevel::Auto));
         assert_eq!(EffortLevel::parse("unset"), Some(EffortLevel::Auto));
         assert_eq!(EffortLevel::parse("xxl"), None);

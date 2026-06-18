@@ -271,12 +271,20 @@ fn build_openai_request_high_effort_emits_reasoning_effort() {
 }
 
 #[test]
-fn build_openai_request_max_effort_downgrades_to_high() {
-    // Documented: max → high (matches CC's
-    // modelSupportsMaxEffort clamp).
+fn build_openai_request_max_effort_maps_to_xhigh() {
+    // User-facing max is an alias for OpenAI's current xhigh tier.
     let msgs = vec![json!({"role": "user", "content": "hi"})];
     let req = build_openai_request("o3", &msgs, "max");
-    assert_eq!(req["reasoning_effort"], "high");
+    assert_eq!(req["reasoning_effort"], "xhigh");
+}
+
+#[test]
+fn build_openai_request_low_and_none_emit_reasoning_effort() {
+    let msgs = vec![json!({"role": "user", "content": "hi"})];
+    let low = build_openai_request("gpt-5.5", &msgs, "low");
+    assert_eq!(low["reasoning_effort"], "low");
+    let none = build_openai_request("gpt-5.5", &msgs, "none");
+    assert_eq!(none["reasoning_effort"], "none");
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! provider-specific shape, or explicitly no-op when the upstream uses
 //! provider-specific thinking controls not modeled here:
 //!
-//!   - **`OpenAI`**: `reasoning_effort: "low|medium|high"`,
+//!   - **`OpenAI`**: `reasoning_effort: "none|low|medium|high|xhigh"`,
 //!     only for `OpenAI` reasoning-family models.
 //!   - **`DeepSeek`**: `thinking: {type: "enabled"|"disabled"}`,
 //!     plus `reasoning_effort: "high"|"max"` when enabled.
@@ -127,6 +127,29 @@ fn openai_thinking_injects_reasoning_effort_for_gpt5_codex_model() {
     assert_eq!(
         body["reasoning_effort"], "high",
         "GPT-5 Codex model with thinking enabled MUST set reasoning_effort; got {body}"
+    );
+}
+
+#[test]
+fn openai_thinking_supports_none_and_xhigh_reasoning_effort() {
+    let adapter = get_adapter("openai").expect("openai adapter");
+
+    let none_req = minimal_request("gpt-5.5");
+    let none_body = adapter
+        .transform_request_with_thinking(&none_req, &enabled_thinking(Some("none")))
+        .expect("transform");
+    assert_eq!(
+        none_body["reasoning_effort"], "none",
+        "OpenAI GPT-5.5 must allow reasoning_effort=none; got {none_body}"
+    );
+
+    let xhigh_req = minimal_request("gpt-5.5");
+    let xhigh_body = adapter
+        .transform_request_with_thinking(&xhigh_req, &enabled_thinking(Some("xhigh")))
+        .expect("transform");
+    assert_eq!(
+        xhigh_body["reasoning_effort"], "xhigh",
+        "OpenAI GPT-5.5 must allow reasoning_effort=xhigh; got {xhigh_body}"
     );
 }
 

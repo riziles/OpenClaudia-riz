@@ -234,21 +234,35 @@ pub trait ProviderAdapter: Send + Sync {
     /// See crosslink #479.
     fn extract_token_usage(&self, response: &Value) -> Option<TokenUsage> {
         let usage = response.get("usage")?;
+        let raw_input_tokens = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached_tokens_from_details = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"))
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let cache_read_tokens = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .or(cached_tokens_from_details)
+            .unwrap_or(0);
+        let input_tokens = if cached_tokens_from_details.is_some() {
+            raw_input_tokens.saturating_sub(cache_read_tokens)
+        } else {
+            raw_input_tokens
+        };
+
         Some(TokenUsage {
-            input_tokens: usage
-                .get("prompt_tokens")
-                .or_else(|| usage.get("input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            input_tokens,
             output_tokens: usage
                 .get("completion_tokens")
                 .or_else(|| usage.get("output_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            cache_read_tokens: usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cache_read_tokens,
             cache_write_tokens: usage
                 .get("cache_creation_input_tokens")
                 .and_then(Value::as_u64)
@@ -1287,6 +1301,28 @@ mod tests {
             .expect("usage present");
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn openai_extract_token_usage_splits_cached_prompt_details() {
+        let adapter = OpenAIAdapter::new();
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 300_000,
+                "completion_tokens": 12_000,
+                "prompt_tokens_details": {"cached_tokens": 125_000}
+            }
+        });
+        let usage = adapter
+            .extract_token_usage(&response)
+            .expect("usage present");
+        assert_eq!(
+            usage.input_tokens, 175_000,
+            "OpenAI prompt_tokens includes cached tokens; cost input must keep only uncached tokens"
+        );
+        assert_eq!(usage.output_tokens, 12_000);
+        assert_eq!(usage.cache_read_tokens, 125_000);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     /// A response with NO recognisable usage envelope must return `None`,

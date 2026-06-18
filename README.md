@@ -127,7 +127,7 @@ providers:
   openai:
     base_url: https://api.openai.com
     thinking:
-      reasoning_effort: "medium"  # OpenAI GPT-5/o1/o3/o4: low, medium, high
+      reasoning_effort: "medium"  # OpenAI GPT-5/o1/o3/o4: none, low, medium, high, xhigh
   google:
     base_url: https://generativelanguage.googleapis.com
     thinking:
@@ -236,7 +236,7 @@ The default full-screen TUI intentionally exposes a focused slash-command set. T
 | `/model list`, `/models` | List fallback models for the current provider |
 | `/model <name>` | Switch to a different model |
 | `/mode` | Toggle between Build and Plan modes |
-| `/effort [low\|medium\|high\|max\|auto]` | Set or cycle effort level |
+| `/effort [low\|medium\|high\|max\|xhigh\|auto]` | Set or cycle effort level |
 
 ### TUI Sessions
 

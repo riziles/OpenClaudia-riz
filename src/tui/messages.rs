@@ -248,7 +248,7 @@ impl FromStr for EffortLevel {
         Ok(match s.trim().to_ascii_lowercase().as_str() {
             "low" | "l" => Self::Low,
             "high" | "h" => Self::High,
-            "max" | "x" => Self::Max,
+            "max" | "x" | "xhigh" => Self::Max,
             "auto" | "unset" => Self::Auto,
             _ => Self::Medium,
         })
@@ -802,6 +802,7 @@ mod tests {
         );
         assert_eq!("high".parse::<EffortLevel>().unwrap(), EffortLevel::High);
         assert_eq!("max".parse::<EffortLevel>().unwrap(), EffortLevel::Max);
+        assert_eq!("xhigh".parse::<EffortLevel>().unwrap(), EffortLevel::Max);
         assert_eq!("x".parse::<EffortLevel>().unwrap(), EffortLevel::Max);
         assert_eq!("auto".parse::<EffortLevel>().unwrap(), EffortLevel::Auto);
         assert_eq!("unset".parse::<EffortLevel>().unwrap(), EffortLevel::Auto);

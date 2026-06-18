@@ -7,7 +7,7 @@
 //! [`ULTRATHINK_BUDGET_TOKENS`] (matches Claude Code's `_Q0.ULTRATHINK`).
 //!
 //! Environment overrides, in precedence order:
-//! 1. `CLAUDE_CODE_EFFORT_LEVEL=low|medium|high|max` forces that effort.
+//! 1. `CLAUDE_CODE_EFFORT_LEVEL=low|medium|high|max|xhigh` forces that effort.
 //!    `unset` or `auto` disables the effort parameter entirely.
 //! 2. `MAX_THINKING_TOKENS=<n>` forces a specific Anthropic budget.
 //!
@@ -113,7 +113,7 @@ pub fn has_ultrathink_in_messages(messages: &[Value]) -> bool {
 }
 
 /// Parse `CLAUDE_CODE_EFFORT_LEVEL`. Returns:
-/// - `Some(Some(level))` for a recognized level (`low`/`medium`/`high`/`max`)
+/// - `Some(Some(level))` for a recognized level (`low`/`medium`/`high`/`max`/`xhigh`)
 /// - `Some(None)` for `unset`/`auto` (disable effort parameter)
 /// - `None` if the env var is absent or unparseable
 #[must_use]
@@ -123,6 +123,7 @@ pub fn env_effort_override() -> Option<Option<String>> {
     match lower.as_str() {
         "unset" | "auto" => Some(None),
         "low" | "medium" | "high" | "max" => Some(Some(lower)),
+        "xhigh" => Some(Some("max".to_string())),
         _ => None,
     }
 }

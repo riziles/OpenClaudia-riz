@@ -83,6 +83,12 @@ pub const OPUS_4_8_FAST_MODE_INPUT_PER_MILLION: f64 = 10.0;
 /// Fast-mode output rate for Claude Opus 4.8 per million tokens.
 pub const OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION: f64 = 50.0;
 
+/// OpenAI GPT-5.5 / GPT-5.4 long-context pricing threshold.
+///
+/// Official pricing applies the long-context rate to the whole request
+/// when prompt input exceeds 272K tokens.
+pub const OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
+
 /// Errors returned by [`calculate_cost`] / [`calculate_cost_with_ttl`].
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum PricingError {
@@ -142,6 +148,13 @@ pub struct ModelPricing {
     /// Per-million-token output rate to bill in fast mode.  Same
     /// fallback rules as [`Self::fast_mode_input_per_million`].
     pub fast_mode_output_per_million: Option<f64>,
+    /// Prompt-token threshold above which a provider bills a separate
+    /// long-context tier for the whole request.
+    pub long_context_threshold_tokens: Option<u64>,
+    /// Per-million-token input rate for the long-context tier.
+    pub long_context_input_per_million: Option<f64>,
+    /// Per-million-token output rate for the long-context tier.
+    pub long_context_output_per_million: Option<f64>,
 }
 
 impl ModelPricing {
@@ -158,6 +171,9 @@ impl ModelPricing {
             cache_write_1hr_multiplier: 2.0,
             fast_mode_input_per_million: None,
             fast_mode_output_per_million: None,
+            long_context_threshold_tokens: None,
+            long_context_input_per_million: None,
+            long_context_output_per_million: None,
         }
     }
 
@@ -178,6 +194,9 @@ impl ModelPricing {
             cache_write_1hr_multiplier: 2.0,
             fast_mode_input_per_million: Some(fast_input),
             fast_mode_output_per_million: Some(fast_output),
+            long_context_threshold_tokens: None,
+            long_context_input_per_million: None,
+            long_context_output_per_million: None,
         }
     }
 
@@ -185,7 +204,8 @@ impl ModelPricing {
     /// the previous fixed-ratio code applied uniformly across providers,
     /// and mirror the 5 m multiplier into the 1 h slot since these
     /// providers do not currently differentiate.  This preserves the
-    /// pre-refactor cost numbers for `OpenAI` / `Google` / `DeepSeek` / `Qwen`.
+    /// pre-refactor cost numbers for legacy `OpenAI` rows / `Google` /
+    /// `DeepSeek` / `Qwen`.
     const fn other(input_per_million: f64, output_per_million: f64) -> Self {
         Self {
             input_per_million,
@@ -195,6 +215,9 @@ impl ModelPricing {
             cache_write_1hr_multiplier: 1.25,
             fast_mode_input_per_million: None,
             fast_mode_output_per_million: None,
+            long_context_threshold_tokens: None,
+            long_context_input_per_million: None,
+            long_context_output_per_million: None,
         }
     }
 
@@ -215,6 +238,33 @@ impl ModelPricing {
             cache_write_1hr_multiplier: cache_write_multiplier,
             fast_mode_input_per_million: None,
             fast_mode_output_per_million: None,
+            long_context_threshold_tokens: None,
+            long_context_input_per_million: None,
+            long_context_output_per_million: None,
+        }
+    }
+
+    /// OpenAI text pricing with optional cached-input and long-context
+    /// rates. OpenAI cached input is cheaper, but prompt-cache writes do
+    /// not have Anthropic's separate write premium.
+    const fn openai_long_context(
+        input_per_million: f64,
+        output_per_million: f64,
+        cache_read_multiplier: f64,
+        long_context_input_per_million: f64,
+        long_context_output_per_million: f64,
+    ) -> Self {
+        Self {
+            input_per_million,
+            output_per_million,
+            cache_read_multiplier,
+            cache_write_5m_multiplier: 1.0,
+            cache_write_1hr_multiplier: 1.0,
+            fast_mode_input_per_million: None,
+            fast_mode_output_per_million: None,
+            long_context_threshold_tokens: Some(OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS),
+            long_context_input_per_million: Some(long_context_input_per_million),
+            long_context_output_per_million: Some(long_context_output_per_million),
         }
     }
 
@@ -251,6 +301,39 @@ impl ModelPricing {
             }
         }
         self.output_per_million
+    }
+
+    fn uses_long_context_rates(&self, usage: &TokenUsage, fast: bool) -> bool {
+        if fast {
+            return false;
+        }
+        let Some(threshold) = self.long_context_threshold_tokens else {
+            return false;
+        };
+
+        usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens)
+            > threshold
+    }
+
+    fn effective_input_per_million_for_usage(&self, usage: &TokenUsage, fast: bool) -> f64 {
+        if self.uses_long_context_rates(usage, fast) {
+            if let Some(rate) = self.long_context_input_per_million {
+                return rate;
+            }
+        }
+        self.effective_input_per_million(fast)
+    }
+
+    fn effective_output_per_million_for_usage(&self, usage: &TokenUsage, fast: bool) -> f64 {
+        if self.uses_long_context_rates(usage, fast) {
+            if let Some(rate) = self.long_context_output_per_million {
+                return rate;
+            }
+        }
+        self.effective_output_per_million(fast)
     }
 }
 
@@ -350,12 +433,24 @@ pub static PRICING_TABLE: &[(&str, ModelPricing)] = &[
     ("gpt-4", ModelPricing::other(30.0, 60.0)),
     ("gpt-3.5-turbo", ModelPricing::other(0.50, 1.50)),
     ("chat-latest", ModelPricing::other(5.0, 30.0)),
-    ("gpt-5.5-pro", ModelPricing::other(30.0, 180.0)),
-    ("gpt-5.5", ModelPricing::other(5.0, 30.0)),
-    ("gpt-5.4-pro", ModelPricing::other(30.0, 180.0)),
+    (
+        "gpt-5.5-pro",
+        ModelPricing::openai_long_context(30.0, 180.0, 1.0, 60.0, 270.0),
+    ),
+    (
+        "gpt-5.5",
+        ModelPricing::openai_long_context(5.0, 30.0, 0.1, 10.0, 45.0),
+    ),
+    (
+        "gpt-5.4-pro",
+        ModelPricing::openai_long_context(30.0, 180.0, 1.0, 60.0, 270.0),
+    ),
     ("gpt-5.4-mini", ModelPricing::other(0.75, 4.50)),
     ("gpt-5.4-nano", ModelPricing::other(0.20, 1.25)),
-    ("gpt-5.4", ModelPricing::other(2.50, 15.0)),
+    (
+        "gpt-5.4",
+        ModelPricing::openai_long_context(2.50, 15.0, 0.1, 5.0, 22.50),
+    ),
     ("gpt-5.3-codex", ModelPricing::other(1.75, 14.0)),
     ("gpt-5.3-chat-latest", ModelPricing::other(1.75, 14.0)),
     ("gpt-5.2-pro", ModelPricing::other(21.0, 168.0)),
@@ -725,8 +820,8 @@ fn calculate_cost_impl(
     let cache_read = f64_from_tokens(usage.cache_read_tokens);
     let cache_write = f64_from_tokens(usage.cache_write_tokens);
 
-    let input_rate = pricing.effective_input_per_million(fast);
-    let output_rate = pricing.effective_output_per_million(fast);
+    let input_rate = pricing.effective_input_per_million_for_usage(usage, fast);
+    let output_rate = pricing.effective_output_per_million_for_usage(usage, fast);
 
     let input_cost = input * input_rate / 1_000_000.0;
     let output_cost = output * output_rate / 1_000_000.0;

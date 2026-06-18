@@ -1488,12 +1488,12 @@ mod tests {
         let openai =
             build_chat_request_body("openai", &messages, "o3", &prompt_blocks, "max", None)
                 .expect("openai-like request must build");
-        assert_eq!(openai["reasoning_effort"], "high");
+        assert_eq!(openai["reasoning_effort"], "xhigh");
 
         let gpt5 =
             build_chat_request_body("openai", &messages, "gpt-5.5", &prompt_blocks, "max", None)
                 .expect("gpt-5 request must build");
-        assert_eq!(gpt5["reasoning_effort"], "high");
+        assert_eq!(gpt5["reasoning_effort"], "xhigh");
 
         let google = build_chat_request_body(
             "google",

@@ -93,7 +93,8 @@ pub struct ThinkingConfig {
     /// Preserve thinking across turns (Z.AI/GLM specific)
     #[serde(default)]
     pub preserve_across_turns: bool,
-    /// Reasoning effort level for `OpenAI` GPT-5/o1/o3/o4: "low", "medium", "high"
+    /// Reasoning effort level for `OpenAI` GPT-5/o1/o3/o4:
+    /// "none", "low", "medium", "high", "xhigh" (`max` aliases to `xhigh`).
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// When `budget_tokens` is `None`, derive the budget from

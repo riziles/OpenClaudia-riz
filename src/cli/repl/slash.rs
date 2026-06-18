@@ -1605,7 +1605,7 @@ pub fn slash_effort(args: &str) -> SlashCommandResult {
             println!("\n\u{2713} Effort set to \x1b[32mhigh\x1b[0m (thorough, slower)\n");
             SlashCommandResult::SetEffort("high".to_string())
         }
-        "max" | "x" => {
+        "max" | "x" | "xhigh" => {
             println!("\n\u{2713} Effort set to \x1b[35mmax\x1b[0m (maximum thinking)\n");
             SlashCommandResult::SetEffort("max".to_string())
         }
@@ -1615,11 +1615,11 @@ pub fn slash_effort(args: &str) -> SlashCommandResult {
         }
         "" => SlashCommandResult::CycleEffort,
         _ => {
-            println!("\nUsage: /effort [low|medium|high|max|auto]");
+            println!("\nUsage: /effort [low|medium|high|max|xhigh|auto]");
             println!("  low    - Quick answers, minimal thinking");
             println!("  medium - Balanced (default)");
             println!("  high   - Thorough, more thinking time");
-            println!("  max    - Maximum thinking where supported");
+            println!("  max    - Maximum thinking where supported (OpenAI xhigh)");
             println!("  auto   - Omit effort hints and use provider default");
             println!("  (no argument cycles through levels)\n");
             SlashCommandResult::Handled

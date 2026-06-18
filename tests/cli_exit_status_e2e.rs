@@ -1202,7 +1202,9 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         "README feature list must match the implemented provider thinking surface"
     );
     assert!(
-        readme.contains("reasoning_effort: \"medium\"  # OpenAI GPT-5/o1/o3/o4: low, medium, high"),
+        readme.contains(
+            "reasoning_effort: \"medium\"  # OpenAI GPT-5/o1/o3/o4: none, low, medium, high, xhigh"
+        ),
         "README config sample must mention every OpenAI reasoning family supported by the adapter"
     );
     assert!(

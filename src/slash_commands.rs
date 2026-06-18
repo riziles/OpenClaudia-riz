@@ -196,7 +196,7 @@ const TUI_CORE: &[SlashCommand] = &[
     cmd("/model <name>", "Switch to a different model"),
     cmd("/mode", "Toggle between Build and Plan modes"),
     cmd(
-        "/effort [low|medium|high|max|auto]",
+        "/effort [low|medium|high|max|xhigh|auto]",
         "Set or cycle effort level",
     ),
 ];

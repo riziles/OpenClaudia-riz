@@ -20,8 +20,8 @@ use openclaudia::session::{
     calculate_cost, calculate_cost_fast_mode, calculate_cost_with_ttl, get_pricing,
     web_search_cost, CacheWriteTtl, ModelPricing, PricingError, TokenUsage,
     FAST_MODE_INPUT_PER_MILLION, FAST_MODE_OUTPUT_PER_MILLION,
-    OPUS_4_8_FAST_MODE_INPUT_PER_MILLION, OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION,
-    WEB_SEARCH_REQUEST_USD,
+    OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS, OPUS_4_8_FAST_MODE_INPUT_PER_MILLION,
+    OPUS_4_8_FAST_MODE_OUTPUT_PER_MILLION, WEB_SEARCH_REQUEST_USD,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -95,10 +95,18 @@ fn get_pricing_for_current_openai_gpt5_models_returns_documented_rates() {
     let gpt55 = get_pricing("gpt-5.5").expect("gpt-5.5");
     assert_eq!(gpt55.input_per_million, 5.0);
     assert_eq!(gpt55.output_per_million, 30.0);
+    assert_eq!(
+        gpt55.long_context_threshold_tokens,
+        Some(OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS)
+    );
+    assert_eq!(gpt55.long_context_input_per_million, Some(10.0));
+    assert_eq!(gpt55.long_context_output_per_million, Some(45.0));
 
     let gpt55_pro = get_pricing("gpt-5.5-pro").expect("gpt-5.5-pro");
     assert_eq!(gpt55_pro.input_per_million, 30.0);
     assert_eq!(gpt55_pro.output_per_million, 180.0);
+    assert_eq!(gpt55_pro.long_context_input_per_million, Some(60.0));
+    assert_eq!(gpt55_pro.long_context_output_per_million, Some(270.0));
 
     let gpt54_mini = get_pricing("gpt-5.4-mini").expect("gpt-5.4-mini");
     assert_eq!(gpt54_mini.input_per_million, 0.75);
@@ -459,6 +467,53 @@ fn calculate_cost_combines_input_and_output_rates() {
     assert!(
         (cost - expected).abs() < 1e-6,
         "MUST equal input + 0.5 * output; got {cost} vs expected {expected}"
+    );
+}
+
+#[test]
+fn calculate_cost_uses_openai_long_context_rates_only_above_threshold() {
+    let at_threshold = TokenUsage {
+        input_tokens: OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS,
+        output_tokens: 100_000,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    };
+    let standard = calculate_cost("gpt-5.5", &at_threshold).expect("gpt-5.5 pricing");
+    let expected_standard = (272_000.0 * 5.0 / 1_000_000.0) + (100_000.0 * 30.0 / 1_000_000.0);
+    assert!(
+        (standard - expected_standard).abs() < 1e-9,
+        "272K input tokens stays on standard GPT-5.5 rates; got {standard}"
+    );
+
+    let above_threshold = TokenUsage {
+        input_tokens: OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS + 1,
+        output_tokens: 100_000,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    };
+    let long_context = calculate_cost("gpt-5.5", &above_threshold).expect("gpt-5.5 pricing");
+    let expected_long = (272_001.0 * 10.0 / 1_000_000.0) + (100_000.0 * 45.0 / 1_000_000.0);
+    assert!(
+        (long_context - expected_long).abs() < 1e-9,
+        ">272K input tokens must use the GPT-5.5 long-context rate for the full request; got {long_context}"
+    );
+}
+
+#[test]
+fn calculate_cost_counts_openai_cached_input_toward_long_context_threshold() {
+    let usage = TokenUsage {
+        input_tokens: 200_000,
+        output_tokens: 100_000,
+        cache_read_tokens: 80_001,
+        cache_write_tokens: 0,
+    };
+    let cost = calculate_cost("gpt-5.5", &usage).expect("gpt-5.5 pricing");
+    let expected = (200_000.0 * 10.0 / 1_000_000.0)
+        + (100_000.0 * 45.0 / 1_000_000.0)
+        + (80_001.0 * 10.0 * 0.1 / 1_000_000.0);
+    assert!(
+        (cost - expected).abs() < 1e-9,
+        "cached input is part of the OpenAI prompt length that selects the long-context tier; got {cost}"
     );
 }
 

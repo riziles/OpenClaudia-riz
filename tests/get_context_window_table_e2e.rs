@@ -1,7 +1,7 @@
 //! End-to-end tests for `compaction::get_context_window` —
 //! exact per-model constants pinned (current Claude long-context
 //! models at 1M, older Claude family at 200k, GPT-5.5/5.4 at
-//! 1M/1.05M, GPT-4o at 128k, GPT-4.1 at 1M, GPT-5 at 400k,
+//! 1.05M, GPT-4o at 128k, GPT-4.1 at 1M, GPT-5 at 400k,
 //! Gemini Pro at 1M, DeepSeek V4 at 1M, Qwen current
 //! families at 1M or 256k, Kimi/Moonshot at their documented
 //! family windows, MiniMax M3 at 1M / M2.x at 204.8k),
@@ -72,11 +72,11 @@ fn bare_claude_falls_through_to_claude_generic_200k() {
 #[test]
 fn current_gpt_5_5_and_5_4_long_context_models_return_documented_windows() {
     assert_eq!(get_context_window("gpt-5.5-pro"), 1_050_000);
-    assert_eq!(get_context_window("gpt-5.5"), 1_000_000);
-    assert_eq!(get_context_window("gpt-5.5-2026-04-23"), 1_000_000);
+    assert_eq!(get_context_window("gpt-5.5"), 1_050_000);
+    assert_eq!(get_context_window("gpt-5.5-2026-04-23"), 1_050_000);
     assert_eq!(get_context_window("gpt-5.4-pro"), 1_050_000);
-    assert_eq!(get_context_window("gpt-5.4"), 1_000_000);
-    assert_eq!(get_context_window("gpt-5.4-2026-03-05"), 1_000_000);
+    assert_eq!(get_context_window("gpt-5.4"), 1_050_000);
+    assert_eq!(get_context_window("gpt-5.4-2026-03-05"), 1_050_000);
 }
 
 #[test]
