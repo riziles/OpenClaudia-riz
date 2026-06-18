@@ -146,15 +146,14 @@ const SKILLS: &[SlashCommand] = &[
 ];
 
 /// Time-travel and session-shape commands (crosslink #653, #657, #659,
-/// #662). `/rewind`/`/checkpoint`, `/thinkback`, and `/fast` are implemented
-/// in the legacy REPL; `/teleport` remains a tracked but not implemented
-/// response while named-checkpoint storage lands.
+/// #662). These commands are implemented in the legacy REPL; the default TUI
+/// exposes the subset listed in [`TUI_SLASH_SECTIONS`].
 const TIME_TRAVEL: &[SlashCommand] = &[
     cmd("/rewind", "Show turns or rewind the last N turns"),
     cmd("/checkpoint", "Alias for /rewind"),
     cmd(
         "/teleport",
-        "Jump to a named checkpoint (stub; CC parity tracking)",
+        "Restore a named /branch snapshot into the conversation",
     ),
     cmd(
         "/thinkback",
@@ -359,7 +358,7 @@ mod tests {
 
     /// CC-parity time-travel + management commands (#653, #657, #659,
     /// #662, #663, #666). Each entry must appear at least once in the
-    /// flat iterator so /help and the TUI cheatsheet surface it.
+    /// flat iterator so legacy /help surfaces it.
     #[test]
     fn time_travel_and_management_commands_present() {
         let invocations: Vec<&str> = all_commands().map(|c| c.invocation).collect();

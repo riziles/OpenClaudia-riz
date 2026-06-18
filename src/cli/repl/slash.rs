@@ -106,10 +106,15 @@ pub enum SlashCommandResult {
     /// Add a working directory to the session scope (#176)
     AddWorkingDir(std::path::PathBuf),
     /// Branch conversation at current point, saving snapshot under the given name (#177)
-    // The inner name is matched in test assertions; production code uses a `_`
-    // catch-all because branch-session handling is a planned follow-up (#177).
+    // The snapshot is already persisted by `slash_branch`; the inner name is
+    // retained for tests and future UI affordances.
     #[allow(dead_code)]
     BranchSession(String),
+    /// Restore a named branch snapshot into the active conversation (#657).
+    TeleportSession {
+        name: String,
+        messages: Vec<serde_json::Value>,
+    },
     /// Ask a side question without disturbing main conversation flow (#179)
     SideQuestion(String),
 }
@@ -1718,7 +1723,7 @@ pub fn slash_branch(args: &str, messages: &[serde_json::Value]) -> SlashCommandR
         println!("\nError: could not create branches directory: {e}\n");
         return SlashCommandResult::Handled;
     }
-    let branch_path = branches_dir.join(format!("{name}.json"));
+    let branch_path = branch_snapshot_path(&name);
     if branch_path.exists() {
         println!("\nError: branch '{name}' already exists. Choose a different name.\n");
         return SlashCommandResult::Handled;
@@ -1749,6 +1754,10 @@ pub fn slash_branch(args: &str, messages: &[serde_json::Value]) -> SlashCommandR
     }
 }
 
+fn branch_snapshot_path(name: &str) -> PathBuf {
+    PathBuf::from(".openclaudia/branches").join(format!("{name}.json"))
+}
+
 fn validate_branch_snapshot_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("name must not be empty");
@@ -1765,6 +1774,48 @@ fn validate_branch_snapshot_name(name: &str) -> Result<(), &'static str> {
         Ok(())
     } else {
         Err("use only ASCII letters, numbers, '-' or '_'")
+    }
+}
+
+fn load_branch_snapshot(name: &str) -> Result<Vec<serde_json::Value>, String> {
+    validate_branch_snapshot_name(name)
+        .map_err(|reason| format!("invalid branch name: {reason}"))?;
+
+    let path = branch_snapshot_path(name);
+    let raw = fs::read_to_string(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            format!("branch snapshot '{name}' was not found")
+        } else {
+            format!("could not read {}: {err}", path.display())
+        }
+    })?;
+
+    let snapshot: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("could not parse {}: {err}", path.display()))?;
+    let messages = snapshot
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} does not contain a messages array", path.display()))?;
+
+    Ok(messages.clone())
+}
+
+pub fn slash_teleport(args: &str) -> SlashCommandResult {
+    let name = args.trim();
+    if name.is_empty() {
+        println!("\nUsage: /teleport <branch-name>\n");
+        return SlashCommandResult::Handled;
+    }
+
+    match load_branch_snapshot(name) {
+        Ok(messages) => SlashCommandResult::TeleportSession {
+            name: name.to_string(),
+            messages,
+        },
+        Err(reason) => {
+            println!("\nError: {reason}\n");
+            SlashCommandResult::Handled
+        }
     }
 }
 
@@ -3492,23 +3543,6 @@ mod tests {
         );
     }
 
-    // ── Remaining gap commands absent from OC (pin unknown-command path) ─────
-    //
-    // These tests document that the commands from CC gap issue #657 currently
-    // fall through to the unknown-command arm and return Handled. If it starts
-    // returning something else, a
-    // Phase 3 implementation landed and this pin must be updated.
-
-    /// Gap B (#657): `/teleport` does not exist in OC → unknown-command path.
-    #[test]
-    fn gap_missing_teleport_returns_handled() {
-        let result = handle_slash_command("/teleport", &mut ctx(), "anthropic", "claude-sonnet");
-        assert!(
-            matches!(result, Some(SlashCommandResult::Handled)),
-            "/teleport must return Handled — command not yet implemented (gap #657)"
-        );
-    }
-
     /// Gap E (#663): `/mcp` now reports configured MCP servers instead of
     /// falling through to the unknown-command path.
     #[test]
@@ -3848,6 +3882,75 @@ mod tests {
                 "branch name {bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn teleport_missing_name_returns_usage_handled() {
+        let result = handle_slash_command("/teleport", &mut ctx(), "anthropic", "claude-sonnet");
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "/teleport without a name must return Handled usage"
+        );
+    }
+
+    #[test]
+    fn teleport_rejects_path_traversal_name() {
+        let result = handle_slash_command(
+            "/teleport ../escape",
+            &mut ctx(),
+            "anthropic",
+            "claude-sonnet",
+        );
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "path-like teleport names must be rejected"
+        );
+    }
+
+    #[test]
+    fn teleport_restores_named_branch_snapshot() {
+        let name = format!("test-teleport-{}", uuid::Uuid::new_v4().simple());
+        let mut branched_messages = vec![
+            serde_json::json!({"role": "user", "content": "saved prompt"}),
+            serde_json::json!({"role": "assistant", "content": "saved answer"}),
+        ];
+
+        let branch_input = format!("/branch {name}");
+        let branch_result =
+            handle_slash_command(&branch_input, &mut branched_messages, "anthropic", "claude");
+        assert!(matches!(
+            branch_result,
+            Some(SlashCommandResult::BranchSession(_))
+        ));
+
+        let teleport_input = format!("/teleport {name}");
+        let teleport_result =
+            handle_slash_command(&teleport_input, &mut ctx(), "anthropic", "claude");
+        match teleport_result {
+            Some(SlashCommandResult::TeleportSession { messages, .. }) => {
+                assert_eq!(messages, branched_messages);
+            }
+            _ => panic!("/teleport must load branch snapshot"),
+        }
+
+        let _ = std::fs::remove_file(super::branch_snapshot_path(&name));
+    }
+
+    #[test]
+    fn teleport_malformed_snapshot_returns_handled() {
+        let name = format!("test-teleport-bad-{}", uuid::Uuid::new_v4().simple());
+        let path = super::branch_snapshot_path(&name);
+        std::fs::create_dir_all(path.parent().expect("branch path has parent")).unwrap();
+        std::fs::write(&path, r#"{"name":"bad","messages":"not-array"}"#).unwrap();
+
+        let input = format!("/teleport {name}");
+        let result = handle_slash_command(&input, &mut ctx(), "anthropic", "claude-sonnet");
+
+        assert!(
+            matches!(result, Some(SlashCommandResult::Handled)),
+            "malformed branch snapshots must not mutate the session"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     // ── §12 /btw (#179) ───────────────────────────────────────────────

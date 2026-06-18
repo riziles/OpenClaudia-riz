@@ -624,6 +624,10 @@ impl ChatRepl {
                 self.handle_rewind(turns);
                 SlashOutcome::Continue
             }
+            SlashCommandResult::TeleportSession { name, messages } => {
+                self.handle_teleport(&name, messages);
+                SlashOutcome::Continue
+            }
             SlashCommandResult::Rename(new_title) => {
                 self.handle_rename(&new_title);
                 SlashOutcome::Continue
@@ -761,6 +765,23 @@ impl ChatRepl {
             }
         } else {
             println!("\nNothing to rewind.\n");
+        }
+    }
+
+    /// Replace the active transcript with a named `/branch` snapshot.
+    fn handle_teleport(&mut self, name: &str, messages: Vec<serde_json::Value>) {
+        self.chat_session.messages = messages;
+        self.chat_session.clear_undo_stack();
+        self.chat_session.update_title();
+        self.chat_session.touch();
+
+        println!(
+            "\nTeleported to branch snapshot '{name}'. {} messages active.\n",
+            self.chat_session.messages.len()
+        );
+
+        if let Err(e) = save_chat_session(&self.chat_session) {
+            tracing::warn!("Failed to save session after teleport: {}", e);
         }
     }
 

@@ -91,7 +91,7 @@ use super::slash::{
     slash_commit_push_pr, slash_config, slash_context, slash_continue, slash_copy, slash_cost,
     slash_debug, slash_doctor, slash_effort, slash_fast, slash_find, slash_help, slash_history,
     slash_hooks, slash_init, slash_login, slash_mcp, slash_model, slash_permissions, slash_plugin,
-    slash_rewind, slash_sessions, slash_skill, slash_thinkback, slash_version,
+    slash_rewind, slash_sessions, slash_skill, slash_teleport, slash_thinkback, slash_version,
 };
 use crate::cli::display::theme::handle_theme_command;
 
@@ -288,6 +288,18 @@ impl CommandHandler for RewindCommand {
     }
     fn handle(&self, ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
         slash_rewind(args, ctx.messages)
+    }
+}
+
+// ── /teleport ────────────────────────────────────────────────────────────────
+
+struct TeleportCommand;
+impl CommandHandler for TeleportCommand {
+    fn name(&self) -> &'static str {
+        "teleport"
+    }
+    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        slash_teleport(args)
     }
 }
 
@@ -801,6 +813,7 @@ static HANDLERS: &[&dyn CommandHandler] = &[
     &UndoCommand,
     &RedoCommand,
     &RewindCommand,
+    &TeleportCommand,
     &ThinkbackCommand,
     &CopyCommand,
     &InitCommand,
