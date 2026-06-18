@@ -65,6 +65,7 @@ fn build_print_request(
     adapter: &dyn ProviderAdapter,
     model: &str,
     prompt: String,
+    thinking: &openclaudia::config::ThinkingConfig,
     claude_code_token: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let request = openclaudia::proxy::ChatCompletionRequest {
@@ -86,7 +87,7 @@ fn build_print_request(
     };
 
     let mut body = adapter
-        .transform_request(&request)
+        .transform_request_with_thinking(&request, thinking)
         .map_err(|e| format!("request transform error: {e}"))?;
     if claude_code_token.is_some() {
         openclaudia::claude_credentials::inject_system_prompt(&mut body);
@@ -257,6 +258,7 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         adapter,
         &model,
         options.prompt,
+        &provider.thinking,
         claude_code_token.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -350,9 +352,51 @@ mod tests {
     #[test]
     fn print_request_has_no_tools_and_streams_non_google() {
         let adapter = openclaudia::providers::get_adapter("openai").unwrap();
-        let body = build_print_request(adapter, "gpt-5.5", "hi".to_string(), None).unwrap();
+        let body = build_print_request(
+            adapter,
+            "gpt-5.5",
+            "hi".to_string(),
+            &openclaudia::config::ThinkingConfig::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(body["stream"], true);
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn print_request_applies_openai_reasoning_effort() {
+        let adapter = openclaudia::providers::get_adapter("openai").unwrap();
+        let mut thinking = openclaudia::config::ThinkingConfig::default();
+        thinking.reasoning_effort = Some("xhigh".to_string());
+
+        let body =
+            build_print_request(adapter, "gpt-5.5", "hi".to_string(), &thinking, None).unwrap();
+
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn print_request_applies_google_thinking_budget() {
+        let adapter = openclaudia::providers::get_adapter("google").unwrap();
+        let thinking = openclaudia::config::ThinkingConfig {
+            budget_tokens: Some(7777),
+            ..openclaudia::config::ThinkingConfig::default()
+        };
+
+        let body = build_print_request(
+            adapter,
+            "gemini-3.5-flash",
+            "hi".to_string(),
+            &thinking,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            7777
+        );
     }
 
     #[test]
