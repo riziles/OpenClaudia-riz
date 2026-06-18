@@ -191,6 +191,7 @@ const TUI_CORE: &[SlashCommand] = &[
         "/status",
         "Show model, provider, effort, and token estimate",
     ),
+    cmd("/provider [name]", "Show or switch provider"),
     cmd("/mode", "Toggle between Build and Plan modes"),
     cmd(
         "/effort [low|medium|high|max|auto]",
@@ -396,7 +397,13 @@ mod tests {
                 "TUI help must not advertise unimplemented legacy command {legacy_only}"
             );
         }
-        for tui_command in ["/help, ?", "/load <id>", "/doctor", "/skill, /skills"] {
+        for tui_command in [
+            "/help, ?",
+            "/provider [name]",
+            "/load <id>",
+            "/doctor",
+            "/skill, /skills",
+        ] {
             assert!(
                 invocations.contains(&tui_command),
                 "TUI help missing implemented command {tui_command}"

@@ -1228,6 +1228,10 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         "README keyboard docs must describe the default full-screen TUI"
     );
     assert!(
+        readme.contains("| `/provider [name]` | Show or switch provider |"),
+        "README default-TUI slash docs must advertise the implemented provider switch command"
+    );
+    assert!(
         readme.contains("The `keybindings:` config map customizes the legacy line-oriented REPL"),
         "README must explain that configurable keybindings apply to the legacy REPL"
     );
