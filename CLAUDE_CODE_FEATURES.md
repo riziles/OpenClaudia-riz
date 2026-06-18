@@ -30,7 +30,7 @@ This document catalogs features from Anthropic's Claude Code CLI for replication
 | Tool | Description | Priority |
 |------|-------------|----------|
 | **WebFetch** | Fetch URL content, convert HTML to markdown | ✅ Have |
-| **WebSearch** | Search the web for current information | ✅ Have (DDG/Tavily/Brave) |
+| **WebSearch** | Search the web for current information | ✅ Have (free DuckDuckGo/Bing browser scraping) |
 
 ---
 

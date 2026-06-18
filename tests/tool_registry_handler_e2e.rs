@@ -411,6 +411,10 @@ fn web_tool_descriptions_match_browser_feature_set() {
 fn readme_web_search_docs_explain_browser_feature_boundary() {
     let readme = include_str!("../README.md");
     let comparison = include_str!("../COMPARISON.md");
+    let prompt_tools = include_str!("../prompts/base/tools.md");
+    let claude_code_features = include_str!("../CLAUDE_CODE_FEATURES.md");
+    let architecture = include_str!("../ARCHITECTURE.md");
+    let changelog = include_str!("../CHANGELOG.md");
 
     assert!(
         readme.contains("Free DuckDuckGo/Bing browser scraping"),
@@ -424,13 +428,34 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
         readme.contains("web_search is unavailable"),
         "README no-default-features build note must explain web_search's browser-feature requirement"
     );
-    for doc in [readme, comparison] {
+    assert!(
+        prompt_tools.contains("No search API key is required"),
+        "model-facing tool prompt must not tell the model to require a paid search API key"
+    );
+    assert!(
+        claude_code_features.contains("free DuckDuckGo/Bing browser scraping"),
+        "Claude Code feature parity doc must describe the current free search backend"
+    );
+    assert!(
+        architecture.contains("DuckDuckGo") && architecture.contains("/ Bing"),
+        "architecture doc must describe the current free search backend"
+    );
+    for doc in [
+        readme,
+        comparison,
+        prompt_tools,
+        claude_code_features,
+        architecture,
+        changelog,
+    ] {
         assert!(
             !doc.contains("API keys work in all builds")
                 && !doc.contains("web_search requires")
                 && !doc.contains("APIs work in all builds")
-                && !doc.contains("Tavily")
-                && !doc.contains("Brave"),
+                && !doc.contains(concat!("TA", "VILY"))
+                && !doc.contains(concat!("BR", "AVE"))
+                && !doc.contains(concat!("Ta", "vily"))
+                && !doc.contains(concat!("Bra", "ve")),
             "docs must not advertise paid web-search API backends"
         );
     }

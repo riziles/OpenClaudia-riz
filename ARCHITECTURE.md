@@ -256,9 +256,9 @@
    │   spawn proc  │    │  PKCE auth    │    │   (Jina)      │
    │   JSON-RPC    │    │  Token store  │    │               │
    │               │    │  API key gen  │    │  search_web   │
-   │  HTTP:        │    │               │    │   DuckDuckGo  │
-   │   REST client │    │  Claude Max   │    │   Tavily      │
-   │               │    │  integration  │    │   Brave       │
+   │  HTTP:        │    │               │    │ browser scrape│
+   │   REST client │    │  Claude Max   │    │  DuckDuckGo   │
+   │               │    │  integration  │    │   / Bing      │
    └───────────────┘    └───────────────┘    └───────────────┘
 
    ┌───────────────┐    ┌───────────────┐    ┌───────────────┐

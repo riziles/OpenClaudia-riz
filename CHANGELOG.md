@@ -426,7 +426,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Auto-save session summary on session end (#102)
 - Add short-term memory database schema and initialization (#101)
 - Add web_browser tool using headless-chrome (#95)
-- Add web_search tool with Tavily/Brave API support (#94)
+- Add web_search tool (#94)
 - Add web_fetch tool using Jina Reader (#93)
 - Fix chainlink tool to properly find and execute the chainlink binary (#88)
 - Add helpful install message when chainlink is not found (#87)

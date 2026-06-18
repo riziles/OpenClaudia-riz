@@ -54,7 +54,7 @@ Fetch a URL and return its content as markdown.
 - Good for looking up library docs, error messages, etc.
 
 ### `web_search` - Search the Web
-Search the web for information. Requires TAVILY_API_KEY or BRAVE_API_KEY.
+Search the web for information through free DuckDuckGo/Bing browser scraping. No search API key is required.
 - Use when you need current information beyond your training data
 - Good for finding solutions to specific errors
 
