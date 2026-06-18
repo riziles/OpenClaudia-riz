@@ -54,6 +54,15 @@ pub fn validate_final_answer(
             "final verification ids must reference verifier observations",
         ));
     }
+    if summary_claims_verification_success(summary)
+        && !hydrated_verification
+            .iter()
+            .any(|obs| matches!(obs.kind, ObservationKind::Verification { passed: true, .. }))
+    {
+        return Err(Denial::new(
+            "final successful verification claims require a passing verifier observation",
+        ));
+    }
 
     if summary_mentions_tests(summary)
         && !hydrated_evidence
@@ -127,6 +136,52 @@ pub fn extract_cited_obs_ids(text: &str) -> Vec<ObsId> {
 fn summary_mentions_tests(summary: &str) -> bool {
     let lower = summary.to_ascii_lowercase();
     lower.contains("test") || lower.contains("cargo check") || lower.contains("verified")
+}
+
+fn summary_claims_verification_success(summary: &str) -> bool {
+    let tokens = summary
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    tokens.iter().enumerate().any(|(idx, token)| {
+        matches!(
+            token.as_str(),
+            "pass"
+                | "passed"
+                | "passes"
+                | "passing"
+                | "succeed"
+                | "succeeded"
+                | "succeeds"
+                | "successful"
+                | "successfully"
+                | "clean"
+                | "green"
+                | "ok"
+                | "okay"
+                | "verified"
+        ) && !has_recent_negation(&tokens, idx)
+    })
+}
+
+fn has_recent_negation(tokens: &[String], idx: usize) -> bool {
+    let start = idx.saturating_sub(3);
+    tokens[start..idx].iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "not"
+                | "no"
+                | "never"
+                | "without"
+                | "fail"
+                | "failed"
+                | "fails"
+                | "failing"
+                | "failure"
+        )
+    })
 }
 
 fn extract_file_claims(summary: &str) -> Vec<String> {
@@ -317,6 +372,66 @@ mod tests {
             denial.reason(),
             "final verification ids must reference verifier observations"
         );
+    }
+
+    #[test]
+    fn final_success_claim_rejects_failed_verifier_observation() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run(
+                "/tmp",
+                vec!["cargo".into(), "check".into()],
+                1,
+                "",
+                "failed",
+            )
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: false,
+                    command: Some("cargo check".to_string()),
+                    findings: vec!["cargo check failed".to_string()],
+                },
+            )
+            .expect("verification");
+        let summary = format!("cargo check passed cleanly [{command}] [{verification}].");
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final successful verification claims require a passing verifier observation"
+        );
+    }
+
+    #[test]
+    fn final_failed_verification_summary_accepts_failed_verifier_observation() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run(
+                "/tmp",
+                vec!["cargo".into(), "check".into()],
+                1,
+                "",
+                "failed",
+            )
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: false,
+                    command: Some("cargo check".to_string()),
+                    findings: vec!["cargo check failed".to_string()],
+                },
+            )
+            .expect("verification");
+        let summary = format!("cargo check failed [{command}] [{verification}].");
+
+        validate_cited_final_answer(&summary, &ledger)
+            .expect("honest failed verification summary is allowed");
     }
 
     #[test]
