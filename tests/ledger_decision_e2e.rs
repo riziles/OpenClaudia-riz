@@ -128,6 +128,31 @@ fn diff_marks_previous_file_reads_stale() {
 }
 
 #[test]
+fn newer_diff_marks_previous_diff_for_same_file_stale() {
+    let mut ledger = RealityLedger::new();
+    let first = ledger
+        .observe_diff(
+            vec!["src/pipeline.rs".to_string()],
+            "diff --git a/src/pipeline.rs b/src/pipeline.rs\n-old\n+new\n",
+        )
+        .expect("first diff");
+    assert!(!ledger.is_stale(first));
+
+    let second = ledger
+        .observe_diff(
+            vec!["src/pipeline.rs".to_string()],
+            "diff --git a/src/pipeline.rs b/src/pipeline.rs\n-new\n+newer\n",
+        )
+        .expect("second diff");
+
+    assert!(
+        ledger.is_stale(first),
+        "older diff must not remain evidence"
+    );
+    assert!(!ledger.is_stale(second));
+}
+
+#[test]
 fn tool_result_observation_records_bounded_result_envelope() {
     let mut ledger = RealityLedger::new();
     let content = "x".repeat(TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128);

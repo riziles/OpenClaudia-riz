@@ -550,6 +550,12 @@ impl RealityLedger {
                 {
                     Some(*existing_id)
                 }
+                ObservationKind::DiffObserved { files, .. }
+                    if !record.stale
+                        && files.iter().any(|path| touched.contains(path.as_str())) =>
+                {
+                    Some(*existing_id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
