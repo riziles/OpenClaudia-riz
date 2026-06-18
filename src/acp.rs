@@ -144,6 +144,11 @@ pub struct AcpServer {
     /// Local/OpenAI-compatible providers may run without one; remote providers
     /// are validated by the CLI before the ACP server starts.
     api_key: Option<crate::providers::ApiKey>,
+    /// Optional Claude OAuth bearer token for keyless Anthropic ACP sessions.
+    /// This mirrors the TUI/chat auth path: provider adapters stay transport
+    /// translators, while the ACP loop selects OAuth headers/endpoints above
+    /// that layer.
+    claude_code_token: Option<String>,
     /// Library-layer permission manager. Every tool call dispatched from
     /// `execute_tool_via_openclaudia` consults this gate — closes
     /// crosslink #505 for the ACP path.
@@ -531,6 +536,7 @@ impl AcpServer {
         config: AppConfig,
         model: String,
         api_key: Option<crate::providers::ApiKey>,
+        claude_code_token: Option<String>,
         stdout_tx: mpsc::UnboundedSender<String>,
     ) -> Self {
         let persist_dir = dirs::data_dir()
@@ -558,6 +564,7 @@ impl AcpServer {
             messages: Vec::new(),
             model,
             api_key,
+            claude_code_token,
             permission_mgr,
             next_request_id: AtomicU64::new(1),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
@@ -1120,7 +1127,7 @@ impl AcpServer {
             };
 
             // Transform for provider
-            let transformed = match adapter.transform_request_with_thinking(
+            let mut transformed = match adapter.transform_request_with_thinking(
                 &chat_request,
                 &self
                     .config
@@ -1143,11 +1150,26 @@ impl AcpServer {
             let Some(provider) = self.config.active_provider() else {
                 return "error".to_string();
             };
-            let endpoint = format!(
-                "{}{}",
-                provider.base_url,
-                adapter.chat_endpoint(&self.model)
-            );
+            let claude_code_token = self.claude_code_token.as_deref();
+            if claude_code_token.is_some() && self.config.proxy.target == "anthropic" {
+                crate::claude_credentials::inject_system_prompt(&mut transformed);
+            }
+            let endpoint = match crate::pipeline::resolve_endpoint(
+                &self.config.proxy.target,
+                &self.model,
+                &provider.base_url,
+                claude_code_token,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    self.send_session_update(
+                        acp_session_id,
+                        "agent_message_chunk",
+                        &json!({"type": "text", "text": format!("Provider error: {}", e)}),
+                    );
+                    return "error".to_string();
+                }
+            };
 
             // Build HTTP request with headers
             let extra_headers: Vec<(String, String)> = provider
@@ -1158,7 +1180,7 @@ impl AcpServer {
             let headers = match crate::pipeline::resolve_headers(
                 &self.config.proxy.target,
                 self.api_key.as_ref(),
-                None,
+                claude_code_token,
                 &extra_headers,
             ) {
                 Ok(headers) => headers,
@@ -2678,6 +2700,7 @@ pub async fn run_acp_server(
     config: AppConfig,
     model: String,
     api_key: Option<crate::providers::ApiKey>,
+    claude_code_token: Option<String>,
 ) -> Result<()> {
     // Set up stdout writer channel — all writes go through this to avoid interleaving
     let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<String>();
@@ -2714,7 +2737,7 @@ pub async fn run_acp_server(
         }
     });
 
-    let mut server = AcpServer::new(config, model, api_key, stdout_tx);
+    let mut server = AcpServer::new(config, model, api_key, claude_code_token, stdout_tx);
 
     info!("ACP server started on stdio");
 

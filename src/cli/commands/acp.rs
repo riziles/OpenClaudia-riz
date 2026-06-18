@@ -1,5 +1,11 @@
 use openclaudia::config;
 
+fn anthropic_oauth_unavailable_message(error: &str) -> String {
+    format!(
+        "No API key configured for 'anthropic', and Claude OAuth credentials are unavailable: {error}. Run 'openclaudia auth' or set ANTHROPIC_API_KEY."
+    )
+}
+
 /// ACP server mode -- stdin/stdout JSON-RPC for acpx interoperability
 pub async fn cmd_acp(
     target_override: Option<String>,
@@ -29,39 +35,43 @@ pub async fn cmd_acp(
         }
     };
 
+    let target = config.proxy.target.clone();
     let Some(provider) = config.active_provider() else {
-        eprintln!(
-            "No provider configured for target '{}'",
-            config.proxy.target
-        );
-        anyhow::bail!(
-            "no provider configured for target '{}'",
-            config.proxy.target
-        );
+        eprintln!("No provider configured for target '{}'", target);
+        anyhow::bail!("no provider configured for target '{}'", target);
     };
+    let provider_api_key = provider.api_key.clone();
+    let provider_model = provider.model.clone();
 
-    let api_key = if let Some(k) = &provider.api_key {
-        Some(k.clone())
-    } else if config::is_local_provider_name(&config.proxy.target) {
-        None
+    let (api_key, claude_code_token) = if let Some(k) = provider_api_key {
+        (Some(k), None)
+    } else if target.eq_ignore_ascii_case("anthropic") {
+        match openclaudia::claude_credentials::load_credentials().await {
+            Ok(creds) => (None, Some(creds.access_token)),
+            Err(e) => {
+                let msg = anthropic_oauth_unavailable_message(&e);
+                eprintln!("{msg}");
+                anyhow::bail!(msg);
+            }
+        }
+    } else if config::is_local_provider_name(&target) {
+        (None, None)
     } else {
-        let env_var = super::provider_api_key_env_var(&config.proxy.target);
+        let env_var = super::provider_api_key_env_var(&target);
         eprintln!(
             "No API key configured for '{}'. Set {} or add to config.",
-            config.proxy.target, env_var
+            target, env_var
         );
         anyhow::bail!(
             "no API key configured for '{}'; set {} or add to config",
-            config.proxy.target,
+            target,
             env_var
         );
     };
 
     let model = model_override
-        .or_else(|| provider.model.clone())
-        .unwrap_or_else(|| {
-            openclaudia::providers::default_model_for_target(&config.proxy.target).to_string()
-        });
+        .or(provider_model)
+        .unwrap_or_else(|| openclaudia::providers::default_model_for_target(&target).to_string());
 
-    openclaudia::acp::run_acp_server(config, model, api_key).await
+    openclaudia::acp::run_acp_server(config, model, api_key, claude_code_token).await
 }

@@ -208,6 +208,44 @@ providers:
     .expect("config file");
 }
 
+fn write_anthropic_provider_config(cwd: &tempfile::TempDir) {
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        r#"
+proxy:
+  port: 8080
+  host: "127.0.0.1"
+  target: anthropic
+providers:
+  anthropic:
+    base_url: https://api.anthropic.com
+"#,
+    )
+    .expect("config file");
+}
+
+fn write_claude_oauth_credentials(claude_config: &std::path::Path) {
+    fs::create_dir_all(claude_config).expect("claude config dir");
+    fs::write(
+        claude_config.join(".credentials.json"),
+        r#"
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-test-access-token",
+    "refreshToken": "sk-ant-ort01-test-refresh-token",
+    "expiresAt": 4102444800000,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max",
+    "rateLimitTier": "max"
+  }
+}
+"#,
+    )
+    .expect("credentials fixture");
+}
+
 fn write_openai_target_with_local_fallback_config(cwd: &tempfile::TempDir) {
     let config_dir = cwd.path().join(".openclaudia");
     fs::create_dir_all(&config_dir).expect("config dir");
@@ -733,6 +771,38 @@ fn acp_accepts_keyless_local_provider_until_stdin_eof() {
     assert!(
         !combined.contains("No API key configured") && !combined.contains("Set API_KEY"),
         "local ACP mode must not require an API key; got {combined:?}"
+    );
+}
+
+#[test]
+fn acp_accepts_keyless_anthropic_with_claude_oauth_credentials_until_stdin_eof() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let claude_config = home.path().join("claude-config");
+    write_anthropic_provider_config(&cwd);
+    write_claude_oauth_credentials(&claude_config);
+
+    let output = isolated_command(&cwd, &home)
+        .arg("acp")
+        .env("CLAUDE_CONFIG_HOME_DIR", &claude_config)
+        .stdin(Stdio::null())
+        .output()
+        .expect("openclaudia acp must run");
+
+    assert!(
+        output.status.success(),
+        "acp should start and exit cleanly on EOF for keyless Anthropic with Claude OAuth credentials; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("ANTHROPIC_API_KEY") && !combined.contains("No API key configured"),
+        "Anthropic ACP OAuth mode must not ask for an API key; got {combined:?}"
     );
 }
 
