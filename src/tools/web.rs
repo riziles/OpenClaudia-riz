@@ -236,7 +236,22 @@ pub fn execute_web_fetch_with_config(
                     false,
                 );
             };
-            let config = app_config.expect("prompt config validated before fetch");
+            let Some(config) = app_config else {
+                return (
+                    "web_fetch prompt distillation requires application configuration; call without \
+                     `prompt` to fetch raw markdown."
+                        .to_string(),
+                    true,
+                );
+            };
+            if !config.web_fetch.distillation_enabled {
+                return (
+                    "web_fetch prompt distillation is disabled. Set \
+                     web_fetch.distillation_enabled=true or omit `prompt` to fetch raw markdown."
+                        .to_string(),
+                    true,
+                );
+            }
             match distill_fetch_result(prompt, &fetch_result.url, &fetch_result.content, config) {
                 Ok(answer) => (answer, false),
                 Err(e) => (format!("Failed to distill fetched page: {e}"), true),

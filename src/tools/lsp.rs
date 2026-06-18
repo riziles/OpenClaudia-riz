@@ -320,8 +320,8 @@ impl Read for LspDeadlineReader {
         loop {
             if !self.pending.is_empty() {
                 let n = out.len().min(self.pending.len());
-                for slot in &mut out[..n] {
-                    *slot = self.pending.pop_front().expect("pending length checked");
+                for (slot, byte) in out[..n].iter_mut().zip(self.pending.drain(..n)) {
+                    *slot = byte;
                 }
                 return Ok(n);
             }
