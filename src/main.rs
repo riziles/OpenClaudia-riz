@@ -204,6 +204,10 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
 
+        /// Host to bind to (overrides config)
+        #[arg(long)]
+        host: Option<String>,
+
         /// Target provider (anthropic, openai, google, gemini, deepseek, qwen, alibaba, zai, glm, zhipu, kimi, moonshot, minimax, ollama, local, lmstudio, localai, text-generation-webui)
         #[arg(
             short,
@@ -324,8 +328,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Loop {
             max_iterations,
             port,
+            host,
             target,
-        }) => cli::commands::loop_cmd::cmd_loop(max_iterations, port, target.or(cli.target)).await,
+        }) => {
+            cli::commands::loop_cmd::cmd_loop(max_iterations, port, host, target.or(cli.target))
+                .await
+        }
     }
 }
 

@@ -207,6 +207,26 @@ fn write_local_provider_config(cwd: &tempfile::TempDir) {
     write_local_provider_config_with_base_url(cwd, "http://localhost:1234/v1");
 }
 
+fn write_local_provider_config_with_host(cwd: &tempfile::TempDir, host: &str) {
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            r#"
+proxy:
+  port: 8080
+  host: "{host}"
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+"#,
+        ),
+    )
+    .expect("config file");
+}
+
 fn write_local_provider_config_with_base_url(cwd: &tempfile::TempDir, base_url: &str) {
     let config_dir = cwd.path().join(".openclaudia");
     fs::create_dir_all(&config_dir).expect("config dir");
@@ -927,6 +947,44 @@ fn loop_root_target_flag_overrides_config_before_auth_preflight() {
     assert!(
         combined.to_lowercase().contains("address already in use"),
         "loop should reach bind after root target override; got {combined:?}"
+    );
+}
+
+#[test]
+fn loop_host_flag_overrides_config_before_bind() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_local_provider_config_with_host(&cwd, "192.0.2.1");
+    let (_listener, port) = held_loopback_port();
+    let port = port.to_string();
+
+    let output = isolated_command(&cwd, &home)
+        .args([
+            "loop",
+            "--max-iterations",
+            "1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+        ])
+        .output()
+        .expect("openclaudia loop must run");
+
+    assert!(
+        !output.status.success(),
+        "loop should fail when the overridden bind address hits the held port; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("address already in use"),
+        "loop --host should override the config host before binding; got {combined:?}"
     );
 }
 

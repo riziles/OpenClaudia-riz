@@ -5,6 +5,7 @@ use tracing::{error, info};
 pub async fn cmd_loop(
     max_iterations: u32,
     port: Option<u16>,
+    host: Option<String>,
     target: Option<String>,
 ) -> anyhow::Result<()> {
     if !config::config_file_exists() {
@@ -23,6 +24,9 @@ pub async fn cmd_loop(
 
     if let Some(p) = port {
         config.proxy.port = p;
+    }
+    if let Some(h) = host {
+        config.proxy.host = h;
     }
     if let Some(t) = target {
         config.proxy.target = t;
