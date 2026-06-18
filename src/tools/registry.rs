@@ -289,10 +289,12 @@ impl ToolHandler for ReadFileHandler {
                         },
                         "offset": {
                             "type": "integer",
+                            "minimum": 1,
                             "description": "Line number to start reading from (1-indexed). Defaults to 1."
                         },
                         "limit": {
                             "type": "integer",
+                            "minimum": 1,
                             "description": "Maximum number of lines to read. Defaults to reading entire file."
                         },
                         "pages": {

@@ -535,18 +535,16 @@ pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, boo
     }
 
     // Get optional offset (1-indexed line number to start from)
-    let offset = args
-        .get("offset")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(0, |n| {
-            usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX)
-        });
+    let offset = match parse_read_offset_arg(args.get("offset")) {
+        Ok(offset) => offset,
+        Err(msg) => return (msg, true),
+    };
 
     // Get optional limit (max lines to read)
-    let limit = args
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let limit = match parse_read_limit_arg(args.get("limit")) {
+        Ok(limit) => limit,
+        Err(msg) => return (msg, true),
+    };
 
     let file_content = match fs::File::open(path) {
         Ok(f) => {
@@ -625,6 +623,32 @@ pub fn read_text_file(path: &str, args: &HashMap<String, Value>) -> (String, boo
         let result = numbered.join("\n");
         (format!("{result}{suffix}"), false)
     }
+}
+
+fn parse_read_offset_arg(value: Option<&Value>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Some(offset) = value.as_u64() else {
+        return Err("Error: offset must be a 1-indexed positive integer".to_string());
+    };
+    if offset == 0 {
+        return Err("Error: offset must be a 1-indexed positive integer".to_string());
+    }
+    Ok(usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX))
+}
+
+fn parse_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(limit) = value.as_u64() else {
+        return Err("Error: limit must be a positive integer".to_string());
+    };
+    if limit == 0 {
+        return Err("Error: limit must be a positive integer".to_string());
+    }
+    Ok(Some(usize::try_from(limit).unwrap_or(usize::MAX)))
 }
 
 #[cfg(test)]
@@ -732,29 +756,15 @@ mod tests {
     }
 
     #[test]
-    fn read_text_offset_zero_treated_as_start_of_file() {
-        // Behavior 1 edge: offset=0 — CC treats as "start of file" (no skip).
-        // OC: saturating_sub(1) on 0u64 yields 0 → .skip(0) — same behavior.
-        //
-        // crosslink #989: the previous version of this test had a "NOTE"
-        // comment claiming OC emits a suffix when offset=0 because the
-        // suffix gate checked the *pre*-subtraction value. The production
-        // code in `read_text_file` actually checks the POST-subtraction
-        // `offset > 0` (see read.rs `suffix = if offset > 0 || limit.is_some()`),
-        // so with offset=0 and no limit no suffix is emitted. The stale
-        // comment has been removed; we now also pin the absence of a
-        // suffix so a future regression that misreads the gate as
-        // `offset_arg > 0` is caught immediately.
+    fn read_text_offset_zero_returns_validation_error() {
         let (_f, path) = tmp_text("alpha\nbeta\n");
         let mut args = HashMap::new();
         args.insert("offset".to_string(), serde_json::json!(0u64));
         let (output, is_err) = read_text_file(&path, &args);
-        assert!(!is_err);
-        assert!(output.contains("alpha"), "offset=0 must yield first line");
-        assert!(output.contains("beta"));
+        assert!(is_err);
         assert!(
-            !output.contains("(showing lines"),
-            "offset=0 + no limit must NOT emit the windowing suffix; got: {output}"
+            output.contains("offset") && output.contains("1-indexed"),
+            "offset=0 must fail with a clear contract error; got: {output}"
         );
     }
 
@@ -777,22 +787,15 @@ mod tests {
     }
 
     #[test]
-    fn read_text_limit_zero_returns_empty_body() {
-        // Behavior 1 edge: limit=0 — CC rejects at schema level; OC silently
-        // returns empty content via .take(0). Pinned as current OC behavior.
-        // CC parity: CC schema rejects limit < 1 — no gap issue filed yet.
+    fn read_text_limit_zero_returns_validation_error() {
         let (_f, path) = tmp_text("data\n");
         let mut args = HashMap::new();
         args.insert("limit".to_string(), serde_json::json!(0u64));
         let (output, is_err) = read_text_file(&path, &args);
-        // OC: take(0) → empty result, not an error
+        assert!(is_err);
         assert!(
-            !is_err,
-            "OC does not validate limit=0 at the function level"
-        );
-        assert!(
-            !output.contains("data"),
-            "limit=0 yields no content: {output}"
+            output.contains("limit") && output.contains("positive"),
+            "limit=0 must fail with a clear contract error; got: {output}"
         );
     }
 

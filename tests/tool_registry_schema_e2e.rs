@@ -469,6 +469,31 @@ fn lsp_position_schema_advertises_indexing_bounds() {
 }
 
 #[test]
+fn read_file_window_schema_advertises_positive_bounds() {
+    let def = registry()
+        .get("read_file")
+        .expect("read_file registered")
+        .definition();
+    let offset_schema = def
+        .pointer("/function/parameters/properties/offset")
+        .expect("read_file offset schema");
+    let limit_schema = def
+        .pointer("/function/parameters/properties/limit")
+        .expect("read_file limit schema");
+
+    assert_eq!(
+        offset_schema.get("minimum").and_then(Value::as_u64),
+        Some(1),
+        "read_file offset schema must advertise the enforced 1-indexed lower bound"
+    );
+    assert_eq!(
+        limit_schema.get("minimum").and_then(Value::as_u64),
+        Some(1),
+        "read_file limit schema must advertise the enforced positive lower bound"
+    );
+}
+
+#[test]
 fn file_tool_path_descriptions_match_relative_path_support() {
     for (tool_name, path_property) in [
         ("read_file", "path"),

@@ -301,8 +301,7 @@ fn offset_beyond_file_length_returns_no_lines_but_no_error() {
 }
 
 #[test]
-fn offset_zero_treated_as_one_via_saturating_sub() {
-    // PINS COERCION: offset uses saturating_sub(1), so 0 → 0 → starts at line 1.
+fn offset_zero_returns_validation_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("offset_zero.txt");
     std::fs::write(&path, "first\nsecond\n").expect("write");
@@ -310,8 +309,27 @@ fn offset_zero_treated_as_one_via_saturating_sub() {
 
     let args = args_with(&[("path", json!(path_str)), ("offset", json!(0))]);
     let (text, is_err) = dispatch_read(&args);
-    assert!(!is_err);
-    assert!(text.contains("first"));
+    assert!(is_err);
+    assert!(
+        text.contains("offset") && text.contains("1-indexed"),
+        "offset=0 must fail before reading; got {text:?}"
+    );
+}
+
+#[test]
+fn limit_zero_returns_validation_error() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("limit_zero.txt");
+    std::fs::write(&path, "first\nsecond\n").expect("write");
+    let path_str = path.to_str().unwrap();
+
+    let args = args_with(&[("path", json!(path_str)), ("limit", json!(0))]);
+    let (text, is_err) = dispatch_read(&args);
+    assert!(is_err);
+    assert!(
+        text.contains("limit") && text.contains("positive"),
+        "limit=0 must fail before reading; got {text:?}"
+    );
 }
 
 #[test]
