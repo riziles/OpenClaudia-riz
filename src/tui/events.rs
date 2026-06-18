@@ -103,6 +103,15 @@ pub enum AppEvent {
         delay_ms: u64,
         status: Option<u16>,
     },
+    /// An SSE stream stalled after partial or empty provider output.
+    ///
+    /// This is runtime metadata, not assistant-authored content. The UI may
+    /// render it to the user, but it must not be appended to the conversation
+    /// transcript or fed back to the provider as model text.
+    StreamTimeout {
+        elapsed_secs: u64,
+        timeout_secs: u64,
+    },
     /// Tool results require a follow-up API call
     FollowUp,
     /// Sync updated session messages back to the App after an agentic loop.

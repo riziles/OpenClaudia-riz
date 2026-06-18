@@ -1112,11 +1112,15 @@ fn enforce_sse_line_cap_with_report(
     Ok(())
 }
 
-/// Stream an SSE response (Anthropic or `OpenAI` format), sending events to the TUI.
-/// Emit the structured #600 timeout event and append the user-facing
-/// inline marker. Extracted so `stream_sse_response` stays within the
-/// `too_many_lines` lint.
-fn handle_sse_timeout(elapsed_secs: u64, full_content: &mut String) {
+/// Emit a structured timeout event for a stalled SSE stream.
+///
+/// The timeout is runtime metadata, not provider-authored assistant text, so
+/// it must not be appended to `full_content`.
+fn handle_sse_timeout(
+    elapsed_secs: u64,
+    full_content_bytes: usize,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<(), String> {
     tracing::error!(
         target: "openclaudia::stream",
         event = "sse_stream_timeout",
@@ -1124,12 +1128,17 @@ fn handle_sse_timeout(elapsed_secs: u64, full_content: &mut String) {
         is_error = true,
         elapsed_secs,
         timeout_secs = proxy::SSE_STREAM_TIMEOUT_SECS,
-        content_so_far_bytes = full_content.len(),
+        content_so_far_bytes = full_content_bytes,
         "SSE stream timed out without further data"
     );
-    if !full_content.is_empty() {
-        full_content.push_str("\n\n[Response truncated: stream timeout]");
-    }
+    send_event!(
+        tx,
+        AppEvent::StreamTimeout {
+            elapsed_secs,
+            timeout_secs: proxy::SSE_STREAM_TIMEOUT_SECS,
+        }
+    );
+    Ok(())
 }
 
 /// Borrowed inputs threaded through the SSE-streaming code path.
@@ -1176,7 +1185,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
 
     while let Some(chunk_result) = stream.next().await {
         if last_data_time.elapsed() > stream_timeout {
-            handle_sse_timeout(last_data_time.elapsed().as_secs(), &mut full_content);
+            handle_sse_timeout(last_data_time.elapsed().as_secs(), full_content.len(), tx)?;
             break;
         }
 
@@ -3307,19 +3316,36 @@ mod tests {
         );
     }
 
-    /// B6 — `SSE_STREAM_TIMEOUT_SECS` is pinned at 30 seconds.
+    /// B6 - `SSE_STREAM_TIMEOUT_SECS` is pinned at 30 seconds.
     ///
     /// Increasing this without a gap issue would silently change user-visible
-    /// latency characteristics. Stream timeout appends inline text (gap #600
-    /// tracks upgrading to a structured error event like CC does).
+    /// latency characteristics.
     #[test]
     fn b6_stream_timeout_constant_is_30s() {
-        // Pin current value — gap #600 tracks upgrading to structured error
         assert_eq!(
             crate::proxy::SSE_STREAM_TIMEOUT_SECS,
             30,
-            "SSE_STREAM_TIMEOUT_SECS must stay at 30s until gap #600 is addressed"
+            "SSE_STREAM_TIMEOUT_SECS must stay at 30s unless timeout UX is revalidated"
         );
+    }
+
+    #[test]
+    fn stream_timeout_emits_event_without_mutating_content() {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle_sse_timeout(31, "partial provider text".len(), &tx)
+            .expect("timeout event should send while receiver is alive");
+
+        match rx.recv().expect("timeout event should be queued") {
+            AppEvent::StreamTimeout {
+                elapsed_secs,
+                timeout_secs,
+            } => {
+                assert_eq!(elapsed_secs, 31);
+                assert_eq!(timeout_secs, crate::proxy::SSE_STREAM_TIMEOUT_SECS);
+            }
+            _ => panic!("timeout must be represented as a structured event"),
+        }
     }
 
     /// B1 — request builders keep the streaming flag contract separate from

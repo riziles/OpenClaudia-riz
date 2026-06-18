@@ -1223,6 +1223,17 @@ impl App {
                     )));
                 self.messages.scroll_to_bottom();
             }
+            Ok(AppEvent::StreamTimeout {
+                elapsed_secs,
+                timeout_secs,
+            }) => {
+                self.messages
+                    .add(DisplayMessage::system(format_stream_timeout_message(
+                        elapsed_secs,
+                        timeout_secs,
+                    )));
+                self.messages.scroll_to_bottom();
+            }
             Ok(AppEvent::Resize(_, _)) => {}
             Ok(AppEvent::FollowUp) => {
                 self.spawn_api_turn();
@@ -3307,6 +3318,10 @@ fn format_api_retry_message(
     }
 }
 
+fn format_stream_timeout_message(elapsed_secs: u64, timeout_secs: u64) -> String {
+    format!("Stream timed out after {elapsed_secs}s without new data (timeout {timeout_secs}s)")
+}
+
 /// One-line human-readable description of an `AppEvent` for the
 /// channel-closed warning. We avoid `Debug` since `AppEvent` doesn't derive
 /// it and adding the derive would ripple through the rest of the file.
@@ -3327,6 +3342,12 @@ fn describe_event(event: &super::events::AppEvent) -> String {
             ..
         } => {
             format!("ApiRetry({kind:?},{attempt}/{max_attempts})")
+        }
+        super::events::AppEvent::StreamTimeout {
+            elapsed_secs,
+            timeout_secs,
+        } => {
+            format!("StreamTimeout({elapsed_secs}/{timeout_secs}s)")
         }
         super::events::AppEvent::StreamText(_) => "StreamText".to_string(),
         super::events::AppEvent::StreamThinking(_) => "StreamThinking".to_string(),
@@ -3739,9 +3760,9 @@ fn parse_prompt_effort_level(effort: &str) -> Option<EffortLevel> {
 mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        current_exe_command, format_api_retry_delay, format_api_retry_message, git_bin,
-        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, ProviderSwitch,
-        SpawnTarget, TuiSession, TEST_SESSIONS_DIR,
+        current_exe_command, format_api_retry_delay, format_api_retry_message,
+        format_stream_timeout_message, git_bin, resolve_provider_switch_auth, save_session,
+        ApiClient, App, AppEvent, ProviderSwitch, SpawnTarget, TuiSession, TEST_SESSIONS_DIR,
     };
     use crate::tui::events::ApiRetryKind;
     use std::io::Write as _;
@@ -3812,6 +3833,21 @@ mod tests {
         assert_eq!(
             format_api_retry_message(ApiRetryKind::Transport, 2, 11, 2_000, None),
             "API retry 2/11 in 2s after transport error"
+        );
+    }
+
+    #[test]
+    fn stream_timeout_message_and_descriptor_are_structured() {
+        assert_eq!(
+            format_stream_timeout_message(31, 30),
+            "Stream timed out after 31s without new data (timeout 30s)"
+        );
+        assert_eq!(
+            super::describe_event(&AppEvent::StreamTimeout {
+                elapsed_secs: 31,
+                timeout_secs: 30,
+            }),
+            "StreamTimeout(31/30s)"
         );
     }
 

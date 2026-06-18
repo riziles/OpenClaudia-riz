@@ -3132,12 +3132,12 @@ mod tests {
         );
     }
 
-    /// Spec — `SSE_STREAM_TIMEOUT_SECS` constant is 30 (pin; gap #600 tracks upgrade).
+    /// Spec - `SSE_STREAM_TIMEOUT_SECS` constant is 30.
     #[test]
     fn sse_stream_timeout_constant_pinned_at_30() {
         assert_eq!(
             SSE_STREAM_TIMEOUT_SECS, 30,
-            "SSE_STREAM_TIMEOUT_SECS must stay at 30s until gap #600 is resolved"
+            "SSE_STREAM_TIMEOUT_SECS must stay at 30s unless timeout UX is revalidated"
         );
     }
 

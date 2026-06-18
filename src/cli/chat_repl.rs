@@ -2194,7 +2194,7 @@ impl ChatRepl {
         while let Some(chunk_result) = stream.next().await {
             let mut md_renderer = tui::StreamingMarkdownRenderer::from_state(md_state);
             if last_data_time.elapsed() > stream_timeout {
-                Self::handle_stream_timeout(&mut full_content);
+                Self::handle_stream_timeout(&full_content);
                 md_state = md_renderer.into_state();
                 break;
             }
@@ -2243,9 +2243,8 @@ impl ChatRepl {
         }
     }
 
-    /// Print the timeout banner and append a truncation marker to any
-    /// partial content already streamed.
-    fn handle_stream_timeout(full_content: &mut String) {
+    /// Print the timeout banner without mutating assistant content.
+    fn handle_stream_timeout(full_content: &str) {
         eprintln!(
             "\nStream timeout: no data received for {}s",
             proxy::SSE_STREAM_TIMEOUT_SECS
@@ -2256,7 +2255,6 @@ impl ChatRepl {
                 "Stream timed out with partial content; preserving {} bytes",
                 full_content.len()
             );
-            full_content.push_str("\n\n[Response truncated: stream timeout]");
         }
     }
 
@@ -4336,6 +4334,15 @@ providers: {}
         assert_eq!(a, b, "provider_path must not leak into the user message");
         assert_ne!(a, c, "different max_turns must yield different messages");
         assert!(c.contains("10"));
+    }
+
+    #[test]
+    fn stream_timeout_preserves_assistant_content() {
+        let content = "partial provider text".to_string();
+
+        ChatRepl::handle_stream_timeout(&content);
+
+        assert_eq!(content, "partial provider text");
     }
 
     /// Regression guard for the Vim toggle panic path: editor construction is
