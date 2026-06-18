@@ -107,6 +107,7 @@ pub struct ChatRepl {
     model: String,
     rl: rustyline::DefaultEditor,
     chat_session: ChatSession,
+    current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
     vim_enabled: bool,
     vim_state: VimState,
@@ -152,6 +153,7 @@ struct GeminiLoopState {
     full_content: String,
     tool_calls: Vec<tools::ToolCall>,
     contents: Vec<serde_json::Value>,
+    executed_tool_loop: bool,
 }
 
 /// Mutable state carried through the OpenAI-compatible tool loop.
@@ -179,6 +181,7 @@ struct SseFrameCtx<'a> {
 /// Spinner template — uses indicatif placeholder syntax, not `format!`.
 const SPINNER_TMPL: &str = "{spinner:.cyan} {msg}";
 const EXTENSION_REGEX_PATTERN: &str = r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b";
+const LEDGER_VERIFICATION_OUTPUT_MAX_BYTES: usize = 20_000;
 
 fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::ProviderConfig, String> {
     config.active_provider().ok_or_else(|| {
@@ -192,6 +195,204 @@ fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::Provi
 fn compile_extension_regex() -> Result<regex::Regex, String> {
     regex::Regex::new(EXTENSION_REGEX_PATTERN)
         .map_err(|err| format!("failed to compile file extension detector regex: {err}"))
+}
+
+fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+        .and_then(|message| message.get("content").and_then(|content| content.as_str()))
+}
+
+fn observe_cli_user_task(session_id: &str, content: &str) -> Option<openclaudia::ledger::ObsId> {
+    let mut ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for CLI user task"
+            );
+            return None;
+        }
+    };
+    match ledger.observe_user_task(content.to_string()) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to append CLI user task observation to reality ledger"
+            );
+            None
+        }
+    }
+}
+
+fn request_messages_with_cli_grounding(
+    session_id: &str,
+    task_obs: Option<openclaudia::ledger::ObsId>,
+    session_messages: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut request_messages = session_messages.to_vec();
+    let Some(task_obs) = task_obs else {
+        return request_messages;
+    };
+    let Some(content) = cli_grounding_system_content(session_id, task_obs) else {
+        return request_messages;
+    };
+    let insert_at = request_messages
+        .iter()
+        .position(|message| message.get("role").and_then(|role| role.as_str()) != Some("system"))
+        .unwrap_or(request_messages.len());
+    request_messages.insert(
+        insert_at,
+        serde_json::json!({
+            "role": "system",
+            "content": content,
+        }),
+    );
+    request_messages
+}
+
+fn append_gemini_system_instruction_text(request: &mut serde_json::Value, content: &str) {
+    if let Some(parts) = request
+        .get_mut("systemInstruction")
+        .and_then(|instruction| instruction.get_mut("parts"))
+        .and_then(|parts| parts.as_array_mut())
+    {
+        parts.push(serde_json::json!({ "text": content }));
+        return;
+    }
+    request["systemInstruction"] = serde_json::json!({
+        "parts": [{ "text": content }]
+    });
+}
+
+fn cli_grounding_system_content(
+    session_id: &str,
+    task_obs: openclaudia::ledger::ObsId,
+) -> Option<String> {
+    let ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for CLI grounding packet"
+            );
+            return None;
+        }
+    };
+    let packet = match openclaudia::grounded_loop::build_prompt_packet(
+        &ledger,
+        task_obs,
+        openclaudia::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT,
+        Vec::new(),
+    ) {
+        Ok(packet) => packet,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                reason = %err.reason(),
+                "failed to build CLI grounding packet"
+            );
+            return None;
+        }
+    };
+    Some(openclaudia::grounded_loop::render_grounding_system_message(
+        &packet,
+    ))
+}
+
+fn validate_cli_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut ledger = match openclaudia::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for CLI final gate"
+            );
+            return Ok(());
+        }
+    };
+    validate_cli_final_against_ledger(&mut ledger, content)
+}
+
+fn validate_cli_final_against_ledger(
+    ledger: &mut openclaudia::ledger::RealityLedger,
+    content: &str,
+) -> Result<(), String> {
+    match openclaudia::final_gate::validate_cited_final_answer(content, ledger) {
+        Ok(_) => {
+            append_cli_final_policy_decision(ledger, true, "final answer grounded");
+            Ok(())
+        }
+        Err(denial) => {
+            let reason = denial.reason().to_string();
+            append_cli_final_policy_decision(ledger, false, &reason);
+            Err(reason)
+        }
+    }
+}
+
+fn append_cli_final_policy_decision(
+    ledger: &mut openclaudia::ledger::RealityLedger,
+    allowed: bool,
+    reason: &str,
+) {
+    if let Err(err) = ledger.append(
+        openclaudia::ledger::Authority::Policy,
+        openclaudia::ledger::ObservationKind::PolicyDecision {
+            allowed,
+            reason: reason.to_string(),
+        },
+    ) {
+        tracing::warn!(
+            allowed,
+            reason,
+            error = %err,
+            "failed to append CLI final-gate policy decision to reality ledger"
+        );
+    }
+}
+
+fn append_cli_quality_gate_verification(
+    ledger: &mut openclaudia::ledger::RealityLedger,
+    gate: &guardrails::QualityCheckResult,
+) -> Result<openclaudia::ledger::ObsId, openclaudia::ledger::LedgerError> {
+    let mut findings = Vec::new();
+    if !gate.passed {
+        findings.push(format!(
+            "quality gate '{}' failed: exit_code={} required={}",
+            gate.name, gate.exit_code, gate.required
+        ));
+        if !gate.stdout.trim().is_empty() {
+            findings.push(format!(
+                "stdout: {}",
+                safe_truncate(&gate.stdout, LEDGER_VERIFICATION_OUTPUT_MAX_BYTES)
+            ));
+        }
+        if !gate.stderr.trim().is_empty() {
+            findings.push(format!(
+                "stderr: {}",
+                safe_truncate(&gate.stderr, LEDGER_VERIFICATION_OUTPUT_MAX_BYTES)
+            ));
+        }
+    }
+    ledger.append(
+        openclaudia::ledger::Authority::Verifier,
+        openclaudia::ledger::ObservationKind::Verification {
+            passed: gate.passed,
+            command: Some(gate.command.clone()),
+            findings,
+        },
+    )
 }
 
 fn load_repl_config(
@@ -330,6 +531,7 @@ impl ChatRepl {
             model,
             rl,
             chat_session,
+            current_task_obs: None,
             active_theme: tui::Theme::load(),
             vim_enabled: false,
             vim_state: VimState::new(),
@@ -436,6 +638,7 @@ impl ChatRepl {
         let mut input = line.trim().to_string();
         let mut editor_message_added = false;
         let mut skip_local_input_shortcuts = false;
+        self.current_task_obs = None;
 
         if self.vim_enabled {
             let _ = self.vim_state.process_key("Escape");
@@ -481,13 +684,21 @@ impl ChatRepl {
             return Ok(Some(false));
         }
 
+        self.current_task_obs = latest_user_message_content(&self.chat_session.messages)
+            .and_then(|content| observe_cli_user_task(&self.chat_session.id, content));
+
         self.inject_rules_from_extensions();
         let prompt_blocks = self.build_prompt_blocks_for_turn(memory_db);
         self.install_system_prompt(&prompt_blocks);
+        let request_messages = request_messages_with_cli_grounding(
+            &self.chat_session.id,
+            self.current_task_obs,
+            &self.chat_session.messages,
+        );
 
         let request_body = match build_chat_request_body(
             &self.config.proxy.target,
-            &self.chat_session.messages,
+            &request_messages,
             &self.model,
             &prompt_blocks,
             &self.effort_level,
@@ -1071,6 +1282,29 @@ impl ChatRepl {
         true
     }
 
+    fn request_messages_with_grounding(&self) -> Vec<serde_json::Value> {
+        request_messages_with_cli_grounding(
+            &self.chat_session.id,
+            self.current_task_obs,
+            &self.chat_session.messages,
+        )
+    }
+
+    fn current_grounding_system_content(&self) -> Option<String> {
+        self.current_task_obs
+            .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id, task_obs))
+    }
+
+    fn agentic_final_allowed(&self, content: &str) -> bool {
+        match validate_cli_agentic_final_response(&self.chat_session.id, content) {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!("\n\x1b[31mFinal answer failed grounding gate: {reason}\x1b[0m");
+                false
+            }
+        }
+    }
+
     /// Extract file extensions from recent messages and inject combined
     /// rules content (once per session) at the head of `messages`.
     fn inject_rules_from_extensions(&mut self) {
@@ -1368,12 +1602,18 @@ impl ChatRepl {
             full_content,
             tool_calls,
             contents,
+            executed_tool_loop: false,
         };
         self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db, auto_learner)
             .await;
 
-        self.finalize_gemini_response(&state.full_content, input_tokens, output_tokens)
-            .await;
+        self.finalize_gemini_response(
+            &state.full_content,
+            input_tokens,
+            output_tokens,
+            state.executed_tool_loop,
+        )
+        .await;
     }
 
     /// Parse the Gemini HTTP body to JSON, or print an error, pop the
@@ -1423,6 +1663,7 @@ impl ChatRepl {
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
             iteration += 1;
+            state.executed_tool_loop = true;
             guardrails::reset_turn();
             self.gemini_record_model_turn(
                 &state.full_content,
@@ -1480,8 +1721,12 @@ impl ChatRepl {
         full_content: &str,
         input_tokens: u64,
         output_tokens: u64,
+        agentic_final: bool,
     ) {
         if !full_content.trim().is_empty() {
+            if agentic_final && !self.agentic_final_allowed(full_content.trim()) {
+                return;
+            }
             self.chat_session.messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": full_content.trim()
@@ -1784,6 +2029,9 @@ impl ChatRepl {
         if let Some(sys) = request_body.get("systemInstruction") {
             followup_req["systemInstruction"] = sys.clone();
         }
+        if let Some(grounding) = self.current_grounding_system_content() {
+            append_gemini_system_instruction_text(&mut followup_req, &grounding);
+        }
 
         let mut req = self.client.post(transport.endpoint).json(&followup_req);
         for (key, value) in transport.headers {
@@ -1985,6 +2233,10 @@ impl ChatRepl {
                 .await
         };
         if let Some(ref engine) = self.vdd_engine {
+            if final_content.trim().is_empty() {
+                println!();
+                return;
+            }
             run_vdd_review(
                 engine,
                 &final_content,
@@ -2281,6 +2533,9 @@ impl ChatRepl {
         }
 
         if !full_content.trim().is_empty() {
+            if proxy_iteration > 0 && !self.agentic_final_allowed(full_content.trim()) {
+                return String::new();
+            }
             self.chat_session.messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": full_content.trim()
@@ -2504,8 +2759,9 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let anthropic_messages = convert_messages_to_anthropic_checked(&self.chat_session.messages)
-            .map_err(|e| e.to_string())?;
+        let request_messages = self.request_messages_with_grounding();
+        let anthropic_messages =
+            convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
         let openai_tools = tools::get_all_tool_definitions(true);
         let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
             .map_err(|e| e.to_string())?;
@@ -2665,6 +2921,9 @@ impl ChatRepl {
             );
         }
         if !full_content.trim().is_empty() && !tool_interceptor.has_pending_tool_calls() {
+            if proxy_iteration > 0 && !self.agentic_final_allowed(full_content.trim()) {
+                return String::new();
+            }
             self.chat_session.messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": full_content.trim()
@@ -2775,8 +3034,9 @@ impl ChatRepl {
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
     ) -> Result<serde_json::Value, String> {
-        let anthropic_messages = convert_messages_to_anthropic_checked(&self.chat_session.messages)
-            .map_err(|e| e.to_string())?;
+        let request_messages = self.request_messages_with_grounding();
+        let anthropic_messages =
+            convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
         let mut followup_req = serde_json::json!({
             "model": self.model,
             "messages": anthropic_messages,
@@ -2933,14 +3193,16 @@ impl ChatRepl {
             );
         }
 
-        self.persist_openai_loop_state(
+        let final_allowed = self.persist_openai_loop_state(
             &state.current_content,
             &state.current_reasoning_content,
             tool_accumulator,
             iteration,
         );
-        self.run_openai_vdd_review(&state.current_content, state.cancelled)
-            .await;
+        if final_allowed {
+            self.run_openai_vdd_review(&state.current_content, state.cancelled)
+                .await;
+        }
     }
 
     /// Append the assistant message that initiated this `OpenAI` tool
@@ -2998,10 +3260,16 @@ impl ChatRepl {
         reasoning_content: &str,
         tool_accumulator: &tools::ToolCallAccumulator,
         iteration: u32,
-    ) {
+    ) -> bool {
         if (!current_content.is_empty() || !reasoning_content.is_empty())
             && !tool_accumulator.has_tool_calls()
         {
+            if iteration > 0
+                && !current_content.trim().is_empty()
+                && !self.agentic_final_allowed(current_content.trim())
+            {
+                return false;
+            }
             let mut message = serde_json::json!({
                 "role": "assistant",
                 "content": current_content
@@ -3012,17 +3280,22 @@ impl ChatRepl {
             if let Err(e) = save_chat_session(&self.chat_session) {
                 tracing::warn!("Failed to save session: {}", e);
             }
+            true
         } else if iteration > 0 {
             self.chat_session.touch();
             if let Err(e) = save_chat_session(&self.chat_session) {
                 tracing::warn!("Failed to save session: {}", e);
             }
+            true
         } else if current_content.is_empty()
             && reasoning_content.is_empty()
             && !tool_accumulator.has_tool_calls()
         {
             let _ = save_chat_session(&self.chat_session);
             self.chat_session.messages.pop();
+            true
+        } else {
+            true
         }
     }
 
@@ -3050,17 +3323,15 @@ impl ChatRepl {
     /// Build the OpenAI-compatible follow-up request body (handles both
     /// the Anthropic direct branch and the generic `OpenAI` shape).
     fn build_openai_followup_request(&self) -> Result<serde_json::Value, String> {
+        let request_messages = self.request_messages_with_grounding();
         if self.config.proxy.target == "anthropic" {
-            let system_msg = self
-                .chat_session
-                .messages
+            let system_msg = request_messages
                 .iter()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
                 .and_then(|m| m.get("content").and_then(|c| c.as_str()))
                 .map(String::from);
-            let anthropic_messages =
-                convert_messages_to_anthropic_checked(&self.chat_session.messages)
-                    .map_err(|e| e.to_string())?;
+            let anthropic_messages = convert_messages_to_anthropic_checked(&request_messages)
+                .map_err(|e| e.to_string())?;
             let openai_tools = tools::get_all_tool_definitions(true);
             let anthropic_tools = convert_tool_definitions_to_anthropic_checked(&openai_tools)
                 .map_err(|e| e.to_string())?;
@@ -3082,7 +3353,7 @@ impl ChatRepl {
         } else {
             Ok(serde_json::json!({
                 "model": self.model,
-                "messages": self.chat_session.messages,
+                "messages": request_messages,
                 "max_tokens": openclaudia::DEFAULT_MAX_TOKENS,
                 "stream": true,
                 "tools": tools::get_all_tool_definitions(true)
@@ -3284,6 +3555,7 @@ impl ChatRepl {
     /// back into the session as system messages.
     fn run_quality_gates_and_inject(&mut self) {
         let qg_results = guardrails::run_quality_gates();
+        self.record_quality_gate_verifications(&qg_results);
         for qg in &qg_results {
             if qg.passed {
                 tracing::debug!(name = %qg.name, "Quality gate passed");
@@ -3307,6 +3579,34 @@ impl ChatRepl {
                     if qg.stderr.len() > 500 { safe_truncate(&qg.stderr, 500) } else { &qg.stderr }
                 )
             }));
+        }
+    }
+
+    fn record_quality_gate_verifications(&self, qg_results: &[guardrails::QualityCheckResult]) {
+        if qg_results.is_empty() {
+            return;
+        }
+        let mut ledger =
+            match openclaudia::ledger::RealityLedger::open_project_session(&self.chat_session.id) {
+                Ok(ledger) => ledger,
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %self.chat_session.id,
+                        error = %err,
+                        "failed to open session reality ledger for CLI quality gates"
+                    );
+                    return;
+                }
+            };
+        for gate in qg_results {
+            if let Err(err) = append_cli_quality_gate_verification(&mut ledger, gate) {
+                tracing::warn!(
+                    session_id = %self.chat_session.id,
+                    gate = %gate.name,
+                    error = %err,
+                    "failed to append CLI quality-gate verification to reality ledger"
+                );
+            }
         }
     }
 
@@ -3743,6 +4043,95 @@ providers: {}
         let parsed = parse_tool_args(&func).expect("object JSON should parse");
 
         assert_eq!(parsed["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn cli_final_gate_accepts_cited_evidence_and_verification() {
+        let mut ledger = openclaudia::ledger::RealityLedger::new();
+        let task = ledger.observe_user_task("Audit CLI loop.").expect("task");
+        let command = ledger
+            .observe_command_run(
+                "/repo",
+                vec!["cargo".to_string(), "test".to_string()],
+                0,
+                "ok",
+                "",
+            )
+            .expect("command");
+        let verification = ledger
+            .append(
+                openclaudia::ledger::Authority::Verifier,
+                openclaudia::ledger::ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo test".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let content =
+            format!("Verified the CLI loop with evidence [{task}] [{command}] [{verification}].");
+
+        validate_cli_final_against_ledger(&mut ledger, &content).expect("cited final should pass");
+
+        assert!(ledger
+            .observations_chronological()
+            .iter()
+            .any(|obs| matches!(
+                &obs.kind,
+                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: true, .. }
+            )));
+    }
+
+    #[test]
+    fn cli_final_gate_rejects_uncited_agentic_final() {
+        let mut ledger = openclaudia::ledger::RealityLedger::new();
+
+        let err = validate_cli_final_against_ledger(&mut ledger, "Verified with cargo test.")
+            .expect_err("uncited final must be denied");
+
+        assert_eq!(err, "final answer requires evidence");
+        assert!(ledger
+            .observations_chronological()
+            .iter()
+            .any(|obs| matches!(
+                &obs.kind,
+                openclaudia::ledger::ObservationKind::PolicyDecision { allowed: false, .. }
+            )));
+    }
+
+    #[test]
+    fn cli_quality_gate_result_records_verification_observation() {
+        let mut ledger = openclaudia::ledger::RealityLedger::new();
+        let gate = guardrails::QualityCheckResult {
+            name: "fmt".to_string(),
+            command: "cargo fmt --check".to_string(),
+            passed: false,
+            exit_code: 1,
+            stdout: "format drift".to_string(),
+            stderr: "run cargo fmt".to_string(),
+            required: true,
+        };
+
+        let id = append_cli_quality_gate_verification(&mut ledger, &gate)
+            .expect("quality gate should ledger verification");
+
+        let obs = ledger
+            .get(id)
+            .expect("verification observation should exist");
+        let openclaudia::ledger::ObservationKind::Verification {
+            passed,
+            command,
+            findings,
+        } = &obs.kind
+        else {
+            panic!("expected verification observation");
+        };
+        assert!(!passed);
+        assert_eq!(command.as_deref(), Some("cargo fmt --check"));
+        assert!(findings.iter().any(|finding| finding.contains("fmt")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("run cargo fmt")));
     }
 
     fn chat_session_with_turns(turns: usize) -> ChatSession {
