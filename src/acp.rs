@@ -1278,6 +1278,12 @@ impl AcpServer {
                         let result = self
                             .execute_tool_via_acp(oc_session_id, &tc.name, &tc.arguments)
                             .await;
+                        record_acp_tool_result_observation(
+                            oc_session_id,
+                            &tc.name,
+                            &tc.id,
+                            &result,
+                        );
 
                         self.send_session_update(
                             acp_session_id,
@@ -2304,6 +2310,41 @@ fn record_acp_command_argv_observation(
     }
 }
 
+fn record_acp_tool_result_observation(
+    session_id: &str,
+    tool_name: &str,
+    tool_call_id: &str,
+    result: &AcpToolResult,
+) {
+    let tool_result = crate::tools::ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: result.content.clone(),
+        is_error: result.is_error,
+    };
+    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                tool = tool_name,
+                error = %err,
+                "failed to open session reality ledger for ACP tool result"
+            );
+            return;
+        }
+    };
+    if let Err(err) =
+        crate::grounded_loop::append_tool_result_observation(&mut ledger, tool_name, &tool_result)
+    {
+        tracing::warn!(
+            session_id,
+            tool = tool_name,
+            error = %err,
+            "failed to append ACP tool result observation to reality ledger"
+        );
+    }
+}
+
 fn acp_list_files_command(path: &str) -> Result<String, String> {
     let quoted = shlex::try_quote(path).map_err(|err| format!("Invalid list_files path: {err}"))?;
     Ok(format!("ls -la -- {quoted}"))
@@ -3076,7 +3117,10 @@ mod search_security_tests {
 
 #[cfg(test)]
 mod acp_ledger_helper_tests {
-    use super::acp_read_line_range;
+    use super::{
+        acp_read_line_range, record_acp_tool_result_observation, AcpToolResult,
+        ACP_LEDGER_EXCERPT_MAX_BYTES,
+    };
 
     #[test]
     fn acp_read_line_range_maps_slice_offsets_to_one_based_lines() {
@@ -3089,6 +3133,46 @@ mod acp_ledger_helper_tests {
         assert_eq!(acp_read_line_range("", 0, 0), (0, 0));
         assert_eq!(acp_read_line_range("a\nb\nc\n", 99, 99), (3, 3));
         assert_eq!(acp_read_line_range("a\nb\nc\n", 1, 1), (2, 2));
+    }
+
+    #[test]
+    fn acp_tool_result_observer_records_bounded_result_envelope() {
+        let session_id = "acp-tool-result-ledger-test";
+        let path = crate::ledger::project_session_ledger_path(session_id)
+            .expect("test session id must be ledger safe");
+        let _ = std::fs::remove_file(&path);
+
+        let result = AcpToolResult {
+            content: "x".repeat(ACP_LEDGER_EXCERPT_MAX_BYTES + 128),
+            is_error: true,
+        };
+        record_acp_tool_result_observation(session_id, "read_file", "call_acp", &result);
+
+        let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
+            .expect("reopen session ledger");
+        let observation = ledger
+            .observations_chronological()
+            .into_iter()
+            .find(|obs| {
+                matches!(
+                    &obs.kind,
+                    crate::ledger::ObservationKind::ToolResult { tool, .. } if tool == "read_file"
+                )
+            })
+            .expect("tool result observation");
+        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        let crate::ledger::ObservationKind::ToolResult { result, .. } = &observation.kind else {
+            panic!("expected tool result observation");
+        };
+        assert_eq!(result["tool_call_id"], "call_acp");
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["content"].as_str().expect("content").len(),
+            crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
