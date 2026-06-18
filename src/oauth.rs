@@ -381,6 +381,188 @@ pub struct OAuthStore {
     persist_path: Option<PathBuf>,
 }
 
+/// Advisory lock for one OAuth session persistence file.
+///
+/// This is process-wide coordination, not an in-process mutex: proxy,
+/// CLI, TUI, and ACP can all be separate processes touching the same
+/// `oauth_sessions.json`. The lock serializes the read-merge-write cycle so
+/// one process cannot overwrite another process's freshly stored session.
+struct OAuthSessionFileLock {
+    _file: fs::File,
+}
+
+impl OAuthSessionFileLock {
+    fn acquire_for(path: &std::path::Path) -> Result<Self> {
+        let lock_path = oauth_session_lock_path(path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create OAuth lock directory {}", parent.display())
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open OAuth lock {}", lock_path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+
+            const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                    file.as_raw_handle() as _,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    0xFFFF_FFFF,
+                    0xFFFF_FFFF,
+                    overlapped.as_mut_ptr(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+
+        Ok(Self { _file: file })
+    }
+}
+
+fn oauth_session_lock_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("json.lock")
+}
+
+fn oauth_session_tmp_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("oauth_sessions.json");
+    path.with_file_name(format!(
+        "{file_name}.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn read_valid_sessions_from_disk(path: &std::path::Path) -> Option<HashMap<String, OAuthSession>> {
+    // Open the session file refusing to follow symlinks (crosslink #814).
+    // With O_NOFOLLOW the open itself fails with ELOOP on a symlink, so there
+    // is no post-open race window.
+    //
+    // On non-Unix targets there is no O_NOFOLLOW equivalent here; fall back to
+    // the prior open-then-check pattern.
+    let file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("No persisted OAuth sessions found");
+                    return None;
+                }
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        error!(
+                            "OAuth session file {} is a symlink — refusing to read for security",
+                            path.display()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Failed to open OAuth session file {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let f = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("No persisted OAuth sessions found");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to open OAuth session file {}: {}",
+                        path.display(),
+                        e
+                    );
+                    return None;
+                }
+            };
+            if path
+                .symlink_metadata()
+                .is_ok_and(|sm| sm.file_type().is_symlink())
+            {
+                error!(
+                    "OAuth session file {} is a symlink — refusing to read for security",
+                    path.display()
+                );
+                return None;
+            }
+            f
+        }
+    };
+
+    match std::io::read_to_string(file) {
+        Ok(data) => match serde_json::from_str::<HashMap<String, OAuthSession>>(&data) {
+            Ok(loaded) => Some(
+                loaded
+                    .into_iter()
+                    .filter(|(id, session)| {
+                        if session.credentials.is_expired() {
+                            info!("Removing expired OAuth session: {}", id);
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect(),
+            ),
+            Err(e) => {
+                error!(
+                    "Failed to parse OAuth sessions from {}: {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("No persisted OAuth sessions found");
+            None
+        }
+        Err(e) => {
+            error!("Failed to load OAuth sessions: {}", e);
+            None
+        }
+    }
+}
+
 impl Default for OAuthStore {
     fn default() -> Self {
         Self::new()
@@ -474,114 +656,23 @@ impl OAuthStore {
             return;
         };
 
-        // Open the session file refusing to follow symlinks (crosslink #814).
-        // The previous implementation called `fs::File::open` (which follows
-        // symlinks) and then inspected `symlink_metadata` AFTER the fact —
-        // by that point a hostile symlink had already been opened, defeating
-        // the check the doc comment claimed it provided. With `O_NOFOLLOW`
-        // the open itself fails with ELOOP on a symlink, so there is no
-        // post-open race window.
-        //
-        // On non-Unix targets there is no O_NOFOLLOW equivalent here; fall
-        // back to the prior open-then-check pattern (still better than
-        // nothing — see #814 for follow-up).
-        let file = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                match fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(path)
-                {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        debug!("No persisted OAuth sessions found");
-                        return;
-                    }
-                    Err(e) => {
-                        // ELOOP surfaces here when the path is a symlink.
-                        // Log it as a security-relevant event rather than a
-                        // generic open failure so operators can spot it.
-                        if e.raw_os_error() == Some(libc::ELOOP) {
-                            error!(
-                                "OAuth session file {} is a symlink — refusing to read for security",
-                                path.display()
-                            );
-                        } else {
-                            tracing::warn!(
-                                "Failed to open OAuth session file {}: {}",
-                                path.display(),
-                                e
-                            );
-                        }
-                        return;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let f = match fs::File::open(path) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        debug!("No persisted OAuth sessions found");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to open OAuth session file {}: {}",
-                            path.display(),
-                            e
-                        );
-                        return;
-                    }
-                };
-                if path
-                    .symlink_metadata()
-                    .is_ok_and(|sm| sm.file_type().is_symlink())
-                {
-                    error!(
-                        "OAuth session file {} is a symlink — refusing to read for security",
-                        path.display()
-                    );
-                    return;
-                }
-                f
+        let _lock = match OAuthSessionFileLock::acquire_for(path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                error!("Failed to lock OAuth sessions for load: {e:#}");
+                return;
             }
         };
 
-        match std::io::read_to_string(file) {
-            Ok(data) => {
-                if let Ok(loaded) = serde_json::from_str::<HashMap<String, OAuthSession>>(&data) {
-                    // Filter out expired sessions during load
-                    let valid_sessions: HashMap<String, OAuthSession> = loaded
-                        .into_iter()
-                        .filter(|(id, session)| {
-                            if session.credentials.is_expired() {
-                                info!("Removing expired OAuth session: {}", id);
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .collect();
-
-                    let mut sessions = self
-                        .sessions
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *sessions = valid_sessions;
-                    let session_count = sessions.len();
-                    drop(sessions);
-                    info!("Loaded {} OAuth sessions from disk", session_count);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                debug!("No persisted OAuth sessions found");
-            }
-            Err(e) => {
-                error!("Failed to load OAuth sessions: {}", e);
-            }
+        if let Some(valid_sessions) = read_valid_sessions_from_disk(path) {
+            let mut sessions = self
+                .sessions
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *sessions = valid_sessions;
+            let session_count = sessions.len();
+            drop(sessions);
+            info!("Loaded {} OAuth sessions from disk", session_count);
         }
     }
 
@@ -619,30 +710,41 @@ impl OAuthStore {
             let _ = fs::create_dir_all(parent);
         }
 
-        let sessions = self
+        let local_sessions = self
             .sessions
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let json = match serde_json::to_string_pretty(&*sessions) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        let _lock = match OAuthSessionFileLock::acquire_for(path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                error!("Failed to lock OAuth sessions for persist: {e:#}");
+                return;
+            }
+        };
+
+        let mut merged_sessions = read_valid_sessions_from_disk(path).unwrap_or_default();
+        merged_sessions.extend(local_sessions);
+
+        let json = match serde_json::to_string_pretty(&merged_sessions) {
             Ok(j) => j,
             Err(e) => {
                 error!("Failed to serialize OAuth sessions: {}", e);
                 return;
             }
         };
-        drop(sessions);
 
         #[cfg(unix)]
         {
             use std::io::Write;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-            let tmp_path = path.with_extension("tmp");
+            let tmp_path = oauth_session_tmp_path(path);
 
             // Atomically create the temp file with O_CREAT|O_EXCL|O_WRONLY
-            // at mode 0o600. If `.tmp` already exists (stale crash residue,
-            // symlink attack, racing writer) this fails and we bail out
-            // rather than silently truncating someone else's file.
+            // at mode 0o600. The random sibling name plus create_new avoids
+            // clobbering stale crash residue or a pre-planted symlink.
             let mut file = match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -704,7 +806,14 @@ impl OAuthStore {
                  atomically create the file with owner-only permissions. OAuth sessions will \
                  not survive process restart on this platform."
             );
+            return;
         }
+
+        let mut sessions = self
+            .sessions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *sessions = merged_sessions;
     }
 }
 
@@ -1214,22 +1323,31 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("oauth_sessions.json");
-        let tmp_path_w = path.with_extension("tmp");
+        let watch_dir = tmp.path().to_path_buf();
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = Arc::clone(&stop);
 
-        // Watcher: poll the tmp file as fast as we can and record every
-        // mode we observe along with whether the token bytes were there.
+        // Watcher: poll random OAuth temp files as fast as we can and record
+        // every mode we observe along with whether the token bytes were there.
         let watcher = thread::spawn(move || -> Vec<(u32, bool)> {
             let mut observations = Vec::new();
             let deadline = Instant::now() + StdDuration::from_secs(3);
             while !stop_w.load(Ordering::Relaxed) && Instant::now() < deadline {
-                if let Ok(md) = fs::symlink_metadata(&tmp_path_w) {
-                    let mode = md.permissions().mode() & 0o777;
-                    let has_token = fs::read_to_string(&tmp_path_w)
-                        .is_ok_and(|s| s.contains("racy-secret-token-CANARY"));
-                    observations.push((mode, has_token));
+                if let Ok(entries) = fs::read_dir(&watch_dir) {
+                    for entry in entries.flatten() {
+                        let file_name = entry.file_name();
+                        let file_name = file_name.to_string_lossy();
+                        if !file_name.starts_with("oauth_sessions.json.tmp.") {
+                            continue;
+                        }
+                        if let Ok(md) = fs::symlink_metadata(entry.path()) {
+                            let mode = md.permissions().mode() & 0o777;
+                            let has_token = fs::read_to_string(entry.path())
+                                .is_ok_and(|s| s.contains("racy-secret-token-CANARY"));
+                            observations.push((mode, has_token));
+                        }
+                    }
                 }
             }
             observations
@@ -1269,14 +1387,14 @@ mod tests {
         );
     }
 
-    /// FORENSIC EVIDENCE #3: a pre-existing `.tmp` file (e.g. a symlink to
-    /// `/etc/shadow` staged by a local attacker, or stale crash residue)
-    /// must not be truncated. `O_EXCL` causes `persist_to_disk` to fail
-    /// closed, leaving the attacker's file untouched and the real
-    /// destination unchanged.
+    /// FORENSIC EVIDENCE #3: a pre-existing legacy `.tmp` file (e.g. a
+    /// symlink to `/etc/shadow` staged against the older predictable temp
+    /// name, or stale crash residue) must not be truncated. Persistence now
+    /// uses random `oauth_sessions.json.tmp.*` siblings, so the stale file is
+    /// left untouched while the real destination is still written.
     #[cfg(unix)]
     #[test]
-    fn persist_to_disk_refuses_to_clobber_existing_tmp() {
+    fn persist_to_disk_does_not_clobber_legacy_tmp_path() {
         use std::io::Write;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1299,13 +1417,13 @@ mod tests {
         let after = fs::read(&tmp_path).expect("attacker file should still exist");
         assert_eq!(
             after, attacker_sentinel,
-            "persist_to_disk truncated a pre-existing .tmp file — symlink attack still possible"
+            "persist_to_disk truncated a pre-existing legacy .tmp file"
         );
 
-        // Destination was never written (no fallback path bypasses O_EXCL).
+        // Destination is still written through the random temp path.
         assert!(
-            !path.exists(),
-            "persist_to_disk wrote the destination despite failing the exclusive-create step"
+            path.exists(),
+            "persist_to_disk should ignore stale legacy .tmp and use a random sibling"
         );
     }
 
@@ -1330,5 +1448,35 @@ mod tests {
         );
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// FORENSIC EVIDENCE #5: two independent store instances writing the
+    /// same persistence file must merge under the advisory lock instead of
+    /// losing the first writer's session.
+    #[cfg(unix)]
+    #[test]
+    fn persist_to_disk_merges_sessions_from_independent_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oauth_sessions.json");
+        let store_a = OAuthStore::with_persist_path(path.clone());
+        let store_b = OAuthStore::with_persist_path(path.clone());
+
+        store_a.store_session(make_session("alpha-race-token"));
+        store_b.store_session(make_session("beta-race-token"));
+
+        let bytes = fs::read_to_string(&path).expect("destination must exist");
+        assert!(
+            bytes.contains("alpha-race-token"),
+            "second store overwrote first store's persisted session"
+        );
+        assert!(
+            bytes.contains("beta-race-token"),
+            "second store did not persist its own session"
+        );
+
+        let reloaded = OAuthStore::with_persist_path(path);
+        reloaded.load_from_disk();
+        assert!(reloaded.get_session("session-alpha-race-token").is_some());
+        assert!(reloaded.get_session("session-beta-race-token").is_some());
     }
 }
