@@ -15,7 +15,7 @@
 use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn cwd_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -135,6 +135,39 @@ fn relative_path_is_accepted_and_resolved_to_cwd_relative() {
         !is_err,
         "relative path MUST be accepted (resolved to cwd); got error {msg:?}"
     );
+}
+
+#[test]
+fn write_file_records_diff_observation_when_session_ledger_is_active() {
+    let _session_guard = openclaudia::tools::SessionIdGuard::set("writeledger");
+    let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
+    let _ledger_guard =
+        openclaudia::ledger::install_active_ledger_for_session("writeledger", Arc::clone(&ledger));
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("ledger_write.txt");
+    let args = args_with(&[
+        ("path", json!(path.to_str().unwrap())),
+        ("content", json!("created\n")),
+    ]);
+    let (msg, is_err) = dispatch_write(&args);
+    assert!(!is_err, "write should succeed: {msg}");
+
+    let ledger = ledger.lock().expect("ledger lock");
+    assert_eq!(ledger.len(), 1);
+    let observation = ledger
+        .get(ledger.observation_index(8)[0].id)
+        .expect("observation");
+    let openclaudia::ledger::ObservationKind::DiffObserved { files, patch } = &observation.kind
+    else {
+        panic!("expected diff observation");
+    };
+    assert_eq!(
+        files,
+        &vec![path.canonicalize().unwrap().to_string_lossy().to_string()]
+    );
+    assert!(patch.contains("+created"));
+    assert_eq!(observation.authority, openclaudia::ledger::Authority::Git);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

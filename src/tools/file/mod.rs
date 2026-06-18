@@ -24,6 +24,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use similar::TextDiff;
+
 const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
 
 /// Maximum number of entries in the read tracker, per session, before
@@ -538,6 +540,31 @@ fn count_display_lines(text: &str) -> usize {
         return 0;
     }
     text.lines().count().max(1)
+}
+
+pub(super) fn record_active_diff_observation(path: &str, before: &str, after: &str) {
+    if before == after {
+        return;
+    }
+    let session_key = super::todo::current_session_key();
+    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
+        return;
+    };
+    let patch = TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    let mut ledger = ledger.lock().unwrap_or_else(|err| {
+        tracing::error!("active reality ledger lock poisoned; recovering inner state");
+        err.into_inner()
+    });
+    if let Err(err) = ledger.observe_diff(vec![path.to_string()], patch) {
+        tracing::warn!(
+            path,
+            error = %err,
+            "failed to append file diff observation to reality ledger"
+        );
+    }
 }
 
 /// Process-wide mutex for tests that mutate the global `READ_TRACKER`.

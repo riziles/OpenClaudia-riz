@@ -300,6 +300,7 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
     match rewrite_in_place(&mut file, &new_content) {
         Ok(()) => {
             crate::guardrails::record_file_modification(path, lines_added, lines_removed);
+            super::record_active_diff_observation(path, &content, &new_content);
             (
                 format_edit_success(path, old_string, new_string, count, replace_all),
                 false,

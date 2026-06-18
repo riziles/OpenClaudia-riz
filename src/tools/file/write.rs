@@ -94,8 +94,8 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
         return (msg, true);
     }
 
-    let old_lines = fs::read_to_string(path)
-        .map_or(0, |c| u32::try_from(c.lines().count()).unwrap_or(u32::MAX));
+    let old_content = fs::read_to_string(path).unwrap_or_default();
+    let old_lines = u32::try_from(old_content.lines().count()).unwrap_or(u32::MAX);
     let new_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     if let Some(parent) = Path::new(path).parent() {
@@ -120,6 +120,7 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
     match file.write_all(content.as_bytes()) {
         Ok(()) => {
             crate::guardrails::record_file_modification(path, new_lines, old_lines);
+            super::record_active_diff_observation(path, &old_content, content);
             let mut result = format!("Successfully wrote {} bytes to '{}'", content.len(), path);
             if let Some(warning) = crate::guardrails::check_diff_thresholds() {
                 let _ = write!(result, "\n\nWarning: {}", warning.message);

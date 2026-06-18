@@ -16,6 +16,7 @@
 use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn dispatch_edit(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
@@ -133,6 +134,60 @@ fn edit_after_explicit_read_file_dispatch_passes_must_read_gate() {
     // Content actually changed on disk.
     let after = std::fs::read_to_string(&path).expect("read");
     assert_eq!(after, "after");
+}
+
+#[test]
+fn edit_records_diff_and_stales_prior_read_observation() {
+    let _session_guard = openclaudia::tools::SessionIdGuard::set("editledger");
+    let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
+    let _ledger_guard =
+        openclaudia::ledger::install_active_ledger_for_session("editledger", Arc::clone(&ledger));
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("ledger_edit.txt");
+    std::fs::write(&path, "before\n").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let read_args = args_with(&[("path", json!(path_str))]);
+    let (_msg, read_err) = dispatch_read(&read_args);
+    assert!(!read_err, "read_file MUST succeed");
+    let read_id = {
+        let ledger = ledger.lock().expect("ledger lock");
+        assert_eq!(ledger.len(), 1);
+        ledger.observation_index(8)[0].id
+    };
+
+    let edit_args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("before")),
+        ("new_string", json!("after")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&edit_args);
+    assert!(!is_err, "edit after read MUST succeed; got error {msg:?}");
+
+    let ledger = ledger.lock().expect("ledger lock");
+    assert_eq!(ledger.len(), 2);
+    assert!(ledger.is_stale(read_id), "prior file read must be stale");
+    let diff = ledger
+        .observation_index(8)
+        .into_iter()
+        .filter_map(|entry| ledger.get(entry.id))
+        .find(|obs| {
+            matches!(
+                obs.kind,
+                openclaudia::ledger::ObservationKind::DiffObserved { .. }
+            )
+        })
+        .expect("diff observation");
+    let openclaudia::ledger::ObservationKind::DiffObserved { files, patch } = &diff.kind else {
+        panic!("expected diff observation");
+    };
+    assert_eq!(
+        files,
+        &vec![path.canonicalize().unwrap().to_string_lossy().to_string()]
+    );
+    assert!(patch.contains("-before"));
+    assert!(patch.contains("+after"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
