@@ -1,4 +1,4 @@
-use super::input::handle_user_questions;
+use super::input::{handle_user_questions, run_external_editor};
 use super::{AgentMode, ChatSession};
 use openclaudia::tools;
 use std::fs;
@@ -111,9 +111,7 @@ fn handle_plan_edit(
     use std::io::{self, Write};
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     println!("\n\x1b[90mOpening plan in {editor}...\x1b[0m");
-    let edit_result = std::process::Command::new(&editor)
-        .arg(&plan_state.plan_file)
-        .status();
+    let edit_result = run_external_editor(&editor, &plan_state.plan_file);
     match edit_result {
         Ok(status) if status.success() => {
             let edited_content = fs::read_to_string(&plan_state.plan_file).unwrap_or_default();

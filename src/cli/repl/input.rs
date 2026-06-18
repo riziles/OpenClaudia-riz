@@ -1,10 +1,48 @@
 use std::fs;
+use std::path::Path;
 
 #[cfg(windows)]
 fn resolved_process_command(binary: &str) -> Result<std::process::Command, String> {
     which::which(binary)
         .map(std::process::Command::new)
         .map_err(|e| format!("{binary} binary not found on PATH: {e}"))
+}
+
+#[cfg(not(windows))]
+fn editor_command_tokens(editor: &str) -> Result<Vec<String>, String> {
+    let tokens =
+        shlex::split(editor).ok_or_else(|| format!("could not parse editor command: {editor}"))?;
+    if tokens.is_empty() {
+        return Err("editor command is empty".to_string());
+    }
+    Ok(tokens)
+}
+
+pub fn run_external_editor(
+    editor: &str,
+    target_file: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    #[cfg(windows)]
+    {
+        let target = target_file.to_string_lossy();
+        resolved_process_command("cmd").and_then(|mut command| {
+            command
+                .args(["/C", editor, target.as_ref()])
+                .status()
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut tokens = editor_command_tokens(editor)?;
+        let program = tokens.remove(0);
+        std::process::Command::new(&program)
+            .args(tokens)
+            .arg(target_file)
+            .status()
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Display structured questions to the user and collect answers.
@@ -136,8 +174,6 @@ pub fn handle_user_questions(questions: &[serde_json::Value]) -> String {
 
 /// Open external editor for composing a message
 pub fn open_external_editor() -> Option<String> {
-    use std::process::Command;
-
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| {
@@ -156,16 +192,7 @@ pub fn open_external_editor() -> Option<String> {
 
     println!("\nOpening {editor}...");
 
-    #[cfg(windows)]
-    let status = resolved_process_command("cmd").and_then(|mut command| {
-        command
-            .args(["/C", &editor, temp_file.to_str().unwrap_or("")])
-            .status()
-            .map_err(|e| e.to_string())
-    });
-
-    #[cfg(not(windows))]
-    let status = Command::new(&editor).arg(&temp_file).status();
+    let status = run_external_editor(&editor, &temp_file);
 
     match status {
         Ok(s) if s.success() => fs::read_to_string(&temp_file).map_or_else(
@@ -279,6 +306,8 @@ pub fn expand_file_references(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn repl_editor_windows_shell_uses_resolved_cmd() {
         let source = include_str!("input.rs");
@@ -295,6 +324,36 @@ mod tests {
         assert!(
             production.contains("which::which(binary)"),
             "external editor wrapper must resolve cmd through the Rust resolver"
+        );
+        assert!(
+            !production.contains("Command::new(&editor)")
+                && !production.contains("std::process::Command::new(&editor)"),
+            "external editor wrapper must parse EDITOR specs instead of treating them as a literal executable"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn editor_command_tokens_preserve_editor_arguments() {
+        let tokens = editor_command_tokens(r#"code --wait --reuse-window"#).expect("tokens");
+        assert_eq!(tokens, vec!["code", "--wait", "--reuse-window"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn editor_command_tokens_handles_quoted_editor_path() {
+        let tokens =
+            editor_command_tokens(r#""/opt/Visual Studio Code/bin/code" --wait"#).expect("tokens");
+        assert_eq!(tokens, vec!["/opt/Visual Studio Code/bin/code", "--wait"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn editor_command_tokens_rejects_malformed_quotes() {
+        let err = editor_command_tokens(r#"code "--wait"#).expect_err("malformed editor spec");
+        assert!(
+            err.contains("could not parse editor command"),
+            "unexpected error: {err}"
         );
     }
 }
