@@ -341,6 +341,70 @@ fn unknown_cell_id_on_replace_is_refused() {
     assert!(is_err, "unknown cell_id must error; got msg={msg:?}");
 }
 
+#[test]
+fn parent_dir_traversal_in_notebook_path_is_refused_before_read_gate() {
+    let _sess = session_lock();
+    let _guard = SessionIdGuard::set("sprint23-traversal");
+
+    let (msg, is_err) = notebook_edit(&json!({
+        "notebook_path": "/tmp/../etc/passwd",
+        "cell_id": "c1",
+        "edit_mode": "replace",
+        "new_source": "x",
+    }));
+    assert!(is_err, "../-traversal notebook_path MUST be rejected");
+    assert!(
+        msg.contains("traversal") || msg.contains("Path"),
+        "MUST surface path-traversal message; got {msg:?}"
+    );
+    assert!(
+        !msg.contains("must read"),
+        "traversal must fail before must-read gate; got {msg:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_leaf_notebook_path_is_refused_through_public_dispatch() {
+    let _sess = session_lock();
+    let _guard = SessionIdGuard::set("sprint23-symlink-leaf");
+
+    let dir = TempDir::new().expect("tempdir");
+    let target = dir.path().join("target.ipynb");
+    let nb = make_notebook(&[("guarded", "code", "SAFE")]);
+    write_notebook(&target, &nb);
+    let link = dir.path().join("link.ipynb");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let link_str = link.to_string_lossy().to_string();
+
+    let (read_msg, read_err) = mark_read(&link_str);
+    assert!(
+        !read_err,
+        "read_file through symlink should mark canonical target: {read_msg}"
+    );
+
+    let (msg, is_err) = notebook_edit(&json!({
+        "notebook_path": link_str,
+        "cell_id": "guarded",
+        "edit_mode": "replace",
+        "new_source": "ATTACKER_INJECTED_SOURCE",
+    }));
+    assert!(
+        is_err,
+        "notebook_edit through a symlink leaf must fail via public dispatch: {msg}"
+    );
+
+    let after = std::fs::read_to_string(&target).expect("read target");
+    assert!(
+        after.contains("SAFE"),
+        "symlink target must not be overwritten; got {after}"
+    );
+    assert!(
+        !after.contains("ATTACKER_INJECTED_SOURCE"),
+        "injected source must not appear in target"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section D — schema preservation
 // ───────────────────────────────────────────────────────────────────────────

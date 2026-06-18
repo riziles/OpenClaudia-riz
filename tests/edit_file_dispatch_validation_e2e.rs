@@ -75,6 +75,29 @@ fn path_arg_as_number_treated_as_missing() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Section A2 — Path resolution
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn path_with_parent_dir_traversal_rejected_pre_read_gate() {
+    let args = args_with(&[
+        ("path", json!("/tmp/../etc/passwd")),
+        ("old_string", json!("root")),
+        ("new_string", json!("changed")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err, "../-traversal path MUST be rejected");
+    assert!(
+        msg.contains("traversal") || msg.contains("Path"),
+        "MUST surface path-traversal message before read gate; got {msg:?}"
+    );
+    assert!(
+        !msg.contains("must read"),
+        "traversal must fail before must-read gate; got {msg:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Section B — Must-read-before-edit gate
 // ───────────────────────────────────────────────────────────────────────────
 
