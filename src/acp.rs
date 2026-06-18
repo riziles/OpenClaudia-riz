@@ -34,7 +34,7 @@ use crate::hooks::{
 use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
 use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
-use crate::session::SessionManager;
+use crate::session::{SessionManager, SessionMode};
 
 // ============================================================================
 // JSON-RPC types
@@ -510,6 +510,13 @@ fn upsert_session_mapping_into(
     order.push_back(acp_session_id);
 }
 
+const fn acp_mode_label(mode: SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Initializer => "initializer",
+        SessionMode::Coding => "coding",
+    }
+}
+
 impl AcpServer {
     /// See [`upsert_session_mapping_into`]. Thin instance wrapper so
     /// existing call sites read naturally.
@@ -863,7 +870,7 @@ impl AcpServer {
         info!("Prompt cancellation requested");
     }
 
-    fn handle_session_set_mode(&self, id: Option<Value>, params: &Value) {
+    fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let Some(mode) = params.get("mode").and_then(|v| v.as_str()) else {
@@ -871,20 +878,38 @@ impl AcpServer {
             return;
         };
 
-        // Map to OpenClaudia session modes
-        match mode {
-            "initializer" | "coding" | "auto" => {
-                self.send_response(id, Some(json!({"mode": mode})), None);
-                info!(mode = %mode, "Session mode set");
+        let active_mode = match mode {
+            "initializer" => {
+                self.session_manager
+                    .set_current_mode(SessionMode::Initializer)
+                    .mode
             }
+            "coding" => {
+                self.session_manager
+                    .set_current_mode(SessionMode::Coding)
+                    .mode
+            }
+            "auto" => self.session_manager.get_or_create_session().mode,
             _ => {
                 self.send_error(
                     id,
                     INVALID_PARAMS,
                     &format!("Invalid mode: {mode}. Supported: initializer, coding, auto"),
                 );
+                return;
             }
-        }
+        };
+        let active_mode = acp_mode_label(active_mode);
+
+        self.send_response(
+            id,
+            Some(json!({
+                "mode": mode,
+                "activeMode": active_mode,
+            })),
+            None,
+        );
+        info!(requested_mode = %mode, active_mode, "Session mode set");
     }
 
     fn handle_session_set_config_option(&mut self, id: Option<Value>, params: &Value) {
@@ -3465,6 +3490,159 @@ mod tool_argument_tests {
                 .and_then(serde_json::Value::as_str),
             Some("pwd")
         );
+    }
+}
+
+#[cfg(test)]
+mod session_mode_tests {
+    use super::{acp_mode_label, AcpServer, IdeState, INVALID_PARAMS};
+    use crate::config::{AppConfig, HooksConfig};
+    use crate::hooks::HookEngine;
+    use crate::permissions::PermissionManager;
+    use crate::rules::RulesEngine;
+    use crate::session::{SessionManager, SessionMode};
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    fn test_config() -> AppConfig {
+        serde_yaml::from_str(
+            r#"
+proxy:
+  port: 8080
+  host: "127.0.0.1"
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+"#,
+        )
+        .expect("test config")
+    }
+
+    fn test_server() -> (
+        AcpServer,
+        mpsc::UnboundedReceiver<String>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let server = AcpServer {
+            config: test_config(),
+            session_manager: SessionManager::new(tmp.path().join("sessions")),
+            hook_engine: HookEngine::new(HooksConfig::default()),
+            rules_engine: RulesEngine::new(tmp.path().join("rules")),
+            session_map: HashMap::new(),
+            session_order: VecDeque::new(),
+            messages: Vec::new(),
+            model: "local-model".to_string(),
+            api_key: None,
+            claude_code_token: None,
+            permission_mgr: PermissionManager::unrestricted(),
+            next_request_id: AtomicU64::new(1),
+            pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            stdout_tx,
+            config_options: HashMap::new(),
+            next_terminal_id: AtomicU64::new(1),
+            ide_state: IdeState::default(),
+        };
+        (server, stdout_rx, tmp)
+    }
+
+    fn next_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
+        let line = rx.try_recv().expect("expected ACP response");
+        serde_json::from_str(&line).expect("response must be JSON")
+    }
+
+    #[test]
+    fn acp_mode_label_matches_protocol_tokens() {
+        assert_eq!(acp_mode_label(SessionMode::Initializer), "initializer");
+        assert_eq!(acp_mode_label(SessionMode::Coding), "coding");
+    }
+
+    #[test]
+    fn session_set_mode_updates_active_session_without_replacing_id() {
+        let (mut server, mut rx, _tmp) = test_server();
+
+        server.handle_session_new(Some(json!(1)), Value::Null);
+        let _ = next_response(&mut rx);
+        let session_id = server
+            .session_manager
+            .get_session()
+            .expect("session/new should create session")
+            .id
+            .clone();
+
+        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}));
+        let response = next_response(&mut rx);
+
+        assert_eq!(response["result"]["mode"], "coding");
+        assert_eq!(response["result"]["activeMode"], "coding");
+        let session = server
+            .session_manager
+            .get_session()
+            .expect("session should remain active");
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.mode, SessionMode::Coding);
+
+        server.handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}));
+        let response = next_response(&mut rx);
+
+        assert_eq!(response["result"]["mode"], "initializer");
+        assert_eq!(response["result"]["activeMode"], "initializer");
+        let session = server
+            .session_manager
+            .get_session()
+            .expect("session should remain active");
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.mode, SessionMode::Initializer);
+        assert!(session.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn session_set_mode_auto_creates_and_reports_selected_mode() {
+        let (mut server, mut rx, _tmp) = test_server();
+
+        server.handle_session_set_mode(Some(json!(1)), &json!({"mode": "auto"}));
+        let response = next_response(&mut rx);
+
+        assert_eq!(response["result"]["mode"], "auto");
+        assert_eq!(response["result"]["activeMode"], "initializer");
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("auto should create a session")
+                .mode,
+            SessionMode::Initializer
+        );
+    }
+
+    #[test]
+    fn session_set_mode_rejects_unknown_modes_without_mutation() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server.handle_session_new(Some(json!(1)), Value::Null);
+        let _ = next_response(&mut rx);
+        let session_id = server
+            .session_manager
+            .get_session()
+            .expect("session/new should create session")
+            .id
+            .clone();
+
+        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "plan"}));
+        let response = next_response(&mut rx);
+
+        assert_eq!(response["error"]["code"], INVALID_PARAMS);
+        let session = server
+            .session_manager
+            .get_session()
+            .expect("session should remain active");
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.mode, SessionMode::Initializer);
     }
 }
 

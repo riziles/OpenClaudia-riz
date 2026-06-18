@@ -761,6 +761,24 @@ impl SessionManager {
         self.current_session.as_ref().map(Session::view)
     }
 
+    /// Set the active session mode without replacing the active session.
+    ///
+    /// ACP's `session/set_mode` targets the current session identity; callers
+    /// that need a brand-new initializer/coding session should continue using
+    /// [`Self::start_initializer`] or [`Self::start_coding`].
+    pub fn set_current_mode(&mut self, mode: SessionMode) -> &Session {
+        let persist_dir = self.persist_dir.clone();
+        let session = self
+            .current_session
+            .get_or_insert_with(|| Self::create_session_for_persist_dir(&persist_dir));
+        session.mode = mode;
+        if mode == SessionMode::Initializer {
+            session.parent_session_id = None;
+        }
+        session.touch();
+        session
+    }
+
     /// Store VDD advisory context to inject into the next turn
     pub fn store_vdd_context(&mut self, context: String) {
         self.vdd_pending_context = Some(context);
@@ -1126,6 +1144,24 @@ mod tests {
         let session = Session::new_coding("parent-123");
         assert_eq!(session.mode, SessionMode::Coding);
         assert_eq!(session.parent_session_id, Some("parent-123".to_string()));
+    }
+
+    #[test]
+    fn set_current_mode_updates_active_session_without_replacing_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manager = SessionManager::new(dir.path());
+        let initial = manager.start_initializer().clone();
+
+        let coding = manager.set_current_mode(SessionMode::Coding);
+
+        assert_eq!(coding.id, initial.id);
+        assert_eq!(coding.mode, SessionMode::Coding);
+
+        let initializer = manager.set_current_mode(SessionMode::Initializer);
+
+        assert_eq!(initializer.id, initial.id);
+        assert_eq!(initializer.mode, SessionMode::Initializer);
+        assert!(initializer.parent_session_id.is_none());
     }
 
     #[test]

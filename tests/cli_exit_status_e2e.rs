@@ -1081,6 +1081,63 @@ fn acp_explicit_target_takes_precedence_over_model_autodetect() {
 }
 
 #[test]
+fn acp_session_set_mode_updates_active_session_over_stdio() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_local_provider_config(&cwd);
+
+    let mut child = isolated_command(&cwd, &home)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("openclaudia acp must spawn");
+
+    {
+        let mut stdin = child.stdin.take().expect("acp stdin should be piped");
+        stdin
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"mode":"coding"}}
+{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"mode":"auto"}}
+"#,
+            )
+            .expect("acp stdin should accept JSON-RPC");
+    }
+
+    let output = child.wait_with_output().expect("openclaudia acp must run");
+    assert!(
+        output.status.success(),
+        "acp stdio session/set_mode should succeed; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8(output.stdout).expect("stdout must be utf8");
+    let response_values = responses
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON-RPC response"))
+        .collect::<Vec<_>>();
+
+    let coding = response_values
+        .iter()
+        .find(|response| response["id"] == 2)
+        .expect("coding response");
+    assert_eq!(coding["result"]["mode"], "coding");
+    assert_eq!(coding["result"]["activeMode"], "coding");
+
+    let auto = response_values
+        .iter()
+        .find(|response| response["id"] == 3)
+        .expect("auto response");
+    assert_eq!(auto["result"]["mode"], "auto");
+    assert_eq!(
+        auto["result"]["activeMode"], "coding",
+        "auto should report the active mode set by the previous request"
+    );
+}
+
+#[test]
 fn print_accepts_keyless_local_provider_and_sends_no_auth_header() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
