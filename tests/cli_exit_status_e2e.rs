@@ -1479,6 +1479,17 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         readme.contains("budget_tokens: 10000        # Google Gemini thinking budget"),
         "README config sample must not pin Google thinking to an older Gemini family"
     );
+    for alias_group in [
+        "google/gemini",
+        "qwen/alibaba",
+        "zai/glm/zhipu",
+        "kimi/moonshot",
+    ] {
+        assert!(
+            readme.contains(alias_group),
+            "README config sample must advertise supported provider alias group {alias_group}"
+        );
+    }
     assert!(
         readme.contains(
             "**Cron Scheduling** — Create, list, and delete cron schedule metadata for external schedulers"
@@ -1719,6 +1730,12 @@ fn init_template_marks_keybindings_as_legacy_repl_specific() {
         assert!(
             config.contains(model),
             "init template should advertise representative current model {model}"
+        );
+    }
+    for provider in openclaudia::providers::SUPPORTED_PROVIDERS {
+        assert!(
+            config.contains(provider),
+            "init template provider inventory must mention supported target {provider}"
         );
     }
     for provider in [

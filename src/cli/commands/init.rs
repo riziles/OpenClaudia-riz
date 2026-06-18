@@ -32,8 +32,9 @@ pub fn cmd_init(force: bool) -> anyhow::Result<()> {
 proxy:
   port: 8080
   host: "127.0.0.1"
-  # Provider: anthropic, openai, google, deepseek, qwen, zai, kimi, minimax,
-  # ollama, local, lmstudio, localai, text-generation-webui
+  # Provider: anthropic, openai, google/gemini, deepseek, qwen/alibaba,
+  # zai/glm/zhipu, kimi/moonshot, minimax, ollama, local, lmstudio,
+  # localai, text-generation-webui
   target: anthropic
 
 providers:
