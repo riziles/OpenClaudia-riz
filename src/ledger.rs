@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -540,19 +540,25 @@ impl RealityLedger {
         }
 
         let touched = observation.kind.touched_files();
-        let touched: HashSet<&str> = touched.into_iter().collect();
         let stale_ids = self
             .records
             .iter()
             .filter_map(|(existing_id, record)| match &record.observation.kind {
                 ObservationKind::FileRead { path, .. }
-                    if touched.contains(path.as_str()) && !record.stale =>
+                    if !record.stale
+                        && touched
+                            .iter()
+                            .any(|touched| ledger_paths_match(path, touched)) =>
                 {
                     Some(*existing_id)
                 }
                 ObservationKind::DiffObserved { files, .. }
                     if !record.stale
-                        && files.iter().any(|path| touched.contains(path.as_str())) =>
+                        && files.iter().any(|path| {
+                            touched
+                                .iter()
+                                .any(|touched| ledger_paths_match(path, touched))
+                        }) =>
                 {
                     Some(*existing_id)
                 }
@@ -603,7 +609,7 @@ impl RealityLedger {
                 ObservationKind::FileRead {
                     path: observed_path,
                     ..
-                } if observed_path == path && !record.stale => Some(*id),
+                } if ledger_paths_match(observed_path, path) && !record.stale => Some(*id),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -730,10 +736,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn first_line(text: &str) -> String {
     const MAX: usize = 120;
     let line = text.lines().next().unwrap_or_default();
-    if line.len() <= MAX {
+    if line.chars().count() <= MAX {
         return line.to_string();
     }
-    format!("{}...", &line[..MAX])
+    format!("{}...", line.chars().take(MAX).collect::<String>())
+}
+
+fn ledger_paths_match(observed: &str, touched: &str) -> bool {
+    let observed = observed.trim_start_matches("./");
+    let touched = touched.trim_start_matches("./");
+    observed == touched
+        || observed.ends_with(&format!("/{touched}"))
+        || touched.ends_with(&format!("/{observed}"))
 }
 
 fn validate_session_key(key: &str) -> Result<(), &'static str> {

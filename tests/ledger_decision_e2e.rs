@@ -128,6 +128,39 @@ fn diff_marks_previous_file_reads_stale() {
 }
 
 #[test]
+fn relative_diff_marks_absolute_file_read_stale() {
+    let mut ledger = RealityLedger::new();
+    let read = ledger
+        .observe_file_read("/repo/src/providers/mod.rs", "old\n", 1, 1, "1| old")
+        .expect("read observation");
+
+    let diff = ledger
+        .observe_diff(
+            vec!["src/providers/mod.rs".to_string()],
+            "diff --git a/src/providers/mod.rs b/src/providers/mod.rs\n",
+        )
+        .expect("diff observation");
+
+    assert!(ledger.is_stale(read));
+    assert!(!ledger.is_stale(diff));
+}
+
+#[test]
+fn stale_file_marker_matches_absolute_and_relative_paths() {
+    let mut ledger = RealityLedger::new();
+    let read = ledger
+        .observe_file_read("/repo/src/lib.rs", "old\n", 1, 1, "1| old")
+        .expect("read observation");
+
+    let stale = ledger
+        .mark_file_observations_stale("src/lib.rs")
+        .expect("mark stale");
+
+    assert_eq!(stale, vec![read]);
+    assert!(ledger.is_stale(read));
+}
+
+#[test]
 fn newer_diff_marks_previous_diff_for_same_file_stale() {
     let mut ledger = RealityLedger::new();
     let first = ledger
@@ -178,6 +211,19 @@ fn tool_result_observation_records_bounded_result_envelope() {
         result["content"].as_str().expect("content").len(),
         TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES
     );
+}
+
+#[test]
+fn observation_index_truncates_unicode_labels_without_panicking() {
+    let mut ledger = RealityLedger::new();
+    ledger
+        .observe_user_task("é".repeat(140))
+        .expect("user task observation");
+
+    let index = ledger.observation_index(10);
+
+    assert_eq!(index.len(), 1);
+    assert!(index[0].label.ends_with("..."));
 }
 
 #[test]
