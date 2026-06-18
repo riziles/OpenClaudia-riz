@@ -391,6 +391,40 @@ fn enter_plan_mode_description_names_allowed_tool_surface() {
 }
 
 #[test]
+fn web_search_description_pins_free_browser_backends() {
+    let def = registry()
+        .get("web_search")
+        .expect("web_search registered")
+        .definition();
+    let desc = def
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .expect("web_search description");
+
+    assert!(
+        desc.contains("free DuckDuckGo/Bing browser scraping"),
+        "web_search must advertise the actual free browser-backed backend; got {desc:?}"
+    );
+    assert!(
+        desc.contains("No search API key is required"),
+        "web_search must not imply users need a paid search provider key; got {desc:?}"
+    );
+    for forbidden in [
+        "Serper",
+        "SERPER_API_KEY",
+        "Brave",
+        "BRAVE_API_KEY",
+        "Tavily",
+        "Jina",
+    ] {
+        assert!(
+            !desc.contains(forbidden),
+            "web_search description must not mention retired paid backend {forbidden}; got {desc:?}"
+        );
+    }
+}
+
+#[test]
 fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
     let def = registry()
         .get("cron_create")
