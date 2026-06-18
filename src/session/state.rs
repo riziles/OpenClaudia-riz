@@ -290,6 +290,7 @@ pub struct AllowedPrompt {
 /// restrictions.
 pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "read_file",
+    "grounding_context",
     "list_files",
     "grep",
     "web_fetch",
@@ -682,6 +683,10 @@ mod plan_mode_tests {
         assert!(
             is_tool_allowed_in_plan_mode("read_file", &state.plan_realpath, &no_args),
             "known allow-listed tool must be permitted (#341 positive control)"
+        );
+        assert!(
+            is_tool_allowed_in_plan_mode("grounding_context", &state.plan_realpath, &no_args),
+            "grounding_context must be permitted as a read-only plan-mode tool"
         );
         assert!(
             is_tool_allowed_in_plan_mode("grep", &state.plan_realpath, &no_args),

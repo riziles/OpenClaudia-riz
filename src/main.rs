@@ -615,6 +615,7 @@ fn tool_needs_permission(tool_name: &str) -> bool {
     !matches!(
         tool_name,
         "read_file"
+            | "grounding_context"
             | "list_files"
             | "grep"
             | "glob"

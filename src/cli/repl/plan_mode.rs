@@ -298,7 +298,7 @@ pub fn check_plan_mode_restriction(
     } else {
         Some(format!(
             "Tool '{}' is not available in plan mode. \
-             Only read-only tools (read_file, list_files, grep, web_fetch, web_search), \
+             Only read-only tools (read_file, grounding_context, list_files, grep, web_fetch, web_search), \
              ask_user_question, and task are allowed. \
              You can use write_file ONLY to write to the plan file at: {}",
             tool_name,

@@ -1497,6 +1497,7 @@ pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
 /// Tools that are safe to execute without permission (read-only / informational).
 const SAFE_TOOLS: &[&str] = &[
     "read_file",
+    "grounding_context",
     "list_files",
     "grep",
     "glob",
@@ -3376,6 +3377,10 @@ mod tests {
     #[test]
     fn b3_tool_needs_permission_safe_list() {
         assert!(!tool_needs_permission("read_file"), "read_file is safe");
+        assert!(
+            !tool_needs_permission("grounding_context"),
+            "grounding_context is safe"
+        );
         assert!(!tool_needs_permission("list_files"), "list_files is safe");
         assert!(!tool_needs_permission("grep"), "grep is safe");
         assert!(

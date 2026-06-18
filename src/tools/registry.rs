@@ -1199,7 +1199,7 @@ impl ToolHandler for EnterPlanModeHandler {
             "type": "function",
             "function": {
                 "name": "enter_plan_mode",
-                "description": "Switch to plan mode. In plan mode, only read-only tools (read_file, list_files, grep, web_fetch, web_search), ask_user_question, and the task/agent tool are available. Write/Edit/Bash are blocked. Use write_file ONLY to write to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.",
+                "description": "Switch to plan mode. In plan mode, only read-only tools (read_file, grounding_context, list_files, grep, web_fetch, web_search), ask_user_question, and the task/agent tool are available. Write/Edit/Bash are blocked. Use write_file ONLY to write to the plan file. This is useful when you want to analyze the codebase and create a structured implementation plan before making changes.",
                 "parameters": {
                     "type": "object",
                     "properties": {},

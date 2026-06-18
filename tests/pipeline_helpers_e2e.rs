@@ -98,6 +98,7 @@ fn fallback_is_case_insensitive_via_to_ascii_lowercase() {
 fn safe_read_only_tools_do_not_need_permission() {
     for t in &[
         "read_file",
+        "grounding_context",
         "list_files",
         "grep",
         "glob",
