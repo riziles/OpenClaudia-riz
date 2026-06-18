@@ -30,8 +30,6 @@ pub const ANTHROPIC_MODELS: &[&str] = &[
     "claude-opus-4-5-20251101",
     "claude-opus-4-5",
     "claude-opus-4-1-20250805",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
 ];
 
 pub const OPENAI_MODELS: &[&str] = &[
@@ -319,6 +317,17 @@ mod tests {
             assert!(
                 models.contains(&model),
                 "Anthropic static catalog must include {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_catalog_does_not_advertise_retired_models() {
+        let models = static_models_for_provider("anthropic");
+        for model in ["claude-sonnet-4-20250514", "claude-opus-4-20250514"] {
+            assert!(
+                !models.contains(&model),
+                "Anthropic static catalog must not advertise retired model {model}"
             );
         }
     }
