@@ -1,7 +1,8 @@
 //! End-to-end tests for `compaction::get_context_window` —
-//! exact per-model constants pinned (Claude family at 200k,
-//! GPT-4o at 128k, GPT-4.1 at 1M, GPT-5 at 400k, Gemini Pro
-//! at 1M), the substring-precedence rule (gpt-4o matches
+//! exact per-model constants pinned (current Claude long-context
+//! models at 1M, older Claude family at 200k, GPT-4o at 128k,
+//! GPT-4.1 at 1M, GPT-5 at 400k, Gemini Pro at 1M),
+//! the substring-precedence rule (gpt-4o matches
 //! BEFORE generic gpt-4), the unknown-model fallback, and
 //! case-insensitivity.
 //!
@@ -17,17 +18,33 @@
 use openclaudia::compaction::get_context_window;
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — Claude family (all 200k)
+// Section A — Claude family
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn claude_opus_returns_200k() {
-    assert_eq!(get_context_window("claude-3-opus"), 200_000);
-    assert_eq!(get_context_window("claude-opus-4"), 200_000);
+fn current_claude_long_context_models_return_1m() {
+    for model in [
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ] {
+        assert_eq!(get_context_window(model), 1_000_000, "{model}");
+    }
 }
 
 #[test]
-fn claude_sonnet_returns_200k() {
+fn older_claude_opus_returns_200k() {
+    assert_eq!(get_context_window("claude-3-opus"), 200_000);
+    assert_eq!(get_context_window("claude-opus-4"), 200_000);
+    assert_eq!(get_context_window("claude-opus-4-5"), 200_000);
+}
+
+#[test]
+fn older_claude_sonnet_returns_200k() {
     assert_eq!(get_context_window("claude-3-5-sonnet"), 200_000);
     assert_eq!(get_context_window("claude-sonnet-4-5"), 200_000);
 }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Context window sizes for different models (in tokens)
+const CLAUDE_1M_CONTEXT: usize = 1_000_000;
 const CLAUDE_OPUS_CONTEXT: usize = 200_000;
 const CLAUDE_SONNET_CONTEXT: usize = 200_000;
 const CLAUDE_HAIKU_CONTEXT: usize = 200_000;
@@ -294,7 +295,36 @@ struct ContextWindowRow {
 /// substring matching cannot accidentally promote `gpt-4o` →
 /// `gpt-4` or `claude-3-5-sonnet-gpt-bridge` → `gpt-4`.
 const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
-    // Claude family — specific names before the generic fallback.
+    // Claude family — current 1M models before broad family fallbacks.
+    ContextWindowRow {
+        needle: "claude-fable-5",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-mythos-5",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-mythos-preview",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-opus-4-8",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-opus-4-7",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-opus-4-6",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "claude-sonnet-4-6",
+        tokens: CLAUDE_1M_CONTEXT,
+    },
+    // Older/general Claude family fallbacks.
     ContextWindowRow {
         needle: "opus",
         tokens: CLAUDE_OPUS_CONTEXT,
@@ -1539,6 +1569,10 @@ mod tests {
 
     #[test]
     fn test_get_context_window() {
+        assert_eq!(get_context_window("claude-fable-5"), CLAUDE_1M_CONTEXT);
+        assert_eq!(get_context_window("claude-opus-4-8"), CLAUDE_1M_CONTEXT);
+        assert_eq!(get_context_window("claude-opus-4-7"), CLAUDE_1M_CONTEXT);
+        assert_eq!(get_context_window("claude-sonnet-4-6"), CLAUDE_1M_CONTEXT);
         assert_eq!(
             get_context_window("claude-3-opus-20240229"),
             CLAUDE_OPUS_CONTEXT
@@ -2058,7 +2092,7 @@ mod tests {
 
     #[test]
     fn test_check_context_budget_normal() {
-        let (warn, compact, _) = check_context_budget(50_000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(50_000, "claude-sonnet-4-5");
         assert!(!warn);
         assert!(!compact);
     }
@@ -2066,31 +2100,43 @@ mod tests {
     #[test]
     fn test_check_context_budget_warn() {
         // Claude sonnet context is 200k, 85% = 170k
-        let (warn, compact, _) = check_context_budget(175_000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(175_000, "claude-sonnet-4-5");
         assert!(warn);
         assert!(!compact);
     }
 
     #[test]
     fn test_check_context_budget_compact() {
-        let (warn, compact, _) = check_context_budget(185_000, "claude-sonnet-4-6");
+        let (warn, compact, _) = check_context_budget(185_000, "claude-sonnet-4-5");
         assert!(warn);
         assert!(compact);
     }
 
     #[test]
     fn test_check_context_budget_percentage() {
-        let (_, _, pct) = check_context_budget(100_000, "claude-sonnet-4-6");
+        let (_, _, pct) = check_context_budget(100_000, "claude-sonnet-4-5");
         // 100k / 200k = 50%
         assert!((pct - 50.0).abs() < 0.1);
     }
 
     #[test]
     fn test_check_context_budget_zero() {
-        let (warn, compact, pct) = check_context_budget(0, "claude-sonnet-4-6");
+        let (warn, compact, pct) = check_context_budget(0, "claude-sonnet-4-5");
         assert!(!warn);
         assert!(!compact);
         assert!((pct - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_check_context_budget_current_claude_1m_model() {
+        let (warn, compact, pct) = check_context_budget(500_000, "claude-sonnet-4-6");
+        assert!(!warn);
+        assert!(!compact);
+        assert!((pct - 50.0).abs() < 0.1);
+
+        let (warn, compact, _) = check_context_budget(900_000, "claude-sonnet-4-6");
+        assert!(warn);
+        assert!(compact);
     }
 
     #[test]
@@ -2345,6 +2391,21 @@ mod tests {
         assert_eq!(get_context_window("gpt-4.1"), GPT41_CONTEXT);
         assert_eq!(get_context_window("gpt-4.1-mini"), GPT41_CONTEXT);
         assert_eq!(get_context_window("gpt-5"), GPT5_CONTEXT);
+    }
+
+    #[test]
+    fn b3_context_window_current_claude_1m_models() {
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ] {
+            assert_eq!(get_context_window(model), CLAUDE_1M_CONTEXT, "{model}");
+        }
     }
 
     /// B3b — plain "claude" (no specific variant) falls back to `CLAUDE_SONNET_CONTEXT`.
