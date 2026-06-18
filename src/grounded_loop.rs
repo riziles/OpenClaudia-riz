@@ -351,12 +351,13 @@ pub fn validate_agentic_final_response(session_id: &str, content: &str) -> Resul
     let mut ledger = match RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
+            let reason = format!("final answer requires reality ledger: {err}");
             tracing::warn!(
                 session_id,
                 error = %err,
                 "failed to open session reality ledger for final gate"
             );
-            return Ok(());
+            return Err(reason);
         }
     };
     validate_final_against_ledger(&mut ledger, content)
@@ -562,5 +563,16 @@ mod tests {
                     && findings.iter().any(|finding| finding.contains("exited with code 0"))
             )
         }));
+    }
+
+    #[test]
+    fn agentic_final_fails_closed_when_ledger_cannot_open() {
+        let err = validate_agentic_final_response("invalid/session", "Done.")
+            .expect_err("ledger open failure must deny non-empty final");
+
+        assert!(
+            err.contains("final answer requires reality ledger"),
+            "unexpected denial: {err}"
+        );
     }
 }
