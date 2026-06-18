@@ -425,6 +425,37 @@ fn web_search_description_pins_free_browser_backends() {
 }
 
 #[test]
+fn file_tool_path_descriptions_match_relative_path_support() {
+    for (tool_name, path_property) in [
+        ("read_file", "path"),
+        ("write_file", "path"),
+        ("edit_file", "path"),
+        ("notebook_edit", "notebook_path"),
+        ("list_files", "path"),
+    ] {
+        let def = registry()
+            .get(tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} registered"))
+            .definition();
+        let pointer = format!("/function/parameters/properties/{path_property}/description");
+        let desc = def
+            .pointer(&pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{tool_name}.{path_property} description"));
+        let desc_lower = desc.to_ascii_lowercase();
+
+        assert!(
+            desc.contains("relative paths are resolved against the current working directory"),
+            "{tool_name}.{path_property} must document actual relative-path support; got {desc:?}"
+        );
+        assert!(
+            !desc_lower.contains("must be absolute") && !desc_lower.contains("not relative"),
+            "{tool_name}.{path_property} must not claim paths are absolute-only; got {desc:?}"
+        );
+    }
+}
+
+#[test]
 fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
     let def = registry()
         .get("cron_create")

@@ -285,7 +285,7 @@ impl ToolHandler for ReadFileHandler {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The absolute path to the file to read (must be absolute, not relative)"
+                            "description": "File path to read. Absolute paths are accepted; relative paths are resolved against the current working directory."
                         },
                         "offset": {
                             "type": "integer",
@@ -364,7 +364,7 @@ impl ToolHandler for WriteFileHandler {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The absolute path to the file to write (must be absolute, not relative)"
+                            "description": "File path to write. Absolute paths are accepted; relative paths are resolved against the current working directory."
                         },
                         "content": {
                             "type": "string",
@@ -404,7 +404,7 @@ impl ToolHandler for EditFileHandler {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The absolute path to the file to edit (must be absolute, not relative)"
+                            "description": "File path to edit. Absolute paths are accepted; relative paths are resolved against the current working directory."
                         },
                         "old_string": {
                             "type": "string",
@@ -448,7 +448,7 @@ impl ToolHandler for NotebookEditHandler {
                     "properties": {
                         "notebook_path": {
                             "type": "string",
-                            "description": "The absolute path to the .ipynb file to edit"
+                            "description": "Notebook path to edit. Absolute paths are accepted; relative paths are resolved against the current working directory."
                         },
                         "cell_id": {
                             "type": "string",
@@ -509,7 +509,7 @@ impl ToolHandler for ListFilesHandler {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The absolute directory path to list (defaults to current working directory)"
+                            "description": "Directory path to list. Absolute paths are accepted; relative paths are resolved against the current working directory. Defaults to the current working directory."
                         }
                     },
                     "required": []
