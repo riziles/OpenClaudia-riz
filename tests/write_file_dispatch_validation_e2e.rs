@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -33,6 +34,17 @@ fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
     registry()
         .dispatch("write_file", args, &mut ctx)
         .expect("write_file must be registered")
+}
+
+fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+    };
+    registry()
+        .dispatch("read_file", args, &mut ctx)
+        .expect("read_file must be registered")
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -304,6 +316,36 @@ fn overwrite_existing_file_without_prior_read_errors() {
     assert_eq!(
         preserved, "original content",
         "gate failure MUST preserve original file content"
+    );
+}
+
+#[test]
+fn failed_read_does_not_satisfy_overwrite_gate() {
+    let _session_guard = SessionIdGuard::set("failed-read-overwrite-gate");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("empty.png");
+    std::fs::write(&path, "").expect("create empty image");
+    let path_str = path.to_str().expect("utf8 path");
+
+    let (read_msg, read_err) = dispatch_read(&args_with(&[("path", json!(path_str))]));
+    assert!(read_err, "empty image read must fail: {read_msg}");
+
+    let (write_msg, write_err) = dispatch_write(&args_with(&[
+        ("path", json!(path_str)),
+        ("content", json!("new content")),
+    ]));
+    assert!(
+        write_err,
+        "failed read must not unlock overwrite gate: {write_msg}"
+    );
+    assert!(
+        write_msg.contains("must read") && write_msg.contains("before overwriting"),
+        "overwrite gate should still require a successful read; got {write_msg:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "",
+        "failed-read path must remain untouched"
     );
 }
 

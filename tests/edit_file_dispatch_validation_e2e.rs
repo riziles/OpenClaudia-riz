@@ -14,6 +14,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,37 @@ fn edit_existing_file_without_prior_read_errors_with_documented_message() {
     assert_eq!(
         preserved, "original body",
         "gate failure MUST preserve file content"
+    );
+}
+
+#[test]
+fn failed_read_does_not_satisfy_edit_gate() {
+    let _session_guard = SessionIdGuard::set("failed-read-edit-gate");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("empty.png");
+    std::fs::write(&path, "").expect("create empty image");
+    let path_str = path.to_str().expect("utf8 path");
+
+    let (read_msg, read_err) = dispatch_read(&args_with(&[("path", json!(path_str))]));
+    assert!(read_err, "empty image read must fail: {read_msg}");
+
+    let (edit_msg, edit_err) = dispatch_edit(&args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("")),
+        ("new_string", json!("replacement")),
+    ]));
+    assert!(
+        edit_err,
+        "failed read must not unlock edit gate: {edit_msg}"
+    );
+    assert!(
+        edit_msg.contains("must read") && edit_msg.contains("before editing"),
+        "edit gate should still require a successful read; got {edit_msg:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "",
+        "failed-read path must remain untouched"
     );
 }
 

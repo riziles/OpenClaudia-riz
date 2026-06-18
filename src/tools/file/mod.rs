@@ -462,8 +462,6 @@ pub fn execute_read_file(
     };
     let resolved_str = resolved.to_string_lossy();
 
-    READ_TRACKER.mark_read(&resolved);
-
     let (content, is_error) = match detect_file_type(&resolved_str) {
         FileType::Image(kind) => read_image_file(&resolved_str, kind),
         FileType::Pdf => {
@@ -475,6 +473,7 @@ pub fn execute_read_file(
     };
 
     if !is_error {
+        READ_TRACKER.mark_read(&resolved);
         record_active_file_read_observation(&resolved, args, &content);
     }
 
