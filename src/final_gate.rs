@@ -156,6 +156,15 @@ fn normalize_claim_token(raw: &str) -> Option<String> {
                 '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
             )
     });
+    if let Some((label, _target)) = token.split_once("](") {
+        token = label.trim_matches(|c: char| {
+            c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+                )
+        });
+    }
     token = token.trim_end_matches('.');
     if token.is_empty() || token.contains("://") {
         return None;
@@ -171,6 +180,7 @@ fn normalize_claim_token(raw: &str) -> Option<String> {
         token = prefix;
     }
 
+    token = token.trim_end_matches(':');
     let token = token.trim_start_matches("./");
     (!token.is_empty()).then(|| token.to_string())
 }
@@ -372,5 +382,62 @@ mod tests {
         );
 
         validate_cited_final_answer(&summary, &ledger).expect("fresh diff grounds file claim");
+    }
+
+    #[test]
+    fn final_file_claim_accepts_markdown_link_with_fresh_diff_evidence() {
+        let mut ledger = RealityLedger::new();
+        let diff = ledger
+            .observe_diff(
+                vec!["src/final_gate.rs".to_string()],
+                "diff --git a/src/final_gate.rs b/src/final_gate.rs",
+            )
+            .expect("diff");
+        let command = ledger
+            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary = format!(
+            "Updated [src/final_gate.rs](/repo/src/final_gate.rs:120) and verified with cargo check [{diff}] [{command}] [{verification}]."
+        );
+
+        validate_cited_final_answer(&summary, &ledger)
+            .expect("fresh diff grounds markdown file claim");
+    }
+
+    #[test]
+    fn final_known_file_claim_with_trailing_colon_requires_evidence() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run("/repo", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let summary =
+            format!("Updated README.md: verified with cargo check [{command}] [{verification}].");
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("file denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final file claim requires fresh file or diff observation: README.md"
+        );
     }
 }
