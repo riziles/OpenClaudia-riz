@@ -1090,20 +1090,15 @@ pub fn slash_model(
             openclaudia::providers::get_adapter(provider),
         ) {
             if let Some(provider_config) = config.get_provider(provider) {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if let Some(dynamic) = handle.block_on(super::models::fetch_dynamic_models(
-                        provider_config,
-                        adapter,
-                    )) {
-                        println!("\n  Dynamic models (from API):");
-                        for m in &dynamic {
-                            let marker = if m == current_model {
-                                " \x1b[32m← current\x1b[0m"
-                            } else {
-                                ""
-                            };
-                            println!("    \x1b[36m{m}\x1b[0m{marker}");
-                        }
+                if let Some(dynamic) = fetch_dynamic_models_for_slash(provider_config, adapter) {
+                    println!("\n  Dynamic models (from API):");
+                    for m in &dynamic {
+                        let marker = if m == current_model {
+                            " \x1b[32m← current\x1b[0m"
+                        } else {
+                            ""
+                        };
+                        println!("    \x1b[36m{m}\x1b[0m{marker}");
                     }
                 }
             }
@@ -1119,6 +1114,24 @@ pub fn slash_model(
     let new_model = args.to_string();
     println!("\nSwitching to model: \x1b[36m{new_model}\x1b[0m\n");
     SlashCommandResult::SwitchModel(new_model)
+}
+
+fn fetch_dynamic_models_for_slash(
+    provider_config: &openclaudia::config::ProviderConfig,
+    adapter: &dyn openclaudia::providers::ProviderAdapter,
+) -> Option<Vec<String>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return None;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?
+        .block_on(super::models::fetch_dynamic_models(
+            provider_config,
+            adapter,
+        ))
 }
 
 /// Split a slash-command argument string into shell-style tokens.
@@ -3243,6 +3256,22 @@ mod tests {
             matches!(result, Some(SlashCommandResult::Handled)),
             "/model list must return Handled"
         );
+    }
+
+    #[test]
+    fn spec_model_list_returns_handled_inside_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        rt.block_on(async {
+            let result = handle_slash_command("/model list", &mut ctx(), "openai", "gpt-5.5");
+            assert!(
+                matches!(result, Some(SlashCommandResult::Handled)),
+                "/model list must not panic when called from the legacy REPL runtime"
+            );
+        });
     }
 
     /// OC: `/models` is an alias that lists models (returns `Handled`).
