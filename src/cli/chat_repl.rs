@@ -178,7 +178,6 @@ struct GeminiLoopState {
     full_content: String,
     tool_calls: Vec<tools::ToolCall>,
     contents: Vec<serde_json::Value>,
-    executed_tool_loop: bool,
 }
 
 /// Mutable state carried through the OpenAI-compatible tool loop.
@@ -268,6 +267,10 @@ fn cli_grounding_system_content(
 
 fn validate_cli_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
     openclaudia::grounded_loop::validate_agentic_final_response(session_id, content)
+}
+
+fn final_response_requires_grounding(content: &str, cancelled: bool) -> bool {
+    !cancelled && !content.trim().is_empty()
 }
 
 fn load_repl_config(
@@ -1189,8 +1192,11 @@ impl ChatRepl {
             .and_then(|task_obs| cli_grounding_system_content(&self.chat_session.id, task_obs))
     }
 
-    fn agentic_final_allowed(&self, content: &str) -> bool {
-        match validate_cli_agentic_final_response(&self.chat_session.id, content) {
+    fn final_response_allowed(&self, content: &str, cancelled: bool) -> bool {
+        if !final_response_requires_grounding(content, cancelled) {
+            return true;
+        }
+        match validate_cli_agentic_final_response(&self.chat_session.id, content.trim()) {
             Ok(()) => true,
             Err(reason) => {
                 eprintln!("\n\x1b[31mFinal answer failed grounding gate: {reason}\x1b[0m");
@@ -1496,18 +1502,12 @@ impl ChatRepl {
             full_content,
             tool_calls,
             contents,
-            executed_tool_loop: false,
         };
         self.run_gemini_tool_loop(&mut state, request_body, transport, memory_db, auto_learner)
             .await;
 
-        self.finalize_gemini_response(
-            &state.full_content,
-            input_tokens,
-            output_tokens,
-            state.executed_tool_loop,
-        )
-        .await;
+        self.finalize_gemini_response(&state.full_content, input_tokens, output_tokens)
+            .await;
     }
 
     /// Parse the Gemini HTTP body to JSON, or print an error, pop the
@@ -1557,7 +1557,6 @@ impl ChatRepl {
         let mut iteration: u32 = 0;
         while !state.tool_calls.is_empty() && (max_iterations == 0 || iteration < max_iterations) {
             iteration += 1;
-            state.executed_tool_loop = true;
             guardrails::reset_turn();
             self.gemini_record_model_turn(
                 &state.full_content,
@@ -1615,10 +1614,9 @@ impl ChatRepl {
         full_content: &str,
         input_tokens: u64,
         output_tokens: u64,
-        agentic_final: bool,
     ) {
         if !full_content.trim().is_empty() {
-            if agentic_final && !self.agentic_final_allowed(full_content.trim()) {
+            if !self.final_response_allowed(full_content.trim(), false) {
                 return;
             }
             self.chat_session.messages.push(serde_json::json!({
@@ -2433,7 +2431,7 @@ impl ChatRepl {
         }
 
         if !full_content.trim().is_empty() {
-            if proxy_iteration > 0 && !self.agentic_final_allowed(full_content.trim()) {
+            if !self.final_response_allowed(full_content.trim(), false) {
                 return String::new();
             }
             self.chat_session.messages.push(serde_json::json!({
@@ -2829,7 +2827,7 @@ impl ChatRepl {
             );
         }
         if !full_content.trim().is_empty() && !tool_interceptor.has_pending_tool_calls() {
-            if proxy_iteration > 0 && !self.agentic_final_allowed(full_content.trim()) {
+            if !self.final_response_allowed(full_content.trim(), false) {
                 return String::new();
             }
             self.chat_session.messages.push(serde_json::json!({
@@ -3107,6 +3105,7 @@ impl ChatRepl {
             &state.current_reasoning_content,
             tool_accumulator,
             iteration,
+            state.cancelled,
         );
         if final_allowed {
             self.run_openai_vdd_review(&state.current_content, state.cancelled)
@@ -3169,14 +3168,12 @@ impl ChatRepl {
         reasoning_content: &str,
         tool_accumulator: &tools::ToolCallAccumulator,
         iteration: u32,
+        cancelled: bool,
     ) -> bool {
         if (!current_content.is_empty() || !reasoning_content.is_empty())
             && !tool_accumulator.has_tool_calls()
         {
-            if iteration > 0
-                && !current_content.trim().is_empty()
-                && !self.agentic_final_allowed(current_content.trim())
-            {
+            if !self.final_response_allowed(current_content.trim(), cancelled) {
                 return false;
             }
             let mut message = serde_json::json!({
@@ -3962,6 +3959,25 @@ providers: {}
         let parsed = parse_tool_args(&func).expect("object JSON should parse");
 
         assert_eq!(parsed["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn non_empty_final_responses_require_grounding() {
+        assert!(final_response_requires_grounding("Done.", false));
+        assert!(final_response_requires_grounding(
+            "  Verified with cargo test.  ",
+            false
+        ));
+    }
+
+    #[test]
+    fn empty_or_cancelled_final_responses_do_not_require_grounding() {
+        assert!(!final_response_requires_grounding("", false));
+        assert!(!final_response_requires_grounding("   ", false));
+        assert!(!final_response_requires_grounding(
+            "partial provider text\n\n[Response interrupted by user]",
+            true
+        ));
     }
 
     #[test]
