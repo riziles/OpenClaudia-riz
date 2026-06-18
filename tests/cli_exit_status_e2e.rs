@@ -1102,6 +1102,12 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         "README must show --coordinator with the required legacy REPL flag"
     );
     assert!(
+        readme.contains(
+            "openclaudia --print \"prompt\"   # Send one prompt, print the response, and exit"
+        ),
+        "README must document the binary's supported non-interactive --print mode"
+    );
+    assert!(
         readme.contains("openclaudia auth --logout      # Clear native OAuth session cache"),
         "README must not imply auth --logout deletes shared Claude credentials"
     );

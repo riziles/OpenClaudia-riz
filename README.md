@@ -196,6 +196,7 @@ openclaudia --session-id <id>  # Resume specific session
 openclaudia --coordinator --tui-mode  # Legacy REPL coordinator prompt mode
 openclaudia --tui-mode         # Legacy line-oriented REPL
 openclaudia --mode <preset>    # Start with a behavioral mode preset
+openclaudia --print "prompt"   # Send one prompt, print the response, and exit
 
 openclaudia init               # Initialize config in current directory
 openclaudia init --force       # Overwrite existing config
