@@ -437,7 +437,7 @@ fn execute_cron_create_at<S: BuildHasher>(
     if store.schedules.len() >= MAX_SCHEDULES {
         return (
             format!(
-                "Maximum scheduled task limit ({MAX_SCHEDULES}) reached. Delete an existing schedule before creating another."
+                "Maximum schedule metadata limit ({MAX_SCHEDULES}) reached. Delete an existing schedule before creating another."
             ),
             true,
         );
@@ -598,10 +598,10 @@ fn execute_cron_list_at<S: BuildHasher>(
     };
 
     if store.schedules.is_empty() {
-        return ("No scheduled tasks.".to_string(), false);
+        return ("No schedule metadata stored.".to_string(), false);
     }
 
-    let mut output = String::from("Scheduled tasks:\n\n");
+    let mut output = String::from("Stored cron schedule metadata:\n\n");
     for s in &store.schedules {
         let _ = write!(
             output,
@@ -685,7 +685,7 @@ mod tests {
         // Use a nonexistent path so we get empty store
         let (msg, is_err) = execute_cron_list(&HashMap::new());
         assert!(!is_err);
-        // Either "No scheduled tasks" or shows existing schedules
+        // Either an empty metadata message or shows existing schedules.
         assert!(!msg.is_empty());
     }
 
@@ -922,7 +922,7 @@ mod tests {
             is_err,
             "create must reject when max schedule cap is reached; got: {msg}"
         );
-        assert!(msg.contains("Maximum scheduled task limit"), "{msg}");
+        assert!(msg.contains("Maximum schedule metadata limit"), "{msg}");
     }
 
     /// Contract: invalid cron expression (wrong field count) is rejected.

@@ -249,20 +249,20 @@ fn list_renders_header_when_schedules_present() {
         let _ = execute_cron_create(&cron_args("x", "0 9 * * *", "x"));
         let (out, _) = execute_cron_list(&list_args());
         assert!(
-            out.starts_with("Scheduled tasks:"),
-            "header MUST be 'Scheduled tasks:'; got {out:?}"
+            out.starts_with("Stored cron schedule metadata:"),
+            "header MUST describe stored cron metadata; got {out:?}"
         );
     });
 }
 
 #[test]
-fn list_on_empty_store_returns_no_scheduled_tasks_message() {
+fn list_on_empty_store_returns_no_schedule_metadata_message() {
     let _lock = cwd_lock();
     run_in_tempdir(|| {
         // No create — list on empty store.
         let (out, err) = execute_cron_list(&list_args());
         assert!(!err);
-        assert_eq!(out.trim(), "No scheduled tasks.");
+        assert_eq!(out.trim(), "No schedule metadata stored.");
     });
 }
 
