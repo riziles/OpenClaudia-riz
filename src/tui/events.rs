@@ -62,6 +62,15 @@ pub struct ProviderSwitch {
     pub prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
 }
 
+/// Transient API retry cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiRetryKind {
+    /// Network/connect/read timeout or another retryable transport failure.
+    Transport,
+    /// Retryable HTTP status response from the upstream provider.
+    Status,
+}
+
 /// Application events from multiple sources.
 pub enum AppEvent {
     /// Terminal key event
@@ -86,6 +95,14 @@ pub enum AppEvent {
     ResponseDone,
     /// API error
     ApiError(String),
+    /// The upstream API request will be retried after a transient failure.
+    ApiRetry {
+        kind: ApiRetryKind,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        status: Option<u16>,
+    },
     /// Tool results require a follow-up API call
     FollowUp,
     /// Sync updated session messages back to the App after an agentic loop.

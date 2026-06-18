@@ -4,7 +4,7 @@
 //! Provides a scrollable message view, text input area, status bar,
 //! and streaming response display wired to the real API pipeline.
 
-use super::events::{AppEvent, EventHandler, ProviderSwitch, SpawnTarget};
+use super::events::{ApiRetryKind, AppEvent, EventHandler, ProviderSwitch, SpawnTarget};
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
@@ -1205,6 +1205,23 @@ impl App {
                     .add(DisplayMessage::error(format!("Error: {msg}")));
                 self.is_waiting = false;
                 self.fire_notification_hook(&format!("API error: {msg}"), "error");
+            }
+            Ok(AppEvent::ApiRetry {
+                kind,
+                attempt,
+                max_attempts,
+                delay_ms,
+                status,
+            }) => {
+                self.messages
+                    .add(DisplayMessage::system(format_api_retry_message(
+                        kind,
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        status,
+                    )));
+                self.messages.scroll_to_bottom();
             }
             Ok(AppEvent::Resize(_, _)) => {}
             Ok(AppEvent::FollowUp) => {
@@ -3261,6 +3278,35 @@ fn build_user_question_lines<'a>(
     lines
 }
 
+fn format_api_retry_delay(delay_ms: u64) -> String {
+    if delay_ms % 1_000 == 0 {
+        format!("{}s", delay_ms / 1_000)
+    } else {
+        let seconds = delay_ms / 1_000;
+        let hundredths = (delay_ms % 1_000) / 10;
+        format!("{seconds}.{hundredths:02}s")
+    }
+}
+
+fn format_api_retry_message(
+    kind: ApiRetryKind,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    status: Option<u16>,
+) -> String {
+    let delay = format_api_retry_delay(delay_ms);
+    match kind {
+        ApiRetryKind::Transport => {
+            format!("API retry {attempt}/{max_attempts} in {delay} after transport error")
+        }
+        ApiRetryKind::Status => {
+            let status = status.map_or_else(|| "unknown status".to_string(), |s| s.to_string());
+            format!("API retry {attempt}/{max_attempts} in {delay} after HTTP {status}")
+        }
+    }
+}
+
 /// One-line human-readable description of an `AppEvent` for the
 /// channel-closed warning. We avoid `Debug` since `AppEvent` doesn't derive
 /// it and adding the derive would ripple through the rest of the file.
@@ -3273,6 +3319,14 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::ApiError(e) => {
             let snippet: String = e.chars().take(80).collect();
             format!("ApiError({snippet:?})")
+        }
+        super::events::AppEvent::ApiRetry {
+            kind,
+            attempt,
+            max_attempts,
+            ..
+        } => {
+            format!("ApiRetry({kind:?},{attempt}/{max_attempts})")
         }
         super::events::AppEvent::StreamText(_) => "StreamText".to_string(),
         super::events::AppEvent::StreamThinking(_) => "StreamThinking".to_string(),
@@ -3685,9 +3739,11 @@ fn parse_prompt_effort_level(effort: &str) -> Option<EffortLevel> {
 mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use super::{
-        current_exe_command, git_bin, resolve_provider_switch_auth, save_session, ApiClient, App,
-        AppEvent, ProviderSwitch, SpawnTarget, TuiSession, TEST_SESSIONS_DIR,
+        current_exe_command, format_api_retry_delay, format_api_retry_message, git_bin,
+        resolve_provider_switch_auth, save_session, ApiClient, App, AppEvent, ProviderSwitch,
+        SpawnTarget, TuiSession, TEST_SESSIONS_DIR,
     };
+    use crate::tui::events::ApiRetryKind;
     use std::io::Write as _;
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -3743,6 +3799,20 @@ mod tests {
                 n = idx + 1,
             );
         }
+    }
+
+    #[test]
+    fn api_retry_message_formats_retry_metadata() {
+        assert_eq!(format_api_retry_delay(0), "0s");
+        assert_eq!(format_api_retry_delay(1_250), "1.25s");
+        assert_eq!(
+            format_api_retry_message(ApiRetryKind::Status, 1, 11, 0, Some(429)),
+            "API retry 1/11 in 0s after HTTP 429"
+        );
+        assert_eq!(
+            format_api_retry_message(ApiRetryKind::Transport, 2, 11, 2_000, None),
+            "API retry 2/11 in 2s after transport error"
+        );
     }
 
     // ── ApiClient extraction (crosslink #253) ───────────────────────────

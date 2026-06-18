@@ -14,7 +14,7 @@ use crate::providers::{
 use crate::proxy::{self, normalize_base_url};
 use crate::session::TokenUsage;
 use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator};
-use crate::tui::events::{AppEvent, PermissionResponse};
+use crate::tui::events::{ApiRetryKind, AppEvent, PermissionResponse};
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::mpsc;
@@ -534,17 +534,6 @@ fn retry_after_with_jitter(retry_after_secs: u64) -> std::time::Duration {
     retry_after_with_jitter_from(retry_after_secs, retry_jitter_seed())
 }
 
-fn retry_delay_label(delay: std::time::Duration) -> String {
-    let millis = delay.as_millis();
-    if millis.is_multiple_of(1_000) {
-        format!("{}s", millis / 1_000)
-    } else {
-        let seconds = millis / 1_000;
-        let hundredths = (millis % 1_000) / 10;
-        format!("{seconds}.{hundredths:02}s")
-    }
-}
-
 /// Map a model name to a lighter sibling that's suitable as a fallback when
 /// the requested model is sustainedly overloaded (HTTP 529).
 ///
@@ -629,9 +618,13 @@ async fn send_with_retry(
                     error = %e,
                     "transient transport error, retrying"
                 );
-                let _ = tx.send(AppEvent::StreamText(format!(
-                    "\n(Retrying in {wait_secs}s — transport...)\n"
-                )));
+                let _ = tx.send(AppEvent::ApiRetry {
+                    kind: ApiRetryKind::Transport,
+                    attempt: attempt + 1,
+                    max_attempts: MAX_API_RETRIES + 1,
+                    delay_ms: wait_secs.saturating_mul(1_000),
+                    status: None,
+                });
                 tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                 continue;
             }
@@ -659,10 +652,14 @@ async fn send_with_retry(
                 wait_ms = wait.as_millis(),
                 "transient API status, retrying"
             );
-            let delay_label = retry_delay_label(wait);
-            let _ = tx.send(AppEvent::StreamText(format!(
-                "\n(Retrying in {delay_label} — {status}...)\n"
-            )));
+            let delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+            let _ = tx.send(AppEvent::ApiRetry {
+                kind: ApiRetryKind::Status,
+                attempt: attempt + 1,
+                max_attempts: MAX_API_RETRIES + 1,
+                delay_ms,
+                status: Some(status),
+            });
             tokio::time::sleep(wait).await;
             continue;
         }
@@ -3900,15 +3897,6 @@ mod tests {
                 "Retry-After jitter must stay within 0-25%; seed={seed}, wait={wait:?}"
             );
         }
-    }
-
-    #[test]
-    fn issue_596_retry_delay_label_formats_fractional_seconds() {
-        assert_eq!(retry_delay_label(std::time::Duration::from_secs(3)), "3s");
-        assert_eq!(
-            retry_delay_label(std::time::Duration::from_millis(1_250)),
-            "1.25s"
-        );
     }
 
     /// #592: `max_retries` cap is the CC-parity value (10). Pins via the

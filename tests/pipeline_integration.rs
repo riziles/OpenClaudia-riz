@@ -223,7 +223,7 @@ async fn b1_503_is_retried() {
 /// OC parses `Retry-After` as `u64` seconds and adds bounded jitter in the
 /// runtime helper. This integration test uses `retry-after: 0` to avoid any
 /// actual sleep while still pinning the retry path.
-/// Gap #595 tracks that CC emits a typed `api_retry` event; OC emits plain text.
+/// Closes gap #595: retries are typed UI events, not assistant stream text.
 #[tokio::test]
 async fn b1_retry_after_zero_retries_without_sleep() {
     let server = MockServer::start().await;
@@ -255,9 +255,8 @@ async fn b1_retry_after_zero_retries_without_sleep() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
 
-    // Capture StreamText events to verify no structured retry event is emitted
-    // Gap #595: CC emits {type:'system', subtype:'api_retry', retry_delay_ms}
-    // OC emits plain AppEvent::StreamText (current broken contract)
+    // Capture events to verify the retry is a structured side-band event
+    // instead of provider-visible assistant text.
     let (tx, rx) = std::sync::mpsc::channel();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
@@ -280,18 +279,35 @@ async fn b1_retry_after_zero_retries_without_sleep() {
 
     assert!(result.is_ok(), "must succeed after one 429 retry");
 
-    // Drain events and check that a retry message was sent as StreamText
-    // (NOT as a structured event type — gap #595)
+    // Drain events and check that the retry was emitted as structured metadata.
     let events: Vec<_> = rx.try_iter().collect();
-    let has_retry_event = events.iter().any(|e| {
-        matches!(
-            e,
-            openclaudia::tui::events::AppEvent::StreamText(s) if s.contains("Retrying")
-        )
+    let retry_event = events.iter().find_map(|e| match e {
+        openclaudia::tui::events::AppEvent::ApiRetry {
+            kind,
+            attempt,
+            max_attempts,
+            delay_ms,
+            status,
+        } => Some((*kind, *attempt, *max_attempts, *delay_ms, *status)),
+        _ => None,
     });
+    assert_eq!(
+        retry_event,
+        Some((
+            openclaudia::tui::events::ApiRetryKind::Status,
+            1,
+            openclaudia::pipeline::MAX_API_RETRIES + 1,
+            0,
+            Some(429)
+        )),
+        "retry metadata should be emitted as AppEvent::ApiRetry"
+    );
     assert!(
-        has_retry_event,
-        "OC emits plain-text retry notice (gap #595: should be typed api_retry event)"
+        !events.iter().any(|e| matches!(
+            e,
+            openclaudia::tui::events::AppEvent::StreamText(s) if s.contains("Retry")
+        )),
+        "retry metadata must not be mixed into assistant stream text"
     );
 }
 
