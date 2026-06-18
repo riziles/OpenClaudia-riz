@@ -57,6 +57,9 @@ pub enum ParseErrorKind {
     /// The response was not JSON in any of the three forms (raw, fenced
     /// code block, or relaxed natural-language).
     NotJson,
+    /// The response was syntactically JSON but did not match the expected
+    /// adversary-response schema.
+    InvalidSchema,
     /// The response parsed as JSON but had no `findings` field.
     MissingFindingsField,
 }
@@ -67,9 +70,36 @@ impl ParseErrorKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotJson => "not_json",
+            Self::InvalidSchema => "invalid_schema",
             Self::MissingFindingsField => "missing_findings_field",
         }
     }
+}
+
+fn validate_adversary_response_shape(value: &Value) -> Result<(), ParseErrorKind> {
+    let Some(obj) = value.as_object() else {
+        return Err(ParseErrorKind::InvalidSchema);
+    };
+
+    if let Some(findings) = obj.get("findings") {
+        if !findings.is_array() {
+            return Err(ParseErrorKind::InvalidSchema);
+        }
+    }
+
+    if let Some(assessment) = obj.get("assessment") {
+        if !assessment.is_string() {
+            return Err(ParseErrorKind::InvalidSchema);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_adversary_response_json(candidate: &str) -> Result<AdversaryResponse, ParseErrorKind> {
+    let value: Value = serde_json::from_str(candidate).map_err(|_| ParseErrorKind::NotJson)?;
+    validate_adversary_response_shape(&value)?;
+    serde_json::from_value(value).map_err(|_| ParseErrorKind::InvalidSchema)
 }
 
 /// Parse adversary response text into a discriminated outcome.
@@ -79,17 +109,47 @@ impl ParseErrorKind {
 /// [`parse_findings`] for the legacy `Vec<Finding>` shape.
 pub fn parse_findings_detailed(adversary_response: &str, iteration: u32) -> ParseFindingsOutcome {
     // Try to parse as JSON first
-    let parsed: Option<AdversaryResponse> = serde_json::from_str(adversary_response)
-        .ok()
-        .or_else(|| {
-            // Try to extract JSON from markdown code blocks
-            extract_json_from_response(adversary_response)
-                .and_then(|json| serde_json::from_str(&json).ok())
+    let mut invalid_schema = false;
+    let parsed = match parse_adversary_response_json(adversary_response) {
+        Ok(response) => Some(response),
+        Err(ParseErrorKind::InvalidSchema) => {
+            invalid_schema = true;
+            None
+        }
+        Err(ParseErrorKind::NotJson | ParseErrorKind::MissingFindingsField) => None,
+    }
+    .or_else(|| {
+        // Try to extract JSON from markdown code blocks
+        extract_json_from_response(adversary_response).and_then(|json| {
+            match parse_adversary_response_json(&json) {
+                Ok(response) => Some(response),
+                Err(ParseErrorKind::InvalidSchema) => {
+                    invalid_schema = true;
+                    None
+                }
+                Err(ParseErrorKind::NotJson | ParseErrorKind::MissingFindingsField) => None,
+            }
         })
-        .or_else(|| {
-            // Try relaxed parsing for natural language responses
+    })
+    .or_else(|| {
+        // Try relaxed parsing for natural language responses
+        if invalid_schema {
+            None
+        } else {
             try_parse_relaxed(adversary_response)
-        });
+        }
+    });
+
+    if invalid_schema && parsed.is_none() {
+        warn!(
+            outcome = "parse_error",
+            kind = ParseErrorKind::InvalidSchema.as_str(),
+            "VDD: Adversary response JSON does not match expected schema"
+        );
+        return ParseFindingsOutcome::ParseError {
+            kind: ParseErrorKind::InvalidSchema,
+        };
+    }
 
     let raw_findings = if let Some(response) = parsed {
         if response.assessment.as_deref() == Some("NO_FINDINGS") {

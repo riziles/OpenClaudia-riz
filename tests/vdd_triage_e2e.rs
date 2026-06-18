@@ -40,6 +40,7 @@ fn finding(severity: Severity, description: &str) -> Finding {
 fn parse_error_kind_labels_match_documented_strings() {
     // Documented contract: stable labels for metrics.
     assert_eq!(ParseErrorKind::NotJson.as_str(), "not_json");
+    assert_eq!(ParseErrorKind::InvalidSchema.as_str(), "invalid_schema");
     assert_eq!(
         ParseErrorKind::MissingFindingsField.as_str(),
         "missing_findings_field"
@@ -178,6 +179,41 @@ fn json_without_findings_field_yields_missing_findings_parse_error() {
             }
         ),
         "JSON without `findings` MUST yield ParseError(MissingFindingsField); got {outcome:?}"
+    );
+}
+
+#[test]
+fn json_with_non_array_findings_yields_invalid_schema_parse_error() {
+    let json = r#"{"findings": "not an array"}"#;
+    let outcome = parse_findings_detailed(json, 1);
+    assert!(
+        matches!(
+            outcome,
+            ParseFindingsOutcome::ParseError {
+                kind: ParseErrorKind::InvalidSchema
+            }
+        ),
+        "JSON with non-array `findings` MUST yield ParseError(InvalidSchema); got {outcome:?}"
+    );
+}
+
+#[test]
+fn fenced_json_with_non_array_findings_yields_invalid_schema_parse_error() {
+    let response = r#"
+The review result is:
+```json
+{"findings": "not an array"}
+```
+"#;
+    let outcome = parse_findings_detailed(response, 1);
+    assert!(
+        matches!(
+            outcome,
+            ParseFindingsOutcome::ParseError {
+                kind: ParseErrorKind::InvalidSchema
+            }
+        ),
+        "fenced JSON with non-array `findings` MUST yield ParseError(InvalidSchema); got {outcome:?}"
     );
 }
 
