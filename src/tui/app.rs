@@ -2640,6 +2640,9 @@ impl App {
         target: SpawnTarget,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let tx = self.api_event_tx.clone();
+        let session_id = self.chat_session.id.clone();
+        let cwd = std::env::current_dir().ok();
+        let ledger_target = target.clone();
         // Eagerly own the argv as Strings — the future outlives `&self`.
         let argv: Vec<String> = cmd.into_iter().map(str::to_owned).collect();
 
@@ -2671,6 +2674,21 @@ impl App {
             };
 
             let result = tokio::process::Command::new(exe).args(rest).output().await;
+
+            if let (SpawnTarget::ShellCommand { displayed }, Some(cwd), Ok(out)) =
+                (&ledger_target, cwd.as_deref(), &result)
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                crate::grounded_loop::observe_shell_command_for_session(
+                    &session_id,
+                    cwd,
+                    displayed,
+                    out.status.code().unwrap_or(-1),
+                    &stdout,
+                    &stderr,
+                );
+            }
 
             let evt = match result {
                 Ok(out) => AppEvent::ShellDone {
@@ -3767,7 +3785,7 @@ mod tests {
     use crate::tui::events::ApiRetryKind;
     use std::io::Write as _;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -4377,6 +4395,53 @@ mod tests {
             Some(7),
             "bash -c 'exit 7' should report exit_code = Some(7)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_shell_command_records_ledger_observation() {
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+        let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
+        let _guard =
+            crate::ledger::install_active_ledger_for_session(&app.chat_session.id, ledger.clone());
+
+        let join = app
+            .spawn_shell(
+                vec!["bash", "-c", "printf tui-ledger"],
+                SpawnTarget::ShellCommand {
+                    displayed: "printf tui-ledger".to_string(),
+                },
+            )
+            .expect("runtime-backed spawn_shell should return a task handle");
+        join.await.expect("spawn_shell task panicked");
+
+        let (_target, stdout, stderr, exit_code) = recv_shell_done(&rx, Duration::from_millis(500))
+            .expect("expected ShellDone event from shell command");
+        assert_eq!(stdout, "tui-ledger");
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, Some(0));
+
+        let ledger = ledger.lock().expect("ledger lock");
+        let observations = ledger.observations_chronological();
+        assert_eq!(observations.len(), 1);
+        assert!(observations.iter().any(|obs| {
+            matches!(
+                &obs.kind,
+                crate::ledger::ObservationKind::CommandRun {
+                    argv,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    ..
+                } if argv == &vec![
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    "printf tui-ledger".to_string(),
+                ] && *exit_code == 0
+                    && stdout == "tui-ledger"
+                    && stderr.is_empty()
+            )
+        }));
     }
 
     #[test]
