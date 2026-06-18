@@ -207,6 +207,22 @@ fn get_pricing_for_current_qwen_models_returns_documented_base_rates() {
     let coder_flash = get_pricing("qwen3-coder-flash").expect("qwen3-coder-flash");
     assert_eq!(coder_flash.input_per_million, 0.30);
     assert_eq!(coder_flash.output_per_million, 1.50);
+
+    let next = get_pricing("qwen3-next-80b-a3b-instruct").expect("qwen3-next");
+    assert_eq!(next.input_per_million, 0.20);
+    assert_eq!(next.output_per_million, 0.80);
+
+    let long = get_pricing("qwen-long-latest").expect("qwen-long");
+    assert_eq!(long.input_per_million, 0.50);
+    assert_eq!(long.output_per_million, 2.0);
+
+    let vl = get_pricing("qwen3-vl-flash-2026-01-25").expect("qwen3-vl-flash");
+    assert_eq!(vl.input_per_million, 0.03);
+    assert_eq!(vl.output_per_million, 0.30);
+
+    let qvq = get_pricing("qvq-max-2025-08-28").expect("qvq-max");
+    assert_eq!(qvq.input_per_million, 1.60);
+    assert_eq!(qvq.output_per_million, 6.40);
 }
 
 #[test]

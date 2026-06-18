@@ -1652,7 +1652,7 @@ fn fast_model_for_provider(provider: &str) -> Option<&'static str> {
             "gemini-3-flash-preview",
         ],
         "zai" => &["glm-5.2", "glm-5v-turbo", "glm-5-turbo"],
-        "qwen" => &["qwen3.6-flash", "qwen3.5-flash", "qwen-turbo"],
+        "qwen" => &["qwen3.7-plus", "qwen3.6-flash", "qwen3-coder-flash"],
         "deepseek" => &["deepseek-v4-flash", "deepseek-chat"],
         "kimi" => &["kimi-k2.7-code-highspeed", "moonshot-v1-8k"],
         "minimax" => &["MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"],

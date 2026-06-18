@@ -206,7 +206,10 @@ fn current_qwen_1m_models_return_1m() {
         "qwen3.5-plus",
         "qwen3.5-flash",
         "qwen3-coder-plus",
+        "qwen3-coder-plus-2025-09-23",
+        "qwen3-coder-plus-2025-07-22",
         "qwen3-coder-flash",
+        "qwen3-coder-flash-2025-07-28",
         "qwen-plus-2025-12-01",
         "qwen-flash-2025-07-28",
     ] {
@@ -223,13 +226,66 @@ fn qwen_max_and_open_weight_families_return_documented_smaller_windows() {
         "qwen3.5-122b-a10b",
         "qwen3.5-27b",
         "qwen3.5-35b-a3b",
+        "qwen3-coder-next",
+        "qwen3-coder-480b-a35b-instruct",
+        "qwen3-coder-30b-a3b-instruct",
         "qwen3-max",
         "qwen3-max-2026-01-23",
+        "qwen3-max-2025-09-23",
     ] {
         assert_eq!(get_context_window(model), 262_144, "{model}");
     }
 
     assert_eq!(get_context_window("qwen-max"), 32_768);
+}
+
+#[test]
+fn qwen3_open_weight_and_qvq_families_return_documented_128k_windows() {
+    for model in [
+        "qwen3-next-80b-a3b-thinking",
+        "qwen3-next-80b-a3b-instruct",
+        "qwen3-235b-a22b",
+        "qwen3-235b-a22b-thinking-2507",
+        "qwen3-235b-a22b-instruct-2507",
+        "qwen3-32b",
+        "qwen3-30b-a3b",
+        "qwen3-30b-a3b-instruct-2507",
+        "qwen3-14b",
+        "qwen3-8b",
+        "qwq-plus",
+        "qvq-max",
+        "qvq-plus",
+        "qwen-turbo",
+        "qwen3-vl-plus",
+        "qwen3-vl-flash",
+        "qwen-vl-ocr",
+    ] {
+        assert_eq!(get_context_window(model), 128_000, "{model}");
+    }
+
+    assert_eq!(get_context_window("qwen3-30b-a3b-thinking-2507"), 80_000);
+}
+
+#[test]
+fn qwen_long_translation_character_and_omni_windows_are_documented() {
+    for model in ["qwen-long", "qwen-long-latest", "qwen-long-2025-01-25"] {
+        assert_eq!(get_context_window(model), 10_000_000, "{model}");
+    }
+
+    for model in [
+        "qwen-mt-plus",
+        "qwen-mt-turbo",
+        "qwen-mt-flash",
+        "qwen-mt-lite",
+    ] {
+        assert_eq!(get_context_window(model), 16_000, "{model}");
+    }
+
+    assert_eq!(get_context_window("qwen-plus-character"), 32_000);
+    assert_eq!(get_context_window("qwen-plus-character-ja"), 32_000);
+    assert_eq!(get_context_window("qwen-flash-character"), 8_000);
+    assert_eq!(get_context_window("qwen2.5-omni-7b"), 32_000);
+    assert_eq!(get_context_window("qwen-omni-turbo"), 32_000);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

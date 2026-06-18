@@ -389,11 +389,13 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 - `deepseek-chat`, `deepseek-reasoner` — Compatibility aliases for V4 Flash through 2026-07-24
 
 ### Qwen
-- `qwen3.7-max`, `qwen3.7-max-2026-06-08`, `qwen3.7-max-2026-05-20`, `qwen3.7-max-2026-05-17`, `qwen3.7-max-preview`, `qwen3.6-max-preview`, `qwen3-max`, `qwen3-max-2026-01-23`, `qwen3-max-preview`, `qwen-max` — Qwen Max family
-- `qwen3.7-plus`, `qwen3.7-plus-2026-05-26`, `qwen3.6-plus`, `qwen3.6-plus-2026-04-02`, `qwen3.5-plus`, `qwen3.5-plus-2026-04-20`, `qwen3.5-plus-2026-02-15`, `qwen-plus`, `qwen-plus-latest`, `qwen-plus-2025-12-01`, `qwen-plus-2025-09-11` — Qwen Plus family
-- `qwen3.6-flash`, `qwen3.6-flash-2026-04-16`, `qwen3.5-flash`, `qwen3.5-flash-2026-02-23`, `qwen-flash`, `qwen-flash-2025-07-28`, `qwen-turbo` — Qwen Flash/Turbo family
-- `qwen3.6-35b-a3b`, `qwen3.5-397b-a17b`, `qwen3.5-122b-a10b`, `qwen3.5-27b`, `qwen3.5-35b-a3b` — Qwen dense/MoE models
-- `qwq-plus`, `qwen3-coder-plus`, `qwen3-coder-flash` — Reasoning and coding specialists
+- `qwen3.7-max`, `qwen3.7-max-2026-06-08`, `qwen3.7-max-2026-05-20`, `qwen3.7-max-2026-05-17`, `qwen3.7-max-preview`, `qwen3.6-max-preview`, `qwen3-max`, `qwen3-max-2026-01-23`, `qwen3-max-2025-09-23`, `qwen3-max-preview`, `qwen-max` — Qwen Max family
+- `qwen3.7-plus`, `qwen3.7-plus-2026-05-26`, `qwen3.6-plus`, `qwen3.6-plus-2026-04-02`, `qwen3.5-plus`, `qwen3.5-plus-2026-04-20`, `qwen3.5-plus-2026-02-15`, `qwen-plus`, `qwen-plus-latest`, `qwen-plus-2025-12-01`, `qwen-plus-2025-09-11`, `qwen-plus-2025-07-28`, `qwen-plus-2025-07-14`, `qwen-plus-2025-04-28`, `qwen-plus-2025-01-25`, `qwen-plus-2025-01-12`, `qwen-plus-2024-12-20` — Qwen Plus family
+- `qwen3.6-flash`, `qwen3.6-flash-2026-04-16`, `qwen3.5-flash`, `qwen3.5-flash-2026-02-23`, `qwen-flash`, `qwen-flash-2025-07-28`, `qwen-flash-character`, `qwen-turbo`, `qwen-long`, `qwen-long-latest`, `qwen-long-2025-01-25` — Qwen Flash/Turbo/Long family
+- `qwen-mt-plus`, `qwen-mt-turbo`, `qwen-mt-flash`, `qwen-mt-lite`, `qwen-plus-character`, `qwen-plus-character-ja` — Translation and character-role models
+- `qwen3-next-80b-a3b-thinking`, `qwen3-next-80b-a3b-instruct`, `qwen3-235b-a22b`, `qwen3-235b-a22b-thinking-2507`, `qwen3-235b-a22b-instruct-2507`, `qwen3-32b`, `qwen3-30b-a3b`, `qwen3-30b-a3b-thinking-2507`, `qwen3-30b-a3b-instruct-2507`, `qwen3-14b`, `qwen3-8b`, `qwen3.6-35b-a3b`, `qwen3.5-397b-a17b`, `qwen3.5-122b-a10b`, `qwen3.5-27b`, `qwen3.5-35b-a3b` — Qwen dense/MoE models
+- `qwq-plus`, `qvq-max`, `qvq-max-2025-08-28`, `qvq-plus`, `qvq-plus-2025-08-27`, `qwen3-coder-plus`, `qwen3-coder-plus-2025-09-23`, `qwen3-coder-plus-2025-07-22`, `qwen3-coder-flash`, `qwen3-coder-flash-2025-07-28`, `qwen3-coder-next`, `qwen3-coder-480b-a35b-instruct`, `qwen3-coder-30b-a3b-instruct` — Reasoning, visual reasoning, and coding specialists
+- `qwen2.5-omni-7b`, `qwen3.5-omni-plus`, `qwen3.5-omni-flash`, `qwen3-omni-flash`, `qwen3-omni-flash-2025-10-22`, `qwen-omni-turbo`, `qwen3-vl-plus`, `qwen3-vl-plus-2026-01-25`, `qwen3-vl-flash`, `qwen3-vl-flash-2026-01-25`, `qwen-vl-plus`, `qwen-vl-max`, `qwen-vl-ocr`, `qwen-vl-ocr-latest`, `qwen-vl-ocr-2025-07-14` — Omni, vision, and OCR chat models
 
 ### Z.AI (GLM)
 - `glm-5.2`, `glm-5.1`, `glm-5`, `glm-5-turbo` — GLM-5 text family

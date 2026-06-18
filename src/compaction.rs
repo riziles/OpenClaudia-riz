@@ -32,9 +32,16 @@ const ZAI_1M_CONTEXT: usize = 1_000_000;
 const ZAI_200K_CONTEXT: usize = 200_000;
 const ZAI_128K_CONTEXT: usize = 128_000;
 const ZAI_64K_CONTEXT: usize = 64_000;
+const QWEN_10M_CONTEXT: usize = 10_000_000;
 const QWEN_1M_CONTEXT: usize = 1_000_000;
 const QWEN_256K_CONTEXT: usize = 262_144;
+const QWEN_128K_CONTEXT: usize = 128_000;
+const QWEN_80K_CONTEXT: usize = 80_000;
+const QWEN_64K_CONTEXT: usize = 64_000;
 const QWEN_MAX_CONTEXT: usize = 32_768;
+const QWEN_32K_CONTEXT: usize = 32_000;
+const QWEN_16K_CONTEXT: usize = 16_000;
+const QWEN_8K_CONTEXT: usize = 8_000;
 const KIMI_256K_CONTEXT: usize = 262_144;
 const MOONSHOT_V1_128K_CONTEXT: usize = 131_072;
 const MOONSHOT_V1_32K_CONTEXT: usize = 32_768;
@@ -475,6 +482,34 @@ const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
     // Qwen current commercial families. Specific rows precede any broad
     // `qwen` fallback because matching is substring-based.
     ContextWindowRow {
+        needle: "qwen-long",
+        tokens: QWEN_10M_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen-mt",
+        tokens: QWEN_16K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen-plus-character",
+        tokens: QWEN_32K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen-flash-character",
+        tokens: QWEN_8K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen2.5-omni",
+        tokens: QWEN_32K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen-omni-turbo",
+        tokens: QWEN_32K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3.5-omni",
+        tokens: QWEN_64K_CONTEXT,
+    },
+    ContextWindowRow {
         needle: "qwen3.7",
         tokens: QWEN_1M_CONTEXT,
     },
@@ -503,7 +538,47 @@ const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
         tokens: QWEN_1M_CONTEXT,
     },
     ContextWindowRow {
+        needle: "qwen3-next",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-235b",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-30b-a3b-thinking-2507",
+        tokens: QWEN_80K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-30b",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-32b",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-14b",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-8b",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
         needle: "qwen3.5",
+        tokens: QWEN_256K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-coder-next",
+        tokens: QWEN_256K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-coder-480b",
+        tokens: QWEN_256K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen3-coder-30b",
         tokens: QWEN_256K_CONTEXT,
     },
     ContextWindowRow {
@@ -525,6 +600,18 @@ const CONTEXT_WINDOW_TABLE: &[ContextWindowRow] = &[
     ContextWindowRow {
         needle: "qwen-max",
         tokens: QWEN_MAX_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwen-turbo",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qwq",
+        tokens: QWEN_128K_CONTEXT,
+    },
+    ContextWindowRow {
+        needle: "qvq",
+        tokens: QWEN_128K_CONTEXT,
     },
     // Kimi / Moonshot.
     ContextWindowRow {
