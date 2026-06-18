@@ -255,6 +255,7 @@ fn from_model_minimax_prefixes() {
         ProviderKind::from_model("MiniMax-M3"),
         ProviderKind::MiniMax
     );
+    assert_eq!(ProviderKind::from_model("M2-her"), ProviderKind::MiniMax);
 }
 
 #[test]

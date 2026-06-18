@@ -311,7 +311,7 @@ impl ProviderKind {
         if m.starts_with("kimi") || m.starts_with("moonshot") {
             return Self::Kimi;
         }
-        if m.starts_with("minimax") {
+        if m.starts_with("minimax") || m == "m2-her" {
             return Self::MiniMax;
         }
         if m.starts_with("glm") {
@@ -1090,6 +1090,7 @@ mod tests {
             ProviderKind::from_model("MiniMax-M3"),
             ProviderKind::MiniMax
         );
+        assert_eq!(ProviderKind::from_model("M2-her"), ProviderKind::MiniMax);
     }
 
     #[test]

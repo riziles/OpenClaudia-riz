@@ -251,6 +251,7 @@ fn classify_minimax_prefix_as_minimax() {
         ProviderKind::from_model("MiniMax-M2.7-highspeed"),
         ProviderKind::MiniMax
     );
+    assert_eq!(ProviderKind::from_model("M2-her"), ProviderKind::MiniMax);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -378,6 +379,7 @@ fn from_model_then_name_yields_canonical_provider_name() {
         ("kimi-k2.7-code", "kimi"),
         ("moonshot-v1-8k", "kimi"),
         ("MiniMax-M3", "minimax"),
+        ("M2-her", "minimax"),
         ("unknown_model", "unknown"),
     ];
     for (model, expected_name) in pairs {

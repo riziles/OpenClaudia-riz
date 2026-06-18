@@ -365,8 +365,8 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 - `claude-sonnet-4-20250514`, `claude-opus-4-20250514` — Legacy
 
 ### OpenAI
-- `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.5-2026-04-23` — Latest frontier family
-- `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-mini-2026-03-17`, `gpt-5.4-nano` — Current GPT-5.4 family
+- `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.5-2026-04-23`, `gpt-5.5-pro-2026-04-23` — Latest frontier family
+- `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-2026-03-05`, `gpt-5.4-pro-2026-03-05`, `gpt-5.4-mini`, `gpt-5.4-mini-2026-03-17`, `gpt-5.4-nano`, `gpt-5.4-nano-2026-03-17` — Current GPT-5.4 family
 - `gpt-5.3-codex`, `gpt-5.3-chat-latest`, `gpt-5.2`, `gpt-5.2-pro`, `gpt-5.2-codex`, `gpt-5.2-chat-latest` — Codex/previous frontier family
 - `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5.1-chat-latest` — GPT-5.1 family
 - `gpt-5`, `gpt-5-pro`, `gpt-5-codex`, `gpt-5-chat-latest`, `gpt-5-mini`, `gpt-5-nano` — GPT-5 family

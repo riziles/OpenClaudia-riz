@@ -2684,6 +2684,8 @@ mod tests {
         assert_eq!(determine_provider("qvq-72b", &config), "qwen");
 
         assert_eq!(determine_provider("glm-4", &config), "zai");
+
+        assert_eq!(determine_provider("M2-her", &config), "minimax");
     }
 
     /// Spec — unknown model prefix falls back to `config.proxy.target`.

@@ -141,6 +141,7 @@ fn classify_then_name_round_trips_for_each_provider() {
         ("kimi-k2.7-code", "kimi"),
         ("moonshot-v1-128k", "kimi"),
         ("MiniMax-M3", "minimax"),
+        ("M2-her", "minimax"),
     ];
     for (model, expected_name) in &cases {
         let kind = ProviderKind::from_model(model);

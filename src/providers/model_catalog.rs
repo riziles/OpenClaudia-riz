@@ -38,11 +38,15 @@ pub const OPENAI_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-5.5-pro",
     "gpt-5.5-2026-04-23",
+    "gpt-5.5-pro-2026-04-23",
     "gpt-5.4",
     "gpt-5.4-pro",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.4-pro-2026-03-05",
     "gpt-5.4-mini",
     "gpt-5.4-mini-2026-03-17",
     "gpt-5.4-nano",
+    "gpt-5.4-nano-2026-03-17",
     "gpt-5.3-codex",
     "gpt-5.3-chat-latest",
     "gpt-5.2",
@@ -200,6 +204,24 @@ mod tests {
             static_models_for_provider("anthropic").contains(&"claude-opus-4-7"),
             "Anthropic static catalog must include claude-opus-4-7"
         );
+    }
+
+    #[test]
+    fn openai_catalog_includes_current_documented_snapshots() {
+        let models = static_models_for_provider("openai");
+        for model in [
+            "gpt-5.5-2026-04-23",
+            "gpt-5.5-pro-2026-04-23",
+            "gpt-5.4-2026-03-05",
+            "gpt-5.4-pro-2026-03-05",
+            "gpt-5.4-mini-2026-03-17",
+            "gpt-5.4-nano-2026-03-17",
+        ] {
+            assert!(
+                models.contains(&model),
+                "OpenAI static catalog must include documented snapshot {model}"
+            );
+        }
     }
 
     #[test]
