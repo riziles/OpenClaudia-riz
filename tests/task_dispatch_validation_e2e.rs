@@ -308,6 +308,70 @@ fn task_update_non_string_status_errors() {
     );
 }
 
+#[test]
+fn task_update_non_string_subject_errors() {
+    let mut tm = TaskManager::new();
+    let create_args = args_with(&[
+        ("subject", json!("non-string subject test")),
+        ("description", json!("desc")),
+    ]);
+    let (_, create_err) = dispatch_with_session("task_create", &create_args, &mut tm);
+    assert!(!create_err);
+
+    let update_args = args_with(&[("task_id", json!("task-1")), ("subject", json!(42))]);
+    let (msg, is_err) = dispatch_with_session("task_update", &update_args, &mut tm);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid task_update field 'subject'") && msg.contains("expected string"),
+        "non-string subject must fail clearly; got {msg:?}"
+    );
+}
+
+#[test]
+fn task_update_add_blocks_non_array_errors() {
+    let mut tm = TaskManager::new();
+    let create_args = args_with(&[
+        ("subject", json!("non-array add_blocks test")),
+        ("description", json!("desc")),
+    ]);
+    let (_, create_err) = dispatch_with_session("task_create", &create_args, &mut tm);
+    assert!(!create_err);
+
+    let update_args = args_with(&[
+        ("task_id", json!("task-1")),
+        ("add_blocks", json!("task-2")),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_update", &update_args, &mut tm);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid task_update field 'add_blocks'") && msg.contains("array of strings"),
+        "non-array add_blocks must fail clearly; got {msg:?}"
+    );
+}
+
+#[test]
+fn task_update_add_blocked_by_non_string_item_errors() {
+    let mut tm = TaskManager::new();
+    let create_args = args_with(&[
+        ("subject", json!("non-string add_blocked_by item test")),
+        ("description", json!("desc")),
+    ]);
+    let (_, create_err) = dispatch_with_session("task_create", &create_args, &mut tm);
+    assert!(!create_err);
+
+    let update_args = args_with(&[
+        ("task_id", json!("task-1")),
+        ("add_blocked_by", json!([42])),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_update", &update_args, &mut tm);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid task_update field 'add_blocked_by[0]'")
+            && msg.contains("expected string"),
+        "non-string add_blocked_by item must fail clearly; got {msg:?}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section F — Cross-tool: TaskManager state persists across dispatches
 // ───────────────────────────────────────────────────────────────────────────

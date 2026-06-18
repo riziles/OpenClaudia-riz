@@ -47,36 +47,27 @@ pub fn execute_task_update<S: BuildHasher>(
         Ok(status) => status,
         Err(msg) => return (msg, true),
     };
-    let subject = args
-        .get("subject")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
-    let description = args
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
-    let active_form = args
-        .get("active_form")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
-
-    let add_blocks: Option<Vec<String>> =
-        args.get("add_blocks")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            });
-
-    let add_blocked_by: Option<Vec<String>> = args
-        .get("add_blocked_by")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        });
+    let subject = match parse_optional_string_field(args.get("subject"), "subject") {
+        Ok(value) => value,
+        Err(msg) => return (msg, true),
+    };
+    let description = match parse_optional_string_field(args.get("description"), "description") {
+        Ok(value) => value,
+        Err(msg) => return (msg, true),
+    };
+    let active_form = match parse_optional_string_field(args.get("active_form"), "active_form") {
+        Ok(value) => value,
+        Err(msg) => return (msg, true),
+    };
+    let add_blocks = match parse_optional_string_array(args.get("add_blocks"), "add_blocks") {
+        Ok(value) => value,
+        Err(msg) => return (msg, true),
+    };
+    let add_blocked_by =
+        match parse_optional_string_array(args.get("add_blocked_by"), "add_blocked_by") {
+            Ok(value) => value,
+            Err(msg) => return (msg, true),
+        };
 
     match task_mgr.update_task(
         task_id,
@@ -124,6 +115,43 @@ fn parse_task_update_status(
                 "Invalid task status '{status}'. Must be: pending, in_progress, completed, deleted"
             )
         })
+}
+
+fn parse_optional_string_field(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value.as_str().map(String::from).map(Some).ok_or_else(|| {
+        format!("Invalid task_update field '{field}': expected string when supplied")
+    })
+}
+
+fn parse_optional_string_array(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "Invalid task_update field '{field}': expected array of strings when supplied"
+        ));
+    };
+
+    let mut parsed = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let Some(s) = item.as_str() else {
+            return Err(format!(
+                "Invalid task_update field '{field}[{idx}]': expected string"
+            ));
+        };
+        parsed.push(s.to_string());
+    }
+    Ok(Some(parsed))
 }
 
 /// Execute the `task_get` tool.
