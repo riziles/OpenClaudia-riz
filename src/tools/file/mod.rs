@@ -20,8 +20,11 @@ pub use read::{
 pub use write::execute_write_file;
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+
+const LEDGER_EXCERPT_MAX_BYTES: usize = 100_000;
 
 /// Maximum number of entries in the read tracker, per session, before
 /// the oldest write is evicted from the front of the list. Per-session so
@@ -436,7 +439,7 @@ pub fn execute_read_file(
 
     READ_TRACKER.mark_read(&resolved);
 
-    match detect_file_type(&resolved_str) {
+    let (content, is_error) = match detect_file_type(&resolved_str) {
         FileType::Image(kind) => read_image_file(&resolved_str, kind),
         FileType::Pdf => {
             let pages = args.get("pages").and_then(|v| v.as_str());
@@ -444,7 +447,97 @@ pub fn execute_read_file(
         }
         FileType::Notebook => read_notebook_file(&resolved_str),
         FileType::Text => read_text_file(&resolved_str, args),
+    };
+
+    if !is_error {
+        record_active_file_read_observation(&resolved, args, &content);
     }
+
+    (content, is_error)
+}
+
+fn record_active_file_read_observation(
+    resolved: &Path,
+    args: &std::collections::HashMap<String, serde_json::Value>,
+    output: &str,
+) {
+    let session_key = super::todo::current_session_key();
+    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
+        return;
+    };
+
+    let bytes = match read_file_bytes_for_ledger(resolved) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %resolved.display(),
+                error = %err,
+                "read_file succeeded but ledger hash read failed; skipping observation"
+            );
+            return;
+        }
+    };
+
+    let (start_line, end_line) = ledger_line_range(args, &bytes, output);
+    let excerpt = super::safe_truncate(output, LEDGER_EXCERPT_MAX_BYTES).to_string();
+    let mut ledger = ledger.lock().unwrap_or_else(|err| {
+        tracing::error!("active reality ledger lock poisoned; recovering inner state");
+        err.into_inner()
+    });
+    if let Err(err) = ledger.observe_file_read_bytes(
+        resolved.to_string_lossy().to_string(),
+        &bytes,
+        start_line,
+        end_line,
+        excerpt,
+    ) {
+        tracing::warn!(
+            path = %resolved.display(),
+            error = %err,
+            "failed to append read_file observation to reality ledger"
+        );
+    }
+}
+
+fn read_file_bytes_for_ledger(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(read::MAX_FILE_SIZE_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn ledger_line_range(
+    args: &std::collections::HashMap<String, serde_json::Value>,
+    bytes: &[u8],
+    output: &str,
+) -> (usize, usize) {
+    let start_line = args
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+
+    let total_lines = std::str::from_utf8(bytes)
+        .map(count_display_lines)
+        .unwrap_or_else(|_| output.lines().count().max(1));
+    let requested = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0);
+    let end_line = requested.map_or(total_lines, |limit| {
+        start_line.saturating_add(limit).saturating_sub(1)
+    });
+    (start_line, end_line.min(total_lines.max(start_line)))
+}
+
+fn count_display_lines(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.lines().count().max(1)
 }
 
 /// Process-wide mutex for tests that mutate the global `READ_TRACKER`.

@@ -12,11 +12,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use thiserror::Error;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 1;
+const SESSION_LEDGER_DIR: &str = ".openclaudia/reality-ledgers";
+
+pub type SharedRealityLedger = Arc<Mutex<RealityLedger>>;
+
+static ACTIVE_REALITY_LEDGERS: LazyLock<Mutex<HashMap<String, SharedRealityLedger>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObsId(Uuid);
@@ -211,6 +218,34 @@ pub enum LedgerError {
     Serde(#[from] serde_json::Error),
     #[error("duplicate observation id {0}")]
     DuplicateObservation(ObsId),
+    #[error("invalid ledger session key {session_key:?}: {reason}")]
+    InvalidSessionKey {
+        session_key: String,
+        reason: &'static str,
+    },
+    #[error("failed to create ledger directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[must_use = "dropping the guard restores the previous active ledger"]
+pub struct ActiveRealityLedgerGuard {
+    session_key: String,
+    previous: Option<SharedRealityLedger>,
+}
+
+impl Drop for ActiveRealityLedgerGuard {
+    fn drop(&mut self) {
+        let mut ledgers = active_ledgers_guard("drop_active_ledger_guard");
+        if let Some(previous) = self.previous.take() {
+            ledgers.insert(self.session_key.clone(), previous);
+        } else {
+            ledgers.remove(&self.session_key);
+        }
+    }
 }
 
 pub struct RealityLedger {
@@ -272,6 +307,26 @@ impl RealityLedger {
             records,
             conn: Some(conn),
         })
+    }
+
+    /// Open the project-local SQLite ledger for a session.
+    ///
+    /// Session keys are constrained to ASCII alphanumeric plus `-`, matching
+    /// session/audit filename rules, so the key can safely become a filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session key is not filename-safe, the ledger
+    /// directory cannot be created, or SQLite cannot be opened.
+    pub fn open_project_session(session_key: &str) -> Result<Self, LedgerError> {
+        let path = project_session_ledger_path(session_key)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| LedgerError::CreateDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        Self::open(path)
     }
 
     #[must_use]
@@ -362,11 +417,33 @@ impl RealityLedger {
         end_line: usize,
         excerpt: impl Into<String>,
     ) -> Result<ObsId, LedgerError> {
+        self.observe_file_read_bytes(
+            path,
+            full_contents.as_bytes(),
+            start_line,
+            end_line,
+            excerpt,
+        )
+    }
+
+    /// Record a file read using raw bytes for the content hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence fails.
+    pub fn observe_file_read_bytes(
+        &mut self,
+        path: impl Into<String>,
+        full_contents: &[u8],
+        start_line: usize,
+        end_line: usize,
+        excerpt: impl Into<String>,
+    ) -> Result<ObsId, LedgerError> {
         self.append(
             Authority::Filesystem,
             ObservationKind::FileRead {
                 path: path.into(),
-                sha256: sha256_hex(full_contents.as_bytes()),
+                sha256: sha256_hex(full_contents),
                 start_line,
                 end_line,
                 excerpt: excerpt.into(),
@@ -531,6 +608,34 @@ impl RealityLedger {
     }
 }
 
+pub fn install_active_ledger_for_session(
+    session_key: impl Into<String>,
+    ledger: SharedRealityLedger,
+) -> ActiveRealityLedgerGuard {
+    let session_key = session_key.into();
+    let previous =
+        active_ledgers_guard("install_active_ledger").insert(session_key.clone(), ledger);
+    ActiveRealityLedgerGuard {
+        session_key,
+        previous,
+    }
+}
+
+#[must_use]
+pub fn active_ledger_for_session(session_key: &str) -> Option<SharedRealityLedger> {
+    active_ledgers_guard("active_ledger_for_session")
+        .get(session_key)
+        .cloned()
+}
+
+pub fn project_session_ledger_path(session_key: &str) -> Result<PathBuf, LedgerError> {
+    validate_session_key(session_key).map_err(|reason| LedgerError::InvalidSessionKey {
+        session_key: session_key.to_string(),
+        reason,
+    })?;
+    Ok(Path::new(SESSION_LEDGER_DIR).join(format!("{session_key}.sqlite3")))
+}
+
 fn initialize_schema(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     conn.execute_batch(
@@ -582,4 +687,30 @@ fn first_line(text: &str) -> String {
         return line.to_string();
     }
     format!("{}...", &line[..MAX])
+}
+
+fn validate_session_key(key: &str) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("session key must not be empty");
+    }
+    if key.len() > 128 {
+        return Err("session key must be 128 bytes or fewer");
+    }
+    if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        Ok(())
+    } else {
+        Err("session key must contain only ASCII letters, numbers, or '-'")
+    }
+}
+
+fn active_ledgers_guard(
+    operation: &'static str,
+) -> MutexGuard<'static, HashMap<String, SharedRealityLedger>> {
+    ACTIVE_REALITY_LEDGERS.lock().unwrap_or_else(|err| {
+        tracing::error!(
+            operation,
+            "active reality ledger registry lock poisoned; recovering inner state"
+        );
+        err.into_inner()
+    })
 }

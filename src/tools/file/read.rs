@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 /// `/dev/zero` and similar unbounded sources.  10 MiB is generous for any
 /// text file an agent would realistically need to read in full; callers
 /// should use `offset`+`limit` or `grep` for larger artifacts.
-const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+pub(super) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum chars retained in [`read_text_file`] output before truncation
 /// at the next line boundary kicks in. crosslink #939.

@@ -15,6 +15,7 @@
 use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
     let mut ctx = ToolContext {
@@ -130,6 +131,55 @@ fn read_simple_text_file_returns_content_with_line_numbers() {
     assert!(
         text.contains('1') && text.contains('2') && text.contains('3'),
         "MUST include line numbers; got {text:?}"
+    );
+}
+
+#[test]
+fn read_file_records_observation_when_session_ledger_is_active() {
+    let _session_guard = openclaudia::tools::SessionIdGuard::set("readledger");
+    let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
+    let _ledger_guard =
+        openclaudia::ledger::install_active_ledger_for_session("readledger", Arc::clone(&ledger));
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("ledgered.txt");
+    std::fs::write(&path, "alpha\nbeta\n").expect("write");
+
+    let args = args_with(&[
+        ("path", json!(path.to_string_lossy())),
+        ("offset", json!(1)),
+        ("limit", json!(2)),
+    ]);
+    let (msg, is_err) = dispatch_read(&args);
+    assert!(!is_err, "read should succeed: {msg}");
+
+    let ledger = ledger.lock().expect("ledger lock");
+    assert_eq!(ledger.len(), 1);
+    let index = ledger.observation_index(8);
+    let observation = ledger.get(index[0].id).expect("observation");
+    let openclaudia::ledger::ObservationKind::FileRead {
+        path: observed_path,
+        sha256,
+        start_line,
+        end_line,
+        excerpt,
+    } = &observation.kind
+    else {
+        panic!("expected FileRead observation");
+    };
+    assert_eq!(
+        observed_path,
+        &path.canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!((*start_line, *end_line), (1, 2));
+    assert_eq!(
+        sha256,
+        "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee"
+    );
+    assert!(excerpt.contains("alpha"));
+    assert_eq!(
+        observation.authority,
+        openclaudia::ledger::Authority::Filesystem
     );
 }
 

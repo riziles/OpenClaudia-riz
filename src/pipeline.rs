@@ -1813,9 +1813,27 @@ async fn execute_single_tool(
     let perm_mgr = permission.mgr;
     let permission_already_checked_for_blocking = permission.already_checked;
     let session_for_task = session_id.map(str::to_string);
+    let session_for_ledger = session_for_task.clone();
     let task_mgr_for_blocking = task_mgr;
     let result = tokio::task::spawn_blocking(move || {
         let _session_guard = session_for_task.map(tools::SessionIdGuard::set);
+        let _ledger_guard = session_for_ledger.as_deref().and_then(|session_id| {
+            let ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
+                Ok(ledger) => ledger,
+                Err(err) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %err,
+                        "failed to open session reality ledger; tool observations disabled"
+                    );
+                    return None;
+                }
+            };
+            Some(crate::ledger::install_active_ledger_for_session(
+                session_id,
+                std::sync::Arc::new(std::sync::Mutex::new(ledger)),
+            ))
+        });
         // Lock the TaskManager only inside the blocking thread so we
         // don't hold the mutex across `.await`. Failure-mode parity with
         // the legacy "no session" branch: poisoned mutex → recover the
