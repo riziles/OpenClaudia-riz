@@ -1,7 +1,7 @@
 //! Final-answer validation for grounded agent turns.
 
 use crate::evidence::{authoritative_evidence, Denial};
-use crate::ledger::{ObsId, ObservationKind, RealityLedger};
+use crate::ledger::{Authority, ObsId, ObservationKind, RealityLedger};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,14 @@ pub fn validate_final_answer(
             "final verification ids must reference verification observations",
         ));
     }
+    if !hydrated_verification
+        .iter()
+        .all(|obs| obs.authority == Authority::Verifier)
+    {
+        return Err(Denial::new(
+            "final verification ids must reference verifier observations",
+        ));
+    }
 
     if summary_mentions_tests(summary)
         && !hydrated_evidence
@@ -87,9 +95,10 @@ pub fn validate_cited_final_answer(
         .iter()
         .copied()
         .filter(|id| {
-            ledger
-                .get(*id)
-                .is_some_and(|obs| matches!(obs.kind, ObservationKind::Verification { .. }))
+            ledger.get(*id).is_some_and(|obs| {
+                matches!(obs.kind, ObservationKind::Verification { .. })
+                    && obs.authority == Authority::Verifier
+            })
         })
         .collect::<Vec<_>>();
     validate_final_answer(summary, &evidence, &verification, ledger)
@@ -239,6 +248,65 @@ mod tests {
         let report = validate_cited_final_answer(&summary, &ledger).expect("valid final");
         assert_eq!(report.evidence, vec![command, verification]);
         assert_eq!(report.verification, vec![verification]);
+    }
+
+    #[test]
+    fn cited_final_rejects_verification_kind_without_verifier_authority() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let forged_verification = ledger
+            .append(
+                Authority::Tool,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("forged verification");
+        let summary =
+            format!("Verified with cargo check using [{command}] and [{forged_verification}].");
+
+        let denial = validate_cited_final_answer(&summary, &ledger).expect_err("denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final answer requires verification observation"
+        );
+    }
+
+    #[test]
+    fn final_rejects_explicit_verification_without_verifier_authority() {
+        let mut ledger = RealityLedger::new();
+        let command = ledger
+            .observe_command_run("/tmp", vec!["cargo".into(), "check".into()], 0, "", "")
+            .expect("command");
+        let forged_verification = ledger
+            .append(
+                Authority::Tool,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo check".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("forged verification");
+        let summary = "Verified with cargo check.";
+
+        let denial = validate_final_answer(
+            summary,
+            &[command, forged_verification],
+            &[forged_verification],
+            &ledger,
+        )
+        .expect_err("denied");
+
+        assert_eq!(
+            denial.reason(),
+            "final verification ids must reference verifier observations"
+        );
     }
 
     #[test]
