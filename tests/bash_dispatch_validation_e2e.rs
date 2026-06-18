@@ -28,6 +28,17 @@ fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
         .expect("bash must be registered")
 }
 
+fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
+    let mut ctx = ToolContext {
+        memory_db: None,
+        app_config: None,
+        task_mgr: None,
+    };
+    registry()
+        .dispatch("bash_output", args, &mut ctx)
+        .expect("bash_output must be registered")
+}
+
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     let mut m = HashMap::new();
     for (k, v) in entries {
@@ -169,6 +180,64 @@ fn bash_records_command_observation_when_session_ledger_is_active() {
         observation.authority,
         openclaudia::ledger::Authority::Command
     );
+}
+
+#[test]
+fn background_bash_records_command_observation_after_finish() {
+    let _session_guard = openclaudia::tools::SessionIdGuard::set("bashbgledger");
+    let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
+    let _ledger_guard =
+        openclaudia::ledger::install_active_ledger_for_session("bashbgledger", Arc::clone(&ledger));
+
+    let command = "printf ledger-background";
+    let args = args_with(&[
+        ("command", json!(command)),
+        ("run_in_background", json!(true)),
+    ]);
+    let (msg, is_err) = dispatch_bash(&args);
+    assert!(!is_err, "background bash should start: {msg}");
+    let shell_id = msg
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Background shell started with ID: "))
+        .expect("shell id should be returned")
+        .to_string();
+
+    for _ in 0..50 {
+        if ledger.lock().expect("ledger lock").len() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output_args = args_with(&[("shell_id", json!(shell_id))]);
+    let (output_msg, output_is_err) = dispatch_bash_output(&output_args);
+    assert!(
+        !output_is_err,
+        "bash_output should retrieve finished shell: {output_msg}"
+    );
+
+    let ledger = ledger.lock().expect("ledger lock");
+    assert_eq!(ledger.len(), 1, "background command should be ledgered");
+    let index = ledger.observation_index(8);
+    let observation = ledger.get(index[0].id).expect("observation");
+    let openclaudia::ledger::ObservationKind::CommandRun {
+        argv,
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    } = &observation.kind
+    else {
+        panic!("expected CommandRun observation");
+    };
+    assert_eq!(
+        argv,
+        &vec!["bash".to_string(), "-c".to_string(), command.to_string()]
+    );
+    assert_eq!(*exit_code, 0);
+    assert_eq!(stdout, "ledger-background");
+    assert_eq!(stderr, "");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -75,6 +75,7 @@ fn recover_mutex_lock<'a, T>(
 fn spawn_output_reader<R>(
     stream: R,
     buffer: Arc<Mutex<Vec<String>>>,
+    ledger_buffer: Arc<Mutex<String>>,
     done: Arc<AtomicBool>,
     op: &'static str,
     resource: &'static str,
@@ -85,10 +86,31 @@ fn spawn_output_reader<R>(
     thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
+            append_ledger_output_line(&ledger_buffer, &line, op, "ledger_buffer", &shell_id);
             recover_mutex_lock(&buffer, op, resource, Some(&shell_id)).push(line);
         }
         done.store(true, Ordering::SeqCst);
     });
+}
+
+fn append_ledger_output_line(
+    buffer: &Arc<Mutex<String>>,
+    line: &str,
+    op: &'static str,
+    resource: &'static str,
+    shell_id: &str,
+) {
+    let mut buffer = recover_mutex_lock(buffer, op, resource, Some(shell_id));
+    if buffer.len() >= LEDGER_COMMAND_OUTPUT_MAX_BYTES {
+        return;
+    }
+    let mut chunk = String::with_capacity(line.len() + usize::from(!buffer.is_empty()));
+    if !buffer.is_empty() {
+        chunk.push('\n');
+    }
+    chunk.push_str(line);
+    let remaining = LEDGER_COMMAND_OUTPUT_MAX_BYTES - buffer.len();
+    buffer.push_str(safe_truncate(&chunk, remaining));
 }
 
 /// Background shell process with captured output
@@ -246,6 +268,8 @@ impl BackgroundShellManager {
 
         let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
         let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stdout_ledger_buffer = Arc::new(Mutex::new(String::new()));
+        let stderr_ledger_buffer = Arc::new(Mutex::new(String::new()));
         let finished = Arc::new(AtomicBool::new(false));
         let stdout_done = Arc::new(AtomicBool::new(false));
         let stderr_done = Arc::new(AtomicBool::new(false));
@@ -267,6 +291,7 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stdout,
                 Arc::clone(&stdout_buffer),
+                Arc::clone(&stdout_ledger_buffer),
                 Arc::clone(&stdout_done),
                 "stdout_reader",
                 "stdout_buffer",
@@ -281,6 +306,7 @@ impl BackgroundShellManager {
             spawn_output_reader(
                 stderr,
                 Arc::clone(&stderr_buffer),
+                Arc::clone(&stderr_ledger_buffer),
                 Arc::clone(&stderr_done),
                 "stderr_reader",
                 "stderr_buffer",
@@ -294,10 +320,18 @@ impl BackgroundShellManager {
         let exit_status_clone = Arc::clone(&exit_status);
         let finished_clone = Arc::clone(&finished);
         let reaped_clone = Arc::clone(&reaped);
+        let stdout_done_for_ledger = Arc::clone(&stdout_done);
+        let stderr_done_for_ledger = Arc::clone(&stderr_done);
+        let stdout_ledger_for_wait = Arc::clone(&stdout_ledger_buffer);
+        let stderr_ledger_for_wait = Arc::clone(&stderr_ledger_buffer);
+        let owner_for_ledger = owner.clone();
+        let cwd_for_ledger = cwd.clone();
+        let command_for_ledger = command.to_string();
         let mut child_for_wait = child;
         let wait_shell_id = shell_id.clone();
         thread::spawn(move || {
             if let Ok(status) = child_for_wait.wait() {
+                let exit_code = status.code().unwrap_or(-1);
                 *recover_mutex_lock(
                     &exit_status_clone,
                     "wait",
@@ -309,6 +343,33 @@ impl BackgroundShellManager {
                 // `exit_status=None`.
                 reaped_clone.store(true, Ordering::SeqCst);
                 finished_clone.store(true, Ordering::SeqCst);
+                wait_for_output_readers(
+                    &stdout_done_for_ledger,
+                    &stderr_done_for_ledger,
+                    &wait_shell_id,
+                );
+                let stdout = recover_mutex_lock(
+                    &stdout_ledger_for_wait,
+                    "wait_ledger",
+                    "stdout_ledger_buffer",
+                    Some(&wait_shell_id),
+                )
+                .clone();
+                let stderr = recover_mutex_lock(
+                    &stderr_ledger_for_wait,
+                    "wait_ledger",
+                    "stderr_ledger_buffer",
+                    Some(&wait_shell_id),
+                )
+                .clone();
+                record_command_observation_for_session(
+                    &owner_for_ledger,
+                    &cwd_for_ledger,
+                    &command_for_ledger,
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                );
             }
         });
 
@@ -503,6 +564,17 @@ impl BackgroundShellManager {
     }
 }
 
+fn wait_for_output_readers(stdout_done: &AtomicBool, stderr_done: &AtomicBool, shell_id: &str) {
+    while !stdout_done.load(Ordering::SeqCst) || !stderr_done.load(Ordering::SeqCst) {
+        tracing::trace!(
+            target: "openclaudia::bash",
+            shell_id,
+            "waiting for background shell output readers before ledger observation"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Global background shell manager
 pub static BACKGROUND_SHELLS: std::sync::LazyLock<BackgroundShellManager> =
     std::sync::LazyLock::new(BackgroundShellManager::new);
@@ -693,23 +765,58 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
 
 fn record_active_command_observation(cwd: &Path, command: &str, output: &std::process::Output) {
     let session_key = super::todo::current_session_key();
-    let Some(ledger) = crate::ledger::active_ledger_for_session(&session_key) else {
-        return;
-    };
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
-    let mut ledger = ledger.lock().unwrap_or_else(|err| {
-        tracing::error!("active reality ledger lock poisoned; recovering inner state");
-        err.into_inner()
-    });
+    record_command_observation_for_session(&session_key, cwd, command, exit_code, &stdout, &stderr);
+}
+
+fn record_command_observation_for_session(
+    session_key: &str,
+    cwd: &Path,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
+    if let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) {
+        let mut ledger = ledger.lock().unwrap_or_else(|err| {
+            tracing::error!("active reality ledger lock poisoned; recovering inner state");
+            err.into_inner()
+        });
+        append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+        return;
+    }
+
+    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_key) {
+        Ok(ledger) => ledger,
+        Err(crate::ledger::LedgerError::InvalidSessionKey { .. }) => return,
+        Err(err) => {
+            tracing::warn!(
+                session_key,
+                error = %err,
+                "failed to open session reality ledger for bash command observation"
+            );
+            return;
+        }
+    };
+    append_command_observation(&mut ledger, cwd, command, exit_code, stdout, stderr);
+}
+
+fn append_command_observation(
+    ledger: &mut crate::ledger::RealityLedger,
+    cwd: &Path,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
     if let Err(err) = ledger.observe_command_run(
         cwd.to_string_lossy().to_string(),
         vec!["bash".to_string(), "-c".to_string(), command.to_string()],
         exit_code,
-        safe_truncate(&stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES).to_string(),
-        safe_truncate(&stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES).to_string(),
+        safe_truncate(stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES).to_string(),
+        safe_truncate(stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES).to_string(),
     ) {
         tracing::warn!(
             command = %command,
