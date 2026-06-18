@@ -30,12 +30,14 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::file_error::{self, FileError};
-use crate::tools::args::ToolArgs as _;
+use crate::tools::{args::ToolArgs as _, safe_truncate};
 
 const SCHEDULES_FILE: &str = ".openclaudia/schedules.json";
 const LOCK_SUFFIX: &str = ".lock";
 const TMP_SUFFIX: &str = ".tmp";
 const MAX_SCHEDULES: usize = 50;
+const LIST_PROMPT_MAX_BYTES: usize = 80;
+const LIST_PROMPT_ELLIPSIS: &str = "...";
 
 const fn default_true() -> bool {
     true
@@ -371,6 +373,19 @@ fn validate_cron(expr: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn format_list_prompt(prompt: &str) -> String {
+    if prompt.len() <= LIST_PROMPT_MAX_BYTES {
+        return prompt.to_string();
+    }
+
+    let max_prefix = LIST_PROMPT_MAX_BYTES.saturating_sub(LIST_PROMPT_ELLIPSIS.len());
+    format!(
+        "{}{}",
+        safe_truncate(prompt, max_prefix),
+        LIST_PROMPT_ELLIPSIS
+    )
+}
+
 #[must_use]
 pub fn execute_cron_create<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
     execute_cron_create_at(args, &schedules_path())
@@ -610,11 +625,7 @@ fn execute_cron_list_at<S: BuildHasher>(
             s.id,
             s.name,
             s.cron_expression,
-            if s.prompt.len() > 80 {
-                format!("{}...", &s.prompt[..77])
-            } else {
-                s.prompt.clone()
-            },
+            format_list_prompt(&s.prompt),
             s.recurring,
             s.durable,
             s.run_count,
@@ -816,6 +827,43 @@ mod tests {
         assert!(
             list_msg.contains("roundtrip"),
             "list must show the newly created schedule; got: {list_msg}"
+        );
+    }
+
+    #[test]
+    fn cron_list_truncates_multibyte_prompt_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let path = temp_schedules_path(&tmp);
+
+        let prompt = "é".repeat(50); // 100 bytes; byte 77 splits a codepoint.
+        let mut args = HashMap::new();
+        args.insert(
+            "name".to_string(),
+            Value::String("unicode-prompt".to_string()),
+        );
+        args.insert(
+            "schedule".to_string(),
+            Value::String("*/5 * * * *".to_string()),
+        );
+        args.insert("prompt".to_string(), Value::String(prompt.clone()));
+
+        let (create_msg, create_err) = execute_cron_create_at(&args, &path);
+        assert!(!create_err, "create must succeed; got: {create_msg}");
+
+        let (list_msg, list_err) = execute_cron_list_at(&HashMap::new(), &path);
+        assert!(!list_err, "list must succeed; got: {list_msg}");
+        assert!(
+            list_msg.contains("unicode-prompt"),
+            "list must include schedule name; got: {list_msg}"
+        );
+        assert!(
+            !list_msg.contains(&prompt),
+            "list must truncate long prompt; got: {list_msg}"
+        );
+        assert!(
+            list_msg.contains("..."),
+            "list must mark truncation; got: {list_msg}"
         );
     }
 
