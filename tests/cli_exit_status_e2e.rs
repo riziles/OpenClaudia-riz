@@ -2510,6 +2510,99 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn init_refuses_broken_config_symlink_without_force() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    let config_path = config_dir.join("config.yaml");
+    let outside_target = home.path().join("outside-config.yaml");
+    symlink(&outside_target, &config_path).expect("broken config symlink");
+    assert!(
+        !config_path.exists(),
+        "fixture should be a broken symlink so Path::exists would miss it"
+    );
+    assert!(
+        config_path.symlink_metadata().is_ok(),
+        "broken config symlink should exist as a path entry"
+    );
+
+    let output = isolated_command(&cwd, &home)
+        .arg("init")
+        .output()
+        .expect("openclaudia init must run");
+
+    assert!(
+        !output.status.success(),
+        "init without --force must refuse a broken config symlink; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("already exists") && combined.contains("--force"),
+        "init should report the existing config path entry; got {combined:?}"
+    );
+    assert!(
+        outside_target.symlink_metadata().is_err(),
+        "init must not follow the broken symlink and create its target"
+    );
+    assert!(
+        config_path.symlink_metadata().is_ok(),
+        "init without --force must leave the config symlink in place"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_force_replaces_broken_config_symlink_with_project_file() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_dir = cwd.path().join(".openclaudia");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    let config_path = config_dir.join("config.yaml");
+    let outside_target = home.path().join("outside-config.yaml");
+    symlink(&outside_target, &config_path).expect("broken config symlink");
+
+    let output = isolated_command(&cwd, &home)
+        .args(["init", "--force"])
+        .output()
+        .expect("openclaudia init --force must run");
+
+    assert!(
+        output.status.success(),
+        "init --force should replace a broken config symlink in-project; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        outside_target.symlink_metadata().is_err(),
+        "init --force must not create the old symlink target"
+    );
+    let metadata = config_path
+        .symlink_metadata()
+        .expect("forced init should write project config path");
+    assert!(
+        metadata.file_type().is_file(),
+        "forced init should replace the symlink with a regular project file"
+    );
+    let config = fs::read_to_string(&config_path).expect("config should be readable");
+    assert!(
+        config.contains("OpenClaudia Configuration"),
+        "forced init should write the default config template"
+    );
+}
+
 #[test]
 fn init_template_marks_keybindings_as_legacy_repl_specific() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");

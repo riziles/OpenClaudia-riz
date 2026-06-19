@@ -1,6 +1,39 @@
-use std::fs;
-use std::path::PathBuf;
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 use tracing::info;
+
+fn config_path_metadata(path: &Path) -> anyhow::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to inspect configuration path {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn write_new_regular_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to create configuration file {}: {err}",
+                path.display()
+            )
+        })?;
+    file.write_all(contents.as_bytes()).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to write configuration file {}: {err}",
+            path.display()
+        )
+    })
+}
 
 #[allow(clippy::too_many_lines)]
 /// Initialize `OpenClaudia` configuration
@@ -8,15 +41,28 @@ pub fn cmd_init(force: bool) -> anyhow::Result<()> {
     let config_dir = PathBuf::from(".openclaudia");
     let config_file = config_dir.join("config.yaml");
 
-    if config_file.exists() && !force {
-        tracing::error!("Configuration already exists. Use --force to overwrite.");
-        // Refuse-to-overwrite MUST exit non-zero so scripts checking $?
-        // can detect the failure. Previously this returned Ok(()) and
-        // exited 0, silently hiding the no-op from callers.
-        anyhow::bail!(
-            "Configuration already exists at .openclaudia/config.yaml. \
-             Re-run with --force to overwrite."
-        );
+    if let Some(metadata) = config_path_metadata(&config_file)? {
+        if !force {
+            tracing::error!("Configuration already exists. Use --force to overwrite.");
+            // Refuse-to-overwrite MUST exit non-zero so scripts checking $?
+            // can detect the failure. Previously this returned Ok(()) and
+            // exited 0, silently hiding the no-op from callers.
+            anyhow::bail!(
+                "Configuration already exists at .openclaudia/config.yaml. \
+                 Re-run with --force to overwrite."
+            );
+        }
+
+        if metadata.file_type().is_dir() {
+            anyhow::bail!("Cannot overwrite .openclaudia/config.yaml because it is a directory.");
+        }
+
+        fs::remove_file(&config_file).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to remove existing configuration path {}: {err}",
+                config_file.display()
+            )
+        })?;
     }
 
     // Create directories
@@ -183,7 +229,7 @@ session:
 #         required: true
 "#;
 
-    fs::write(&config_file, default_config)?;
+    write_new_regular_file(&config_file, default_config)?;
 
     // Write example hook
     let example_hook = r#"#!/usr/bin/env python3
