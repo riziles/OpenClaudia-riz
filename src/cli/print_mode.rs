@@ -188,6 +188,7 @@ async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut state = PrintSseState::new();
+    let mut emitted_text = false;
 
     while let Some(result) = stream.next().await {
         let chunk = result?;
@@ -203,6 +204,7 @@ async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
             let line = buffer[..line_end].to_string();
             buffer = buffer[line_end + 1..].to_string();
             if let Some(text) = extract_print_sse_line(&line, &mut state)? {
+                emitted_text |= !text.is_empty();
                 print!("{text}");
                 std::io::stdout().flush()?;
             }
@@ -211,9 +213,14 @@ async fn print_sse_response(response: reqwest::Response) -> anyhow::Result<()> {
 
     if !buffer.trim().is_empty() {
         if let Some(text) = extract_print_sse_line(&buffer, &mut state)? {
+            emitted_text |= !text.is_empty();
             print!("{text}");
             std::io::stdout().flush()?;
         }
+    }
+
+    if !emitted_text {
+        anyhow::bail!("provider stream did not contain printable assistant text");
     }
 
     println!();

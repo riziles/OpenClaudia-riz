@@ -1499,6 +1499,45 @@ fn print_rejects_malformed_sse_data_instead_of_succeeding_empty() {
 }
 
 #[test]
+fn print_rejects_sse_stream_without_printable_text() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (server, base_url) = spawn_local_sse_server_rejecting_auth_with_body("data: [DONE]\n\n");
+    write_local_provider_config_with_base_url(&cwd, &base_url);
+
+    let output = isolated_command(&cwd, &home)
+        .args(["--print", "hello"])
+        .output()
+        .expect("openclaudia --print must run");
+
+    let server_result = server.join().expect("local SSE server thread should join");
+    assert!(
+        server_result.is_ok(),
+        "local SSE server failed: {:?}",
+        server_result.err()
+    );
+    assert!(
+        !output.status.success(),
+        "print must fail when provider SSE has no assistant text; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("provider stream did not contain printable assistant text"),
+        "print failure should identify empty provider streams; got {combined:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "print must not emit a blank successful-looking line before failing"
+    );
+}
+
+#[test]
 fn print_rejects_keyless_remote_provider_before_request() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
