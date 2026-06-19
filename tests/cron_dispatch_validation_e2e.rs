@@ -109,6 +109,54 @@ fn cron_create_missing_prompt_arg_errors_before_disk_write() {
     });
 }
 
+#[test]
+fn cron_create_wrong_type_name_arg_errors_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let args = args_with(&[
+            ("name", json!(42)),
+            ("schedule", json!("0 9 * * *")),
+            ("prompt", json!("Run report")),
+        ]);
+        let (msg, is_err) = dispatch("cron_create", &args);
+        assert!(is_err);
+        assert_eq!(msg, "Invalid 'name' argument: expected string");
+        assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
+    });
+}
+
+#[test]
+fn cron_create_wrong_type_schedule_arg_errors_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let args = args_with(&[
+            ("name", json!("daily")),
+            ("schedule", json!(["0 9 * * *"])),
+            ("prompt", json!("Run report")),
+        ]);
+        let (msg, is_err) = dispatch("cron_create", &args);
+        assert!(is_err);
+        assert_eq!(msg, "Invalid 'schedule' argument: expected string");
+        assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
+    });
+}
+
+#[test]
+fn cron_create_wrong_type_prompt_arg_errors_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let args = args_with(&[
+            ("name", json!("daily")),
+            ("schedule", json!("0 9 * * *")),
+            ("prompt", Value::Null),
+        ]);
+        let (msg, is_err) = dispatch("cron_create", &args);
+        assert!(is_err);
+        assert_eq!(msg, "Invalid 'prompt' argument: expected string");
+        assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
+    });
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section B — cron_create: invalid cron expression rejected pre-disk
 // ───────────────────────────────────────────────────────────────────────────

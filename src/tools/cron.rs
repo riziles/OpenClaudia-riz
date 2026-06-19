@@ -442,8 +442,9 @@ fn execute_cron_create_at<S: BuildHasher>(
     path: &Path,
 ) -> (String, bool) {
     // crosslink #675: typed accessors replace per-site
-    // `args.get(k).and_then(|v| v.as_str())` extraction. Error wording
-    // normalises from "Error: name is required" to "Missing 'name' argument".
+    // `args.get(k).and_then(|v| v.as_str())` extraction. Missing values keep
+    // the canonical "Missing 'name' argument" wording; present wrong types
+    // get a type-specific validation error.
     let name = match args.arg_string("name") {
         Ok(n) => n,
         Err(e) => return e.into_tool_error(),

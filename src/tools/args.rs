@@ -14,7 +14,6 @@
 //!
 //! | accessor                             | use case                                  |
 //! |--------------------------------------|-------------------------------------------|
-//! | [`ToolArgs::arg_str`]                | required string — returns [`ToolArgError`]|
 //! | [`ToolArgs::arg_str_strict`]         | required string, reject wrong type        |
 //! | [`ToolArgs::arg_string`]             | same, owned `String`                      |
 //! | [`ToolArgs::arg_str_opt_strict`]     | optional string, reject wrong type        |
@@ -35,7 +34,7 @@
 //! use crate::tools::args::ToolArgs as _;
 //!
 //! pub fn execute_thing(args: &HashMap<String, Value>) -> (String, bool) {
-//!     let name = match args.arg_str("name") {
+//!     let name = match args.arg_str_strict("name") {
 //!         Ok(n) => n,
 //!         Err(e) => return e.into_tool_error(),
 //!     };
@@ -49,10 +48,6 @@ use std::hash::BuildHasher;
 
 /// Typed extraction error for tool argument accessors.
 ///
-/// One variant for now (`MissingOrWrongType`) — the legacy executors did
-/// not distinguish "absent" from "present but not a string", so this
-/// preserves the existing observable behaviour while giving callers a
-/// structured error to match on if they want richer reporting later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolArgError {
     /// The requested key is absent, or the value is the wrong JSON type.
@@ -251,15 +246,6 @@ pub fn into_legacy(result: Result<ToolOutput, ToolError>) -> (String, bool) {
 /// (including the worktree/LSP ones that take a generic
 /// `S: BuildHasher`) can call the same methods without converting maps.
 pub trait ToolArgs {
-    /// Required string argument. Returns [`ToolArgError`] if absent or
-    /// not a JSON string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolArgError::MissingOrWrongType`] when `key` is not
-    /// present or the value is not a JSON string.
-    fn arg_str(&self, key: &'static str) -> Result<&str, ToolArgError>;
-
     /// Required string argument. Missing values keep the legacy missing
     /// wording, but present non-string values produce a type-specific
     /// validation error.
@@ -272,15 +258,16 @@ pub trait ToolArgs {
     fn arg_str_strict(&self, key: &'static str) -> Result<&str, ToolArgError>;
 
     /// Required string argument as an owned `String`. Convenience for
-    /// the `.to_string()` follow-up that several executors need (cron,
-    /// task) so a string can outlive the borrowed map.
+    /// the `.to_string()` follow-up that executors need when a string can
+    /// outlive the borrowed map.
     ///
     /// # Errors
     ///
     /// Returns [`ToolArgError::MissingOrWrongType`] when `key` is not
-    /// present or the value is not a JSON string.
+    /// present, or [`ToolArgError::WrongType`] when `key` is present but
+    /// not a JSON string.
     fn arg_string(&self, key: &'static str) -> Result<String, ToolArgError> {
-        self.arg_str(key).map(str::to_owned)
+        self.arg_str_strict(key).map(str::to_owned)
     }
 
     /// Optional string argument. `None` when absent, but present non-string
@@ -316,12 +303,6 @@ pub trait ToolArgs {
 }
 
 impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
-    fn arg_str(&self, key: &'static str) -> Result<&str, ToolArgError> {
-        self.get(key)
-            .and_then(Value::as_str)
-            .ok_or(ToolArgError::MissingOrWrongType { key })
-    }
-
     fn arg_str_strict(&self, key: &'static str) -> Result<&str, ToolArgError> {
         match self.get(key) {
             None => Err(ToolArgError::MissingOrWrongType { key }),
@@ -383,36 +364,6 @@ mod tests {
         m
     }
 
-    // ── arg_str ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn arg_str_returns_value_when_present_and_string() {
-        let m = make();
-        assert_eq!(m.arg_str("name").unwrap(), "alice");
-    }
-
-    #[test]
-    fn arg_str_errors_when_key_missing() {
-        let m = make();
-        let err = m.arg_str("absent").unwrap_err();
-        assert_eq!(err, ToolArgError::MissingOrWrongType { key: "absent" });
-        assert_eq!(err.to_string(), "Missing 'absent' argument");
-    }
-
-    #[test]
-    fn arg_str_errors_when_value_is_wrong_type() {
-        // `count` is a number — must not be coerced to a string.
-        let m = make();
-        let err = m.arg_str("count").unwrap_err();
-        assert_eq!(err, ToolArgError::MissingOrWrongType { key: "count" });
-    }
-
-    #[test]
-    fn arg_str_errors_when_value_is_null() {
-        let m = make();
-        assert!(m.arg_str("null_value").is_err());
-    }
-
     // ── arg_str_strict ─────────────────────────────────────────────────
 
     #[test]
@@ -446,7 +397,7 @@ mod tests {
     #[test]
     fn into_tool_error_returns_legacy_tuple_with_is_error_true() {
         let m = make();
-        let (msg, is_err) = m.arg_str("absent").unwrap_err().into_tool_error();
+        let (msg, is_err) = m.arg_str_strict("absent").unwrap_err().into_tool_error();
         assert!(is_err, "is_error flag must be true");
         assert_eq!(msg, "Missing 'absent' argument");
     }
@@ -458,6 +409,19 @@ mod tests {
         let m = make();
         let owned: String = m.arg_string("name").unwrap();
         assert_eq!(owned, "alice");
+    }
+
+    #[test]
+    fn arg_string_errors_when_value_is_wrong_type() {
+        let m = make();
+        let err = m.arg_string("count").unwrap_err();
+        assert_eq!(
+            err,
+            ToolArgError::WrongType {
+                key: "count",
+                expected: "string",
+            }
+        );
     }
 
     // ── arg_str_opt_strict ─────────────────────────────────────────────
@@ -560,7 +524,7 @@ mod tests {
         let mut m: HashMap<String, Value, RandomState> = HashMap::with_hasher(RandomState::new());
         m.insert("k".into(), json!("v"));
         // Call through the trait — proves blanket impl applies.
-        let v: &str = m.arg_str("k").expect("typed accessor over custom S");
+        let v: &str = m.arg_str_strict("k").expect("typed accessor over custom S");
         assert_eq!(v, "v");
     }
 
