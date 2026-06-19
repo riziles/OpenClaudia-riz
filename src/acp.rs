@@ -2678,16 +2678,8 @@ fn build_search_argv(
 ) -> Result<(std::path::PathBuf, Vec<String>), String> {
     match tool_name {
         "glob" => {
-            let pattern = tool_args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("*")
-                .to_string();
-            let path = tool_args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".")
-                .to_string();
+            let pattern = required_acp_search_string_arg(tool_args, "pattern")?;
+            let path = optional_acp_search_string_arg(tool_args, "path", ".")?;
             let program = resolve_program("find")
                 .ok_or_else(|| "Could not locate `find` on PATH".to_string())?;
             // `find <path> -type f -name <pattern>` — `<path>` comes BEFORE
@@ -2704,35 +2696,37 @@ fn build_search_argv(
             Ok((program, argv))
         }
         "grep" => {
-            let pattern = tool_args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let path = tool_args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".")
-                .to_string();
+            let pattern = required_acp_search_string_arg(tool_args, "pattern")?;
+            let path = optional_acp_search_string_arg(tool_args, "path", ".")?;
+            let context_lines = parse_acp_search_context_lines_arg(tool_args.get("context_lines"))?;
+            let case_insensitive =
+                parse_acp_bool_arg_for_search(tool_args, "case_insensitive", false)?;
             let program =
                 resolve_program("rg").ok_or_else(|| "Could not locate `rg` on PATH".to_string())?;
 
             let mut argv: Vec<String> = vec!["--no-heading".to_string()];
-            if let Some(ft) = tool_args.get("type").and_then(|v| v.as_str()) {
+            if case_insensitive {
+                argv.push("--ignore-case".to_string());
+            }
+            if context_lines > 0 {
+                argv.push("--context".to_string());
+                argv.push(context_lines.to_string());
+            }
+            if let Some(ft) = optional_acp_search_string_arg_opt(tool_args, "type")? {
                 // The type name itself is an argv entry, but disallow values
                 // that look like flags to keep the contract obvious.
                 if ft.starts_with('-') {
                     return Err(format!("Invalid `type` value (looks like a flag): {ft}"));
                 }
                 argv.push("--type".to_string());
-                argv.push(ft.to_string());
+                argv.push(ft);
             }
-            if let Some(g) = tool_args.get("glob").and_then(|v| v.as_str()) {
+            if let Some(g) = optional_acp_search_string_arg_opt(tool_args, "glob")? {
                 if g.starts_with('-') {
                     return Err(format!("Invalid `glob` value (looks like a flag): {g}"));
                 }
                 argv.push("--glob".to_string());
-                argv.push(g.to_string());
+                argv.push(g);
             }
             // `--` terminator: everything after this is positional, so a
             // pattern like `-foo` or `--help` is treated as the search
@@ -2744,6 +2738,56 @@ fn build_search_argv(
         }
         other => Err(format!("Unknown search tool: {other}")),
     }
+}
+
+fn required_acp_search_string_arg(
+    tool_args: &HashMap<String, Value>,
+    key: &'static str,
+) -> Result<String, String> {
+    tool_args
+        .arg_str(key)
+        .map(str::to_owned)
+        .map_err(|e| e.to_string())
+}
+
+fn optional_acp_search_string_arg(
+    tool_args: &HashMap<String, Value>,
+    key: &'static str,
+    default: &str,
+) -> Result<String, String> {
+    optional_acp_search_string_arg_opt(tool_args, key)
+        .map(|value| value.unwrap_or_else(|| default.to_string()))
+}
+
+fn optional_acp_search_string_arg_opt(
+    tool_args: &HashMap<String, Value>,
+    key: &'static str,
+) -> Result<Option<String>, String> {
+    tool_args.get(key).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| format!("Invalid '{key}' argument: expected string"))
+    })
+}
+
+fn parse_acp_bool_arg_for_search(
+    args: &HashMap<String, Value>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, String> {
+    args.arg_bool_or_strict(key, default)
+        .map_err(|e| e.to_string())
+}
+
+fn parse_acp_search_context_lines_arg(value: Option<&Value>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let Some(context) = value.as_u64() else {
+        return Err("Error: context_lines must be a non-negative integer".to_string());
+    };
+    Ok(usize::try_from(context).unwrap_or(usize::MAX))
 }
 
 /// Execute the resolved program with the planned argv and return a result
@@ -3238,13 +3282,20 @@ mod session_lru_tests {
 #[cfg(test)]
 mod search_security_tests {
     use super::{build_search_argv, resolve_program};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
 
     fn args_from(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect()
+    }
+
+    fn args_from_values(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
     }
 
@@ -3393,6 +3444,101 @@ mod search_security_tests {
         assert!(build_search_argv("grep", &tool_args).is_err());
         let tool_args = args_from(&[("pattern", "x"), ("glob", "-rf")]);
         assert!(build_search_argv("grep", &tool_args).is_err());
+    }
+
+    #[test]
+    fn search_tools_require_string_pattern() {
+        let empty = HashMap::new();
+        let err = build_search_argv("glob", &empty).expect_err("glob pattern is required");
+        assert!(err.contains("Missing 'pattern' argument"), "{err}");
+
+        let err = build_search_argv("grep", &empty).expect_err("grep pattern is required");
+        assert!(err.contains("Missing 'pattern' argument"), "{err}");
+
+        let tool_args = args_from_values(&[("pattern", json!(42))]);
+        let err = build_search_argv("glob", &tool_args).expect_err("pattern must be a string");
+        assert!(err.contains("Missing 'pattern' argument"), "{err}");
+    }
+
+    #[test]
+    fn search_tools_reject_wrong_type_optional_strings() {
+        let tool_args = args_from_values(&[("pattern", json!("*.rs")), ("path", json!(false))]);
+        let err = build_search_argv("glob", &tool_args).expect_err("path must be a string");
+        assert!(
+            err.contains("Invalid 'path' argument: expected string"),
+            "{err}"
+        );
+
+        let tool_args = args_from_values(&[("pattern", json!("x")), ("path", json!(["src"]))]);
+        let err = build_search_argv("grep", &tool_args).expect_err("path must be a string");
+        assert!(
+            err.contains("Invalid 'path' argument: expected string"),
+            "{err}"
+        );
+
+        let tool_args = args_from_values(&[("pattern", json!("x")), ("type", json!(7))]);
+        let err = build_search_argv("grep", &tool_args).expect_err("type must be a string");
+        assert!(
+            err.contains("Invalid 'type' argument: expected string"),
+            "{err}"
+        );
+
+        let tool_args = args_from_values(&[("pattern", json!("x")), ("glob", json!(null))]);
+        let err = build_search_argv("grep", &tool_args).expect_err("glob must be a string");
+        assert!(
+            err.contains("Invalid 'glob' argument: expected string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn grep_advertised_options_map_to_ripgrep_argv() {
+        let tool_args = args_from_values(&[
+            ("pattern", json!("needle")),
+            ("path", json!("src")),
+            ("case_insensitive", json!(true)),
+            ("context_lines", json!(3)),
+        ]);
+        let Ok((_, argv)) = build_search_argv("grep", &tool_args) else {
+            eprintln!("skipping: rg not on PATH");
+            return;
+        };
+
+        assert_eq!(
+            argv,
+            vec![
+                "--no-heading".to_string(),
+                "--ignore-case".to_string(),
+                "--context".to_string(),
+                "3".to_string(),
+                "--".to_string(),
+                "needle".to_string(),
+                "src".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn grep_rejects_wrong_type_advertised_options() {
+        let tool_args = args_from_values(&[
+            ("pattern", json!("needle")),
+            ("case_insensitive", json!("true")),
+        ]);
+        let err =
+            build_search_argv("grep", &tool_args).expect_err("case_insensitive must be a boolean");
+        assert!(
+            err.contains("Invalid 'case_insensitive' argument: expected boolean"),
+            "{err}"
+        );
+
+        let tool_args =
+            args_from_values(&[("pattern", json!("needle")), ("context_lines", json!(-1))]);
+        let err =
+            build_search_argv("grep", &tool_args).expect_err("context_lines must be non-negative");
+        assert!(
+            err.contains("context_lines must be a non-negative integer"),
+            "{err}"
+        );
     }
 }
 
