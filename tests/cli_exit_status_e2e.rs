@@ -203,6 +203,49 @@ providers:
     );
 }
 
+#[test]
+fn config_loads_home_provider_key_schema_used_by_connect() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let home_config_dir = home.path().join(".openclaudia");
+    fs::create_dir_all(&home_config_dir).expect("home config dir");
+    fs::write(
+        home_config_dir.join("config.yaml"),
+        r#"
+proxy:
+  port: 8080
+  host: "127.0.0.1"
+  target: openai
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai-home-test-key
+"#,
+    )
+    .expect("home config file");
+
+    let output = isolated_command(&cwd, &home)
+        .arg("config")
+        .output()
+        .expect("openclaudia config must run");
+
+    assert!(
+        output.status.success(),
+        "home provider key schema must load; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Target: openai") && stdout.contains("openai:"),
+        "config output should show the home OpenAI provider; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("API key: configured") && !stdout.contains("sk-openai-home-test-key"),
+        "config output should report key presence without leaking the key; got {stdout:?}"
+    );
+}
+
 fn write_local_provider_config(cwd: &tempfile::TempDir) {
     write_local_provider_config_with_base_url(cwd, "http://localhost:1234/v1");
 }

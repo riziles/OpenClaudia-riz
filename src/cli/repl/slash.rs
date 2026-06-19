@@ -811,12 +811,6 @@ pub fn slash_debug(provider: &str, current_model: &str, msg_count: usize) {
             home.join(".openclaudia/config.yaml").display()
         );
     }
-    if let Some(config_dir) = dirs::config_dir() {
-        println!(
-            "  System:     {}",
-            config_dir.join("openclaudia/config.yaml").display()
-        );
-    }
     println!();
     println!("Data Directories:");
     println!("  Sessions:   {}", get_sessions_dir().display());

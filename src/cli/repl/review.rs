@@ -243,16 +243,16 @@ pub fn configure_provider_api_key() {
         return;
     }
 
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("openclaudia");
+    let config_path = provider_api_key_config_path();
+    let Some(config_dir) = config_path.parent() else {
+        eprintln!("Failed to resolve provider config directory.\n");
+        return;
+    };
 
-    if let Err(e) = fs::create_dir_all(&config_dir) {
+    if let Err(e) = fs::create_dir_all(config_dir) {
         eprintln!("Failed to create config directory: {e}\n");
         return;
     }
-
-    let config_path = config_dir.join("config.yaml");
 
     match upsert_provider_api_key_config(&config_path, provider_id, provider_name, api_key) {
         Ok(ProviderConfigUpdate::AlreadyConfigured) => {
@@ -273,13 +273,20 @@ enum ProviderConfigUpdate {
     Saved,
 }
 
+fn provider_api_key_config_path() -> PathBuf {
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(".openclaudia/config.yaml"),
+        |home| home.join(".openclaudia/config.yaml"),
+    )
+}
+
 fn upsert_provider_api_key_config(
     config_path: &Path,
     provider_id: &str,
-    provider_name: &str,
+    _provider_name: &str,
     api_key: &str,
 ) -> Result<ProviderConfigUpdate, String> {
-    let mut config_content = match fs::read_to_string(config_path) {
+    let config_content = match fs::read_to_string(config_path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -290,22 +297,87 @@ fn upsert_provider_api_key_config(
         }
     };
 
-    let key_pattern = format!("{provider_id}_api_key:");
-    if config_content.contains(&key_pattern) {
+    let mut root = if config_content.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str::<serde_yaml::Value>(&config_content).map_err(|e| {
+            format!(
+                "Failed to parse existing config {}: {e}",
+                config_path.display()
+            )
+        })?
+    };
+
+    let serde_yaml::Value::Mapping(root_map) = &mut root else {
+        return Err(format!(
+            "Failed to update config {}: root document must be a mapping",
+            config_path.display()
+        ));
+    };
+
+    let providers_yaml_key = serde_yaml::Value::String("providers".to_string());
+    let selected_provider_yaml_key = serde_yaml::Value::String(provider_id.to_string());
+    let api_key_yaml_key = serde_yaml::Value::String("api_key".to_string());
+
+    if !root_map.contains_key(&providers_yaml_key) {
+        root_map.insert(
+            providers_yaml_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+
+    let providers = root_map.get_mut(&providers_yaml_key).ok_or_else(|| {
+        format!(
+            "Failed to update config {}: providers block missing after initialization",
+            config_path.display()
+        )
+    })?;
+    let serde_yaml::Value::Mapping(providers_map) = providers else {
+        return Err(format!(
+            "Failed to update config {}: providers must be a mapping",
+            config_path.display()
+        ));
+    };
+
+    if !providers_map.contains_key(&selected_provider_yaml_key) {
+        providers_map.insert(
+            selected_provider_yaml_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+
+    let selected_provider = providers_map
+        .get_mut(&selected_provider_yaml_key)
+        .ok_or_else(|| {
+            format!(
+                "Failed to update config {}: provider block missing after initialization",
+                config_path.display()
+            )
+        })?;
+    let serde_yaml::Value::Mapping(selected_provider_map) = selected_provider else {
+        return Err(format!(
+            "Failed to update config {}: providers.{provider_id} must be a mapping",
+            config_path.display()
+        ));
+    };
+
+    if selected_provider_map.contains_key(&api_key_yaml_key) {
         return Ok(ProviderConfigUpdate::AlreadyConfigured);
     }
 
-    let quoted_api_key = serde_json::to_string(api_key).map_err(|e| {
+    selected_provider_map.insert(
+        api_key_yaml_key,
+        serde_yaml::Value::String(api_key.to_string()),
+    );
+
+    let rendered = serde_yaml::to_string(&root).map_err(|e| {
         format!(
             "Failed to encode API key for config {}: {e}",
             config_path.display()
         )
     })?;
-    let provider_section =
-        format!("\n# {provider_name} configuration\n{provider_id}_api_key: {quoted_api_key}\n");
-    config_content.push_str(&provider_section);
 
-    fs::write(config_path, config_content)
+    fs::write(config_path, rendered)
         .map_err(|e| format!("Failed to save config {}: {e}", config_path.display()))?;
 
     Ok(ProviderConfigUpdate::Saved)
@@ -366,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_provider_api_key_config_writes_escaped_yaml_scalar() {
+    fn upsert_provider_api_key_config_writes_nested_provider_key() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.yaml");
         let api_key = "sk-quote\"and\\slash";
@@ -377,20 +449,56 @@ mod tests {
         assert_eq!(update, ProviderConfigUpdate::Saved);
         let config = fs::read_to_string(&config_path).unwrap();
         let parsed: YamlValue = serde_yaml::from_str(&config).unwrap();
-        assert_eq!(parsed["openai_api_key"].as_str(), Some(api_key));
+        assert_eq!(
+            parsed["providers"]["openai"]["api_key"].as_str(),
+            Some(api_key)
+        );
     }
 
     #[test]
     fn upsert_provider_api_key_config_preserves_existing_provider_key() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.yaml");
-        let original = "openai_api_key: \"sk-existing\"\n";
+        let original = "providers:\n  openai:\n    api_key: \"sk-existing\"\n";
         fs::write(&config_path, original).unwrap();
 
         let update = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
             .expect("existing readable config should load");
 
         assert_eq!(update, ProviderConfigUpdate::AlreadyConfigured);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn upsert_provider_api_key_config_does_not_treat_legacy_key_as_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        fs::write(&config_path, "openai_api_key: \"sk-legacy\"\n").unwrap();
+
+        let update = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
+            .expect("legacy top-level key should not block current schema");
+
+        assert_eq!(update, ProviderConfigUpdate::Saved);
+        let config = fs::read_to_string(&config_path).unwrap();
+        let parsed: YamlValue = serde_yaml::from_str(&config).unwrap();
+        assert_eq!(
+            parsed["providers"]["openai"]["api_key"].as_str(),
+            Some("sk-new")
+        );
+        assert_eq!(parsed["openai_api_key"].as_str(), Some("sk-legacy"));
+    }
+
+    #[test]
+    fn upsert_provider_api_key_config_rejects_invalid_yaml_without_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let original = "providers:\n  openai: [unterminated\n";
+        fs::write(&config_path, original).unwrap();
+
+        let err = upsert_provider_api_key_config(&config_path, "openai", "OpenAI", "sk-new")
+            .expect_err("invalid YAML config must not be overwritten");
+
+        assert!(err.contains("Failed to parse existing config"), "{err}");
         assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
     }
 }
