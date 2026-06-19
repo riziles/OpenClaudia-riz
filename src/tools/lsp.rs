@@ -660,36 +660,13 @@ fn detect_language_server(file_path: &str) -> Option<(&'static str, Vec<&'static
 /// Execute an LSP action
 #[must_use]
 pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
-    let action_str = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("hover");
-
     let Some(file_path) = args.get("file_path").and_then(|v| v.as_str()) else {
         return ("Error: file_path is required".to_string(), true);
     };
 
-    let action = match action_str {
-        "goToDefinition" | "definition" => LspAction::GoToDefinition,
-        "findReferences" | "references" => LspAction::FindReferences,
-        "hover" => LspAction::Hover,
-        "documentSymbols" | "symbols" => LspAction::DocumentSymbols,
-        // crosslink #645: five-op expansion.
-        "workspaceSymbol" => LspAction::WorkspaceSymbol,
-        "goToImplementation" | "implementation" => LspAction::GoToImplementation,
-        "prepareCallHierarchy" => LspAction::PrepareCallHierarchy,
-        "incomingCalls" => LspAction::IncomingCalls,
-        "outgoingCalls" => LspAction::OutgoingCalls,
-        _ => {
-            return (
-                format!(
-                    "Unknown LSP action: {action_str}. Use: goToDefinition, findReferences, \
-                     hover, documentSymbols, workspaceSymbol, goToImplementation, \
-                     prepareCallHierarchy, incomingCalls, outgoingCalls"
-                ),
-                true,
-            )
-        }
+    let action = match parse_lsp_action_arg(args.get("action")) {
+        Ok(action) => action,
+        Err(msg) => return (msg, true),
     };
 
     if matches!(action, LspAction::IncomingCalls | LspAction::OutgoingCalls)
@@ -787,6 +764,33 @@ pub fn execute_lsp<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String,
             false,
         ),
         Err(e) => (format!("LSP error: {e}"), true),
+    }
+}
+
+fn parse_lsp_action_arg(value: Option<&Value>) -> Result<LspAction, String> {
+    let Some(value) = value else {
+        return Err("Error: action is required".to_string());
+    };
+    let Some(action_str) = value.as_str() else {
+        return Err("Invalid 'action' argument: expected string".to_string());
+    };
+
+    match action_str {
+        "goToDefinition" | "definition" => Ok(LspAction::GoToDefinition),
+        "findReferences" | "references" => Ok(LspAction::FindReferences),
+        "hover" => Ok(LspAction::Hover),
+        "documentSymbols" | "symbols" => Ok(LspAction::DocumentSymbols),
+        // crosslink #645: five-op expansion.
+        "workspaceSymbol" => Ok(LspAction::WorkspaceSymbol),
+        "goToImplementation" | "implementation" => Ok(LspAction::GoToImplementation),
+        "prepareCallHierarchy" => Ok(LspAction::PrepareCallHierarchy),
+        "incomingCalls" => Ok(LspAction::IncomingCalls),
+        "outgoingCalls" => Ok(LspAction::OutgoingCalls),
+        _ => Err(format!(
+            "Unknown LSP action: {action_str}. Use: goToDefinition, findReferences, \
+             hover, documentSymbols, workspaceSymbol, goToImplementation, \
+             prepareCallHierarchy, incomingCalls, outgoingCalls"
+        )),
     }
 }
 
@@ -1994,6 +1998,7 @@ mod tests {
             "file_path".to_string(),
             Value::String("readme.md".to_string()),
         );
+        args.insert("action".to_string(), Value::String("hover".to_string()));
         let (msg, is_err) = execute_lsp(&args);
         assert!(is_err);
         assert!(msg.contains("No language server known"));
