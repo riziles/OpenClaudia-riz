@@ -35,6 +35,7 @@ use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
 use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
 use crate::session::{SessionManager, SessionMode};
+use crate::tools::args::ToolArgs as _;
 
 // ============================================================================
 // JSON-RPC types
@@ -457,6 +458,18 @@ fn parse_acp_tool_arguments(
     };
     let args = map.clone().into_iter().collect();
     Ok((args, Value::Object(map)))
+}
+
+fn parse_acp_bool_arg(
+    args: &HashMap<String, Value>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, AcpToolResult> {
+    args.arg_bool_or_strict(key, default)
+        .map_err(|err| AcpToolResult {
+            content: err.to_string(),
+            is_error: true,
+        })
 }
 
 const fn value_type_name(value: &Value) -> &'static str {
@@ -2083,6 +2096,11 @@ impl AcpServer {
             };
         };
 
+        let replace_all = match parse_acp_bool_arg(args, "replace_all", false) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+
         // Read the file via ACP
         let file_content = match self
             .client_request("fs/read_text_file", Some(json!({"path": path})))
@@ -2110,12 +2128,6 @@ impl AcpServer {
             file_end,
             &file_content,
         );
-
-        // Apply the edit
-        let replace_all = args
-            .get("replace_all")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         let (new_content, count) = if replace_all {
             let count = file_content.matches(old_string).count();
@@ -2175,10 +2187,10 @@ impl AcpServer {
             };
         };
 
-        let run_in_background = args
-            .get("run_in_background")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let run_in_background = match parse_acp_bool_arg(args, "run_in_background", false) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
         let cwd = std::env::current_dir().unwrap_or_default();
 
         // Create terminal
@@ -3715,6 +3727,51 @@ providers:
     fn next_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
         let line = rx.try_recv().expect("expected ACP response");
         serde_json::from_str(&line).expect("response must be JSON")
+    }
+
+    #[tokio::test]
+    async fn acp_edit_file_rejects_non_boolean_replace_all_before_client_request() {
+        let (server, _rx, _tmp) = test_server();
+        let args = HashMap::from([
+            ("path".to_string(), json!("src/lib.rs")),
+            ("old_string".to_string(), json!("old")),
+            ("new_string".to_string(), json!("new")),
+            ("replace_all".to_string(), json!("true")),
+        ]);
+
+        let result = server.acp_edit_file("acp-bad-replace-all", &args).await;
+
+        assert!(result.is_error, "bad replace_all must error: {result:?}");
+        assert!(
+            result
+                .content
+                .contains("Invalid 'replace_all' argument: expected boolean"),
+            "unexpected error: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_bash_rejects_non_boolean_run_in_background_before_client_request() {
+        let (server, _rx, _tmp) = test_server();
+        let args = HashMap::from([
+            ("command".to_string(), json!("echo nope")),
+            ("run_in_background".to_string(), json!("true")),
+        ]);
+
+        let result = server.acp_bash("acp-bad-background", &args).await;
+
+        assert!(
+            result.is_error,
+            "bad run_in_background must error: {result:?}"
+        );
+        assert!(
+            result
+                .content
+                .contains("Invalid 'run_in_background' argument: expected boolean"),
+            "unexpected error: {}",
+            result.content
+        );
     }
 
     fn config_option<'a>(response: &'a Value, id: &str) -> &'a Value {
