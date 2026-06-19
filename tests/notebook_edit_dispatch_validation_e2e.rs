@@ -35,7 +35,7 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — Missing notebook_path arg
+// Section A — Missing / wrong-type notebook_path arg
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -50,26 +50,26 @@ fn missing_notebook_path_arg_returns_documented_error() {
 }
 
 #[test]
-fn notebook_path_as_number_treated_as_missing() {
+fn notebook_path_as_number_returns_validation_error() {
     let args = args_with(&[("notebook_path", json!(42)), ("new_source", json!("body"))]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'notebook_path' argument"));
+    assert!(msg.contains("Invalid 'notebook_path' argument: expected string"));
 }
 
 #[test]
-fn notebook_path_as_null_treated_as_missing() {
+fn notebook_path_as_null_returns_validation_error() {
     let args = args_with(&[
         ("notebook_path", Value::Null),
         ("new_source", json!("body")),
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'notebook_path' argument"));
+    assert!(msg.contains("Invalid 'notebook_path' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section B — Missing new_source arg
+// Section B — Missing / wrong-type new_source arg
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -84,14 +84,14 @@ fn missing_new_source_arg_returns_documented_error() {
 }
 
 #[test]
-fn new_source_as_number_treated_as_missing() {
+fn new_source_as_number_returns_validation_error() {
     let args = args_with(&[
         ("notebook_path", json!("/tmp/x.ipynb")),
         ("new_source", json!(42)),
     ]);
     let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'new_source' argument"));
+    assert!(msg.contains("Invalid 'new_source' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -132,6 +132,18 @@ fn invalid_edit_mode_returns_documented_3_choice_error() {
         msg.contains("'replace'") && msg.contains("'insert'") && msg.contains("'delete'"),
         "MUST list 3 documented modes; got {msg:?}"
     );
+}
+
+#[test]
+fn edit_mode_as_number_returns_validation_error() {
+    let args = args_with(&[
+        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("new_source", json!("body")),
+        ("edit_mode", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_notebook(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'edit_mode' argument: expected string"));
 }
 
 #[test]
@@ -216,6 +228,18 @@ fn invalid_cell_type_returns_documented_nbformat_error() {
 }
 
 #[test]
+fn cell_type_as_number_returns_validation_error() {
+    let args = args_with(&[
+        ("notebook_path", json!("/tmp/x.ipynb")),
+        ("new_source", json!("body")),
+        ("cell_type", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_notebook(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'cell_type' argument: expected string"));
+}
+
+#[test]
 fn cell_type_code_passes_enum_check() {
     let args = args_with(&[
         ("notebook_path", json!("/tmp/nonexistent.ipynb")),
@@ -285,16 +309,26 @@ fn cell_number_above_usize_range_returns_platform_specific_error() {
 
 #[test]
 fn cell_number_negative_is_rejected_as_non_u64() {
-    // serde_json's as_u64 returns None for negative numbers.
-    // Result: cell_number stays None and notebook tool reaches
-    // file-not-found rather than out-of-range. No panic.
     let args = args_with(&[
         ("notebook_path", json!("/tmp/nonexistent.ipynb")),
         ("new_source", json!("body")),
         ("cell_number", json!(-1)),
     ]);
-    let (_msg, is_err) = dispatch_notebook(&args);
+    let (msg, is_err) = dispatch_notebook(&args);
     assert!(is_err);
+    assert!(msg.contains("Invalid 'cell_number' argument: expected non-negative integer"));
+}
+
+#[test]
+fn cell_id_as_number_returns_validation_error() {
+    let args = args_with(&[
+        ("notebook_path", json!("/tmp/nonexistent.ipynb")),
+        ("new_source", json!("body")),
+        ("cell_id", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_notebook(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'cell_id' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

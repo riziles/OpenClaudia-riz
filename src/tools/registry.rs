@@ -470,7 +470,7 @@ impl ToolHandler for NotebookEditHandler {
                         },
                         "cell_type": {
                             "type": "string",
-                            "enum": ["code", "markdown"],
+                            "enum": ["code", "markdown", "raw"],
                             "description": "The type of cell. Required when inserting a new cell."
                         },
                         "edit_mode": {

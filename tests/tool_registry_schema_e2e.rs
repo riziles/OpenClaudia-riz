@@ -597,6 +597,26 @@ fn grounding_context_schema_advertises_id_and_stale_contract() {
 }
 
 #[test]
+fn notebook_edit_schema_advertises_all_runtime_cell_types() {
+    let def = registry()
+        .get("notebook_edit")
+        .expect("notebook_edit registered")
+        .definition();
+    let cell_type_enum = def
+        .pointer("/function/parameters/properties/cell_type/enum")
+        .and_then(Value::as_array)
+        .expect("notebook_edit cell_type enum");
+    let variants: Vec<&str> = cell_type_enum.iter().filter_map(Value::as_str).collect();
+
+    for expected in ["code", "markdown", "raw"] {
+        assert!(
+            variants.contains(&expected),
+            "notebook_edit cell_type schema must advertise runtime-supported {expected:?}; got {variants:?}"
+        );
+    }
+}
+
+#[test]
 fn file_tool_path_descriptions_match_relative_path_support() {
     for (tool_name, path_property) in [
         ("read_file", "path"),

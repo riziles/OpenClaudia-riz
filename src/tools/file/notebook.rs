@@ -1,4 +1,5 @@
 use super::{resolve_open_path, resolve_path, READ_TRACKER};
+use crate::tools::args::{ToolArgError, ToolArgs as _};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -172,26 +173,23 @@ struct EditOutcome {
 /// no path resolution — just argument shape and the `edit_mode` enum check.
 fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> {
     let raw_path = args
-        .get("notebook_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ("Missing 'notebook_path' argument".to_string(), true))?
+        .arg_str_strict("notebook_path")
+        .map_err(ToolArgError::into_tool_error)?
         .to_string();
 
     let new_source = args
-        .get("new_source")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ("Missing 'new_source' argument".to_string(), true))?
+        .arg_str_strict("new_source")
+        .map_err(ToolArgError::into_tool_error)?
         .to_string();
 
     let edit_mode = EditMode::parse(
-        args.get("edit_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("replace"),
+        args.arg_str_or_strict("edit_mode", "replace")
+            .map_err(ToolArgError::into_tool_error)?,
     )?;
 
     let cell_id = args
-        .get("cell_id")
-        .and_then(|v| v.as_str())
+        .arg_str_opt_strict("cell_id")
+        .map_err(ToolArgError::into_tool_error)?
         .map(str::to_string);
     // crosslink #470: do NOT saturate a u64 cell_number into usize::MAX. On a
     // 32-bit target the silent truncation would let `cell_number = u64::MAX`
@@ -200,18 +198,30 @@ fn parse_args(args: &HashMap<String, Value>) -> Result<ParsedArgs, ToolFailure> 
     // the error names the real cause (out-of-range index, not "out of bounds
     // for a 1-cell notebook"). The `?` returns `(message, true)` via the
     // ToolFailure shape used throughout this module.
-    let cell_number = match args.get("cell_number").and_then(serde_json::Value::as_u64) {
+    let cell_number = match args.get("cell_number") {
         None => None,
-        Some(n) => Some(usize::try_from(n).map_err(|_| {
-            (
-                format!("Cell number {n} is out of range for this platform."),
-                true,
-            )
-        })?),
+        Some(value) => {
+            let n = value.as_u64().ok_or_else(|| {
+                ToolArgError::WrongType {
+                    key: "cell_number",
+                    expected: "non-negative integer",
+                }
+                .into_tool_error()
+            })?;
+            Some(usize::try_from(n).map_err(|_| {
+                (
+                    format!("Cell number {n} is out of range for this platform."),
+                    true,
+                )
+            })?)
+        }
     };
     // crosslink #985: validate `cell_type` against the nbformat allowlist —
     // `code`, `markdown`, `raw` — instead of accepting any string verbatim.
-    let cell_type = match args.get("cell_type").and_then(|v| v.as_str()) {
+    let cell_type = match args
+        .arg_str_opt_strict("cell_type")
+        .map_err(ToolArgError::into_tool_error)?
+    {
         Some(s) => Some(CellType::parse(s)?),
         None => None,
     };
