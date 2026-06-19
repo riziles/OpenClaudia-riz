@@ -1612,6 +1612,67 @@ fn print_rejects_interactive_only_root_flags_instead_of_ignoring_them() {
 }
 
 #[test]
+fn subcommands_reject_unsupported_root_flags_before_config_loading() {
+    for (args, expected) in [
+        (
+            vec!["--session-id", "abc123", "doctor"],
+            "--session-id cannot be used with 'doctor'",
+        ),
+        (
+            vec!["--coordinator", "config"],
+            "--coordinator cannot be used with 'config'",
+        ),
+        (
+            vec!["--dangerously-skip-permissions", "init"],
+            "--dangerously-skip-permissions cannot be used with 'init'",
+        ),
+        (
+            vec!["--tui-mode", "auth", "--status"],
+            "--tui-mode cannot be used with 'auth'",
+        ),
+        (
+            vec!["--mode", "debug", "loop", "--max-iterations", "1"],
+            "--mode cannot be used with 'loop'",
+        ),
+        (
+            vec!["--target", "OpenAI", "config"],
+            "--target cannot be used with 'config'",
+        ),
+        (
+            vec!["--model", "gpt-5.5", "loop", "--max-iterations", "1"],
+            "--model cannot be used with 'loop'",
+        ),
+    ] {
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let output = isolated_command(&cwd, &home)
+            .args(&args)
+            .output()
+            .expect("openclaudia subcommand must run");
+
+        assert!(
+            !output.status.success(),
+            "subcommand with {args:?} must fail instead of ignoring the flag; stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains(expected),
+            "subcommand with {args:?} should reject with {expected:?}; got {combined:?}"
+        );
+        assert!(
+            !combined.contains("No configuration found"),
+            "subcommand with {args:?} should fail before config loading; got {combined:?}"
+        );
+    }
+}
+
+#[test]
 fn doctor_without_config_exits_nonzero() {
     assert_missing_config_is_failure(&["doctor"]);
 }
