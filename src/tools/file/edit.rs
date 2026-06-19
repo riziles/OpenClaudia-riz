@@ -238,7 +238,10 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
     // occurrences are replaced; when `false` (or absent) the existing
     // single-occurrence-with-multi-rejection behaviour is preserved.
     // crosslink #675: typed default-with-fallback accessor.
-    let replace_all = args.arg_bool_or("replace_all", false);
+    let replace_all = match args.arg_bool_or_strict("replace_all", false) {
+        Ok(value) => value,
+        Err(e) => return e.into_tool_error(),
+    };
 
     // Open ONCE with O_NOFOLLOW against the LEAF-PRESERVING path; all
     // I/O goes through this FD. See crosslink #417 (dup #428).
@@ -606,6 +609,25 @@ mod tests {
         );
         let after = std::fs::read_to_string(&path).expect("read back");
         assert!(after.contains("exactly once"));
+    }
+
+    #[test]
+    fn edit_rejects_non_boolean_replace_all() {
+        let (_f, path) = tmp_readable("alpha beta alpha\n");
+        let mut args = make_args(&path, "alpha", "omega");
+        args.insert("replace_all".to_string(), serde_json::json!("true"));
+
+        let (msg, is_err) = super::execute_edit_file(&args);
+
+        assert!(is_err, "non-boolean replace_all must error: {msg}");
+        assert!(
+            msg.contains("Invalid 'replace_all' argument: expected boolean"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alpha beta alpha\n"
+        );
     }
 
     // =========================================================================

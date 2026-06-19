@@ -511,6 +511,30 @@ fn grep_context_schema_advertises_non_negative_bound() {
 }
 
 #[test]
+fn boolean_tool_flag_schemas_match_runtime_validation() {
+    for (tool_name, flag_name) in [
+        ("bash", "run_in_background"),
+        ("edit_file", "replace_all"),
+        ("grep", "case_insensitive"),
+        ("exit_worktree", "apply_changes"),
+        ("exit_worktree", "discard_changes"),
+        ("cron_create", "recurring"),
+        ("cron_create", "durable"),
+    ] {
+        let def = registry()
+            .get(tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} registered"))
+            .definition();
+        let pointer = format!("/function/parameters/properties/{flag_name}/type");
+        assert_eq!(
+            def.pointer(&pointer).and_then(Value::as_str),
+            Some("boolean"),
+            "{tool_name}.{flag_name} must advertise boolean input"
+        );
+    }
+}
+
+#[test]
 fn tool_search_max_results_schema_advertises_bounds() {
     let def = registry()
         .get("tool_search")

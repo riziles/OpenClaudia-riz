@@ -415,6 +415,10 @@ impl ToolHandler for EditFileHandler {
                         "new_string": {
                             "type": "string",
                             "description": "The string to replace it with"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "If true, replace every occurrence of old_string. Defaults to false, which requires old_string to match exactly once."
                         }
                     },
                     "required": ["path", "old_string", "new_string"]

@@ -418,8 +418,14 @@ fn execute_cron_create_at<S: BuildHasher>(
         Ok(p) => p,
         Err(e) => return e.into_tool_error(),
     };
-    let recurring = args.arg_bool_or("recurring", true);
-    let durable = args.arg_bool_or("durable", true);
+    let recurring = match args.arg_bool_or_strict("recurring", true) {
+        Ok(value) => value,
+        Err(e) => return e.into_tool_error(),
+    };
+    let durable = match args.arg_bool_or_strict("durable", true) {
+        Ok(value) => value,
+        Err(e) => return e.into_tool_error(),
+    };
 
     if let Err(e) = validate_cron(&cron_expression) {
         return (format!("Invalid cron expression: {e}"), true);
@@ -931,6 +937,42 @@ mod tests {
             .expect("created schedule missing");
         assert!(!schedule.recurring);
         assert!(!schedule.durable);
+    }
+
+    #[test]
+    fn cron_create_rejects_non_boolean_recurring_and_durable_fields() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let path = temp_schedules_path(&tmp);
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), Value::String("bad-bools".to_string()));
+        args.insert(
+            "schedule".to_string(),
+            Value::String("0 12 * * *".to_string()),
+        );
+        args.insert(
+            "prompt".to_string(),
+            Value::String("noon check".to_string()),
+        );
+        args.insert("recurring".to_string(), Value::String("false".to_string()));
+
+        let (msg, is_err) = execute_cron_create_at(&args, &path);
+        assert!(is_err, "non-boolean recurring must error: {msg}");
+        assert!(
+            msg.contains("Invalid 'recurring' argument: expected boolean"),
+            "unexpected error: {msg}"
+        );
+
+        args.insert("recurring".to_string(), Value::Bool(true));
+        args.insert("durable".to_string(), Value::String("false".to_string()));
+
+        let (msg, is_err) = execute_cron_create_at(&args, &path);
+        assert!(is_err, "non-boolean durable must error: {msg}");
+        assert!(
+            msg.contains("Invalid 'durable' argument: expected boolean"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Regression #621: creation is capped at 50 scheduled jobs.

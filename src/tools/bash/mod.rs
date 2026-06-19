@@ -20,7 +20,7 @@ pub use policy::{
     validate_command,
 };
 
-use crate::tools::args::{into_legacy, ToolError, ToolOutput};
+use crate::tools::args::{into_legacy, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -707,9 +707,8 @@ pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, Too
 
     // Check if this should run in background
     let run_in_background = args
-        .get("run_in_background")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .arg_bool_or_strict("run_in_background", false)
+        .map_err(ToolError::InvalidArgument)?;
 
     if run_in_background {
         // Spawn background shell and return shell_id.
@@ -1376,6 +1375,26 @@ mod tests {
         assert!(
             msg.contains("rejected"),
             "b5_denylist: message must say 'rejected'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn b5_execute_bash_rejects_non_boolean_background_flag() {
+        let mut args = bash_args("echo should_not_run_in_background");
+        args.insert(
+            "run_in_background".to_string(),
+            Value::String("true".to_string()),
+        );
+
+        let (msg, is_error) = execute_bash(&args);
+
+        assert!(
+            is_error,
+            "non-boolean run_in_background must be rejected: {msg}"
+        );
+        assert!(
+            msg.contains("Invalid 'run_in_background' argument: expected boolean"),
+            "unexpected error: {msg}"
         );
     }
 

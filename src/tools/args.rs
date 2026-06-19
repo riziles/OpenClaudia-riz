@@ -18,7 +18,7 @@
 //! | [`ToolArgs::arg_string`]             | same, owned `String`                      |
 //! | [`ToolArgs::arg_str_opt`]            | optional string, no error                 |
 //! | [`ToolArgs::arg_str_or`]             | string with default                       |
-//! | [`ToolArgs::arg_bool_or`]            | bool with default                         |
+//! | [`ToolArgs::arg_bool_or_strict`]     | optional bool, reject wrong type          |
 //!
 //! `ToolArgError`'s `Display` produces the canonical phrasing
 //! `Missing 'KEY' argument`, matching the prevalent style in the codebase
@@ -59,6 +59,14 @@ pub enum ToolArgError {
         /// The argument key that the executor asked for.
         key: &'static str,
     },
+    /// The requested key is optional, but was supplied with the wrong JSON
+    /// type.
+    WrongType {
+        /// The argument key that the executor asked for.
+        key: &'static str,
+        /// Human-readable expected type name.
+        expected: &'static str,
+    },
 }
 
 impl ToolArgError {
@@ -76,6 +84,9 @@ impl std::fmt::Display for ToolArgError {
         match self {
             Self::MissingOrWrongType { key } => {
                 write!(f, "Missing '{key}' argument")
+            }
+            Self::WrongType { key, expected } => {
+                write!(f, "Invalid '{key}' argument: expected {expected}")
             }
         }
     }
@@ -269,9 +280,14 @@ pub trait ToolArgs {
     /// `"replace"`), LSP (`action` defaults to `"hover"`).
     fn arg_str_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str;
 
-    /// Boolean argument with a fallback default. Used by bash
-    /// (`run_in_background`), worktree (`apply_changes`).
-    fn arg_bool_or(&self, key: &str, default: bool) -> bool;
+    /// Optional boolean argument with a fallback default for absent values,
+    /// while rejecting present non-boolean values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolArgError::WrongType`] when `key` is present but not a
+    /// JSON boolean.
+    fn arg_bool_or_strict(&self, key: &'static str, default: bool) -> Result<bool, ToolArgError>;
 }
 
 impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
@@ -289,8 +305,13 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
         self.get(key).and_then(Value::as_str).unwrap_or(default)
     }
 
-    fn arg_bool_or(&self, key: &str, default: bool) -> bool {
-        self.get(key).and_then(Value::as_bool).unwrap_or(default)
+    fn arg_bool_or_strict(&self, key: &'static str, default: bool) -> Result<bool, ToolArgError> {
+        self.get(key).map_or(Ok(default), |value| {
+            value.as_bool().ok_or(ToolArgError::WrongType {
+                key,
+                expected: "boolean",
+            })
+        })
     }
 }
 
@@ -394,26 +415,34 @@ mod tests {
         assert_eq!(m.arg_str_or("count", "fallback"), "fallback");
     }
 
-    // ── arg_bool_or ─────────────────────────────────────────────────────
+    // ── arg_bool_or_strict ─────────────────────────────────────────────
 
     #[test]
-    fn arg_bool_or_returns_value_when_present_and_bool() {
+    fn arg_bool_or_strict_returns_value_when_present_and_bool() {
         let m = make();
-        assert!(m.arg_bool_or("enabled", false));
+        assert!(m.arg_bool_or_strict("enabled", false).unwrap());
     }
 
     #[test]
-    fn arg_bool_or_returns_default_when_missing() {
+    fn arg_bool_or_strict_returns_default_when_missing() {
         let m = make();
-        assert!(!m.arg_bool_or("absent", false));
-        assert!(m.arg_bool_or("absent", true));
+        assert!(!m.arg_bool_or_strict("absent", false).unwrap());
+        assert!(m.arg_bool_or_strict("absent", true).unwrap());
     }
 
     #[test]
-    fn arg_bool_or_returns_default_when_wrong_type() {
-        // A string "true" is NOT coerced — match prior `as_bool` behaviour.
+    fn arg_bool_or_strict_errors_when_present_with_wrong_type() {
         let m = make();
-        assert!(!m.arg_bool_or("name", false));
+        let err = m.arg_bool_or_strict("name", false).unwrap_err();
+
+        assert_eq!(
+            err,
+            ToolArgError::WrongType {
+                key: "name",
+                expected: "boolean",
+            }
+        );
+        assert_eq!(err.to_string(), "Invalid 'name' argument: expected boolean");
     }
 
     // ── BuildHasher compatibility ──────────────────────────────────────

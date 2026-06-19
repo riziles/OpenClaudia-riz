@@ -29,6 +29,7 @@
 //! file / lsp tool calls) is tracked separately — see the follow-up issue
 //! filed against #345.
 
+use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -529,18 +530,16 @@ fn validate_exit_request<S: std::hash::BuildHasher>(
     }
 
     let apply_changes = args
-        .get("apply_changes")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .arg_bool_or_strict("apply_changes", false)
+        .map_err(crate::tools::args::ToolArgError::into_tool_error)?;
 
     // Crosslink #623: opt-in flag that lets the caller acknowledge the loss
     // of uncommitted work. Defaults to `false`, which causes the safety
     // gate in `execute_exit_worktree` to refuse destructive removal when
     // the worktree is dirty.
     let discard_changes = args
-        .get("discard_changes")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .arg_bool_or_strict("discard_changes", false)
+        .map_err(crate::tools::args::ToolArgError::into_tool_error)?;
 
     let common_dir = match git_in(&worktree_path, &["rev-parse", "--git-common-dir"]) {
         Ok(output) if output.status.success() => {
@@ -1029,6 +1028,40 @@ mod tests {
         assert!(
             msg.contains("'path' is required"),
             "error message must mention required path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn exit_worktree_rejects_non_boolean_control_flags() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut args = HashMap::new();
+        args.insert(
+            "path".to_string(),
+            serde_json::Value::String(tmp.path().display().to_string()),
+        );
+        args.insert(
+            "apply_changes".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+
+        let (msg, is_err) = execute_exit_worktree(&args);
+        assert!(is_err, "non-boolean apply_changes must error: {msg}");
+        assert!(
+            msg.contains("Invalid 'apply_changes' argument: expected boolean"),
+            "unexpected error: {msg}"
+        );
+
+        args.insert("apply_changes".to_string(), serde_json::Value::Bool(false));
+        args.insert(
+            "discard_changes".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+
+        let (msg, is_err) = execute_exit_worktree(&args);
+        assert!(is_err, "non-boolean discard_changes must error: {msg}");
+        assert!(
+            msg.contains("Invalid 'discard_changes' argument: expected boolean"),
+            "unexpected error: {msg}"
         );
     }
 

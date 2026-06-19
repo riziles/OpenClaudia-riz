@@ -66,7 +66,10 @@ pub fn execute_grep(args: &HashMap<String, Value>) -> (String, bool) {
         Ok(context) => context,
         Err(msg) => return (msg, true),
     };
-    let case_insensitive = args.arg_bool_or("case_insensitive", false);
+    let case_insensitive = match args.arg_bool_or_strict("case_insensitive", false) {
+        Ok(value) => value,
+        Err(e) => return e.into_tool_error(),
+    };
 
     let effective_pattern = if case_insensitive {
         format!("(?i){pattern}")
@@ -347,5 +350,26 @@ mod tests {
         let (out, err) = execute_grep(&args);
         assert!(!err);
         assert!(out.contains("x.txt:1:"), "case-insensitive miss: {out}");
+    }
+
+    #[test]
+    fn grep_rejects_non_boolean_case_insensitive() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "x.txt", "hello\n");
+        let mut args = HashMap::new();
+        args.insert("pattern".to_string(), json!("hello"));
+        args.insert(
+            "path".to_string(),
+            json!(dir.path().to_string_lossy().to_string()),
+        );
+        args.insert("case_insensitive".to_string(), json!("true"));
+
+        let (out, err) = execute_grep(&args);
+
+        assert!(err, "non-boolean case_insensitive must error: {out}");
+        assert!(
+            out.contains("Invalid 'case_insensitive' argument: expected boolean"),
+            "unexpected error: {out}"
+        );
     }
 }
