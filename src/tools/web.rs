@@ -43,6 +43,7 @@ const WEB_TOOL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg(feature = "browser")]
 const WEB_BROWSER_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
+const WEB_SEARCH_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 const WEB_SEARCH_DEFAULT_LIMIT: usize = 5;
 const WEB_SEARCH_MAX_LIMIT: usize = 10;
@@ -510,6 +511,13 @@ fn parse_domain_list(args: &HashMap<String, Value>, key: &str) -> Result<Vec<Str
 /// name the same domain.
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
 pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
+    execute_web_search_with_backend(args, |query, limit| web::search_web(&query, limit))
+}
+
+fn execute_web_search_with_backend<F>(args: &HashMap<String, Value>, backend: F) -> (String, bool)
+where
+    F: FnOnce(String, usize) -> Result<Vec<web::SearchResult>, String> + Send + 'static,
+{
     // crosslink #675: typed accessors.
     let query = match args.arg_str_strict("query") {
         Ok(q) => q,
@@ -533,7 +541,7 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e, true),
     };
 
-    let result = web::search_web(query, limit);
+    let result = run_web_search_backend(query.to_string(), limit, WEB_SEARCH_TOOL_TIMEOUT, backend);
 
     match result {
         Ok(mut results) => {
@@ -558,6 +566,29 @@ pub fn execute_web_search(args: &HashMap<String, Value>) -> (String, bool) {
         }
         Err(e) => (format!("Search failed: {e}"), true),
     }
+}
+
+fn run_web_search_backend<F>(
+    query: String,
+    limit: usize,
+    timeout: Duration,
+    backend: F,
+) -> Result<Vec<web::SearchResult>, String>
+where
+    F: FnOnce(String, usize) -> Result<Vec<web::SearchResult>, String> + Send + 'static,
+{
+    run_blocking(async move {
+        let task = tokio::task::spawn_blocking(move || backend(query, limit));
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => Err(format!("web search task panicked: {join_err}")),
+            Err(_) => Err(format!(
+                "web search timed out after {} ms",
+                timeout.as_millis()
+            )),
+        }
+    })
+    .map_err(|e| format!("web search dispatch failed: {e}"))?
 }
 
 fn parse_web_search_limit(value: Option<&Value>) -> Result<usize, String> {
@@ -814,6 +845,73 @@ mod tests {
         assert!(
             err.contains("timed out"),
             "timeout error must explain the failed dispatch: {err}"
+        );
+    }
+
+    #[test]
+    fn web_search_backend_timeout_returns_error_instead_of_hanging() {
+        let result = run_web_search_backend(
+            "rust".to_string(),
+            5,
+            Duration::from_millis(25),
+            |_query, _limit| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(Vec::new())
+            },
+        );
+
+        let err = result.expect_err("slow browser search backend must time out");
+        assert!(
+            err.contains("timed out"),
+            "timeout error must explain the failed search dispatch: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_web_search_with_backend_filters_and_formats_without_live_network() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_for_backend = seen.clone();
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), Value::String("rust async".to_string()));
+        args.insert("limit".to_string(), json!(7));
+        args.insert("allowed_domains".to_string(), json!(["example.com"]));
+        args.insert(
+            "blocked_domains".to_string(),
+            json!(["blocked.example.com"]),
+        );
+
+        let (msg, is_err) = execute_web_search_with_backend(&args, move |query, limit| {
+            *seen_for_backend.lock().expect("seen lock") = Some((query, limit));
+            Ok(vec![
+                web::SearchResult {
+                    title: "Keep".to_string(),
+                    url: "https://docs.example.com/rust".to_string(),
+                    snippet: "kept".to_string(),
+                },
+                web::SearchResult {
+                    title: "Blocked".to_string(),
+                    url: "https://blocked.example.com/rust".to_string(),
+                    snippet: "blocked".to_string(),
+                },
+                web::SearchResult {
+                    title: "Other".to_string(),
+                    url: "https://other.test/rust".to_string(),
+                    snippet: "other".to_string(),
+                },
+            ])
+        });
+
+        assert!(!is_err, "search should format injected results: {msg}");
+        assert!(
+            msg.contains("Keep") && msg.contains("https://docs.example.com/rust"),
+            "allowed result must remain: {msg}"
+        );
+        assert!(!msg.contains("Blocked"), "blocked result must be removed");
+        assert!(!msg.contains("Other"), "non-allowed result must be removed");
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            Some(("rust async".to_string(), 7)),
+            "runner must pass query and parsed limit to backend"
         );
     }
 
