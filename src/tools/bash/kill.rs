@@ -1,4 +1,5 @@
 use super::BACKGROUND_SHELLS;
+use crate::tools::args::ToolArgError;
 use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(not(unix))]
@@ -6,8 +7,16 @@ use std::process::Command;
 
 /// Kill a background shell
 pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
-    let Some(shell_id) = args.get("shell_id").and_then(|v| v.as_str()) else {
-        return ("Missing 'shell_id' argument".to_string(), true);
+    let shell_id = match args.get("shell_id") {
+        None => return ("Missing 'shell_id' argument".to_string(), true),
+        Some(Value::String(shell_id)) => shell_id.as_str(),
+        Some(_) => {
+            return ToolArgError::WrongType {
+                key: "shell_id",
+                expected: "string",
+            }
+            .into_tool_error();
+        }
     };
 
     match BACKGROUND_SHELLS.kill(shell_id) {
@@ -18,8 +27,16 @@ pub fn execute_kill_shell(args: &HashMap<String, Value>) -> (String, bool) {
 
 /// Kill every background shell owned by an agent/session id.
 pub fn execute_kill_shells_for_agent(args: &HashMap<String, Value>) -> (String, bool) {
-    let Some(agent_id) = args.get("agent_id").and_then(|v| v.as_str()) else {
-        return ("Missing 'agent_id' argument".to_string(), true);
+    let agent_id = match args.get("agent_id") {
+        None => return ("Missing 'agent_id' argument".to_string(), true),
+        Some(Value::String(agent_id)) => agent_id.as_str(),
+        Some(_) => {
+            return ToolArgError::WrongType {
+                key: "agent_id",
+                expected: "string",
+            }
+            .into_tool_error();
+        }
     };
     if agent_id.is_empty() {
         return ("Missing 'agent_id' argument".to_string(), true);
@@ -157,6 +174,30 @@ mod tests {
         assert!(
             msg.contains("Missing"),
             "b2_kill_missing_arg: message must contain 'Missing'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn b2_kill_rejects_non_string_shell_id_arg() {
+        let mut args = HashMap::new();
+        args.insert("shell_id".to_string(), serde_json::json!(42));
+        let (msg, is_error) = execute_kill_shell(&args);
+        assert!(is_error, "non-string shell_id must be rejected: {msg}");
+        assert!(
+            msg.contains("Invalid 'shell_id' argument: expected string"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn kill_shells_for_agent_rejects_non_string_agent_id_arg() {
+        let mut args = HashMap::new();
+        args.insert("agent_id".to_string(), serde_json::json!(42));
+        let (msg, is_error) = execute_kill_shells_for_agent(&args);
+        assert!(is_error, "non-string agent_id must be rejected: {msg}");
+        assert!(
+            msg.contains("Invalid 'agent_id' argument: expected string"),
+            "unexpected error: {msg}"
         );
     }
 

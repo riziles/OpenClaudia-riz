@@ -62,41 +62,41 @@ fn missing_command_arg_returns_error_without_spawning() {
 }
 
 #[test]
-fn command_arg_as_number_treated_as_missing() {
+fn command_arg_as_number_returns_validation_error() {
     let args = args_with(&[("command", json!(42))]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("command") || msg.contains("Missing"),
-        "non-string command MUST surface missing-arg error; got {msg:?}"
+        msg.contains("Invalid 'command' argument: expected string"),
+        "non-string command MUST be rejected clearly; got {msg:?}"
     );
 }
 
 #[test]
-fn command_arg_as_array_treated_as_missing() {
+fn command_arg_as_array_returns_validation_error() {
     let args = args_with(&[("command", json!(["echo", "hi"]))]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("command") || msg.contains("Missing"),
-        "array command MUST surface missing-arg error; got {msg:?}"
+        msg.contains("Invalid 'command' argument: expected string"),
+        "array command MUST be rejected clearly; got {msg:?}"
     );
 }
 
 #[test]
-fn command_arg_as_object_treated_as_missing() {
+fn command_arg_as_object_returns_validation_error() {
     let args = args_with(&[("command", json!({"cmd": "echo"}))]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("command") || msg.contains("Missing"));
+    assert!(msg.contains("Invalid 'command' argument: expected string"));
 }
 
 #[test]
-fn command_arg_as_null_treated_as_missing() {
+fn command_arg_as_null_returns_validation_error() {
     let args = args_with(&[("command", Value::Null)]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("command") || msg.contains("Missing"));
+    assert!(msg.contains("Invalid 'command' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

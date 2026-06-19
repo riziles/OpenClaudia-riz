@@ -20,7 +20,7 @@ pub use policy::{
     validate_command,
 };
 
-use crate::tools::args::{into_legacy, ToolArgs as _, ToolError, ToolOutput};
+use crate::tools::args::{into_legacy, ToolArgError, ToolArgs as _, ToolError, ToolOutput};
 use crate::tools::safe_truncate;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -667,10 +667,20 @@ pub(crate) fn find_git_bash() -> Option<std::path::PathBuf> {
 /// - [`ToolError::Other`] when the background shell manager refuses the
 ///   spawn (e.g. cap reached). Preserves the existing message verbatim.
 pub fn try_execute_bash(args: &HashMap<String, Value>) -> Result<ToolOutput, ToolError> {
-    let command = args
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ToolError::InvalidInput("Missing 'command' argument".to_string()))?;
+    let command = match args.get("command") {
+        None => {
+            return Err(ToolError::InvalidInput(
+                "Missing 'command' argument".to_string(),
+            ))
+        }
+        Some(Value::String(command)) => command.as_str(),
+        Some(_) => {
+            return Err(ToolError::InvalidArgument(ToolArgError::WrongType {
+                key: "command",
+                expected: "string",
+            }));
+        }
+    };
 
     if let Err(msg) = validate_command(command) {
         return Err(ToolError::InvalidInput(msg));
@@ -1361,6 +1371,18 @@ mod tests {
         assert!(
             msg.contains("Missing"),
             "b5_missing_cmd: message must say 'Missing'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn b5_execute_bash_rejects_non_string_command_arg() {
+        let mut args = HashMap::new();
+        args.insert("command".to_string(), Value::Number(42.into()));
+        let (msg, is_error) = execute_bash(&args);
+        assert!(is_error, "non-string command must be rejected: {msg}");
+        assert!(
+            msg.contains("Invalid 'command' argument: expected string"),
+            "unexpected error: {msg}"
         );
     }
 

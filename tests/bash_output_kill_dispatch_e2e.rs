@@ -74,26 +74,22 @@ fn bash_output_with_no_shell_id_lists_background_shells() {
 }
 
 #[test]
-fn bash_output_with_null_shell_id_treated_as_list_mode() {
+fn bash_output_with_null_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", Value::Null)]);
-    let (text, is_err) = dispatch_bash_output(&args);
-    assert!(!is_err);
+    let (msg, is_err) = dispatch_bash_output(&args);
+    assert!(is_err);
     assert!(
-        text.contains("background shells") || text.contains("No background shells running"),
-        "null shell_id MUST behave as omitted; got {text:?}"
+        msg.contains("Invalid 'shell_id' argument: expected string"),
+        "present null shell_id MUST be rejected clearly; got {msg:?}"
     );
 }
 
 #[test]
-fn bash_output_with_number_shell_id_treated_as_list_mode() {
-    // Non-string shell_id → as_str returns None → list branch.
+fn bash_output_with_number_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(42))]);
-    let (text, is_err) = dispatch_bash_output(&args);
-    assert!(!is_err);
-    assert!(
-        text.contains("background shells") || text.contains("No background shells running"),
-        "number shell_id MUST behave as omitted; got {text:?}"
-    );
+    let (msg, is_err) = dispatch_bash_output(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -138,38 +134,38 @@ fn kill_shell_with_no_shell_id_returns_documented_error() {
 }
 
 #[test]
-fn kill_shell_with_number_shell_id_treated_as_missing() {
+fn kill_shell_with_number_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(42))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Missing 'shell_id' argument"),
-        "non-string shell_id MUST surface missing-arg; got {msg:?}"
+        msg.contains("Invalid 'shell_id' argument: expected string"),
+        "non-string shell_id MUST be rejected clearly; got {msg:?}"
     );
 }
 
 #[test]
-fn kill_shell_with_array_shell_id_treated_as_missing() {
+fn kill_shell_with_array_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!(["a"]))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'shell_id' argument"));
+    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
 }
 
 #[test]
-fn kill_shell_with_object_shell_id_treated_as_missing() {
+fn kill_shell_with_object_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", json!({"k": "v"}))]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'shell_id' argument"));
+    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
 }
 
 #[test]
-fn kill_shell_with_null_shell_id_treated_as_missing() {
+fn kill_shell_with_null_shell_id_returns_validation_error() {
     let args = args_with(&[("shell_id", Value::Null)]);
     let (msg, is_err) = dispatch_kill_shell(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'shell_id' argument"));
+    assert!(msg.contains("Invalid 'shell_id' argument: expected string"));
 }
 
 #[test]
@@ -183,13 +179,13 @@ fn kill_shells_for_agent_with_no_agent_id_returns_documented_error() {
 }
 
 #[test]
-fn kill_shells_for_agent_with_non_string_agent_id_treated_as_missing() {
+fn kill_shells_for_agent_with_non_string_agent_id_returns_validation_error() {
     let args = args_with(&[("agent_id", json!(42))]);
     let (msg, is_err) = dispatch_kill_shells_for_agent(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Missing 'agent_id' argument"),
-        "non-string agent_id MUST surface missing-arg; got {msg:?}"
+        msg.contains("Invalid 'agent_id' argument: expected string"),
+        "non-string agent_id MUST be rejected clearly; got {msg:?}"
     );
 }
 
