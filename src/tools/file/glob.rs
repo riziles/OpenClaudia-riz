@@ -61,7 +61,10 @@ pub fn execute_glob(args: &HashMap<String, Value>) -> (String, bool) {
         Err(e) => return (e.to_string(), true),
     };
 
-    let raw_path = args.arg_str_or("path", ".");
+    let raw_path = match args.arg_str_or_strict("path", ".") {
+        Ok(path) => path,
+        Err(e) => return e.into_tool_error(),
+    };
     let root = match resolve_path(raw_path) {
         Ok(p) => p,
         Err(e) => return (e, true),
@@ -306,6 +309,21 @@ mod tests {
         let (out, err) = execute_glob(&args);
         assert!(err, "missing pattern must be an error: {out}");
         assert!(out.contains("pattern"), "error must name the arg: {out}");
+    }
+
+    #[test]
+    fn glob_rejects_non_string_path() {
+        let mut args = HashMap::new();
+        args.insert("pattern".to_string(), json!("*.rs"));
+        args.insert("path".to_string(), json!(42));
+
+        let (out, err) = execute_glob(&args);
+
+        assert!(err, "non-string path must be an error: {out}");
+        assert!(
+            out.contains("Invalid 'path' argument: expected string"),
+            "unexpected error: {out}"
+        );
     }
 
     /// Pin: the glob walker is robust against unusual but legal glob

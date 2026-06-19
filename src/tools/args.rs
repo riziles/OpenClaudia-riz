@@ -17,7 +17,7 @@
 //! | [`ToolArgs::arg_str`]                | required string — returns [`ToolArgError`]|
 //! | [`ToolArgs::arg_string`]             | same, owned `String`                      |
 //! | [`ToolArgs::arg_str_opt`]            | optional string, no error                 |
-//! | [`ToolArgs::arg_str_or`]             | string with default                       |
+//! | [`ToolArgs::arg_str_or_strict`]      | optional string default, reject wrong type|
 //! | [`ToolArgs::arg_bool_or_strict`]     | optional bool, reject wrong type          |
 //!
 //! `ToolArgError`'s `Display` produces the canonical phrasing
@@ -275,10 +275,18 @@ pub trait ToolArgs {
     /// drop-in replacement for `args.get(k).and_then(|v| v.as_str())`.
     fn arg_str_opt(&self, key: &str) -> Option<&str>;
 
-    /// String argument with a fallback default. Used by `list.rs`
-    /// (`path` defaults to `"."`), notebook (`edit_mode` defaults to
-    /// `"replace"`), LSP (`action` defaults to `"hover"`).
-    fn arg_str_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str;
+    /// Optional string argument with a fallback default for absent values,
+    /// while rejecting present non-string values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolArgError::WrongType`] when `key` is present but not a
+    /// JSON string.
+    fn arg_str_or_strict<'a>(
+        &'a self,
+        key: &'static str,
+        default: &'a str,
+    ) -> Result<&'a str, ToolArgError>;
 
     /// Optional boolean argument with a fallback default for absent values,
     /// while rejecting present non-boolean values.
@@ -301,8 +309,17 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
         self.get(key).and_then(Value::as_str)
     }
 
-    fn arg_str_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
-        self.get(key).and_then(Value::as_str).unwrap_or(default)
+    fn arg_str_or_strict<'a>(
+        &'a self,
+        key: &'static str,
+        default: &'a str,
+    ) -> Result<&'a str, ToolArgError> {
+        self.get(key).map_or(Ok(default), |value| {
+            value.as_str().ok_or(ToolArgError::WrongType {
+                key,
+                expected: "string",
+            })
+        })
     }
 
     fn arg_bool_or_strict(&self, key: &'static str, default: bool) -> Result<bool, ToolArgError> {
@@ -393,26 +410,36 @@ mod tests {
         assert_eq!(m.arg_str_opt("count"), None, "number must not coerce");
     }
 
-    // ── arg_str_or ──────────────────────────────────────────────────────
+    // ── arg_str_or_strict ──────────────────────────────────────────────
 
     #[test]
-    fn arg_str_or_returns_value_when_present() {
+    fn arg_str_or_strict_returns_value_when_present() {
         let m = make();
-        assert_eq!(m.arg_str_or("name", "default"), "alice");
+        assert_eq!(m.arg_str_or_strict("name", "default").unwrap(), "alice");
     }
 
     #[test]
-    fn arg_str_or_returns_default_when_missing() {
+    fn arg_str_or_strict_returns_default_when_missing() {
         let m = make();
-        assert_eq!(m.arg_str_or("absent", "fallback"), "fallback");
+        assert_eq!(
+            m.arg_str_or_strict("absent", "fallback").unwrap(),
+            "fallback"
+        );
     }
 
     #[test]
-    fn arg_str_or_returns_default_when_wrong_type() {
-        // A non-string value at the key must fall through to the default,
-        // matching the prior `as_str().unwrap_or(default)` semantics.
+    fn arg_str_or_strict_errors_when_present_with_wrong_type() {
         let m = make();
-        assert_eq!(m.arg_str_or("count", "fallback"), "fallback");
+        let err = m.arg_str_or_strict("count", "fallback").unwrap_err();
+
+        assert_eq!(
+            err,
+            ToolArgError::WrongType {
+                key: "count",
+                expected: "string",
+            }
+        );
+        assert_eq!(err.to_string(), "Invalid 'count' argument: expected string");
     }
 
     // ── arg_bool_or_strict ─────────────────────────────────────────────

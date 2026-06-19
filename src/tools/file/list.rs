@@ -13,7 +13,10 @@ use std::fs;
 /// the model then acted on incomplete information.
 pub fn execute_list_files(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessor (default-with-fallback variant).
-    let raw_path = args.arg_str_or("path", ".");
+    let raw_path = match args.arg_str_or_strict("path", ".") {
+        Ok(path) => path,
+        Err(e) => return e.into_tool_error(),
+    };
 
     let path = match resolve_path(raw_path) {
         Ok(p) => p,

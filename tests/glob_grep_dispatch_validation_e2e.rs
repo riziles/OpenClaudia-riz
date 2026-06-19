@@ -6,7 +6,7 @@
 //! covered direct execute_* calls; this file pins the
 //! registry-dispatched path so the wire-facing contract
 //! matches, exercising the typed `arg_str` /
-//! `arg_str_or` accessors (#675) end to end.
+//! `arg_str_or_strict` accessors (#675) end to end.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -85,6 +85,17 @@ fn glob_path_with_parent_dir_traversal_rejected() {
     assert!(
         msg.contains("traversal") || msg.contains("Path"),
         "MUST surface traversal rejection; got {msg:?}"
+    );
+}
+
+#[test]
+fn glob_path_as_number_returns_validation_error() {
+    let args = args_with(&[("pattern", json!("*.rs")), ("path", json!(42))]);
+    let (msg, is_err) = dispatch("glob", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid 'path' argument: expected string"),
+        "non-string glob path MUST be rejected; got {msg:?}"
     );
 }
 
@@ -263,6 +274,17 @@ fn grep_path_with_parent_dir_traversal_rejected() {
     );
 }
 
+#[test]
+fn grep_path_as_array_returns_validation_error() {
+    let args = args_with(&[("pattern", json!("foo")), ("path", json!(["."]))]);
+    let (msg, is_err) = dispatch("grep", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid 'path' argument: expected string"),
+        "non-string grep path MUST be rejected; got {msg:?}"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section H — context_lines validation
 // ───────────────────────────────────────────────────────────────────────────
@@ -311,8 +333,7 @@ fn glob_and_grep_both_registered() {
 
 #[test]
 fn glob_and_grep_default_path_is_cwd_dot() {
-    // PINS DEFAULT: arg_str_or("path", ".") — omitted path
-    // defaults to current dir. No traversal, no error.
+    // PINS DEFAULT: omitted path defaults to current dir. No traversal, no error.
     let g_args = args_with(&[("pattern", json!("*.nomatch"))]);
     let (_g_msg, _) = dispatch("glob", &g_args);
     // glob succeeds (empty result) — pin: not a path-error message.

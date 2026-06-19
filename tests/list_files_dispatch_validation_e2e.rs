@@ -41,25 +41,31 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 
 #[test]
 fn missing_path_arg_defaults_to_cwd_dot() {
-    // PINS DEFAULT: arg_str_or("path", ".") — omitted path
-    // defaults to current dir. Should NOT error.
+    // PINS DEFAULT: omitted path defaults to current dir and should not error.
     let (msg, is_err) = dispatch_list(&HashMap::new());
     assert!(!is_err, "default path . MUST succeed; got {msg:?}");
 }
 
 #[test]
-fn path_arg_as_number_falls_back_to_default_cwd() {
-    // arg_str_or falls back to default when as_str returns None.
+fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42))]);
-    let (_msg, is_err) = dispatch_list(&args);
-    assert!(!is_err, "non-string path falls back to . default");
+    let (msg, is_err) = dispatch_list(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid 'path' argument: expected string"),
+        "non-string path MUST be rejected; got {msg:?}"
+    );
 }
 
 #[test]
-fn path_arg_as_null_falls_back_to_default_cwd() {
+fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null)]);
-    let (_msg, is_err) = dispatch_list(&args);
-    assert!(!is_err);
+    let (msg, is_err) = dispatch_list(&args);
+    assert!(is_err);
+    assert!(
+        msg.contains("Invalid 'path' argument: expected string"),
+        "null path MUST be rejected; got {msg:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
