@@ -1473,6 +1473,10 @@ impl ToolHandler for ListMcpResourcesHandler {
         })
     }
     fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
+        let server_filter = match optional_registry_string_arg(args, "server") {
+            Ok(server) => server.map(str::to_string),
+            Err(err) => return (format!("list_mcp_resources: {err}"), true),
+        };
         let Some(mgr) = crate::mcp::registered_manager() else {
             return (
                 "No MCP manager has been installed for this session. \
@@ -1482,10 +1486,6 @@ impl ToolHandler for ListMcpResourcesHandler {
                 true,
             );
         };
-        let server_filter = args
-            .get("server")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         // We're already inside `pipeline::execute_single_tool`'s
         // `spawn_blocking` thread, so blocking on the runtime here
         // does NOT pin the current_thread executor. See the docstring
@@ -1565,17 +1565,13 @@ impl ToolHandler for ReadMcpResourceHandler {
         })
     }
     fn execute(&self, args: &HashMap<String, Value>, _ctx: &mut ToolContext<'_>) -> (String, bool) {
-        let Some(server) = args.get("server").and_then(Value::as_str) else {
-            return (
-                "read_mcp_resource: missing required argument `server`".to_string(),
-                true,
-            );
+        let server = match required_registry_string_arg(args, "read_mcp_resource", "server") {
+            Ok(server) => server,
+            Err(result) => return result,
         };
-        let Some(uri) = args.get("uri").and_then(Value::as_str) else {
-            return (
-                "read_mcp_resource: missing required argument `uri`".to_string(),
-                true,
-            );
+        let uri = match required_registry_string_arg(args, "read_mcp_resource", "uri") {
+            Ok(uri) => uri,
+            Err(result) => return result,
         };
         let Some(mgr) = crate::mcp::registered_manager() else {
             return (
@@ -1606,6 +1602,36 @@ impl ToolHandler for ReadMcpResourceHandler {
             Err(e) => (format!("read_mcp_resource failed: {e}"), true),
         }
     }
+}
+
+fn optional_registry_string_arg<'a>(
+    args: &'a HashMap<String, Value>,
+    key: &'static str,
+) -> Result<Option<&'a str>, String> {
+    args.get(key).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("Invalid '{key}' argument: expected string"))
+    })
+}
+
+fn required_registry_string_arg<'a>(
+    args: &'a HashMap<String, Value>,
+    tool: &str,
+    key: &'static str,
+) -> Result<&'a str, (String, bool)> {
+    args.get(key).map_or_else(
+        || Err((format!("{tool}: missing required argument `{key}`"), true)),
+        |value| {
+            value.as_str().ok_or_else(|| {
+                (
+                    format!("{tool}: Invalid '{key}' argument: expected string"),
+                    true,
+                )
+            })
+        },
+    )
 }
 
 // ── skill (crosslink #612) ───────────────────────────────────────────────────

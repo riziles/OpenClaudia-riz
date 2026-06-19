@@ -69,6 +69,21 @@ fn list_mcp_resources_with_server_arg_reports_missing_registered_manager() {
 }
 
 #[test]
+fn list_mcp_resources_rejects_non_string_server_before_manager_lookup() {
+    let args = args_with(&[("server", json!(42))]);
+    let (msg, is_err) = dispatch("list_mcp_resources", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("list_mcp_resources: Invalid 'server' argument: expected string"),
+        "server type error should be explicit and precede manager lookup; got {msg:?}"
+    );
+    assert!(
+        !msg.contains("No MCP manager has been installed"),
+        "wrong-type server must not fall through to manager lookup; got {msg:?}"
+    );
+}
+
+#[test]
 fn list_mcp_resources_with_arbitrary_args_reports_error_no_panic() {
     let args = args_with(&[
         ("server", json!("x")),
@@ -102,6 +117,32 @@ fn read_mcp_resource_with_server_but_no_uri_reports_missing_uri() {
     assert!(
         msg.contains("read_mcp_resource: missing required argument `uri`"),
         "must validate required uri arg before manager lookup; got {msg:?}"
+    );
+}
+
+#[test]
+fn read_mcp_resource_rejects_non_string_server_before_uri_lookup() {
+    let args = args_with(&[("server", json!(false)), ("uri", json!("file:///example"))]);
+    let (msg, is_err) = dispatch("read_mcp_resource", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("read_mcp_resource: Invalid 'server' argument: expected string"),
+        "server type error should be explicit; got {msg:?}"
+    );
+}
+
+#[test]
+fn read_mcp_resource_rejects_non_string_uri_before_manager_lookup() {
+    let args = args_with(&[("server", json!("test-server")), ("uri", json!(["bad"]))]);
+    let (msg, is_err) = dispatch("read_mcp_resource", &args);
+    assert!(is_err);
+    assert!(
+        msg.contains("read_mcp_resource: Invalid 'uri' argument: expected string"),
+        "uri type error should be explicit and precede manager lookup; got {msg:?}"
+    );
+    assert!(
+        !msg.contains("No MCP manager has been installed"),
+        "wrong-type uri must not fall through to manager lookup; got {msg:?}"
     );
 }
 
