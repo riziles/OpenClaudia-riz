@@ -17,7 +17,6 @@
 //! | [`ToolArgs::arg_str`]                | required string — returns [`ToolArgError`]|
 //! | [`ToolArgs::arg_str_strict`]         | required string, reject wrong type        |
 //! | [`ToolArgs::arg_string`]             | same, owned `String`                      |
-//! | [`ToolArgs::arg_str_opt`]            | optional string, no error                 |
 //! | [`ToolArgs::arg_str_opt_strict`]     | optional string, reject wrong type        |
 //! | [`ToolArgs::arg_str_or_strict`]      | optional string default, reject wrong type|
 //! | [`ToolArgs::arg_bool_or_strict`]     | optional bool, reject wrong type          |
@@ -284,10 +283,6 @@ pub trait ToolArgs {
         self.arg_str(key).map(str::to_owned)
     }
 
-    /// Optional string argument. `None` when absent or non-string —
-    /// drop-in replacement for `args.get(k).and_then(|v| v.as_str())`.
-    fn arg_str_opt(&self, key: &str) -> Option<&str>;
-
     /// Optional string argument. `None` when absent, but present non-string
     /// values produce a type-specific validation error.
     ///
@@ -336,10 +331,6 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
                 expected: "string",
             }),
         }
-    }
-
-    fn arg_str_opt(&self, key: &str) -> Option<&str> {
-        self.get(key).and_then(Value::as_str)
     }
 
     fn arg_str_opt_strict(&self, key: &'static str) -> Result<Option<&str>, ToolArgError> {
@@ -467,21 +458,6 @@ mod tests {
         let m = make();
         let owned: String = m.arg_string("name").unwrap();
         assert_eq!(owned, "alice");
-    }
-
-    // ── arg_str_opt ─────────────────────────────────────────────────────
-
-    #[test]
-    fn arg_str_opt_returns_some_for_string_value() {
-        let m = make();
-        assert_eq!(m.arg_str_opt("name"), Some("alice"));
-    }
-
-    #[test]
-    fn arg_str_opt_returns_none_for_missing_or_wrong_type() {
-        let m = make();
-        assert_eq!(m.arg_str_opt("absent"), None);
-        assert_eq!(m.arg_str_opt("count"), None, "number must not coerce");
     }
 
     // ── arg_str_opt_strict ─────────────────────────────────────────────

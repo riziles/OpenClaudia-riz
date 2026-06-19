@@ -12,18 +12,19 @@ pub fn execute_task_create<S: BuildHasher>(
 ) -> (String, bool) {
     // crosslink #675: typed accessors. Wording was already canonical
     // ("Missing 'X' argument") so no test churn.
-    let subject = match args.arg_string("subject") {
-        Ok(s) => s,
+    let subject = match args.arg_str_strict("subject") {
+        Ok(s) => s.to_string(),
         Err(e) => return e.into_tool_error(),
     };
-    let description = match args.arg_string("description") {
-        Ok(d) => d,
+    let description = match args.arg_str_strict("description") {
+        Ok(d) => d.to_string(),
         Err(e) => return e.into_tool_error(),
     };
 
-    let active_form = args
-        .arg_str_opt("active_form")
-        .map(std::string::ToString::to_string);
+    let active_form = match args.arg_str_opt_strict("active_form") {
+        Ok(active_form) => active_form.map(std::string::ToString::to_string),
+        Err(e) => return e.into_tool_error(),
+    };
 
     let task = task_mgr.create_task(subject, description, active_form);
     let output = format!(
@@ -39,8 +40,9 @@ pub fn execute_task_update<S: BuildHasher>(
     args: &HashMap<String, Value, S>,
     task_mgr: &mut TaskManager,
 ) -> (String, bool) {
-    let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
-        return ("Missing 'task_id' argument".to_string(), true);
+    let task_id = match args.arg_str_strict("task_id") {
+        Ok(task_id) => task_id,
+        Err(e) => return e.into_tool_error(),
     };
 
     let status = match parse_task_update_status(args.get("status")) {
@@ -167,8 +169,9 @@ pub fn execute_task_get<S: BuildHasher>(
     args: &HashMap<String, Value, S>,
     task_mgr: &TaskManager,
 ) -> (String, bool) {
-    let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) else {
-        return ("Missing 'task_id' argument".to_string(), true);
+    let task_id = match args.arg_str_strict("task_id") {
+        Ok(task_id) => task_id,
+        Err(e) => return e.into_tool_error(),
     };
 
     task_mgr.get_task(task_id).map_or_else(

@@ -148,10 +148,35 @@ fn task_create_missing_subject_errors_with_session() {
 #[test]
 fn task_create_subject_as_number_errors_with_session() {
     let mut tm = TaskManager::new();
-    let args = args_with(&[("subject", json!(42))]);
+    let args = args_with(&[("subject", json!(42)), ("description", json!("desc"))]);
     let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
+    assert!(msg.contains("Invalid 'subject' argument: expected string"));
+}
+
+#[test]
+fn task_create_description_as_number_errors_with_session() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[("subject", json!("subject")), ("description", json!(42))]);
+    let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+    assert!(msg.contains("Invalid 'description' argument: expected string"));
+}
+
+#[test]
+fn task_create_active_form_as_number_errors_with_session() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[
+        ("subject", json!("subject")),
+        ("description", json!("desc")),
+        ("active_form", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_with_session("task_create", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+    assert!(msg.contains("Invalid 'active_form' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -211,6 +236,16 @@ fn task_get_missing_task_id_arg_errors() {
 }
 
 #[test]
+fn task_get_non_string_task_id_arg_errors() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[("task_id", json!(42))]);
+    let (msg, is_err) = dispatch_with_session("task_get", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
+}
+
+#[test]
 fn task_get_after_create_returns_created_task_details() {
     let mut tm = TaskManager::new();
     let create_args = args_with(&[
@@ -239,6 +274,16 @@ fn task_update_missing_task_id_errors() {
     let (msg, is_err) = dispatch_with_session("task_update", &HashMap::new(), &mut tm);
     assert!(is_err);
     assert_ne!(msg, NO_SESSION_MARKER);
+}
+
+#[test]
+fn task_update_non_string_task_id_errors() {
+    let mut tm = TaskManager::new();
+    let args = args_with(&[("task_id", json!(42))]);
+    let (msg, is_err) = dispatch_with_session("task_update", &args, &mut tm);
+    assert!(is_err);
+    assert_ne!(msg, NO_SESSION_MARKER);
+    assert!(msg.contains("Invalid 'task_id' argument: expected string"));
 }
 
 #[test]
