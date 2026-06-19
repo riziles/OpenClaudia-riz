@@ -145,6 +145,7 @@ async fn b1_retry_max_matches_cc_10_attempts() {
         permission_mgr: None,
         transient_allowed_tool_rules: &[],
         hook_engine: None,
+        policy_enforcer: None,
         task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
             openclaudia::session::TaskManager::new(),
         )),
@@ -207,6 +208,7 @@ async fn b1_503_is_retried() {
         permission_mgr: None,
         transient_allowed_tool_rules: &[],
         hook_engine: None,
+        policy_enforcer: None,
         task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
             openclaudia::session::TaskManager::new(),
         )),
@@ -269,6 +271,7 @@ async fn b1_retry_after_zero_retries_without_sleep() {
         permission_mgr: None,
         transient_allowed_tool_rules: &[],
         hook_engine: None,
+        policy_enforcer: None,
         task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
             openclaudia::session::TaskManager::new(),
         )),
@@ -350,6 +353,7 @@ async fn b1_408_is_retried() {
         permission_mgr: None,
         transient_allowed_tool_rules: &[],
         hook_engine: None,
+        policy_enforcer: None,
         task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
             openclaudia::session::TaskManager::new(),
         )),

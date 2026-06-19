@@ -12,6 +12,7 @@ use crate::providers::{
     convert_tools_to_gemini_functions, extract_gemini_text_content, get_adapter,
 };
 use crate::proxy::{self, normalize_base_url};
+use crate::services::policy::{PolicyEnforcer, PolicyError};
 use crate::session::TokenUsage;
 use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator};
 use crate::tui::events::{ApiRetryKind, AppEvent, PermissionResponse};
@@ -423,6 +424,7 @@ pub struct RunTurnParams<'a> {
     pub permission_mgr: Option<Arc<PermissionManager>>,
     pub transient_allowed_tool_rules: &'a [PermissionRule],
     pub hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    pub policy_enforcer: Option<Arc<PolicyEnforcer>>,
     /// Session-scoped `TaskManager` used by `task_create` / `task_update`
     /// / `task_list` / `task_get`. The TUI keeps a single
     /// `Arc<Mutex<TaskManager>>` and clones the `Arc` into every turn so
@@ -718,6 +720,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id,
         tx,
@@ -755,6 +758,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             permission_mgr,
             transient_allowed_tool_rules,
             hook_engine.clone(),
+            policy_enforcer.clone(),
             task_mgr.clone(),
             session_id.clone(),
             &tx,
@@ -770,6 +774,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id,
         tx: &tx,
@@ -968,6 +973,7 @@ async fn handle_google_response(
     permission_mgr: Option<Arc<PermissionManager>>,
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &mpsc::Sender<AppEvent>,
@@ -1018,6 +1024,7 @@ async fn handle_google_response(
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id.as_deref(),
         tx,
@@ -1156,6 +1163,7 @@ struct SseStreamParams<'a> {
     permission_mgr: Option<Arc<PermissionManager>>,
     transient_allowed_tool_rules: &'a [PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &'a mpsc::Sender<AppEvent>,
@@ -1169,6 +1177,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id,
         tx,
@@ -1256,6 +1265,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id,
         tx,
@@ -1320,6 +1330,7 @@ struct SseFinalize<'a> {
     permission_mgr: Option<Arc<PermissionManager>>,
     transient_allowed_tool_rules: &'a [PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &'a mpsc::Sender<AppEvent>,
@@ -1345,6 +1356,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         f.permission_mgr,
         f.transient_allowed_tool_rules,
         f.hook_engine,
+        f.policy_enforcer,
         f.task_mgr,
         f.session_id.as_deref(),
         f.tx,
@@ -1556,6 +1568,34 @@ fn permission_denied_with_result(
         "content": model_content,
         "is_error": true
     }))
+}
+
+fn observe_policy_decision_json(session_id: Option<&str>, allowed: bool, reason: &str) {
+    if let Some(session_id) = session_id {
+        crate::grounded_loop::observe_policy_decision_for_session(session_id, allowed, reason);
+    }
+}
+
+fn policy_denied_tool_result(
+    tool_name: &str,
+    tool_call_id: &str,
+    error: &PolicyError,
+    session_id: Option<&str>,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Value {
+    let reason = error.to_string();
+    observe_policy_decision_json(session_id, false, &reason);
+    let _ = tx.send(AppEvent::ToolDone {
+        name: tool_name.to_string(),
+        success: false,
+        content: format!("Blocked by policy: {reason}"),
+    });
+    serde_json::json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": format!("[POLICY DENIED] {reason}"),
+        "is_error": true
+    })
 }
 
 fn parse_permission_arguments_for_tui(
@@ -2057,6 +2097,7 @@ async fn execute_tool_calls_for_tui(
     permission_mgr: Option<Arc<PermissionManager>>,
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
     tx: &mpsc::Sender<AppEvent>,
@@ -2133,6 +2174,16 @@ async fn execute_tool_calls_for_tui(
                     continue;
                 }
                 PermissionOutcome::ChannelBroken => break,
+            }
+        }
+
+        if let (Some(enforcer), Some(session_id)) = (policy_enforcer.as_deref(), session_id) {
+            if let Err(err) = enforcer.check_and_record_tool(session_id, tool_name) {
+                let result_json =
+                    policy_denied_tool_result(tool_name, &tool_call.id, &err, Some(session_id), tx);
+                observe_tool_result_json(Some(session_id), tool_name, &result_json);
+                results.push(result_json);
+                continue;
             }
         }
 
@@ -2455,6 +2506,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             task_mgr,
             Some(session_id),
             &tx,
@@ -2548,6 +2600,7 @@ mod tests {
                     Some(mgr),
                     &[],
                     None,
+                    None,
                     task_mgr,
                     Some("s"),
                     &tx,
@@ -2618,6 +2671,7 @@ mod tests {
             Some(mgr),
             &[],
             None,
+            None,
             task_mgr,
             Some(session_id),
             &tx,
@@ -2660,6 +2714,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_tool_calls_for_tui_enforces_policy_tool_cap_before_execution() {
+        use std::sync::mpsc as std_mpsc;
+
+        let session_id = "tui-policy-tool-cap-ledger";
+        let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
+        let _ledger_guard =
+            crate::ledger::install_active_ledger_for_session(session_id, Arc::clone(&ledger));
+        let policy = crate::services::policy::EnterprisePolicy {
+            tool_caps: std::collections::HashMap::from([("bash".to_string(), 0)]),
+            ..Default::default()
+        };
+        let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(policy));
+        let mgr = Arc::new(PermissionManager::unrestricted());
+        let tool_call = ToolCall {
+            id: "call_policy_denied".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"printf policy-should-not-run"}"#.to_string(),
+            },
+        };
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+
+        let (results, has_tools) = execute_tool_calls_for_tui(
+            &[tool_call],
+            None,
+            Some(mgr),
+            &[],
+            None,
+            Some(policy_enforcer),
+            task_mgr,
+            Some(session_id),
+            &tx,
+        )
+        .await;
+
+        assert!(has_tools);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], true);
+        let content = results[0]["content"].as_str().unwrap_or_default();
+        assert!(content.contains("POLICY DENIED"), "{content}");
+        assert!(
+            !content.contains("policy-should-not-run"),
+            "denied tool must not execute command output: {content}"
+        );
+
+        let mut saw_policy_done = false;
+        let mut saw_tool_start = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ToolDone { content, .. } => {
+                    saw_policy_done = content.contains("Blocked by policy");
+                }
+                AppEvent::ToolStart { .. } => saw_tool_start = true,
+                _ => {}
+            }
+        }
+        assert!(saw_policy_done, "TUI should receive the policy denial");
+        assert!(!saw_tool_start, "policy-denied tool must not start");
+
+        let observations = {
+            let ledger = ledger.lock().expect("ledger lock");
+            ledger
+                .observations_chronological()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            observations.iter().any(|obs| {
+                matches!(
+                    &obs.kind,
+                    crate::ledger::ObservationKind::PolicyDecision { allowed: false, reason }
+                    if reason.contains("bash")
+                )
+            }),
+            "policy denial should be ledgered"
+        );
+        assert!(
+            observations.iter().any(|obs| {
+                matches!(
+                    &obs.kind,
+                    crate::ledger::ObservationKind::ToolResult { tool, result }
+                    if tool == "bash" && result["is_error"] == true
+                )
+            }),
+            "policy-denied tool result should be ledgered"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_tool_calls_for_tui_records_tool_result_observation() {
         use std::sync::mpsc as std_mpsc;
 
@@ -2683,6 +2829,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             task_mgr,
             Some(session_id),

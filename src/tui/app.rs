@@ -803,6 +803,8 @@ pub struct App {
     pending_user_question: Option<PendingUserQuestion>,
     /// Hook engine for running lifecycle hooks.
     pub hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    /// Session-scoped enterprise policy enforcer for tool caps.
+    pub policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     /// Session-scoped task tracker for the `task_create` / `task_update` /
     /// `task_list` / `task_get` tools. Always populated for the full-screen
     /// TUI so those tools have a place to write — previously the TUI passed
@@ -865,6 +867,11 @@ impl App {
             pending_permission: None,
             pending_user_question: None,
             hook_engine: None,
+            policy_enforcer: std::sync::Arc::new(crate::services::policy::PolicyEnforcer::new(
+                crate::config::load_config()
+                    .map(|config| config.policy)
+                    .unwrap_or_default(),
+            )),
             task_mgr: std::sync::Arc::new(
                 std::sync::Mutex::new(crate::session::TaskManager::new()),
             ),
@@ -2827,6 +2834,7 @@ impl App {
         let session_id_for_task = self.chat_session.id.clone();
         let memory_db = self.memory_db.clone();
         let permission_mgr = self.permission_mgr.clone();
+        let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
         let session_messages = self.session_messages.clone();
@@ -2845,6 +2853,7 @@ impl App {
             permission_mgr,
             transient_allowed_tool_rules,
             hook_engine,
+            policy_enforcer,
             task_mgr,
             session_id: session_id_for_task,
             tx,
@@ -3156,6 +3165,7 @@ struct ApiTurnParams {
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     transient_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: String,
     tx: std::sync::mpsc::Sender<super::events::AppEvent>,
@@ -3175,6 +3185,7 @@ struct AgenticCtx<'a> {
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     transient_allowed_tool_rules: &'a [crate::permissions::PermissionRule],
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
@@ -3608,6 +3619,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             permission_mgr: ctx.permission_mgr.clone(),
             transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
             hook_engine: ctx.hook_engine.clone(),
+            policy_enforcer: Some(std::sync::Arc::clone(&ctx.policy_enforcer)),
             task_mgr: ctx.task_mgr.clone(),
             session_id: Some(ctx.session_id.to_string()),
             tx: ctx.tx.clone(),
@@ -3683,6 +3695,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         permission_mgr,
         transient_allowed_tool_rules,
         hook_engine,
+        policy_enforcer,
         task_mgr,
         session_id,
         tx,
@@ -3725,6 +3738,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         permission_mgr: permission_mgr.clone(),
         transient_allowed_tool_rules: &transient_allowed_tool_rules,
         hook_engine: hook_engine.clone(),
+        policy_enforcer: Some(std::sync::Arc::clone(&policy_enforcer)),
         task_mgr: task_mgr.clone(),
         session_id: Some(session_id.clone()),
         tx: tx.clone(),
@@ -3748,6 +3762,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     permission_mgr,
                     transient_allowed_tool_rules: &transient_allowed_tool_rules,
                     hook_engine,
+                    policy_enforcer,
                     task_mgr,
                     session_id: &session_id,
                     task_obs,
@@ -3778,6 +3793,7 @@ struct TurnContext<'a> {
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
     transient_allowed_tool_rules: &'a [crate::permissions::PermissionRule],
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
+    policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
@@ -3827,6 +3843,7 @@ async fn handle_turn_result(
             permission_mgr: ctx.permission_mgr,
             transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
             hook_engine: ctx.hook_engine,
+            policy_enforcer: ctx.policy_enforcer,
             task_mgr: ctx.task_mgr,
             session_id: ctx.session_id,
             task_obs: ctx.task_obs,
@@ -4408,6 +4425,9 @@ mod tests {
         let client = reqwest::Client::new();
         let headers: Vec<(String, String)> = Vec::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy::default(),
+        ));
 
         handle_turn_result(
             direct_turn_result("Verified with cargo check.".to_string()),
@@ -4425,6 +4445,7 @@ mod tests {
                 permission_mgr: None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
+                policy_enforcer,
                 task_mgr,
                 session_id,
                 task_obs: None,
@@ -4462,6 +4483,9 @@ mod tests {
         let client = reqwest::Client::new();
         let headers: Vec<(String, String)> = Vec::new();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy::default(),
+        ));
 
         handle_turn_result(
             direct_turn_result(content.clone()),
@@ -4479,6 +4503,7 @@ mod tests {
                 permission_mgr: None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
+                policy_enforcer,
                 task_mgr,
                 session_id,
                 task_obs: None,

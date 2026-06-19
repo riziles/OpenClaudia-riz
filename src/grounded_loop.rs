@@ -441,6 +441,60 @@ pub fn append_final_policy_decision(ledger: &mut RealityLedger, allowed: bool, r
     }
 }
 
+pub fn observe_policy_decision_for_session(
+    session_id: &str,
+    allowed: bool,
+    reason: &str,
+) -> Option<ObsId> {
+    if let Some(shared) = crate::ledger::active_ledger_for_session(session_id) {
+        let mut ledger = shared.lock().unwrap_or_else(|err| {
+            tracing::error!("active reality ledger lock poisoned; recovering inner state");
+            err.into_inner()
+        });
+        return append_policy_decision_observation(&mut ledger, allowed, reason, session_id);
+    }
+
+    let mut ledger = match RealityLedger::open_project_session(session_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "failed to open session reality ledger for policy decision"
+            );
+            return None;
+        }
+    };
+    append_policy_decision_observation(&mut ledger, allowed, reason, session_id)
+}
+
+fn append_policy_decision_observation(
+    ledger: &mut RealityLedger,
+    allowed: bool,
+    reason: &str,
+    session_id: &str,
+) -> Option<ObsId> {
+    match ledger.append(
+        Authority::Policy,
+        ObservationKind::PolicyDecision {
+            allowed,
+            reason: reason.to_string(),
+        },
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                allowed,
+                reason,
+                error = %err,
+                "failed to append policy decision to reality ledger"
+            );
+            None
+        }
+    }
+}
+
 #[must_use]
 pub fn render_grounding_system_message(packet: &GroundedPromptPacket) -> String {
     let mut out = String::new();
