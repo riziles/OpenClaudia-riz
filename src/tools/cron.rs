@@ -386,6 +386,44 @@ fn format_list_prompt(prompt: &str) -> String {
     )
 }
 
+fn optional_string_arg<S: BuildHasher>(
+    args: &HashMap<String, Value, S>,
+    key: &'static str,
+) -> Result<Option<String>, (String, bool)> {
+    args.get(key).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| (format!("Invalid '{key}' argument: expected string"), true))
+    })
+}
+
+fn optional_one_based_index_arg<S: BuildHasher>(
+    args: &HashMap<String, Value, S>,
+) -> Result<Option<usize>, (String, bool)> {
+    let Some(value) = args.get("index") else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err((
+            "Invalid 'index' argument: expected integer >= 1".to_string(),
+            true,
+        ));
+    };
+    if raw == 0 {
+        return Err((
+            "Invalid 'index' argument: expected integer >= 1".to_string(),
+            true,
+        ));
+    }
+    usize::try_from(raw).map(Some).map_err(|_| {
+        (
+            "Invalid 'index' argument: value is too large".to_string(),
+            true,
+        )
+    })
+}
+
 #[must_use]
 pub fn execute_cron_create<S: BuildHasher>(args: &HashMap<String, Value, S>) -> (String, bool) {
     execute_cron_create_at(args, &schedules_path())
@@ -532,9 +570,18 @@ fn execute_cron_delete_at<S: BuildHasher>(
     // The legacy `id` field is still accepted for backwards compatibility
     // with any persisted prompts that captured a UUID, but it is no longer
     // documented in the tool surface.
-    let name_arg = args.arg_str_opt("name").map(str::to_string);
-    let index_arg = args.get("index").and_then(serde_json::Value::as_u64);
-    let id_arg = args.arg_str_opt("id").map(str::to_string);
+    let name_arg = match optional_string_arg(args, "name") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let index_arg = match optional_one_based_index_arg(args) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let id_arg = match optional_string_arg(args, "id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
 
     if name_arg.is_none() && index_arg.is_none() && id_arg.is_none() {
         return (
@@ -559,12 +606,11 @@ fn execute_cron_delete_at<S: BuildHasher>(
     // of the list cannot shift an index out from under us.
     let target_name: String = if let Some(name) = name_arg {
         name
-    } else if let Some(idx) = index_arg {
-        let one_based = usize::try_from(idx).unwrap_or(0);
-        if one_based == 0 || one_based > store.schedules.len() {
+    } else if let Some(one_based) = index_arg {
+        if one_based > store.schedules.len() {
             return (
                 format!(
-                    "Index {idx} is out of range (1..={})",
+                    "Index {one_based} is out of range (1..={})",
                     store.schedules.len()
                 ),
                 true,

@@ -216,6 +216,88 @@ fn cron_delete_with_no_args_errors() {
 }
 
 #[test]
+fn cron_delete_rejects_wrong_type_name_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let args = args_with(&[("name", json!(42))]);
+        let (msg, is_err) = dispatch("cron_delete", &args);
+        assert!(is_err);
+        assert!(
+            msg.contains("Invalid 'name' argument: expected string"),
+            "wrong-type name MUST be rejected; got {msg:?}"
+        );
+        assert!(
+            !std::path::Path::new(".openclaudia/schedules.json").exists(),
+            "wrong-type identifier MUST NOT touch schedules.json"
+        );
+    });
+}
+
+#[test]
+fn cron_delete_rejects_wrong_type_id_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let args = args_with(&[("id", json!({"legacy": "bad"}))]);
+        let (msg, is_err) = dispatch("cron_delete", &args);
+        assert!(is_err);
+        assert!(
+            msg.contains("Invalid 'id' argument: expected string"),
+            "wrong-type id MUST be rejected; got {msg:?}"
+        );
+        assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
+    });
+}
+
+#[test]
+fn cron_delete_rejects_wrong_type_index_before_disk_write() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        for bad_index in [json!("1"), json!(-1), json!(0)] {
+            let args = args_with(&[("index", bad_index)]);
+            let (msg, is_err) = dispatch("cron_delete", &args);
+            assert!(is_err);
+            assert!(
+                msg.contains("Invalid 'index' argument"),
+                "wrong-type or zero index MUST be rejected; got {msg:?}"
+            );
+            assert!(!std::path::Path::new(".openclaudia/schedules.json").exists());
+        }
+    });
+}
+
+#[test]
+fn cron_delete_rejects_malformed_extra_identifier_even_with_valid_name() {
+    let _l = cwd_lock();
+    run_in_tempdir(|| {
+        let create_args = args_with(&[
+            ("name", json!("keep_on_bad_extra_identifier")),
+            ("schedule", json!("0 9 * * *")),
+            ("prompt", json!("noop")),
+        ]);
+        let (_c_msg, c_err) = dispatch("cron_create", &create_args);
+        assert!(!c_err);
+
+        let delete_args = args_with(&[
+            ("name", json!("keep_on_bad_extra_identifier")),
+            ("index", json!("1")),
+        ]);
+        let (delete_msg, delete_err) = dispatch("cron_delete", &delete_args);
+        assert!(delete_err);
+        assert!(
+            delete_msg.contains("Invalid 'index' argument"),
+            "malformed provided index MUST not be ignored; got {delete_msg:?}"
+        );
+
+        let (list_msg, list_err) = dispatch("cron_list", &HashMap::new());
+        assert!(!list_err);
+        assert!(
+            list_msg.contains("keep_on_bad_extra_identifier"),
+            "schedule MUST remain after rejected delete; got {list_msg:?}"
+        );
+    });
+}
+
+#[test]
 fn cron_delete_nonexistent_id_errors_cleanly() {
     let _l = cwd_lock();
     run_in_tempdir(|| {
