@@ -1907,15 +1907,15 @@ async fn execute_single_tool(
         return None;
     }
     if let Some((engine, tool_input)) = hook_context {
-        engine
-            .fire_post_tool(
-                !result.is_error,
-                tool_name,
-                tool_input,
-                &result.content,
-                session_id,
-            )
-            .await;
+        crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            engine,
+            !result.is_error,
+            tool_name,
+            tool_input,
+            &result.content,
+            session_id,
+        )
+        .await;
     }
     let result_content = if result.is_error {
         format!("[ERROR] {}", result.content)
@@ -1974,15 +1974,7 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
 }
 
 fn parse_tool_arguments_for_tui(tool_name: &str, arguments: &str) -> Result<Value, String> {
-    let value = serde_json::from_str::<Value>(arguments)
-        .map_err(|e| format!("Invalid tool arguments JSON for '{tool_name}': {e}"))?;
-    if !value.is_object() {
-        return Err(format!(
-            "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
-            json_value_type_name(&value)
-        ));
-    }
-    Ok(value)
+    crate::services::tool_executor::ToolExecutor::parse_arguments(tool_name, arguments)
 }
 
 fn malformed_tool_arguments_result(
@@ -2143,16 +2135,42 @@ async fn execute_tool_calls_for_tui(
             continue;
         }
 
-        let tool_policy = crate::services::policy::ToolExecutionPolicy::new(
+        if let Err(err) = crate::services::tool_executor::ToolExecutor::check_policy_before_prompt(
             policy_enforcer.as_deref(),
             session_id,
-        );
-        if let Err(err) = tool_policy.check_tool(tool_name) {
+            tool_name,
+        ) {
             let result_json =
                 policy_denied_tool_result(tool_name, &tool_call.id, &err, session_id, tx);
             observe_tool_result_json(session_id, tool_name, &result_json);
             results.push(result_json);
             continue;
+        }
+
+        if let Some(engine) = hook_engine.as_deref() {
+            if let Err(blocked) = crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
+                engine, session_id, tool_name, &tool_args,
+            )
+            .await
+            {
+                send_event_or_break!(
+                    tx,
+                    AppEvent::ToolDone {
+                        name: tool_name.clone(),
+                        success: false,
+                        content: blocked.content.clone(),
+                    }
+                );
+                let result_json = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": format!("[BLOCKED] {}", blocked.content),
+                    "is_error": true
+                });
+                observe_tool_result_json(session_id, tool_name, &result_json);
+                results.push(result_json);
+                continue;
+            }
         }
 
         // Permission check for write/destructive tools
@@ -2250,7 +2268,11 @@ fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_js
             .and_then(Value::as_bool)
             .unwrap_or(false),
     };
-    crate::grounded_loop::observe_tool_result_for_session(session_id, tool_name, &result);
+    crate::services::tool_executor::ToolExecutor::observe_tool_result(
+        Some(session_id),
+        tool_name,
+        &result,
+    );
 }
 
 /// Bridge the sync `ask_user_question` tool's `USER_QUESTION_MARKER`
@@ -2800,6 +2822,78 @@ mod tests {
                 )
             }),
             "policy-denied tool result should be ledgered"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_for_tui_runs_pre_tool_use_before_dispatch() {
+        use crate::config::{Hook, HookEntry, HooksConfig};
+        use crate::hooks::HookEngine;
+        use std::sync::mpsc as std_mpsc;
+
+        let mut hooks = HooksConfig::default();
+        hooks.pre_tool_use.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![Hook::Command {
+                command: r#"printf '{"decision":"deny","reason":"prehook veto"}'; exit 2"#
+                    .to_string(),
+                shell: true,
+                timeout: 5,
+            }],
+        });
+        let hook_engine = Arc::new(HookEngine::new(hooks));
+        let tool_call = ToolCall {
+            id: "call_prehook_denied".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"printf prehook-should-not-run"}"#.to_string(),
+            },
+        };
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+
+        let (results, has_tools) = execute_tool_calls_for_tui(
+            &[tool_call],
+            None,
+            Some(Arc::new(PermissionManager::unrestricted())),
+            &[],
+            Some(hook_engine),
+            None,
+            task_mgr,
+            Some("tui-prehook-session"),
+            &tx,
+        )
+        .await;
+
+        assert!(has_tools);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], true);
+        let content = results[0]["content"].as_str().unwrap_or_default();
+        assert!(content.contains("prehook veto"), "{content}");
+        assert!(
+            !content.contains("prehook-should-not-run"),
+            "pre-hook denied tool must not execute command output: {content}"
+        );
+
+        let mut saw_tool_done = false;
+        let mut saw_tool_start = false;
+        let mut saw_permission_request = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ToolDone { content, .. } => {
+                    saw_tool_done = content.contains("prehook veto");
+                }
+                AppEvent::ToolStart { .. } => saw_tool_start = true,
+                AppEvent::PermissionRequest { .. } => saw_permission_request = true,
+                _ => {}
+            }
+        }
+        assert!(saw_tool_done, "TUI should receive the pre-hook denial");
+        assert!(!saw_tool_start, "pre-hook-denied tool must not start");
+        assert!(
+            !saw_permission_request,
+            "pre-hook-denied tool must not prompt for permission"
         );
     }
 

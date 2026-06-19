@@ -26,7 +26,7 @@ use crate::cli::repl::keybindings::{display_keybindings, execute_key_action, key
 use crate::cli::repl::permissions::execute_shell_command_with_permission;
 use crate::cli::repl::plan_mode::{check_plan_mode_restriction, process_tool_result_marker};
 use crate::cli::repl::session_io::{
-    compact_chat_session, estimate_session_tokens, export_chat_session,
+    compact_chat_session_with_instructions, estimate_session_tokens, export_chat_session,
     save_session_to_short_term_memory,
 };
 use crate::cli::repl::slash::{
@@ -790,8 +790,11 @@ impl ChatRepl {
                 export_chat_session(&self.chat_session);
                 SlashOutcome::Continue
             }
-            SlashCommandResult::Compact => {
-                let (before, after) = compact_chat_session(&mut self.chat_session);
+            SlashCommandResult::Compact { instructions } => {
+                let (before, after) = compact_chat_session_with_instructions(
+                    &mut self.chat_session,
+                    instructions.as_deref(),
+                );
                 if before != after {
                     println!("\nCompacted: ~{before} tokens -> ~{after} tokens\n");
                     if let Err(e) = save_chat_session(&self.chat_session) {
@@ -1300,6 +1303,22 @@ impl ChatRepl {
             })
     }
 
+    async fn pre_tool_use_denied_tool_result(
+        &self,
+        tool_call: &tools::ToolCall,
+        tool_args: &serde_json::Value,
+    ) -> Option<tools::ToolResult> {
+        openclaudia::services::tool_executor::ToolExecutor::run_pre_tool_use(
+            &self.hook_engine,
+            Some(&self.chat_session.id),
+            &tool_call.function.name,
+            tool_args,
+        )
+        .await
+        .err()
+        .map(|blocked| blocked.into_tool_result(tool_call.id.clone()))
+    }
+
     fn final_response_allowed(&self, content: &str, cancelled: bool) -> bool {
         if !final_response_requires_grounding(content, cancelled) {
             return true;
@@ -1675,8 +1694,9 @@ impl ChatRepl {
                 &state.tool_calls,
                 &mut state.contents,
             );
-            let function_responses =
-                self.gemini_execute_tools(&state.tool_calls, memory_db, auto_learner);
+            let function_responses = self
+                .gemini_execute_tools(&state.tool_calls, memory_db, auto_learner)
+                .await;
             state.contents.push(serde_json::json!({
                 "role": "user",
                 "parts": function_responses
@@ -1841,7 +1861,7 @@ impl ChatRepl {
 
     /// Execute each tool call from a Gemini turn and produce the
     /// `functionResponse` parts to send back.
-    fn gemini_execute_tools(
+    async fn gemini_execute_tools(
         &mut self,
         gemini_tool_calls: &[tools::ToolCall],
         memory_db: Option<&memory::MemoryDb>,
@@ -1853,21 +1873,21 @@ impl ChatRepl {
                 function_responses.push(blocked);
                 continue;
             }
-            let permission_already_checked = match self.gemini_permission_error_response(tool_call)
-            {
-                Ok(checked) => checked,
-                Err(blocked) => {
-                    function_responses.push(blocked);
-                    continue;
-                }
-            };
+            let permission_already_checked =
+                match self.gemini_permission_error_response(tool_call).await {
+                    Ok(checked) => checked,
+                    Err(blocked) => {
+                        function_responses.push(blocked);
+                        continue;
+                    }
+                };
             let result = self.gemini_run_single_tool(
                 tool_call,
                 memory_db,
                 auto_learner,
                 permission_already_checked,
             );
-            function_responses.push(self.gemini_record_tool_outcome(tool_call, &result));
+            function_responses.push(self.gemini_record_tool_outcome(tool_call, &result).await);
         }
         function_responses
     }
@@ -1905,7 +1925,7 @@ impl ChatRepl {
 
     /// Run the interactive permission check for a Gemini tool call.
     /// Returns a `functionResponse` error when the caller should not execute it.
-    fn gemini_permission_error_response(
+    async fn gemini_permission_error_response(
         &mut self,
         tool_call: &tools::ToolCall,
     ) -> Result<bool, serde_json::Value> {
@@ -1922,6 +1942,19 @@ impl ChatRepl {
                 return Err(gemini_tool_error_response(tool_call, &msg));
             }
         };
+        if let Some(result) = self
+            .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
+            .await
+        {
+            push_observed_cli_tool_result_message(
+                &mut self.chat_session,
+                tool_call,
+                &result.tool_call_id,
+                &result.content,
+                true,
+            );
+            return Err(gemini_tool_error_response(tool_call, &result.content));
+        }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
             push_observed_cli_tool_result_message(
                 &mut self.chat_session,
@@ -1996,7 +2029,7 @@ impl ChatRepl {
 
     /// Render the tool result, push it onto the session as a `tool`
     /// message, and return the `functionResponse` value for Gemini.
-    fn gemini_record_tool_outcome(
+    async fn gemini_record_tool_outcome(
         &mut self,
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
@@ -2007,6 +2040,18 @@ impl ChatRepl {
             &result.content,
         );
         let final_is_error = if was_marker { false } else { result.is_error };
+        let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
+            |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
+        );
+        openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.hook_engine,
+            !final_is_error,
+            &tool_call.function.name,
+            tool_input,
+            &final_content,
+            Some(&self.chat_session.id),
+        )
+        .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
         push_observed_cli_tool_result_message(
             &mut self.chat_session,
@@ -2563,7 +2608,8 @@ impl ChatRepl {
                 anthropic_accumulator,
                 memory_db,
                 auto_learner,
-            );
+            )
+            .await;
 
             let followup_req = match self.build_anthropic_followup(prompt_blocks) {
                 Ok(req) => req,
@@ -2641,7 +2687,7 @@ impl ChatRepl {
     /// Execute every tool from one Anthropic iteration, run quality
     /// gates, clear the accumulator, and print the "sending N results"
     /// banner before the follow-up request.
-    fn dispatch_anthropic_tool_batch(
+    async fn dispatch_anthropic_tool_batch(
         &mut self,
         tool_calls: &[tools::ToolCall],
         anthropic_accumulator: &mut tools::AnthropicToolAccumulator,
@@ -2649,7 +2695,8 @@ impl ChatRepl {
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_anthropic_tool(tool_call, memory_db, auto_learner);
+            self.execute_anthropic_tool(tool_call, memory_db, auto_learner)
+                .await;
         }
         self.run_quality_gates_and_inject();
         anthropic_accumulator.clear();
@@ -2663,7 +2710,7 @@ impl ChatRepl {
 
     /// Execute a single tool call from the Anthropic structured path,
     /// updating chat history with the result.
-    fn execute_anthropic_tool(
+    async fn execute_anthropic_tool(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
@@ -2672,7 +2719,8 @@ impl ChatRepl {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call) else {
+        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call).await
+        else {
             return;
         };
         let result = self.run_tool_with_audit(
@@ -2700,6 +2748,18 @@ impl ChatRepl {
         ) {
             tracing::error!("Security audit failed for tool_result: {e}");
         }
+        let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
+            |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
+        );
+        openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.hook_engine,
+            !final_is_error,
+            &tool_call.function.name,
+            tool_input,
+            &final_content,
+            Some(&self.chat_session.id),
+        )
+        .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
         push_observed_cli_tool_result_message(
             &mut self.chat_session,
@@ -2737,7 +2797,7 @@ impl ChatRepl {
     /// Run the interactive permission check. On `Denied` push the error
     /// tool message and return `None`. On `Allowed` return whether the
     /// lower-level permission gate has already been checked.
-    fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> Option<bool> {
+    async fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> Option<bool> {
         let tool_args_val = match parse_tool_args(&tool_call.function) {
             Ok(args) => args,
             Err(msg) => {
@@ -2751,6 +2811,19 @@ impl ChatRepl {
                 return None;
             }
         };
+        if let Some(result) = self
+            .pre_tool_use_denied_tool_result(tool_call, &tool_args_val)
+            .await
+        {
+            push_observed_cli_tool_result_message(
+                &mut self.chat_session,
+                tool_call,
+                &result.tool_call_id,
+                &result.content,
+                true,
+            );
+            return None;
+        }
         if let Some(result) = self.policy_denied_tool_result(tool_call) {
             push_observed_cli_tool_result_message(
                 &mut self.chat_session,
@@ -3252,7 +3325,8 @@ impl ChatRepl {
                 &state.current_content,
                 &state.current_reasoning_content,
             );
-            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db, auto_learner);
+            self.dispatch_openai_tool_batch(&tool_calls, tool_accumulator, memory_db, auto_learner)
+                .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
             let request_body = match self.build_openai_followup_request() {
@@ -3336,7 +3410,7 @@ impl ChatRepl {
 
     /// Execute every tool from one `OpenAI` iteration, run quality
     /// gates, and clear the accumulator for the next pass.
-    fn dispatch_openai_tool_batch(
+    async fn dispatch_openai_tool_batch(
         &mut self,
         tool_calls: &[tools::ToolCall],
         tool_accumulator: &mut tools::ToolCallAccumulator,
@@ -3344,7 +3418,8 @@ impl ChatRepl {
         auto_learner: &mut Option<openclaudia::auto_learn::AutoLearner<'_>>,
     ) {
         for tool_call in tool_calls {
-            self.execute_openai_tool(tool_call, memory_db, auto_learner);
+            self.execute_openai_tool(tool_call, memory_db, auto_learner)
+                .await;
         }
         self.run_quality_gates_and_inject();
         tool_accumulator.clear();
@@ -3563,7 +3638,7 @@ impl ChatRepl {
 
     /// Execute a single tool call from the OpenAI-style loop (matches
     /// the original inline path including activity logging).
-    fn execute_openai_tool(
+    async fn execute_openai_tool(
         &mut self,
         tool_call: &tools::ToolCall,
         memory_db: Option<&memory::MemoryDb>,
@@ -3572,7 +3647,8 @@ impl ChatRepl {
         if self.push_plan_mode_block_if_any(tool_call) {
             return;
         }
-        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call) else {
+        let Some(permission_already_checked) = self.push_permission_or_proceed(tool_call).await
+        else {
             return;
         };
         let result = self.run_openai_tool_unaudited(
@@ -3590,6 +3666,18 @@ impl ChatRepl {
         let final_is_error = if was_marker { false } else { result.is_error };
 
         Self::log_openai_activity(memory_db, &self.chat_session.id, tool_call, final_is_error);
+        let tool_input = parse_tool_args(&tool_call.function).unwrap_or_else(
+            |_| serde_json::json!({ "raw_arguments": tool_call.function.arguments }),
+        );
+        openclaudia::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.hook_engine,
+            !final_is_error,
+            &tool_call.function.name,
+            tool_input,
+            &final_content,
+            Some(&self.chat_session.id),
+        )
+        .await;
         display_tool_result(&tool_call.function.name, &final_content, final_is_error);
         push_observed_cli_tool_result_message(
             &mut self.chat_session,
@@ -3844,18 +3932,15 @@ fn push_chat_session_message_and_persist(
 }
 
 fn parse_tool_args(func: &tools::FunctionCall) -> Result<serde_json::Value, String> {
-    let value = serde_json::from_str::<serde_json::Value>(&func.arguments).map_err(|e| {
-        tracing::warn!("Malformed tool arguments for '{}': {}", func.name, e);
-        format!("Invalid tool arguments JSON for '{}': {e}", func.name)
-    })?;
-    if !value.is_object() {
-        return Err(format!(
-            "Invalid tool arguments JSON for '{}': expected a JSON object, got {}",
-            func.name,
-            json_value_type_name(&value)
-        ));
-    }
-    Ok(value)
+    openclaudia::services::tool_executor::ToolExecutor::parse_arguments(&func.name, &func.arguments)
+        .map_err(|err| {
+            if err.contains("Invalid tool arguments JSON")
+                && !err.contains("expected a JSON object")
+            {
+                tracing::warn!("Malformed tool arguments for '{}': {}", func.name, err);
+            }
+            err
+        })
 }
 
 fn canonical_provider_name(provider: &str) -> &str {
@@ -3902,17 +3987,6 @@ fn apply_fast_mode_result(
     if let Some(fast_model) = fast_model {
         *model = fast_model;
         session.model.clone_from(model);
-    }
-}
-
-const fn json_value_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
     }
 }
 

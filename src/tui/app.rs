@@ -3223,23 +3223,26 @@ fn request_messages_with_grounding(
     crate::grounded_loop::request_messages_with_grounding(session_id, task_obs, session_messages)
 }
 
-fn validate_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
-    crate::grounded_loop::validate_agentic_final_response(session_id, content)
+fn validate_and_render_agentic_final_response(
+    session_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    crate::grounded_loop::validate_and_render_agentic_final_response(session_id, content)
 }
 
-fn validate_final_response_for_history(session_id: &str, content: &str) -> bool {
+fn render_final_response_for_history(session_id: &str, content: &str) -> Option<String> {
     if content.trim().is_empty() {
-        return true;
+        return Some(String::new());
     }
-    match validate_agentic_final_response(session_id, content.trim()) {
-        Ok(()) => true,
+    match validate_and_render_agentic_final_response(session_id, content.trim()) {
+        Ok(rendered) => Some(rendered),
         Err(reason) => {
             tracing::warn!(
                 session_id,
                 reason,
                 "final answer rejected by grounding gate"
             );
-            false
+            None
         }
     }
 }
@@ -3691,11 +3694,15 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
                         .as_deref()
                         .filter(|text| !text.is_empty());
                     if !followup.content.is_empty() || reasoning.is_some() {
-                        if !validate_final_response_for_history(ctx.session_id, &followup.content) {
+                        let Some(rendered_content) =
+                            render_final_response_for_history(ctx.session_id, &followup.content)
+                        else {
                             break;
-                        }
-                        let mut message =
-                            serde_json::json!({ "role": "assistant", "content": followup.content });
+                        };
+                        let mut message = serde_json::json!({
+                            "role": "assistant",
+                            "content": rendered_content
+                        });
                         if let Some(reasoning) = reasoning {
                             message["reasoning_content"] =
                                 serde_json::Value::String(reasoning.to_string());
@@ -3909,16 +3916,17 @@ async fn handle_turn_result(
             ctx.session_id,
         );
     } else if !turn_result.content.is_empty() {
-        if !validate_final_response_for_history(ctx.session_id, &turn_result.content) {
+        let Some(rendered_content) =
+            render_final_response_for_history(ctx.session_id, &turn_result.content)
+        else {
             send_or_warn(
                 ctx.tx,
                 super::events::AppEvent::ResponseDone,
                 ctx.session_id,
             );
             return;
-        }
-        let mut message =
-            serde_json::json!({ "role": "assistant", "content": turn_result.content });
+        };
+        let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
         if let Some(reasoning) = turn_result
             .reasoning_content
             .as_deref()
@@ -4268,6 +4276,24 @@ mod tests {
         // Sanity: model/provider stay on App (not migrated into ApiClient).
         assert_eq!(app.model, "test-model");
         assert_eq!(app.provider, "anthropic");
+    }
+
+    #[test]
+    fn app_constructors_do_not_load_config_from_disk() {
+        let src = include_str!("app.rs");
+        let constructor_start = src
+            .find("pub fn new(model: &str, provider: &str) -> Self")
+            .expect("App::new constructor must exist");
+        let constructor_end = src[constructor_start..]
+            .find("pub fn set_api_config")
+            .map(|offset| constructor_start + offset)
+            .expect("constructor block must end before set_api_config");
+        let constructors = &src[constructor_start..constructor_end];
+
+        assert!(
+            !constructors.contains("load_config("),
+            "App constructors must not read project config; startup passes policy via new_with_policy"
+        );
     }
 
     fn last_display_content(app: &App) -> &str {

@@ -232,8 +232,10 @@ impl CommandHandler for CompactCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["summarize"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
-        SlashCommandResult::Compact
+    fn handle(&self, _ctx: &mut SlashCtx<'_>, args: &str) -> SlashCommandResult {
+        SlashCommandResult::Compact {
+            instructions: (!args.trim().is_empty()).then(|| args.trim().to_string()),
+        }
     }
 }
 

@@ -18,6 +18,14 @@ pub fn estimate_session_tokens(session: &ChatSession) -> usize {
 
 /// Compact a chat session by summarizing older messages
 pub fn compact_chat_session(session: &mut ChatSession) -> (usize, usize) {
+    compact_chat_session_with_instructions(session, None)
+}
+
+/// Compact a chat session while preserving optional user instructions.
+pub fn compact_chat_session_with_instructions(
+    session: &mut ChatSession,
+    custom_instructions: Option<&str>,
+) -> (usize, usize) {
     let before_tokens = estimate_session_tokens(session);
     let msg_count = session.messages.len();
 
@@ -43,11 +51,21 @@ pub fn compact_chat_session(session: &mut ChatSession) -> (usize, usize) {
         summary_parts.push(format!("[{role}]: {preview}"));
     }
 
-    let summary = format!(
+    let mut summary = format!(
         "[CONVERSATION SUMMARY - {} messages compacted]\n{}",
         to_summarize,
         summary_parts.join("\n")
     );
+    if let Some(instructions) = custom_instructions.and_then(|text| {
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }) {
+        let _ = write!(
+            summary,
+            "\n\n[COMPACTION INSTRUCTIONS]\n{}",
+            safe_truncate(instructions, 4_000)
+        );
+    }
 
     let preserved: Vec<_> = session
         .messages
@@ -197,5 +215,56 @@ pub fn save_session_to_short_term_memory(
                 activities
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_messages(count: usize) -> ChatSession {
+        let mut session = ChatSession::new(
+            "test-model",
+            "anthropic",
+            openclaudia::modes::BehaviorMode::default(),
+        );
+        for index in 0..count {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            session.messages.push(serde_json::json!({
+                "role": role,
+                "content": format!("message {index}")
+            }));
+        }
+        session
+    }
+
+    #[test]
+    fn compact_chat_session_preserves_custom_instructions() {
+        let mut session = session_with_messages(8);
+
+        let _ = compact_chat_session_with_instructions(&mut session, Some("preserve test context"));
+
+        assert_eq!(
+            session.messages.len(),
+            5,
+            "compaction should replace old messages with one summary plus preserved tail"
+        );
+        let summary = session.messages[0]["content"]
+            .as_str()
+            .expect("summary content");
+        assert!(summary.contains("[COMPACTION INSTRUCTIONS]"));
+        assert!(summary.contains("preserve test context"));
+    }
+
+    #[test]
+    fn compact_chat_session_omits_instruction_marker_when_empty() {
+        let mut session = session_with_messages(8);
+
+        let _ = compact_chat_session_with_instructions(&mut session, Some("   "));
+
+        let summary = session.messages[0]["content"]
+            .as_str()
+            .expect("summary content");
+        assert!(!summary.contains("[COMPACTION INSTRUCTIONS]"));
     }
 }

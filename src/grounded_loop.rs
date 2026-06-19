@@ -384,8 +384,24 @@ pub fn request_messages_with_grounding(
 /// Returns a string error when the ledger cannot be opened or the response is
 /// denied by the final-answer gate.
 pub fn validate_agentic_final_response(session_id: &str, content: &str) -> Result<(), String> {
+    validate_and_render_agentic_final_response(session_id, content).map(|_| ())
+}
+
+/// Validate a final model response and return the human-rendered final text.
+///
+/// Structured final decisions are preferred. Plain text with observation-id
+/// citations remains accepted as a compatibility fallback.
+///
+/// # Errors
+///
+/// Returns a string error when the ledger cannot be opened or the response is
+/// denied by the final-answer gate.
+pub fn validate_and_render_agentic_final_response(
+    session_id: &str,
+    content: &str,
+) -> Result<String, String> {
     if content.trim().is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
     let mut ledger = match RealityLedger::open_project_session(session_id) {
         Ok(ledger) => ledger,
@@ -399,7 +415,7 @@ pub fn validate_agentic_final_response(session_id: &str, content: &str) -> Resul
             return Err(reason);
         }
     };
-    validate_final_against_ledger(&mut ledger, content)
+    validate_and_render_final_against_ledger(&mut ledger, content)
 }
 
 /// Validate final text against an already-open ledger and record the decision.
@@ -411,10 +427,34 @@ pub fn validate_final_against_ledger(
     ledger: &mut RealityLedger,
     content: &str,
 ) -> Result<(), String> {
+    validate_and_render_final_against_ledger(ledger, content).map(|_| ())
+}
+
+/// Validate final text against an already-open ledger and return rendered text.
+///
+/// `AgentDecision::Final` JSON is validated directly. If no structured final
+/// decision is present, this falls back to the legacy text citation extractor.
+///
+/// # Errors
+///
+/// Returns a string error when the final-answer gate denies the response.
+pub fn validate_and_render_final_against_ledger(
+    ledger: &mut RealityLedger,
+    content: &str,
+) -> Result<String, String> {
+    match parse_structured_final_decision(content) {
+        Ok(Some(decision)) => return validate_and_render_structured_final(ledger, decision),
+        Ok(None) => {}
+        Err(reason) => {
+            append_final_policy_decision(ledger, false, &reason);
+            return Err(reason);
+        }
+    }
+
     match crate::final_gate::validate_cited_final_answer(content, ledger) {
         Ok(_) => {
             append_final_policy_decision(ledger, true, "final answer grounded");
-            Ok(())
+            Ok(content.to_string())
         }
         Err(denial) => {
             let reason = denial.reason().to_string();
@@ -422,6 +462,72 @@ pub fn validate_final_against_ledger(
             Err(reason)
         }
     }
+}
+
+fn validate_and_render_structured_final(
+    ledger: &mut RealityLedger,
+    decision: crate::decision::AgentDecision,
+) -> Result<String, String> {
+    let summary = match &decision {
+        crate::decision::AgentDecision::Final { summary, .. } => summary.clone(),
+        _ => {
+            let reason = "structured final decision must have kind 'final'".to_string();
+            append_final_policy_decision(ledger, false, &reason);
+            return Err(reason);
+        }
+    };
+
+    match crate::decision::validate_decision(&decision, ledger) {
+        Ok(crate::decision::DecisionValidation::Final(_)) => {
+            append_final_policy_decision(ledger, true, "structured final decision grounded");
+            Ok(summary)
+        }
+        Ok(_) => {
+            let reason = "structured final decision validated as a non-final decision".to_string();
+            append_final_policy_decision(ledger, false, &reason);
+            Err(reason)
+        }
+        Err(denial) => {
+            let reason = denial.reason().to_string();
+            append_final_policy_decision(ledger, false, &reason);
+            Err(reason)
+        }
+    }
+}
+
+fn parse_structured_final_decision(
+    content: &str,
+) -> Result<Option<crate::decision::AgentDecision>, String> {
+    let Some(candidate) = structured_json_candidate(content) else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str::<serde_json::Value>(candidate)
+        .map_err(|err| format!("Invalid structured final decision JSON: {err}"))?;
+    let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    if kind != "final" {
+        return Err("structured final decision must have kind 'final'".to_string());
+    }
+    serde_json::from_value::<crate::decision::AgentDecision>(value)
+        .map(Some)
+        .map_err(|err| format!("Invalid structured final decision: {err}"))
+}
+
+fn structured_json_candidate(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') {
+        return Some(trimmed);
+    }
+
+    let fenced = trimmed.strip_prefix("```")?;
+    let fenced = fenced
+        .strip_prefix("json")
+        .or_else(|| fenced.strip_prefix("JSON"))
+        .unwrap_or(fenced)
+        .trim_start();
+    let end = fenced.rfind("```")?;
+    Some(fenced[..end].trim())
 }
 
 pub fn append_final_policy_decision(ledger: &mut RealityLedger, allowed: bool, reason: &str) {
@@ -530,7 +636,7 @@ pub fn render_grounding_system_message(packet: &GroundedPromptPacket) -> String 
         );
     }
     out.push_str(
-        "\nRules: Use memory, summaries, and provider chat history only as navigation aids. Treat facts as grounded only when backed by non-stale, non-summary ledger observations. Use grounding_context to hydrate selected observation IDs when detailed evidence is needed. Cite observation IDs for file, command, diff, and verification claims in final answers.\n",
+        "\nRules: Use memory, summaries, and provider chat history only as navigation aids. Treat facts as grounded only when backed by non-stale, non-summary ledger observations. Use grounding_context to hydrate selected observation IDs when detailed evidence is needed. Prefer final answers as JSON {\"kind\":\"final\",\"summary\":\"...\",\"evidence\":[\"obs-id\"],\"verification\":[\"obs-id\"]}; plain text with cited observation IDs is accepted only as a compatibility fallback.\n",
     );
     out
 }
@@ -619,7 +725,8 @@ mod tests {
         assert!(rendered.contains("Reality Ledger > TaskSpec"));
         assert!(rendered.contains(&format!("TaskSpec [{task}]")));
         assert!(rendered.contains("navigation aids"));
-        assert!(rendered.contains("Cite observation IDs"));
+        assert!(rendered.contains("\"kind\":\"final\""));
+        assert!(rendered.contains("compatibility fallback"));
     }
 
     #[test]
@@ -701,6 +808,113 @@ mod tests {
                     && findings.iter().any(|finding| finding.contains("exited with code 0"))
             )
         }));
+    }
+
+    #[test]
+    fn structured_final_decision_renders_summary_and_records_allow() {
+        let mut ledger = RealityLedger::new();
+        let task = ledger
+            .observe_user_task("Verify the command path.")
+            .expect("task");
+        let command = ledger
+            .observe_command_run(
+                "/repo",
+                vec!["cargo".to_string(), "test".to_string()],
+                0,
+                "ok",
+                "",
+            )
+            .expect("command");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: true,
+                    command: Some("cargo test".to_string()),
+                    findings: Vec::new(),
+                },
+            )
+            .expect("verification");
+        let content = serde_json::json!({
+            "kind": "final",
+            "summary": "Verified the command path with cargo test.",
+            "evidence": [task, command],
+            "verification": [verification]
+        })
+        .to_string();
+
+        let rendered = validate_and_render_final_against_ledger(&mut ledger, &content)
+            .expect("structured final should pass");
+
+        assert_eq!(rendered, "Verified the command path with cargo test.");
+        assert!(
+            ledger.observations_chronological().iter().any(|obs| {
+                matches!(
+                    &obs.kind,
+                    ObservationKind::PolicyDecision { allowed: true, reason }
+                        if reason == "structured final decision grounded"
+                )
+            }),
+            "structured final allow decision must be recorded"
+        );
+    }
+
+    #[test]
+    fn structured_final_decision_rejects_missing_verification_and_records_denial() {
+        let mut ledger = RealityLedger::new();
+        let task = ledger.observe_user_task("Return final.").expect("task");
+        let content = serde_json::json!({
+            "kind": "final",
+            "summary": "Done.",
+            "evidence": [task],
+            "verification": []
+        })
+        .to_string();
+
+        let err = validate_and_render_final_against_ledger(&mut ledger, &content)
+            .expect_err("missing verification must be denied");
+
+        assert_eq!(err, "final answer requires verification observation");
+        assert!(
+            ledger.observations_chronological().iter().any(|obs| {
+                matches!(
+                    &obs.kind,
+                    ObservationKind::PolicyDecision { allowed: false, reason }
+                        if reason == "final answer requires verification observation"
+                )
+            }),
+            "structured final denial must be recorded"
+        );
+    }
+
+    #[test]
+    fn structured_final_decision_accepts_json_fence() {
+        let mut ledger = RealityLedger::new();
+        let task = ledger.observe_user_task("Summarize work.").expect("task");
+        let verification = ledger
+            .append(
+                Authority::Verifier,
+                ObservationKind::Verification {
+                    passed: false,
+                    command: None,
+                    findings: vec!["not run".to_string()],
+                },
+            )
+            .expect("verification");
+        let content = format!(
+            "```json\n{}\n```",
+            serde_json::json!({
+                "kind": "final",
+                "summary": "Work is summarized; verification was not run.",
+                "evidence": [task],
+                "verification": [verification]
+            })
+        );
+
+        let rendered = validate_and_render_final_against_ledger(&mut ledger, &content)
+            .expect("fenced structured final should pass");
+
+        assert_eq!(rendered, "Work is summarized; verification was not run.");
     }
 
     #[test]

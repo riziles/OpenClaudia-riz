@@ -1065,13 +1065,11 @@ pub fn execute_intercepted_tools_for_session(
                 policy_enforcer,
             },
         );
-        if let Some(session_id) = session_id {
-            crate::grounded_loop::observe_tool_result_for_session(
-                session_id,
-                &tool_call.function.name,
-                &result,
-            );
-        }
+        crate::services::tool_executor::ToolExecutor::observe_tool_result(
+            session_id,
+            &tool_call.function.name,
+            &result,
+        );
 
         // Show preview
         let preview: String = result

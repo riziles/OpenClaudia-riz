@@ -3,10 +3,12 @@
 //! Adds three orthogonal caps that operators can set in
 //! `.openclaudia/config.yaml` under a top-level `policy:` block:
 //!
-//! * **`token_caps`** — per-request or per-session token ceilings the
-//!   proxy refuses to exceed. Sits above the existing compaction
-//!   layer: compaction trims context to fit a budget, this hard-stops
-//!   when the budget itself is policy-violating.
+//! * **`token_caps`** — per-request or projected per-session token ceilings
+//!   the proxy refuses to exceed. Session projection is cumulative recorded
+//!   usage plus the current request's estimated input plus its requested (or
+//!   default) output budget. This sits above the existing compaction layer:
+//!   compaction trims context to fit a budget, this hard-stops when the
+//!   projected budget itself is policy-violating.
 //! * **`tool_caps`** — per-tool invocation limits per session
 //!   (e.g. "no more than 50 bash calls per session"). Prevents a
 //!   runaway agent from chewing through quota or sandboxes.
@@ -83,8 +85,12 @@ pub struct EnterprisePolicy {
     /// Hard ceiling on tokens per request. `None` disables this check.
     #[serde(default)]
     pub max_request_tokens: Option<usize>,
-    /// Hard ceiling on tokens per session (sum of `max_tokens` budgets).
-    /// `None` disables this check.
+    /// Hard ceiling on projected tokens per session.
+    ///
+    /// The enforced value is:
+    /// `cumulative_session_tokens + estimated_input_tokens + output_token_budget`.
+    /// `output_token_budget` is the request's `max_tokens` when set, otherwise
+    /// OpenClaudia's default output budget. `None` disables this check.
     #[serde(default)]
     pub max_session_tokens: Option<usize>,
     /// Per-tool invocation caps. Tools not present in the map are

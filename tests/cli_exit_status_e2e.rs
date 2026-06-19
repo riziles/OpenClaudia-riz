@@ -93,10 +93,42 @@ fn default_tui_auth_failure_does_not_create_project_state_without_config() {
             && combined.contains("could not resolve authentication for target 'anthropic'"),
         "default startup should surface the auth failure from the default provider; got {combined:?}"
     );
-    assert!(
-        !cwd.path().join(".openclaudia").exists(),
-        "default startup without config must not create project .openclaudia state"
-    );
+    let state_dir = cwd.path().join(".openclaudia");
+    if state_dir.exists() {
+        let entries = fs::read_dir(&state_dir)
+            .expect("project state dir should be readable")
+            .map(|entry| {
+                entry
+                    .expect("project state entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec!["logs".to_string()],
+            "default startup without config must only create TUI logs, not project state"
+        );
+
+        let log_entries = fs::read_dir(state_dir.join("logs"))
+            .expect("project logs dir should be readable")
+            .map(|entry| {
+                entry
+                    .expect("project log entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !log_entries.is_empty()
+                && log_entries
+                    .iter()
+                    .all(|name| name.starts_with("tui-") && name.ends_with(".log")),
+            "default startup without config must only create TUI log files; got {log_entries:?}"
+        );
+    }
 }
 
 fn isolated_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Command {
@@ -131,6 +163,115 @@ fn run_auth_with_stdin(input: &str) -> Output {
         .expect("auth stdin should accept input");
 
     child.wait_with_output().expect("openclaudia auth must run")
+}
+
+fn readme_cli_command_invocations() -> Vec<String> {
+    let readme = include_str!("../README.md");
+    let section = readme
+        .split("## CLI Commands")
+        .nth(1)
+        .expect("README must have CLI Commands section")
+        .split("## Slash Commands")
+        .next()
+        .expect("README CLI section must end before slash commands");
+    let block = section
+        .split("```bash")
+        .nth(1)
+        .expect("README CLI section must include bash command block")
+        .split("```")
+        .next()
+        .expect("README CLI command block must close");
+
+    block
+        .lines()
+        .filter_map(|line| {
+            let invocation = line.split('#').next().unwrap_or_default().trim();
+            (!invocation.is_empty()).then(|| invocation.to_string())
+        })
+        .collect()
+}
+
+fn binary_capability_matrix_rows() -> Vec<(String, String, Vec<String>)> {
+    let matrix = include_str!("../docs/binary-capability-matrix.md");
+    matrix
+        .lines()
+        .filter(|line| line.starts_with("| `openclaudia"))
+        .map(|line| {
+            let cells = line
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            assert_eq!(cells.len(), 7, "matrix row must have 7 cells: {line}");
+            let invocation = cells[0].trim_matches('`').to_string();
+            let entrypoint = cells[1].to_string();
+            let statuses = cells[2..6]
+                .iter()
+                .map(|cell| (*cell).to_string())
+                .collect::<Vec<_>>();
+            (invocation, entrypoint, statuses)
+        })
+        .collect()
+}
+
+#[test]
+fn binary_capability_matrix_covers_readme_cli_commands() {
+    let readme_commands = readme_cli_command_invocations();
+    let matrix_rows = binary_capability_matrix_rows();
+    let matrix_commands = matrix_rows
+        .iter()
+        .map(|(invocation, _, _)| invocation.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let readme_command_set = readme_commands
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+
+    for command in &readme_commands {
+        assert!(
+            matrix_commands.contains(command.as_str()),
+            "docs/binary-capability-matrix.md must cover README command `{command}`"
+        );
+    }
+    for command in &matrix_commands {
+        assert!(
+            readme_command_set.contains(command),
+            "capability matrix contains stale command `{command}` not present in README"
+        );
+    }
+
+    for (invocation, _entrypoint, statuses) in &matrix_rows {
+        for status in statuses {
+            assert!(
+                status.starts_with("works:")
+                    || status.starts_with("unsupported:")
+                    || status == "not_applicable",
+                "matrix status for `{invocation}` must be works/unsupported/not_applicable, got `{status}`"
+            );
+        }
+    }
+
+    let entrypoints = matrix_rows
+        .iter()
+        .map(|(_, entrypoint, _)| entrypoint.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for expected in [
+        "default_tui",
+        "legacy_repl",
+        "print",
+        "init",
+        "auth",
+        "proxy",
+        "acp",
+        "loop",
+        "config",
+        "doctor",
+    ] {
+        assert!(
+            entrypoints.contains(expected),
+            "capability matrix must include entrypoint `{expected}`"
+        );
+    }
 }
 
 #[test]
@@ -1406,7 +1547,7 @@ fn acp_session_set_config_option_updates_mode_and_model_over_stdio() {
     stdin
         .write_all(
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/set_config_option\",\"params\":{{\"sessionId\":\"{session_id}\",\"configId\":\"model\",\"value\":\"gpt-5.4\"}}}}\n"
+                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/set_config_option\",\"params\":{{\"sessionId\":\"{session_id}\",\"configId\":\"model\",\"value\":\"future-model-2099\"}}}}\n"
             )
             .as_bytes(),
         )
@@ -1448,7 +1589,7 @@ fn acp_session_set_config_option_updates_mode_and_model_over_stdio() {
         .find(|option| option["id"] == "model")
         .expect("model config option")["currentValue"]
         .as_str();
-    assert_eq!(returned_model_id, Some("gpt-5.4"));
+    assert_eq!(returned_model_id, Some("future-model-2099"));
 }
 
 #[test]

@@ -52,7 +52,7 @@ pub fn execute_key_action(action: &config::KeyAction) -> Option<SlashCommandResu
         KeyAction::NewSession | KeyAction::Clear => Some(SlashCommandResult::Clear),
         KeyAction::Exit => Some(SlashCommandResult::Exit),
         KeyAction::Export => Some(SlashCommandResult::Export),
-        KeyAction::Compact => Some(SlashCommandResult::Compact),
+        KeyAction::Compact => Some(SlashCommandResult::Compact { instructions: None }),
         KeyAction::Undo => Some(SlashCommandResult::Undo),
         KeyAction::Redo => Some(SlashCommandResult::Redo),
         KeyAction::ToggleMode => Some(SlashCommandResult::ToggleMode),

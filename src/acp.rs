@@ -28,12 +28,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
-use crate::hooks::{
-    load_claude_code_hooks, merge_hooks_config, HookEngine, HookError, HookEvent, HookInput,
-};
+use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
 use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
 use crate::providers::get_adapter;
-use crate::rules::{extract_extensions_from_tool_input, RulesEngine};
+use crate::rules::RulesEngine;
 use crate::session::{SessionManager, SessionMode};
 use crate::tools::args::ToolArgs as _;
 
@@ -354,33 +352,18 @@ async fn pre_tool_use_gate(
     tool_name: &str,
     tool_input: &Value,
 ) -> Option<AcpToolResult> {
-    let extensions = extract_extensions_from_tool_input(tool_name, tool_input);
-
-    let mut hook_input =
-        HookInput::new(HookEvent::PreToolUse).with_tool(tool_name, tool_input.clone());
-    if !extensions.is_empty() {
-        hook_input = hook_input.with_extra("extensions", json!(extensions));
-    }
-
-    let hook_result = hook_engine.run(HookEvent::PreToolUse, &hook_input).await;
-
-    if let Err(hook_err) = HookEngine::check_blocked(&hook_result) {
-        let reason = match hook_err {
-            HookError::Blocked(r) => r,
-            other => other.to_string(),
-        };
-        warn!(
-            tool = %tool_name,
-            reason = %reason,
-            "ACP PreToolUse hook blocked tool dispatch"
-        );
-        return Some(AcpToolResult {
-            content: format!("Tool '{tool_name}' blocked by PreToolUse hook: {reason}"),
-            is_error: true,
-        });
-    }
-
-    None
+    crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
+        hook_engine,
+        None,
+        tool_name,
+        tool_input,
+    )
+    .await
+    .err()
+    .map(|blocked| AcpToolResult {
+        content: blocked.content,
+        is_error: true,
+    })
 }
 
 /// Run the ACP dispatch through the same permission manager used by
@@ -445,21 +428,11 @@ fn parse_acp_tool_arguments(
     tool_name: &str,
     arguments_json: &str,
 ) -> Result<(HashMap<String, Value>, Value), AcpToolResult> {
-    let value = serde_json::from_str::<Value>(arguments_json).map_err(|err| AcpToolResult {
-        content: format!("Invalid tool arguments JSON for '{tool_name}': {err}"),
-        is_error: true,
-    })?;
-    let Value::Object(map) = value else {
-        return Err(AcpToolResult {
-            content: format!(
-                "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
-                value_type_name(&value)
-            ),
+    crate::services::tool_executor::ToolExecutor::parse_arguments_map(tool_name, arguments_json)
+        .map_err(|content| AcpToolResult {
+            content,
             is_error: true,
-        });
-    };
-    let args = map.clone().into_iter().collect();
-    Ok((args, Value::Object(map)))
+        })
 }
 
 fn parse_acp_bool_arg(
@@ -771,12 +744,14 @@ impl AcpServer {
     }
 
     fn apply_acp_model_value(&mut self, model: &str) -> Result<(), String> {
-        let options = acp_model_option_ids(&self.config.proxy.target, &self.model);
-        if !options.iter().any(|option| option.as_str() == model) {
-            return Err(format!(
-                "Invalid value for model: {model}. It must be one of the advertised model config options"
-            ));
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("Invalid value for model: model must not be empty".to_string());
         }
+        self.policy_enforcer
+            .policy()
+            .check_model(model)
+            .map_err(|err| format!("Blocked by policy: {err}"))?;
         self.model = model.to_string();
         Ok(())
     }
@@ -1602,25 +1577,29 @@ impl AcpServer {
 
             match stream_result {
                 StreamResult::EndTurn { content } => {
-                    if let Err(reason) = crate::grounded_loop::validate_agentic_final_response(
-                        oc_session_id,
-                        &content,
-                    ) {
-                        self.send_session_update(
-                            acp_session_id,
-                            "agent_message_chunk",
-                            &json!({
-                                "type": "text",
-                                "text": format!("\nFinal answer failed grounding gate: {reason}"),
-                            }),
-                        );
-                        return "error".to_string();
-                    }
+                    let rendered_content =
+                        match crate::grounded_loop::validate_and_render_agentic_final_response(
+                            oc_session_id,
+                            &content,
+                        ) {
+                            Ok(rendered) => rendered,
+                            Err(reason) => {
+                                self.send_session_update(
+                                acp_session_id,
+                                "agent_message_chunk",
+                                &json!({
+                                    "type": "text",
+                                    "text": format!("\nFinal answer failed grounding gate: {reason}"),
+                                }),
+                            );
+                                return "error".to_string();
+                            }
+                        };
                     // No tool calls — we're done
-                    if !content.is_empty() {
+                    if !rendered_content.is_empty() {
                         self.messages.push(json!({
                             "role": "assistant",
-                            "content": content,
+                            "content": rendered_content,
                         }));
                     }
                     return "end_turn".to_string();
@@ -2031,15 +2010,15 @@ impl AcpServer {
         };
 
         // ── PostToolUse fire-and-forget ─────────────────────────────────
-        self.hook_engine
-            .fire_post_tool(
-                !result.is_error,
-                tool_name,
-                tool_input,
-                &result.content,
-                None,
-            )
-            .await;
+        crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            &self.hook_engine,
+            !result.is_error,
+            tool_name,
+            tool_input,
+            &result.content,
+            Some(session_id),
+        )
+        .await;
 
         result
     }
@@ -4629,7 +4608,7 @@ providers:
     }
 
     #[test]
-    fn session_set_config_option_rejects_unadvertised_model_without_mutation() {
+    fn session_set_config_option_accepts_unadvertised_model_without_static_catalog_gate() {
         let (mut server, mut rx, _tmp) = test_server();
         server.config.proxy.target = "anthropic".to_string();
         server.model = "claude-opus-4-8".to_string();
@@ -4650,8 +4629,46 @@ providers:
         );
         let response = next_response(&mut rx);
 
-        assert_eq!(response["error"]["code"], INVALID_PARAMS);
-        assert_eq!(server.model, "claude-opus-4-8");
+        assert_eq!(server.model, "not-advertised");
+        assert_eq!(
+            config_option(&response, ACP_CONFIG_MODEL_ID)["currentValue"],
+            "not-advertised"
+        );
+    }
+
+    #[test]
+    fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server.model = "allowed-model".to_string();
+        server.policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
+            crate::services::policy::EnterprisePolicy {
+                model_allowlist: std::collections::HashSet::from(["allowed-model".to_string()]),
+                ..Default::default()
+            },
+        ));
+        server.handle_session_new(Some(json!(1)), Value::Null);
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        server.handle_session_set_config_option(
+            Some(json!(2)),
+            &json!({
+                "sessionId": acp_session_id,
+                "configId": "model",
+                "value": "not-allowed",
+            }),
+        );
+        let response = next_response(&mut rx);
+
+        assert_invalid_params(&response, "Blocked by policy");
+        assert_invalid_params(
+            &response,
+            "model `not-allowed` is not in the enterprise allowlist",
+        );
+        assert_eq!(server.model, "allowed-model");
     }
 
     #[test]

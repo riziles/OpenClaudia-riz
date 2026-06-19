@@ -1,6 +1,6 @@
 # OpenClaudia
 
-**Open-source universal agent harness** — Claude Code-like capabilities for any AI provider.
+**Open-source universal agent harness** — Claude Code-like coding workflows for many AI providers.
 
 OpenClaudia is a Rust-based CLI that transforms any LLM into an agentic coding assistant with tools, memory, hooks, and multi-provider support.
 
@@ -544,6 +544,8 @@ OpenClaudia automatically learns from your coding sessions without any flags or 
 - **Session Continuity** — Recent session summaries and activity logs for context across restarts
 
 Knowledge is injected into the model's context automatically — file-specific patterns when you read/edit a file, and preferences in every system prompt. Use `/memory` commands to inspect what's been learned.
+
+Background memory agents such as autoDream consolidation, MagicDocs, SessionMemory, PromptSuggestion, and automatic `MEMORY.md` injection are design-stage work, not production behavior yet.
 
 ## Project Structure
 

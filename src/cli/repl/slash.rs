@@ -90,7 +90,10 @@ pub enum SlashCommandResult {
     /// Export conversation to markdown
     Export,
     /// Compact conversation (summarize old messages)
-    Compact,
+    Compact {
+        /// Optional user instructions to preserve during compaction.
+        instructions: Option<String>,
+    },
     /// Editor returned content to send
     EditorInput(String),
     /// Undo last message pair
@@ -3088,7 +3091,10 @@ mod tests {
     fn spec_compact_bare_returns_compact() {
         let result = handle_slash_command("/compact", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
-            matches!(result, Some(SlashCommandResult::Compact)),
+            matches!(
+                result,
+                Some(SlashCommandResult::Compact { instructions: None })
+            ),
             "/compact must return Compact"
         );
     }
@@ -3097,26 +3103,26 @@ mod tests {
     fn spec_compact_summarize_alias_returns_compact() {
         let result = handle_slash_command("/summarize", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
-            matches!(result, Some(SlashCommandResult::Compact)),
+            matches!(
+                result,
+                Some(SlashCommandResult::Compact { instructions: None })
+            ),
             "/summarize alias must return Compact"
         );
     }
 
-    /// Pinned divergence: OC ignores the free-text argument; CC passes it as
-    /// `customInstructions`.  The current OC contract is: still returns Compact,
-    /// arg silently dropped.  Test documents this, not fixes it.
     #[test]
-    fn spec_compact_arg_ignored_returns_compact() {
+    fn spec_compact_arg_is_preserved_as_custom_instructions() {
         let result = handle_slash_command(
             "/compact write tests first",
             &mut ctx(),
             "anthropic",
             "claude-sonnet",
         );
-        assert!(
-            matches!(result, Some(SlashCommandResult::Compact)),
-            "/compact with custom-instructions arg must still return Compact (arg is currently dropped)"
-        );
+        let Some(SlashCommandResult::Compact { instructions }) = result else {
+            panic!("/compact with custom instructions must return Compact")
+        };
+        assert_eq!(instructions.as_deref(), Some("write tests first"));
     }
 
     // ── §2 /continue | /load | /resume ───────────────────────────────────────
@@ -4109,7 +4115,10 @@ mod tests {
     fn command_case_normalised() {
         let result = handle_slash_command("/COMPACT", &mut ctx(), "anthropic", "claude-sonnet");
         assert!(
-            matches!(result, Some(SlashCommandResult::Compact)),
+            matches!(
+                result,
+                Some(SlashCommandResult::Compact { instructions: None })
+            ),
             "/COMPACT must be treated the same as /compact (case-insensitive)"
         );
     }

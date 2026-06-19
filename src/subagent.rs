@@ -261,7 +261,8 @@ Guidelines:
   - Any issues encountered
   - Recommendations for follow-up if needed
 
-You have access to file and shell tools. Use them to explore the codebase, make changes, and verify your work.";
+You have access to file and shell tools. Use them to explore the codebase, make changes, and verify your work.
+For bash, write_file, and edit_file, include the required decision object with Reality Ledger evidence before requesting the tool.";
 
 const EXPLORE_PROMPT: &str = r"You are a fast exploration agent specialized for searching codebases.
 
@@ -269,6 +270,7 @@ Your goal is to quickly find relevant files, code patterns, and answer questions
 
 Guidelines:
 - Use bash with grep, find, or similar tools to search efficiently
+- Include the required decision object with Reality Ledger evidence for bash calls
 - Read files to understand their contents
 - Be fast and focused - don't over-explore
 - Return a concise summary of what you found including:
@@ -1277,11 +1279,14 @@ pub async fn run_subagent(
     run_subagent_inner(config, app_config, client, None).await
 }
 
-fn validate_subagent_final_response(agent_id: &str, final_output: &str) -> Result<(), String> {
+fn validate_and_render_subagent_final_response(
+    agent_id: &str,
+    final_output: &str,
+) -> Result<String, String> {
     if final_output.trim().is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
-    crate::grounded_loop::validate_agentic_final_response(agent_id, final_output)
+    crate::grounded_loop::validate_and_render_agentic_final_response(agent_id, final_output)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1409,6 +1414,7 @@ async fn run_subagent_inner(
                 .collect()
         })
         .unwrap_or_default();
+    let filtered_tools = add_subagent_typed_decision_contracts(filtered_tools);
 
     // Determine the model to use
     let model = config
@@ -1618,17 +1624,22 @@ async fn run_subagent_inner(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            if let Err(reason) = validate_subagent_final_response(&agent_id, &final_output) {
-                BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
-                store_transcript(&agent_id, messages, config.agent_type);
-                return SubagentResult {
-                    agent_id,
-                    success: false,
-                    output: format!("Final answer failed grounding gate: {reason}"),
-                    turns_used: turns,
-                    is_background: config.run_in_background,
-                    worktree: worktree.clone(),
-                };
+            match validate_and_render_subagent_final_response(&agent_id, &final_output) {
+                Ok(rendered) => {
+                    final_output = rendered;
+                }
+                Err(reason) => {
+                    BACKGROUND_AGENTS.fail(&agent_id, reason.clone());
+                    store_transcript(&agent_id, messages, config.agent_type);
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: format!("Final answer failed grounding gate: {reason}"),
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
             }
             // No tool calls means agent is done
             break;
@@ -1669,6 +1680,23 @@ async fn run_subagent_inner(
                 continue;
             }
 
+            if let Err(content) = validate_subagent_tool_decision_for_session(&agent_id, &tc) {
+                let result = crate::tools::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: format!("Error: {content}"),
+                    is_error: true,
+                };
+                observe_subagent_tool_result(&agent_id, &tc.function.name, &result);
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result.content
+                }));
+                continue;
+            }
+
+            let executable_tc = strip_subagent_decision_argument(&tc);
+
             // Execute the tool with the library-layer permission gate
             // engaged (crosslink #505).
             // Bind the subagent's id as the session key so its task
@@ -1677,7 +1705,7 @@ async fn run_subagent_inner(
             // present. Closes crosslink #518 for subagents.
             let result = crate::services::tool_executor::ToolExecutor::execute(
                 crate::services::tool_executor::ToolExecutorRequest {
-                    tool_call: &tc,
+                    tool_call: &executable_tc,
                     memory_db: None,
                     app_config: None,
                     task_mgr: None,
@@ -1687,11 +1715,11 @@ async fn run_subagent_inner(
                     policy_enforcer: Some(&policy_enforcer),
                 },
             );
-            observe_subagent_tool_result(&agent_id, &tc.function.name, &result);
+            observe_subagent_tool_result(&agent_id, &executable_tc.function.name, &result);
 
             messages.push(json!({
                 "role": "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": executable_tc.id,
                 "content": result.content
             }));
         }
@@ -1798,6 +1826,229 @@ fn check_provider_request_policy(
             0,
         ),
     )
+}
+
+const SUBAGENT_TYPED_DECISION_TOOLS: &[&str] = &["bash", "write_file", "edit_file"];
+
+fn requires_subagent_typed_decision(tool_name: &str) -> bool {
+    SUBAGENT_TYPED_DECISION_TOOLS.contains(&tool_name)
+}
+
+fn add_subagent_typed_decision_contracts(mut tools: Vec<Value>) -> Vec<Value> {
+    for tool in &mut tools {
+        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(tool_name) = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| requires_subagent_typed_decision(name))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(parameters) = function
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        parameters
+            .entry("properties".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(properties) = parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "decision".to_string(),
+                subagent_typed_decision_schema(&tool_name),
+            );
+        }
+        parameters
+            .entry("required".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(required) = parameters.get_mut("required").and_then(Value::as_array_mut) {
+            if !required
+                .iter()
+                .any(|item| item.as_str() == Some("decision"))
+            {
+                required.push(Value::String("decision".to_string()));
+            }
+        }
+    }
+    tools
+}
+
+fn subagent_typed_decision_schema(tool_name: &str) -> Value {
+    match tool_name {
+        "bash" => json!({
+            "type": "object",
+            "description": "Required grounded AgentDecision for this command. Cite authoritative Reality Ledger observation ids from the grounding packet or grounding_context.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["run_command"] },
+                "reason": { "type": "string" },
+                "evidence": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1
+                },
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "The command intent as argv. For shell commands use ['bash', '-lc', <command>] or argv text matching the command."
+                }
+            },
+            "required": ["kind", "reason", "evidence", "argv"]
+        }),
+        "write_file" | "edit_file" => json!({
+            "type": "object",
+            "description": "Required grounded AgentDecision for this file mutation. Cite authoritative Reality Ledger file-read observation ids from the grounding packet or grounding_context.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["edit"] },
+                "reason": { "type": "string" },
+                "evidence": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "Patch or diff for the intended file mutation. It must mention the same path as the tool call."
+                }
+            },
+            "required": ["kind", "reason", "evidence", "patch"]
+        }),
+        _ => json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    }
+}
+
+fn validate_subagent_tool_decision_for_session(
+    agent_id: &str,
+    tool_call: &ToolCall,
+) -> Result<(), String> {
+    if !requires_subagent_typed_decision(&tool_call.function.name) {
+        return Ok(());
+    }
+    let ledger = crate::ledger::RealityLedger::open_project_session(agent_id)
+        .map_err(|err| format!("typed decision requires reality ledger: {err}"))?;
+    let args = crate::services::tool_executor::ToolExecutor::parse_arguments(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+    )?;
+    match validate_subagent_tool_decision_against_ledger(&tool_call.function.name, &args, &ledger) {
+        Ok(()) => {
+            crate::grounded_loop::observe_policy_decision_for_session(
+                agent_id,
+                true,
+                &format!(
+                    "typed decision accepted for subagent tool '{}'",
+                    tool_call.function.name
+                ),
+            );
+            Ok(())
+        }
+        Err(err) => {
+            crate::grounded_loop::observe_policy_decision_for_session(agent_id, false, &err);
+            Err(err)
+        }
+    }
+}
+
+fn validate_subagent_tool_decision_against_ledger(
+    tool_name: &str,
+    args: &Value,
+    ledger: &crate::ledger::RealityLedger,
+) -> Result<(), String> {
+    if !requires_subagent_typed_decision(tool_name) {
+        return Ok(());
+    }
+    let decision_value = args
+        .get("decision")
+        .ok_or_else(|| format!("Tool '{tool_name}' requires arguments.decision"))?;
+    let decision = serde_json::from_value::<crate::decision::AgentDecision>(decision_value.clone())
+        .map_err(|err| format!("Invalid typed decision for tool '{tool_name}': {err}"))?;
+    validate_subagent_tool_decision_shape(tool_name, args, &decision)?;
+    crate::decision::validate_decision(&decision, ledger)
+        .map(|_| ())
+        .map_err(|denial| {
+            format!(
+                "Typed decision denied for tool '{tool_name}': {}",
+                denial.reason()
+            )
+        })
+}
+
+fn validate_subagent_tool_decision_shape(
+    tool_name: &str,
+    args: &Value,
+    decision: &crate::decision::AgentDecision,
+) -> Result<(), String> {
+    match (tool_name, decision) {
+        ("bash", crate::decision::AgentDecision::RunCommand { argv, .. }) => {
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !subagent_command_decision_matches(command, argv) {
+                return Err(
+                    "Typed command decision argv must match the bash command argument".to_string(),
+                );
+            }
+            Ok(())
+        }
+        ("write_file" | "edit_file", crate::decision::AgentDecision::Edit { patch, .. }) => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            if path.is_empty() || !patch_mentions_tool_path(patch, path) {
+                return Err(format!(
+                    "Typed edit decision patch must mention the tool path '{path}'"
+                ));
+            }
+            Ok(())
+        }
+        ("bash", _) => Err("Tool 'bash' requires a run_command typed decision".to_string()),
+        ("write_file" | "edit_file", _) => Err(format!(
+            "Tool '{tool_name}' requires an edit typed decision"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn subagent_command_decision_matches(command: &str, argv: &[String]) -> bool {
+    if command.trim().is_empty() || argv.is_empty() {
+        return false;
+    }
+    (argv.len() == 1 && argv[0] == command)
+        || (argv.len() == 3 && argv[0] == "bash" && argv[1] == "-lc" && argv[2] == command)
+        || argv.join(" ") == command
+}
+
+fn patch_mentions_tool_path(patch: &str, path: &str) -> bool {
+    let normalized = path.trim_start_matches("./");
+    !normalized.is_empty()
+        && patch.lines().any(|line| {
+            let line = line.trim_start_matches("./");
+            line.contains(normalized)
+        })
+}
+
+fn strip_subagent_decision_argument(tool_call: &ToolCall) -> ToolCall {
+    if !requires_subagent_typed_decision(&tool_call.function.name) {
+        return tool_call.clone();
+    }
+    let Ok(Value::Object(mut args)) = serde_json::from_str::<Value>(&tool_call.function.arguments)
+    else {
+        return tool_call.clone();
+    };
+    args.remove("decision");
+    let mut stripped = tool_call.clone();
+    stripped.function.arguments = Value::Object(args).to_string();
+    stripped
 }
 
 /// Make an API call to the LLM provider.
@@ -2704,6 +2955,216 @@ mod tests {
             subagent_tool_call_id_for_error(&json!({}), 7),
             "invalid_tool_call_7"
         );
+    }
+
+    fn subagent_test_tool_call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn required_fields(tool: &Value) -> Vec<&str> {
+        tool.get("function")
+            .and_then(|function| function.get("parameters"))
+            .and_then(|parameters| parameters.get("required"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    fn decision_property(tool: &Value) -> Option<&Value> {
+        tool.get("function")
+            .and_then(|function| function.get("parameters"))
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(|properties| properties.get("decision"))
+    }
+
+    #[test]
+    fn subagent_typed_decision_contracts_require_decision_for_mutating_tools() {
+        let all_tools = crate::tools::get_tool_definitions();
+        let selected = all_tools
+            .as_array()
+            .expect("tool definitions array")
+            .iter()
+            .filter(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        ["bash", "write_file", "edit_file", "read_file"].contains(&name)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let tools = add_subagent_typed_decision_contracts(selected);
+
+        for name in ["bash", "write_file", "edit_file"] {
+            let tool = tools
+                .iter()
+                .find(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("{name} definition must be selected"));
+            assert!(
+                required_fields(tool).contains(&"decision"),
+                "{name} must require the decision envelope"
+            );
+            assert!(
+                decision_property(tool).is_some(),
+                "{name} must expose a decision schema"
+            );
+        }
+
+        let read_file = tools
+            .iter()
+            .find(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("read_file")
+            })
+            .expect("read_file definition must be selected");
+        assert!(!required_fields(read_file).contains(&"decision"));
+        assert!(decision_property(read_file).is_none());
+    }
+
+    #[test]
+    fn subagent_tool_decision_rejects_missing_decision() {
+        let ledger = crate::ledger::RealityLedger::new();
+        let args = json!({"command": "cargo test"});
+
+        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
+            .expect_err("missing decision must be rejected");
+
+        assert!(
+            err.contains("requires arguments.decision"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn subagent_tool_decision_accepts_grounded_command_decision() {
+        let mut ledger = crate::ledger::RealityLedger::new();
+        let task = ledger
+            .observe_user_task("Run the focused test command")
+            .expect("task observation");
+        let args = json!({
+            "command": "cargo test --lib subagent_tool_decision",
+            "decision": {
+                "kind": "run_command",
+                "reason": "verify the subagent decision gate",
+                "evidence": [task],
+                "argv": ["bash", "-lc", "cargo test --lib subagent_tool_decision"]
+            }
+        });
+
+        validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
+            .expect("grounded command decision must be accepted");
+    }
+
+    #[test]
+    fn subagent_tool_decision_rejects_mismatched_command_argv() {
+        let mut ledger = crate::ledger::RealityLedger::new();
+        let task = ledger
+            .observe_user_task("Run tests")
+            .expect("task observation");
+        let args = json!({
+            "command": "cargo test",
+            "decision": {
+                "kind": "run_command",
+                "reason": "verify behavior",
+                "evidence": [task],
+                "argv": ["bash", "-lc", "cargo check"]
+            }
+        });
+
+        let err = validate_subagent_tool_decision_against_ledger("bash", &args, &ledger)
+            .expect_err("mismatched argv must be rejected");
+
+        assert!(err.contains("argv must match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn subagent_tool_decision_accepts_grounded_edit_decision() {
+        let mut ledger = crate::ledger::RealityLedger::new();
+        let read = ledger
+            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .expect("file observation");
+        let args = json!({
+            "path": "src/lib.rs",
+            "old_string": "old",
+            "new_string": "new",
+            "decision": {
+                "kind": "edit",
+                "reason": "apply the requested source edit",
+                "evidence": [read],
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            }
+        });
+
+        validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
+            .expect("grounded edit decision must be accepted");
+    }
+
+    #[test]
+    fn subagent_tool_decision_rejects_edit_patch_for_different_path() {
+        let mut ledger = crate::ledger::RealityLedger::new();
+        let read = ledger
+            .observe_file_read("src/lib.rs", "old\n", 1, 1, "old")
+            .expect("file observation");
+        let args = json!({
+            "path": "src/lib.rs",
+            "old_string": "old",
+            "new_string": "new",
+            "decision": {
+                "kind": "edit",
+                "reason": "apply the requested source edit",
+                "evidence": [read],
+                "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+            }
+        });
+
+        let err = validate_subagent_tool_decision_against_ledger("edit_file", &args, &ledger)
+            .expect_err("path mismatch must be rejected");
+
+        assert!(err.contains("tool path"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn strip_subagent_decision_argument_removes_decision_before_dispatch() {
+        let tool_call = subagent_test_tool_call(
+            "bash",
+            json!({
+                "command": "cargo test",
+                "decision": {
+                    "kind": "run_command",
+                    "reason": "verify",
+                    "evidence": ["00000000-0000-0000-0000-000000000000"],
+                    "argv": ["bash", "-lc", "cargo test"]
+                }
+            }),
+        );
+
+        let stripped = strip_subagent_decision_argument(&tool_call);
+        let args = serde_json::from_str::<Value>(&stripped.function.arguments)
+            .expect("stripped args must stay valid JSON");
+
+        assert_eq!(
+            args.get("command").and_then(Value::as_str),
+            Some("cargo test")
+        );
+        assert!(args.get("decision").is_none());
     }
 
     #[test]
