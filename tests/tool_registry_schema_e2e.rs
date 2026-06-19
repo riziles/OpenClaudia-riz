@@ -178,6 +178,32 @@ fn required_fields_are_subsets_of_properties() {
     );
 }
 
+#[test]
+fn no_tool_schema_uses_anthropic_rejected_top_level_combinators() {
+    let defs = get_tool_definitions();
+    let arr = defs.as_array().expect("array");
+    let mut rejected = Vec::new();
+    for entry in arr {
+        let name = entry
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let Some(params) = entry.pointer("/function/parameters") else {
+            continue;
+        };
+        for keyword in ["oneOf", "allOf", "anyOf"] {
+            if params.get(keyword).is_some() {
+                rejected.push(format!("{name}: top-level {keyword}"));
+            }
+        }
+    }
+    assert!(
+        rejected.is_empty(),
+        "Anthropic rejects top-level oneOf/allOf/anyOf in tool input_schema; found:\n  {}",
+        rejected.join("\n  ")
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section B — documented core tools present
 // ───────────────────────────────────────────────────────────────────────────
@@ -705,19 +731,20 @@ fn cron_delete_schema_matches_identifier_contract() {
         params.pointer("/properties/id").is_some(),
         "cron_delete schema must expose legacy id deletion: {params:?}"
     );
-    let any_of = params
-        .pointer("/anyOf")
-        .and_then(Value::as_array)
-        .expect("cron_delete anyOf");
-    for required_field in ["name", "index", "id"] {
+    for keyword in ["oneOf", "allOf", "anyOf"] {
         assert!(
-            any_of
-                .iter()
-                .any(|entry| entry.pointer("/required/0").and_then(Value::as_str)
-                    == Some(required_field)),
-            "cron_delete anyOf must accept {required_field}; got {any_of:?}"
+            params.get(keyword).is_none(),
+            "cron_delete must not use top-level {keyword}; Anthropic rejects it: {params:?}"
         );
     }
+    let params_desc = params
+        .pointer("/description")
+        .and_then(Value::as_str)
+        .expect("cron_delete parameter description");
+    assert!(
+        params_desc.contains("exactly one identifier"),
+        "cron_delete schema must explain the identifier contract without top-level anyOf; got {params_desc:?}"
+    );
     let id_desc = params
         .pointer("/properties/id/description")
         .and_then(Value::as_str)

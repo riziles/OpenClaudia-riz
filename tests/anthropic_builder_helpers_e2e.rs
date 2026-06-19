@@ -332,6 +332,51 @@ fn convert_tools_openai_format_to_anthropic_format() {
 }
 
 #[test]
+fn convert_tools_simplifies_top_level_schema_combinators_for_anthropic() {
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "delete_thing",
+            "description": "Delete by one identifier",
+            "parameters": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"}
+                        },
+                        "required": ["id"]
+                    }
+                ]
+            }
+        }
+    })];
+
+    let converted = convert_tools_to_anthropic(&tools);
+    let schema = &converted[0]["input_schema"];
+    assert_eq!(schema["type"], "object");
+    assert!(
+        schema.get("anyOf").is_none(),
+        "Anthropic rejects top-level anyOf in input_schema: {schema:?}"
+    );
+    assert!(schema["properties"].get("name").is_some());
+    assert!(schema["properties"].get("id").is_some());
+    assert!(
+        schema["description"]
+            .as_str()
+            .is_some_and(|desc| desc.contains("Anthropic compatibility note")),
+        "simplified schema should explain that runtime validation owns exact semantics: {schema:?}"
+    );
+}
+
+#[test]
 fn convert_tools_empty_slice_returns_empty_vec() {
     let converted = convert_tools_to_anthropic(&[]);
     assert!(converted.is_empty());

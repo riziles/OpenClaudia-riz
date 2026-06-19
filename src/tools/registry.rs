@@ -1143,6 +1143,7 @@ impl ToolHandler for CronDeleteHandler {
                 "description": "Delete stored cron schedule metadata by name, list index, or legacy ID.",
                 "parameters": {
                     "type": "object",
+                    "description": "Provide exactly one identifier: name, index, or id. Prefer name when available; use index from cron_list output or legacy id only when name is unavailable.",
                     "properties": {
                         "name": {
                             "type": "string",
@@ -1158,11 +1159,7 @@ impl ToolHandler for CronDeleteHandler {
                             "description": "Legacy persisted schedule ID (16-character hex string)"
                         }
                     },
-                    "anyOf": [
-                        { "required": ["name"] },
-                        { "required": ["index"] },
-                        { "required": ["id"] }
-                    ]
+                    "required": []
                 }
             }
         })

@@ -55,6 +55,94 @@ pub fn apply_anthropic_adaptive_thinking(body: &mut Value, model: &str, effort: 
     }
 }
 
+const ANTHROPIC_TOP_LEVEL_SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "allOf", "anyOf"];
+
+fn anthropic_input_schema(parameters: Option<&Value>) -> Value {
+    sanitize_anthropic_input_schema(
+        parameters
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default())),
+    )
+}
+
+fn sanitize_anthropic_input_schema(mut schema: Value) -> Value {
+    let Value::Object(map) = &mut schema else {
+        return schema;
+    };
+
+    let mut removed_keywords = Vec::new();
+    let mut branches = Vec::new();
+    for keyword in ANTHROPIC_TOP_LEVEL_SCHEMA_COMBINATORS {
+        if let Some(value) = map.remove(keyword) {
+            removed_keywords.push(keyword);
+            if let Some(items) = value.as_array() {
+                branches.extend(items.iter().cloned());
+            }
+        }
+    }
+
+    if removed_keywords.is_empty() {
+        return schema;
+    }
+
+    map.entry("type".to_string())
+        .or_insert_with(|| Value::String("object".to_string()));
+    merge_top_level_schema_branches(map, branches);
+    append_anthropic_schema_compatibility_note(map, &removed_keywords);
+    schema
+}
+
+fn merge_top_level_schema_branches(map: &mut serde_json::Map<String, Value>, branches: Vec<Value>) {
+    let entry = map
+        .entry("properties".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::default()));
+    if !entry.is_object() {
+        *entry = Value::Object(serde_json::Map::default());
+    }
+
+    let Some(target_props) = entry.as_object_mut() else {
+        return;
+    };
+
+    for branch in branches {
+        let Value::Object(branch_map) = branch else {
+            continue;
+        };
+        let Some(Value::Object(props)) = branch_map.get("properties") else {
+            continue;
+        };
+        for (name, value) in props {
+            target_props
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+fn append_anthropic_schema_compatibility_note(
+    map: &mut serde_json::Map<String, Value>,
+    removed_keywords: &[&str],
+) {
+    let note = format!(
+        "Anthropic compatibility note: top-level {} constraints were simplified; exact input semantics are validated when the tool runs.",
+        removed_keywords.join("/")
+    );
+    match map.get_mut("description") {
+        Some(Value::String(description))
+            if !description.contains("Anthropic compatibility note") =>
+        {
+            if !description.ends_with(' ') {
+                description.push(' ');
+            }
+            description.push_str(&note);
+        }
+        Some(Value::String(_)) => {}
+        _ => {
+            map.insert("description".to_string(), Value::String(note));
+        }
+    }
+}
+
 /// Anthropic Messages API adapter
 pub struct AnthropicAdapter;
 
@@ -182,7 +270,7 @@ impl AnthropicAdapter {
             let mut tool_def = json!({
                 "name": name,
                 "description": func.get("description").cloned().unwrap_or_else(|| Value::String(String::new())),
-                "input_schema": func.get("parameters").cloned().unwrap_or_else(|| Value::Object(serde_json::Map::default()))
+                "input_schema": anthropic_input_schema(func.get("parameters"))
             });
 
             // Add cache_control to the last tool for prompt caching.
@@ -232,7 +320,7 @@ impl AnthropicAdapter {
                         let mut tool_def = json!({
                             "name": name,
                             "description": func.get("description").cloned().unwrap_or_else(|| Value::String(String::new())),
-                            "input_schema": func.get("parameters").cloned().unwrap_or_else(|| Value::Object(serde_json::Map::default()))
+                            "input_schema": anthropic_input_schema(func.get("parameters"))
                         });
                         if cache_last && i + 1 == len {
                             tool_def["cache_control"] = json!({"type": "ephemeral"});
