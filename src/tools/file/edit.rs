@@ -172,7 +172,7 @@ fn format_edit_success(
 /// a uniquely-matching `old_string`.
 pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
     // crosslink #675: typed accessor.
-    let user_path = match args.arg_str("path") {
+    let user_path = match args.arg_str_strict("path") {
         Ok(p) => p,
         Err(e) => return e.into_tool_error(),
     };
@@ -213,11 +213,11 @@ pub fn execute_edit_file(args: &HashMap<String, Value>) -> (String, bool) {
     }
 
     // crosslink #675: typed accessors.
-    let old_string = match args.arg_str("old_string") {
+    let old_string = match args.arg_str_strict("old_string") {
         Ok(s) => s,
         Err(e) => return e.into_tool_error(),
     };
-    let new_string = match args.arg_str("new_string") {
+    let new_string = match args.arg_str_strict("new_string") {
         Ok(s) => s,
         Err(e) => return e.into_tool_error(),
     };

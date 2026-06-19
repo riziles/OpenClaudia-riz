@@ -15,6 +15,7 @@
 //! | accessor                             | use case                                  |
 //! |--------------------------------------|-------------------------------------------|
 //! | [`ToolArgs::arg_str`]                | required string — returns [`ToolArgError`]|
+//! | [`ToolArgs::arg_str_strict`]         | required string, reject wrong type        |
 //! | [`ToolArgs::arg_string`]             | same, owned `String`                      |
 //! | [`ToolArgs::arg_str_opt`]            | optional string, no error                 |
 //! | [`ToolArgs::arg_str_or_strict`]      | optional string default, reject wrong type|
@@ -259,6 +260,17 @@ pub trait ToolArgs {
     /// present or the value is not a JSON string.
     fn arg_str(&self, key: &'static str) -> Result<&str, ToolArgError>;
 
+    /// Required string argument. Missing values keep the legacy missing
+    /// wording, but present non-string values produce a type-specific
+    /// validation error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolArgError::MissingOrWrongType`] when `key` is not
+    /// present, or [`ToolArgError::WrongType`] when `key` is present but
+    /// not a JSON string.
+    fn arg_str_strict(&self, key: &'static str) -> Result<&str, ToolArgError>;
+
     /// Required string argument as an owned `String`. Convenience for
     /// the `.to_string()` follow-up that several executors need (cron,
     /// task) so a string can outlive the borrowed map.
@@ -303,6 +315,17 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
         self.get(key)
             .and_then(Value::as_str)
             .ok_or(ToolArgError::MissingOrWrongType { key })
+    }
+
+    fn arg_str_strict(&self, key: &'static str) -> Result<&str, ToolArgError> {
+        match self.get(key) {
+            None => Err(ToolArgError::MissingOrWrongType { key }),
+            Some(Value::String(value)) => Ok(value.as_str()),
+            Some(_) => Err(ToolArgError::WrongType {
+                key,
+                expected: "string",
+            }),
+        }
     }
 
     fn arg_str_opt(&self, key: &str) -> Option<&str> {
@@ -376,6 +399,36 @@ mod tests {
     fn arg_str_errors_when_value_is_null() {
         let m = make();
         assert!(m.arg_str("null_value").is_err());
+    }
+
+    // ── arg_str_strict ─────────────────────────────────────────────────
+
+    #[test]
+    fn arg_str_strict_returns_value_when_present_and_string() {
+        let m = make();
+        assert_eq!(m.arg_str_strict("name").unwrap(), "alice");
+    }
+
+    #[test]
+    fn arg_str_strict_errors_when_key_missing() {
+        let m = make();
+        let err = m.arg_str_strict("absent").unwrap_err();
+        assert_eq!(err, ToolArgError::MissingOrWrongType { key: "absent" });
+        assert_eq!(err.to_string(), "Missing 'absent' argument");
+    }
+
+    #[test]
+    fn arg_str_strict_errors_when_value_is_wrong_type() {
+        let m = make();
+        let err = m.arg_str_strict("count").unwrap_err();
+        assert_eq!(
+            err,
+            ToolArgError::WrongType {
+                key: "count",
+                expected: "string",
+            }
+        );
+        assert_eq!(err.to_string(), "Invalid 'count' argument: expected string");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::{canonicalize_or_walk_up, resolve_open_path, resolve_path, READ_TRACKER};
+use crate::tools::args::ToolArgs as _;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -40,8 +41,9 @@ fn open_for_write_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Write content to a file
 pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
-    let Some(user_path) = args.get("path").and_then(|v| v.as_str()) else {
-        return ("Missing 'path' argument".to_string(), true);
+    let user_path = match args.arg_str_strict("path") {
+        Ok(path) => path,
+        Err(e) => return e.into_tool_error(),
     };
 
     let p = match resolve_path(user_path) {
@@ -94,8 +96,9 @@ pub fn execute_write_file(args: &HashMap<String, Value>) -> (String, bool) {
         }
     }
 
-    let Some(content) = args.get("content").and_then(|v| v.as_str()) else {
-        return ("Missing 'content' argument".to_string(), true);
+    let content = match args.arg_str_strict("content") {
+        Ok(content) => content,
+        Err(e) => return e.into_tool_error(),
     };
 
     if let Err(msg) = crate::guardrails::check_file_access(path) {

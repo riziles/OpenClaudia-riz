@@ -19,6 +19,7 @@ pub use read::{
 };
 pub use write::execute_write_file;
 
+use crate::tools::args::{ToolArgError, ToolArgs as _};
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -452,8 +453,9 @@ pub fn resolve_open_path(user_path: &str) -> Result<PathBuf, String> {
 pub fn execute_read_file(
     args: &std::collections::HashMap<String, serde_json::Value>,
 ) -> (String, bool) {
-    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-        return ("Missing 'path' argument".to_string(), true);
+    let path = match args.arg_str_strict("path") {
+        Ok(path) => path,
+        Err(e) => return e.into_tool_error(),
     };
 
     let resolved = match resolve_path(path) {
@@ -465,7 +467,17 @@ pub fn execute_read_file(
     let (content, is_error) = match detect_file_type(&resolved_str) {
         FileType::Image(kind) => read_image_file(&resolved_str, kind),
         FileType::Pdf => {
-            let pages = args.get("pages").and_then(|v| v.as_str());
+            let pages = match args.get("pages") {
+                None => None,
+                Some(serde_json::Value::String(value)) => Some(value.as_str()),
+                Some(_) => {
+                    return ToolArgError::WrongType {
+                        key: "pages",
+                        expected: "string",
+                    }
+                    .into_tool_error();
+                }
+            };
             read::read_pdf_file(&resolved_str, pages)
         }
         FileType::Notebook => read_notebook_file(&resolved_str),

@@ -70,38 +70,38 @@ fn missing_path_arg_errors_with_documented_message() {
 }
 
 #[test]
-fn path_arg_as_number_treated_as_missing() {
+fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42)), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Missing 'path' argument"),
-        "non-string path MUST surface missing-path; got {msg:?}"
+        msg.contains("Invalid 'path' argument: expected string"),
+        "non-string path MUST surface path type validation; got {msg:?}"
     );
 }
 
 #[test]
-fn path_arg_as_array_treated_as_missing() {
+fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["x"])), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 #[test]
-fn path_arg_as_object_treated_as_missing() {
+fn path_arg_as_object_returns_validation_error() {
     let args = args_with(&[("path", json!({"k": "v"})), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 #[test]
-fn path_arg_as_null_treated_as_missing() {
+fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -205,7 +205,7 @@ fn missing_content_arg_on_new_file_errors() {
 }
 
 #[test]
-fn content_arg_as_number_treated_as_missing() {
+fn content_arg_as_number_returns_validation_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
@@ -215,13 +215,13 @@ fn content_arg_as_number_treated_as_missing() {
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Missing 'content' argument"),
-        "non-string content MUST surface missing-content; got {msg:?}"
+        msg.contains("Invalid 'content' argument: expected string"),
+        "non-string content MUST surface content type validation; got {msg:?}"
     );
 }
 
 #[test]
-fn content_arg_as_array_treated_as_missing() {
+fn content_arg_as_array_returns_validation_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
@@ -230,11 +230,11 @@ fn content_arg_as_array_treated_as_missing() {
     ]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'content' argument"));
+    assert!(msg.contains("Invalid 'content' argument: expected string"));
 }
 
 #[test]
-fn content_arg_as_null_treated_as_missing() {
+fn content_arg_as_null_returns_validation_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("test.txt");
     let args = args_with(&[
@@ -243,7 +243,7 @@ fn content_arg_as_null_treated_as_missing() {
     ]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'content' argument"));
+    assert!(msg.contains("Invalid 'content' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

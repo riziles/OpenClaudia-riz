@@ -50,7 +50,7 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — Missing path arg
+// Section A — Missing / wrong-type path arg
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -65,14 +65,15 @@ fn missing_path_arg_errors() {
 }
 
 #[test]
-fn path_arg_as_number_treated_as_missing() {
+fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[
         ("path", json!(42)),
         ("old_string", json!("foo")),
         ("new_string", json!("bar")),
     ]);
-    let (_msg, is_err) = dispatch_edit(&args);
+    let (msg, is_err) = dispatch_edit(&args);
     assert!(is_err);
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -288,6 +289,44 @@ fn missing_new_string_after_read_errors() {
         msg.contains("new_string"),
         "MUST mention missing new_string; got {msg:?}"
     );
+}
+
+#[test]
+fn old_string_arg_as_number_after_read_returns_validation_error() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("wrong_old.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!(42)),
+        ("new_string", json!("bar")),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'old_string' argument: expected string"));
+}
+
+#[test]
+fn new_string_arg_as_number_after_read_returns_validation_error() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("wrong_new.txt");
+    std::fs::write(&path, "body").expect("create");
+    let path_str = path.to_str().unwrap();
+
+    let _ = dispatch_read(&args_with(&[("path", json!(path_str))]));
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("old_string", json!("body")),
+        ("new_string", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_edit(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'new_string' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

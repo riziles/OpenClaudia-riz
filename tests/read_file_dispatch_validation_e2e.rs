@@ -37,7 +37,7 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section A — Missing path arg
+// Section A — Missing / wrong-type path args
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -51,27 +51,42 @@ fn missing_path_arg_returns_documented_error() {
 }
 
 #[test]
-fn path_arg_as_number_treated_as_missing() {
+fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 #[test]
-fn path_arg_as_array_treated_as_missing() {
+fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["a", "b"]))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
 }
 
 #[test]
-fn path_arg_as_null_treated_as_missing() {
+fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null)]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Missing 'path' argument"));
+    assert!(msg.contains("Invalid 'path' argument: expected string"));
+}
+
+#[test]
+fn pdf_pages_arg_as_number_returns_validation_error() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("bad_pages.pdf");
+    std::fs::write(&path, b"%PDF-1.4\n").expect("write");
+
+    let args = args_with(&[
+        ("path", json!(path.to_string_lossy())),
+        ("pages", json!(42)),
+    ]);
+    let (msg, is_err) = dispatch_read(&args);
+    assert!(is_err);
+    assert!(msg.contains("Invalid 'pages' argument: expected string"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
