@@ -4277,33 +4277,12 @@ providers: {}
     }
 
     #[test]
-    fn cli_final_gate_accepts_cited_evidence_and_verification() {
+    fn cli_plain_final_records_allow_decision() {
         let mut ledger = openclaudia::ledger::RealityLedger::new();
-        let task = ledger.observe_user_task("Audit CLI loop.").expect("task");
-        let command = ledger
-            .observe_command_run(
-                "/repo",
-                vec!["cargo".to_string(), "test".to_string()],
-                0,
-                "ok",
-                "",
-            )
-            .expect("command");
-        let verification = ledger
-            .append(
-                openclaudia::ledger::Authority::Verifier,
-                openclaudia::ledger::ObservationKind::Verification {
-                    passed: true,
-                    command: Some("cargo test".to_string()),
-                    findings: Vec::new(),
-                },
-            )
-            .expect("verification");
-        let content =
-            format!("Verified the CLI loop with evidence [{task}] [{command}] [{verification}].");
+        let content = "Verified with cargo test.";
 
         openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, &content)
-            .expect("cited final should pass");
+            .expect("plain assistant text should render");
 
         assert!(ledger
             .observations_chronological()
@@ -4315,16 +4294,21 @@ providers: {}
     }
 
     #[test]
-    fn cli_final_gate_rejects_uncited_agentic_final() {
+    fn cli_structured_final_gate_rejects_missing_verification() {
         let mut ledger = openclaudia::ledger::RealityLedger::new();
+        let task = ledger.observe_user_task("Audit CLI loop.").expect("task");
+        let content = serde_json::json!({
+            "kind": "final",
+            "summary": "Verified with cargo test.",
+            "evidence": [task],
+            "verification": [],
+        })
+        .to_string();
 
-        let err = openclaudia::grounded_loop::validate_final_against_ledger(
-            &mut ledger,
-            "Verified with cargo test.",
-        )
-        .expect_err("uncited final must be denied");
+        let err = openclaudia::grounded_loop::validate_final_against_ledger(&mut ledger, &content)
+            .expect_err("structured final without verification must be denied");
 
-        assert_eq!(err, "final answer requires evidence");
+        assert_eq!(err, "final answer requires verification observation");
         assert!(ledger
             .observations_chronological()
             .iter()

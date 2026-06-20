@@ -2643,8 +2643,9 @@ mod tests {
         }));
     }
 
-    fn spawn_openai_no_tool_final_server() -> (std::thread::JoinHandle<Result<(), String>>, String)
-    {
+    fn spawn_openai_no_tool_final_server(
+        final_content: &'static str,
+    ) -> (std::thread::JoinHandle<Result<(), String>>, String) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
         listener
             .set_nonblocking(true)
@@ -2712,7 +2713,24 @@ mod tests {
                 request.extend_from_slice(&buf[..n]);
             }
 
-            let body = r#"{"id":"chatcmpl-subagent-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Ungrounded no-tool final."},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let body = serde_json::json!({
+                "id": "chatcmpl-subagent-test",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                }
+            })
+            .to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -2746,14 +2764,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_no_tool_final_is_rejected_by_grounding_gate() {
-        let agent_id = "subagent-no-tool-final-denied";
+    async fn subagent_no_tool_plain_final_is_allowed() {
+        let agent_id = "subagent-no-tool-final-allowed";
         let ledger_path =
             crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
         let _ = std::fs::remove_file(&ledger_path);
         let _ = BACKGROUND_AGENTS.remove(agent_id);
 
-        let (server, base_url) = spawn_openai_no_tool_final_server();
+        let final_content = "Verified with cargo check.";
+        let (server, base_url) = spawn_openai_no_tool_final_server(final_content);
         let app_config = local_subagent_app_config(base_url);
         let config = SubagentConfig {
             agent_type: AgentType::GeneralPurpose,
@@ -2775,17 +2794,51 @@ mod tests {
             server_result.err()
         );
         assert!(
-            !result.success,
-            "ungrounded no-tool final must fail; output={}",
+            result.success,
+            "plain no-tool final should pass; output={}",
             result.output
+        );
+        assert_eq!(result.output, final_content);
+
+        let _ = BACKGROUND_AGENTS.remove(agent_id);
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn subagent_no_tool_conversational_final_is_allowed() {
+        let agent_id = "subagent-no-tool-greeting-final-allowed";
+        let ledger_path =
+            crate::ledger::project_session_ledger_path(agent_id).expect("safe agent id");
+        let _ = std::fs::remove_file(&ledger_path);
+        let _ = BACKGROUND_AGENTS.remove(agent_id);
+
+        let (server, base_url) = spawn_openai_no_tool_final_server("Good morning!");
+        let app_config = local_subagent_app_config(base_url);
+        let config = SubagentConfig {
+            agent_type: AgentType::GeneralPurpose,
+            task: "Return a direct greeting".to_string(),
+            prompt: "Do not call tools; just answer.".to_string(),
+            run_in_background: false,
+            model_override: Some("gpt-5.5".to_string()),
+            resume_agent_id: None,
+            isolation: None,
+        };
+        let client = Client::new();
+
+        let result = run_subagent_inner(&config, &app_config, &client, Some(agent_id)).await;
+        let server_result = server.join().expect("mock provider thread joined");
+
+        assert!(
+            server_result.is_ok(),
+            "mock provider failed: {:?}",
+            server_result.err()
         );
         assert!(
-            result
-                .output
-                .contains("Final answer failed grounding gate: final answer requires evidence"),
-            "unexpected output: {}",
+            result.success,
+            "plain no-tool final should pass; output={}",
             result.output
         );
+        assert_eq!(result.output, "Good morning!");
 
         let _ = BACKGROUND_AGENTS.remove(agent_id);
         let _ = std::fs::remove_file(ledger_path);

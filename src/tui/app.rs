@@ -4909,8 +4909,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tui_direct_final_rejects_uncited_response_without_user_visible_error() {
-        let session_id = "tui-direct-final-denied";
+    async fn tui_direct_plain_final_syncs_without_grounding_citations() {
+        let session_id = "tui-direct-final-plain-text";
         let ledger_path = reset_project_ledger(session_id);
         let (tx, rx) = mpsc::channel();
         let client = reqwest::Client::new();
@@ -4950,26 +4950,21 @@ mod tests {
         .await;
 
         let mut saw_error = false;
-        let mut saw_done = false;
-        let mut saw_sync = false;
+        let mut synced_messages = None;
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::ApiError(_) => saw_error = true,
-                AppEvent::ResponseDone => saw_done = true,
-                AppEvent::SyncMessages(_) => saw_sync = true,
+                AppEvent::SyncMessages(messages) => synced_messages = Some(messages),
                 _ => {}
             }
         }
         let _ = std::fs::remove_file(ledger_path);
 
-        assert!(
-            !saw_error,
-            "internal final-gate rejection must stay out of chat"
-        );
-        assert!(saw_done, "hidden rejection must still end the turn");
-        assert!(
-            !saw_sync,
-            "ungrounded direct final must not be appended to history"
+        assert!(!saw_error, "plain direct final must not be rejected");
+        let messages = synced_messages.expect("plain direct final should sync messages");
+        assert_eq!(
+            messages.last().and_then(|msg| msg.get("content")),
+            Some(&serde_json::json!("Verified with cargo check."))
         );
     }
 

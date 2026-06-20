@@ -450,12 +450,12 @@ pub fn validate_final_against_ledger(
 
 /// Validate final text against an already-open ledger and return rendered text.
 ///
-/// `AgentDecision::Final` JSON is validated directly. If no structured final
-/// decision is present, this falls back to the legacy text citation extractor.
+/// `AgentDecision::Final` JSON is validated directly. Plain assistant text is
+/// rendered as message text, matching Codex's typed message handling.
 ///
 /// # Errors
 ///
-/// Returns a string error when the final-answer gate denies the response.
+/// Returns a string error when structured final validation denies the response.
 pub fn validate_and_render_final_against_ledger(
     ledger: &mut RealityLedger,
     content: &str,
@@ -469,17 +469,8 @@ pub fn validate_and_render_final_against_ledger(
         }
     }
 
-    match crate::final_gate::validate_cited_final_answer(content, ledger) {
-        Ok(_) => {
-            append_final_policy_decision(ledger, true, "final answer grounded");
-            Ok(content.to_string())
-        }
-        Err(denial) => {
-            let reason = denial.reason().to_string();
-            append_final_policy_decision(ledger, false, &reason);
-            Err(reason)
-        }
-    }
+    append_final_policy_decision(ledger, true, "plain assistant final rendered");
+    Ok(content.to_string())
 }
 
 fn validate_and_render_structured_final(
@@ -654,7 +645,7 @@ pub fn render_grounding_system_message(packet: &GroundedPromptPacket) -> String 
         );
     }
     out.push_str(
-        "\nRules: Use memory, summaries, and provider chat history only as navigation aids. Treat facts as grounded only when backed by non-stale, non-summary ledger observations. Use grounding_context to hydrate selected observation IDs when detailed evidence is needed. Prefer final answers as JSON {\"kind\":\"final\",\"summary\":\"...\",\"evidence\":[\"obs-id\"],\"verification\":[\"obs-id\"]}; plain text with cited observation IDs is accepted only as a compatibility fallback.\n",
+        "\nRules: Use memory, summaries, and provider chat history only as navigation aids. Treat facts as grounded only when backed by non-stale, non-summary ledger observations. Use grounding_context to hydrate selected observation IDs when detailed evidence is needed. Final answers should be plain assistant text. Use structured final JSON {\"kind\":\"final\",\"summary\":\"...\",\"evidence\":[\"obs-id\"],\"verification\":[\"obs-id\"]} only when an explicitly grounded decision is required.\n",
     );
     out
 }
@@ -933,6 +924,27 @@ mod tests {
             .expect("fenced structured final should pass");
 
         assert_eq!(rendered, "Work is summarized; verification was not run.");
+    }
+
+    #[test]
+    fn plain_assistant_final_renders_without_citation_gate() {
+        let mut ledger = RealityLedger::new();
+
+        let rendered =
+            validate_and_render_final_against_ledger(&mut ledger, "Verified with cargo check.")
+                .expect("plain assistant final should render");
+
+        assert_eq!(rendered, "Verified with cargo check.");
+        assert!(
+            ledger.observations_chronological().iter().any(|obs| {
+                matches!(
+                    &obs.kind,
+                    ObservationKind::PolicyDecision { allowed: true, reason }
+                        if reason == "plain assistant final rendered"
+                )
+            }),
+            "plain assistant final allow decision must be recorded"
+        );
     }
 
     #[test]
