@@ -334,6 +334,7 @@ pub struct TriageContext<'a> {
     pub builder_code: &'a str,
     pub builder_provider: &'a str,
     pub builder_api_key: Option<&'a ApiKey>,
+    pub builder_auth: Option<&'a crate::vdd::transport::VddProviderAuth>,
 }
 
 /// Triage findings using three layers:
@@ -559,6 +560,7 @@ async fn verify_findings(
         &request,
         ctx.builder_provider,
         ctx.builder_api_key,
+        ctx.builder_auth,
     )
     .await?;
 
@@ -856,6 +858,7 @@ mod tests {
             builder_code: "let q = format!(\"SELECT * FROM users WHERE id = {}\", x);",
             builder_provider: "test",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(findings[0].status, FindingStatus::FalsePositive);
@@ -897,6 +900,7 @@ mod tests {
             builder_code: "let html = format!(\"<div>{}</div>\", user_input);",
             builder_provider: "nonexistent-provider", // AI layer will fail; we expect Genuine
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(
@@ -941,6 +945,7 @@ mod tests {
             builder_code: "fn x() {} fn y() {}",
             builder_provider: "nonexistent-provider",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(
@@ -990,6 +995,7 @@ mod tests {
             builder_code: "fn auth_helper() {} fn db_helper() {}",
             builder_provider: "nonexistent-provider",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(
@@ -1035,6 +1041,7 @@ mod tests {
             builder_code: "fn helper(s: &str) {}",
             builder_provider: "nonexistent-provider",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(findings[0].status, FindingStatus::FalsePositive);
@@ -1069,6 +1076,7 @@ mod tests {
             builder_code: "let guard = mutex.lock().unwrap();",
             builder_provider: "test",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(findings[0].status, FindingStatus::FalsePositive);
@@ -1104,6 +1112,7 @@ mod tests {
             builder_code: "let query = format!(\"SELECT * FROM users WHERE id = {}\", user_input);",
             builder_provider: "nonexistent-provider",
             builder_api_key: None,
+            builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
         assert_eq!(

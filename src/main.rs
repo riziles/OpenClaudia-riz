@@ -446,14 +446,14 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         }
     })?;
 
-    let preselected_auth = if should_prompt_tui_startup_auth(&options) {
+    let startup_auth = if should_prompt_tui_startup_auth(&options) {
         select_tui_startup_auth(&config).await?
     } else {
         None
     };
 
-    if let Some(selection) = preselected_auth.as_ref() {
-        config.proxy.target.clone_from(&selection.target);
+    if let Some(selection) = startup_auth.as_ref() {
+        config.proxy.target.clone_from(&selection.chat.target);
     } else if let Some(ref target) = options.target_override {
         config.proxy.target.clone_from(target);
     } else if let Some(ref model) = options.model_override {
@@ -462,6 +462,20 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             config.proxy.target = detected;
         }
     }
+
+    let vdd_adversary_auth = startup_auth
+        .as_ref()
+        .and_then(|selection| selection.vdd.as_ref())
+        .map(|selection| {
+            config.vdd.adversary.provider.clone_from(&selection.target);
+            config.vdd.adversary.api_key = selection.auth.api_key.clone();
+            selection.auth.to_vdd_provider_auth()
+        });
+
+    config
+        .vdd
+        .validate(&config.proxy.target)
+        .map_err(|e| anyhow::anyhow!("VDD configuration error: {e}"))?;
 
     let Some(provider) = config.active_provider() else {
         eprintln!(
@@ -474,11 +488,8 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         );
     };
 
-    let Some(ChatAuth {
-        api_key,
-        claude_code_token,
-        codex_responses_auth,
-    }) = resolve_tui_chat_auth(&config.proxy.target, provider, preselected_auth).await?
+    let Some(chat_auth) =
+        resolve_tui_chat_auth(&config.proxy.target, provider, startup_auth.as_ref()).await?
     else {
         // resolve_chat_auth already printed the user-facing error; surface
         // as a non-zero exit so shell wrappers detect the failure.
@@ -487,6 +498,12 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
             config.proxy.target
         );
     };
+    let builder_vdd_auth = chat_auth.to_vdd_provider_auth();
+    let ChatAuth {
+        api_key,
+        claude_code_token,
+        codex_responses_auth,
+    } = chat_auth;
 
     let model = resolve_model_name(
         options.model_override,
@@ -543,6 +560,8 @@ async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
         headers,
         wire_api,
         claude_code_token,
+        builder_vdd_auth,
+        vdd_adversary_auth,
         behavior_mode: &behavior_mode,
         resume: options.resume,
         session_id: options.session_id.as_deref(),
@@ -561,6 +580,8 @@ struct TuiLaunchOptions<'a> {
     headers: Vec<(String, String)>,
     wire_api: openclaudia::pipeline::WireApi,
     claude_code_token: Option<String>,
+    builder_vdd_auth: openclaudia::vdd::VddProviderAuth,
+    vdd_adversary_auth: Option<openclaudia::vdd::VddProviderAuth>,
     behavior_mode: &'a openclaudia::modes::BehaviorMode,
     resume: bool,
     session_id: Option<&'a str>,
@@ -578,6 +599,8 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         headers,
         wire_api,
         claude_code_token,
+        builder_vdd_auth,
+        vdd_adversary_auth,
         behavior_mode,
         resume,
         session_id,
@@ -641,6 +664,9 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         config,
         dangerously_skip_permissions,
     )));
+    app.vdd_engine =
+        init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
+    app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
     app.rules_content = rules_content;
     app.apply_startup_resume(resume, session_id);
@@ -1001,6 +1027,13 @@ fn open_project_memory_db(project_dir: &Path) -> Option<memory::MemoryDb> {
 /// in crosslink #496 applies inside the engine itself — this is the
 /// outer transport timeout). Extracted from `cmd_chat` per #262.
 fn init_vdd_engine_if_enabled(config: &config::AppConfig) -> Option<vdd::VddEngine> {
+    init_vdd_engine_if_enabled_with_auth(config, None)
+}
+
+fn init_vdd_engine_if_enabled_with_auth(
+    config: &config::AppConfig,
+    adversary_auth: Option<vdd::VddProviderAuth>,
+) -> Option<vdd::VddEngine> {
     if !config.vdd.enabled {
         return None;
     }
@@ -1012,7 +1045,12 @@ fn init_vdd_engine_if_enabled(config: &config::AppConfig) -> Option<vdd::VddEngi
         "\x1b[33m🔍 VDD enabled ({} mode) - adversary: {}\x1b[0m",
         config.vdd.mode, config.vdd.adversary.provider
     );
-    Some(vdd::VddEngine::new(&config.vdd, config, http_client))
+    Some(vdd::VddEngine::new_with_adversary_auth(
+        &config.vdd,
+        config,
+        http_client,
+        adversary_auth,
+    ))
 }
 
 /// Chat-session cleanup: finalize auto-learner, autosave session,
@@ -1164,6 +1202,7 @@ fn parse_initial_behavior_mode(
 /// Exactly one of `api_key`, `claude_code_token`, or `codex_responses_auth` is set (or all
 /// `None` when `cmd_chat` has already printed an error and is about to
 /// return). See [`resolve_chat_auth`].
+#[derive(Clone)]
 struct ChatAuth {
     /// Provider API key (newtype — Debug/Display redact).
     api_key: Option<openclaudia::providers::ApiKey>,
@@ -1175,6 +1214,20 @@ struct ChatAuth {
     codex_responses_auth: Option<openclaudia::codex_credentials::CodexResponsesAuth>,
 }
 
+impl ChatAuth {
+    fn to_vdd_provider_auth(&self) -> openclaudia::vdd::VddProviderAuth {
+        if let Some(auth) = &self.codex_responses_auth {
+            openclaudia::vdd::VddProviderAuth::codex_responses(auth.clone())
+        } else if let Some(token) = &self.claude_code_token {
+            openclaudia::vdd::VddProviderAuth::claude_code_token(token.clone())
+        } else if let Some(api_key) = &self.api_key {
+            openclaudia::vdd::VddProviderAuth::api_key(api_key.clone())
+        } else {
+            openclaudia::vdd::VddProviderAuth::None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatAuthSelectionMode {
     Automatic,
@@ -1184,6 +1237,16 @@ enum ChatAuthSelectionMode {
 struct TuiStartupAuthSelection {
     target: String,
     auth: ChatAuth,
+}
+
+struct TuiStartupVddSelection {
+    target: String,
+    auth: ChatAuth,
+}
+
+struct TuiStartupSelections {
+    chat: TuiStartupAuthSelection,
+    vdd: Option<TuiStartupVddSelection>,
 }
 
 enum TuiStartupAuthCandidate {
@@ -1297,6 +1360,14 @@ impl TuiStartupAuthCandidate {
         };
 
         Ok(TuiStartupAuthSelection { target, auth })
+    }
+
+    async fn into_vdd_selection(self) -> anyhow::Result<TuiStartupVddSelection> {
+        let selection = self.into_selection().await?;
+        Ok(TuiStartupVddSelection {
+            target: selection.target,
+            auth: selection.auth,
+        })
     }
 }
 
@@ -1446,6 +1517,128 @@ fn collect_openai_startup_auth_candidates(
     Ok(())
 }
 
+fn canonical_startup_provider(provider: &str) -> &str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => "google",
+        "alibaba" => "qwen",
+        "zhipu" | "glm" => "zai",
+        "moonshot" => "kimi",
+        "lmstudio" | "localai" | "text-generation-webui" => "local",
+        "anthropic" => "anthropic",
+        "openai" => "openai",
+        "google" => "google",
+        "qwen" => "qwen",
+        "zai" => "zai",
+        "kimi" => "kimi",
+        "deepseek" => "deepseek",
+        "minimax" => "minimax",
+        "ollama" => "ollama",
+        "local" => "local",
+        _ => provider.trim(),
+    }
+}
+
+fn same_startup_provider(a: &str, b: &str) -> bool {
+    canonical_startup_provider(a).eq_ignore_ascii_case(canonical_startup_provider(b))
+}
+
+fn push_unique_startup_candidate(
+    candidates: &mut Vec<TuiStartupAuthCandidate>,
+    candidate: TuiStartupAuthCandidate,
+) {
+    let label = candidate.label();
+    if !candidates.iter().any(|existing| existing.label() == label) {
+        candidates.push(candidate);
+    }
+}
+
+fn push_configured_provider_startup_candidate(
+    config: &config::AppConfig,
+    candidates: &mut Vec<TuiStartupAuthCandidate>,
+    target: &str,
+) {
+    let Some(provider) = config.get_provider(target) else {
+        return;
+    };
+    if openclaudia::config::is_local_provider_name(target) {
+        push_unique_startup_candidate(
+            candidates,
+            TuiStartupAuthCandidate::CurrentLocalProvider {
+                target: target.to_string(),
+            },
+        );
+    } else if let Some(api_key) = &provider.api_key {
+        push_unique_startup_candidate(
+            candidates,
+            TuiStartupAuthCandidate::CurrentProviderApiKey {
+                target: target.to_string(),
+                api_key: api_key.clone(),
+            },
+        );
+    }
+}
+
+fn collect_tui_startup_vdd_auth_candidates(
+    config: &config::AppConfig,
+    chat_target: &str,
+) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
+    use std::io::IsTerminal as _;
+
+    let mut candidates = Vec::new();
+
+    let preferred = config.vdd.adversary.provider.trim();
+    if !preferred.is_empty()
+        && !same_startup_provider(preferred, chat_target)
+        && !preferred.eq_ignore_ascii_case("anthropic")
+        && !preferred.eq_ignore_ascii_case("openai")
+    {
+        push_configured_provider_startup_candidate(config, &mut candidates, preferred);
+    }
+
+    if !same_startup_provider("anthropic", chat_target) {
+        if let Some(provider) = config.get_provider("anthropic") {
+            if let Some(api_key) = &provider.api_key {
+                push_unique_startup_candidate(
+                    &mut candidates,
+                    TuiStartupAuthCandidate::AnthropicApiKey {
+                        api_key: api_key.clone(),
+                    },
+                );
+            }
+        }
+        if openclaudia::claude_credentials::has_claude_code_credentials() {
+            push_unique_startup_candidate(
+                &mut candidates,
+                TuiStartupAuthCandidate::AnthropicClaudeCode,
+            );
+        }
+    }
+
+    if !same_startup_provider("openai", chat_target) {
+        collect_openai_startup_auth_candidates(config, &mut candidates)?;
+        if std::io::stdin().is_terminal() {
+            push_unique_startup_candidate(
+                &mut candidates,
+                TuiStartupAuthCandidate::OpenAi(OpenAiAuthCandidate::EnterApiKey),
+            );
+        }
+    }
+
+    let mut provider_names = config.providers.keys().cloned().collect::<Vec<_>>();
+    provider_names.sort();
+    for target in provider_names {
+        if same_startup_provider(&target, chat_target)
+            || target.eq_ignore_ascii_case("anthropic")
+            || target.eq_ignore_ascii_case("openai")
+        {
+            continue;
+        }
+        push_configured_provider_startup_candidate(config, &mut candidates, &target);
+    }
+
+    Ok(candidates)
+}
+
 fn collect_tui_startup_auth_candidates(
     config: &config::AppConfig,
 ) -> anyhow::Result<Vec<TuiStartupAuthCandidate>> {
@@ -1512,9 +1705,45 @@ fn prompt_tui_startup_auth_choice(candidates: &[TuiStartupAuthCandidate]) -> any
     anyhow::bail!("startup login selection cancelled")
 }
 
+fn prompt_tui_startup_vdd_auth_choice(
+    candidates: &[TuiStartupAuthCandidate],
+    chat_target: &str,
+) -> anyhow::Result<usize> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(0);
+    }
+
+    eprintln!("Select VDD adversary login (chat provider: {chat_target}):");
+    for (index, candidate) in candidates.iter().enumerate() {
+        eprintln!("  {}. {}", index + 1, candidate.label());
+    }
+
+    for _ in 0..3 {
+        eprint!("Select VDD login [1]: ");
+        std::io::stderr().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        if let Ok(selection) = trimmed.parse::<usize>() {
+            if (1..=candidates.len()).contains(&selection) {
+                return Ok(selection - 1);
+            }
+        }
+        eprintln!("Enter a number from 1 to {}.", candidates.len());
+    }
+
+    anyhow::bail!("VDD login selection cancelled")
+}
+
 async fn select_tui_startup_auth(
     config: &config::AppConfig,
-) -> anyhow::Result<Option<TuiStartupAuthSelection>> {
+) -> anyhow::Result<Option<TuiStartupSelections>> {
     use std::io::IsTerminal as _;
 
     if !std::io::stdin().is_terminal() {
@@ -1528,18 +1757,38 @@ async fn select_tui_startup_auth(
 
     let selected = prompt_tui_startup_auth_choice(&candidates)?;
     let label = candidates[selected].label();
-    let selection = candidates.remove(selected).into_selection().await?;
+    let chat = candidates.remove(selected).into_selection().await?;
     eprintln!("✓ Starting with {label}");
-    Ok(Some(selection))
+
+    let vdd = if config.vdd.enabled {
+        let mut vdd_candidates = collect_tui_startup_vdd_auth_candidates(config, &chat.target)?;
+        if vdd_candidates.is_empty() {
+            eprintln!(
+                "VDD is enabled, but no alternate adversary login was found for chat provider '{}'.",
+                chat.target
+            );
+            None
+        } else {
+            let selected = prompt_tui_startup_vdd_auth_choice(&vdd_candidates, &chat.target)?;
+            let label = vdd_candidates[selected].label();
+            let selection = vdd_candidates.remove(selected).into_vdd_selection().await?;
+            eprintln!("✓ VDD adversary will use {label}");
+            Some(selection)
+        }
+    } else {
+        None
+    };
+
+    Ok(Some(TuiStartupSelections { chat, vdd }))
 }
 
 async fn resolve_tui_chat_auth(
     target: &str,
     provider: &openclaudia::config::ProviderConfig,
-    preselected_auth: Option<TuiStartupAuthSelection>,
+    preselected_auth: Option<&TuiStartupSelections>,
 ) -> anyhow::Result<Option<ChatAuth>> {
     if let Some(selection) = preselected_auth {
-        return Ok(Some(selection.auth));
+        return Ok(Some(selection.chat.auth.clone()));
     }
 
     resolve_chat_auth(target, provider, ChatAuthSelectionMode::Interactive).await
@@ -1867,6 +2116,68 @@ mod tests {
         }
     }
 
+    fn test_api_key(raw: &str) -> openclaudia::providers::ApiKey {
+        openclaudia::providers::ApiKey::try_from_string(format!("{raw}-0000000000"))
+            .expect("valid api key")
+    }
+
+    fn test_provider(
+        base_url: &str,
+        key: Option<openclaudia::providers::ApiKey>,
+    ) -> config::ProviderConfig {
+        config::ProviderConfig {
+            api_key: key,
+            base_url: base_url.to_string(),
+            model: None,
+            headers: std::collections::HashMap::new(),
+            thinking: config::ThinkingConfig::default(),
+        }
+    }
+
+    fn startup_vdd_config() -> config::AppConfig {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            test_provider("https://api.anthropic.com", Some(test_api_key("anthropic"))),
+        );
+        providers.insert(
+            "openai".to_string(),
+            test_provider("https://api.openai.com", Some(test_api_key("openai"))),
+        );
+        providers.insert(
+            "google".to_string(),
+            test_provider(
+                "https://generativelanguage.googleapis.com",
+                Some(test_api_key("google")),
+            ),
+        );
+
+        config::AppConfig {
+            proxy: config::ProxyConfig {
+                target: "anthropic".to_string(),
+                ..Default::default()
+            },
+            providers,
+            hooks: config::HooksConfig::default(),
+            session: config::SessionConfig::default(),
+            keybindings: config::KeybindingsConfig::default(),
+            vdd: config::VddConfig {
+                enabled: true,
+                adversary: config::VddAdversaryConfig {
+                    provider: "openai".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            guardrails: config::GuardrailsConfig::default(),
+            permissions: config::PermissionsConfig::default(),
+            memory: config::MemoryConfig::default(),
+            web_fetch: config::WebFetchConfig::default(),
+            policy: openclaudia::services::policy::EnterprisePolicy::default(),
+            managed_settings_path: None,
+        }
+    }
+
     #[test]
     fn startup_git_probe_uses_resolved_binary_path() {
         let git = git_bin().expect("main tests require git on PATH");
@@ -1991,6 +2302,41 @@ mod tests {
         assert_eq!(selection.auth.api_key.as_ref(), Some(&api_key));
         assert!(selection.auth.claude_code_token.is_none());
         assert!(selection.auth.codex_responses_auth.is_none());
+    }
+
+    #[test]
+    fn chat_auth_converts_to_vdd_runtime_auth() {
+        let api_key = test_api_key("openai");
+        let auth = ChatAuth {
+            api_key: Some(api_key.clone()),
+            claude_code_token: None,
+            codex_responses_auth: None,
+        };
+
+        assert_eq!(
+            auth.to_vdd_provider_auth(),
+            openclaudia::vdd::VddProviderAuth::api_key(api_key)
+        );
+    }
+
+    #[test]
+    fn vdd_startup_candidates_exclude_selected_chat_provider() {
+        let config = startup_vdd_config();
+        let candidates =
+            collect_tui_startup_vdd_auth_candidates(&config, "anthropic").expect("candidates");
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.target().eq_ignore_ascii_case("openai")),
+            "OpenAI should be available as VDD adversary when chat uses Anthropic"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.target().eq_ignore_ascii_case("anthropic")),
+            "VDD candidates must not include the selected chat provider"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 pub use finding::{Finding, FindingStatus, Severity};
 pub use review::{AdversaryReview, VddIteration, VddSession};
 pub use static_analysis::StaticAnalysisResult;
+pub use transport::VddProviderAuth;
 
 /// Triage entry points re-exported for the VDD-pipeline E2E test
 /// suite (`tests/vdd_triage_e2e.rs`, sprint 54). Curated to avoid

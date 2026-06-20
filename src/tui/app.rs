@@ -720,6 +720,7 @@ async fn resolve_provider_switch(
         .map_err(|e| e.to_string())?;
         (endpoint, headers)
     };
+    let vdd_builder_auth = provider_switch_auth_to_vdd_auth(&auth);
 
     Ok(ProviderSwitch {
         provider: target,
@@ -728,8 +729,21 @@ async fn resolve_provider_switch(
         headers,
         wire_api,
         claude_code_token: auth.claude_code_token,
+        vdd_builder_auth,
         prompt_blocks,
     })
+}
+
+fn provider_switch_auth_to_vdd_auth(auth: &ProviderSwitchAuth) -> crate::vdd::VddProviderAuth {
+    if let Some(codex_auth) = &auth.codex_responses_auth {
+        crate::vdd::VddProviderAuth::codex_responses(codex_auth.clone())
+    } else if let Some(token) = &auth.claude_code_token {
+        crate::vdd::VddProviderAuth::claude_code_token(token.clone())
+    } else if let Some(api_key) = &auth.api_key {
+        crate::vdd::VddProviderAuth::api_key(api_key.clone())
+    } else {
+        crate::vdd::VddProviderAuth::None
+    }
 }
 
 /// Which input mode the TUI is in when a keystroke arrives (crosslink #364).
@@ -855,6 +869,10 @@ pub struct App {
     /// through `pipeline::run_turn` consults this gate in addition to the
     /// UX-layer `PermissionResponse` flow — closes crosslink #505.
     pub permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
+    /// VDD engine for full-screen TUI turns when adversarial review is enabled.
+    pub vdd_engine: Option<std::sync::Arc<crate::vdd::VddEngine>>,
+    /// Auth used by VDD's builder-side verifier for the current chat provider.
+    pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Conversation messages in the provider's wire format.
     pub session_messages: Vec<serde_json::Value>,
     /// Async runtime handle for spawning API tasks from the sync event loop.
@@ -945,6 +963,8 @@ impl App {
             memory_db: None,
             app_config: None,
             permission_mgr: None,
+            vdd_engine: None,
+            vdd_builder_auth: crate::vdd::VddProviderAuth::None,
             session_messages: Vec::new(),
             runtime_handle: None,
             chat_session: TuiSession::new(model, provider),
@@ -1176,6 +1196,7 @@ impl App {
             headers,
             wire_api,
             claude_code_token,
+            vdd_builder_auth,
             prompt_blocks,
         } = switch;
 
@@ -1195,6 +1216,7 @@ impl App {
             prompt_blocks,
             claude_code_token,
         );
+        self.vdd_builder_auth = vdd_builder_auth;
         let _ = save_session(&self.chat_session);
         self.persist_transcript_tail();
         self.messages.add(DisplayMessage::system(format!(
@@ -2971,6 +2993,8 @@ impl App {
         let memory_db = self.memory_db.clone();
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
+        let vdd_engine = self.vdd_engine.clone();
+        let vdd_builder_auth = self.vdd_builder_auth.clone();
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
@@ -2990,6 +3014,8 @@ impl App {
             memory_db,
             app_config,
             permission_mgr,
+            vdd_engine,
+            vdd_builder_auth,
             transient_allowed_tool_rules,
             hook_engine,
             policy_enforcer,
@@ -3304,6 +3330,8 @@ struct ApiTurnParams {
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
+    vdd_engine: Option<std::sync::Arc<crate::vdd::VddEngine>>,
+    vdd_builder_auth: crate::vdd::VddProviderAuth,
     transient_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
@@ -3338,6 +3366,14 @@ struct AgenticCtx<'a> {
 fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
     messages.iter().rev().find_map(|message| {
         (message.get("role").and_then(|role| role.as_str()) == Some("user"))
+            .then(|| message.get("content").and_then(|content| content.as_str()))
+            .flatten()
+    })
+}
+
+fn latest_assistant_message_content(messages: &[serde_json::Value]) -> Option<&str> {
+    messages.iter().rev().find_map(|message| {
+        (message.get("role").and_then(|role| role.as_str()) == Some("assistant"))
             .then(|| message.get("content").and_then(|content| content.as_str()))
             .flatten()
     })
@@ -3928,6 +3964,8 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         memory_db,
         app_config,
         permission_mgr,
+        vdd_engine,
+        vdd_builder_auth,
         transient_allowed_tool_rules,
         hook_engine,
         policy_enforcer,
@@ -4008,6 +4046,8 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     memory_db,
                     app_config,
                     permission_mgr,
+                    vdd_engine,
+                    vdd_builder_auth: &vdd_builder_auth,
                     transient_allowed_tool_rules: &transient_allowed_tool_rules,
                     hook_engine,
                     policy_enforcer,
@@ -4041,6 +4081,8 @@ struct TurnContext<'a> {
     memory_db: Option<std::sync::Arc<crate::memory::MemoryDb>>,
     app_config: Option<std::sync::Arc<crate::config::AppConfig>>,
     permission_mgr: Option<std::sync::Arc<crate::permissions::PermissionManager>>,
+    vdd_engine: Option<std::sync::Arc<crate::vdd::VddEngine>>,
+    vdd_builder_auth: &'a crate::vdd::VddProviderAuth,
     transient_allowed_tool_rules: &'a [crate::permissions::PermissionRule],
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
@@ -4090,18 +4132,23 @@ async fn handle_turn_result(
             wire_api: ctx.wire_api,
             claude_code_token: ctx.claude_code_token,
             prompt_blocks: ctx.prompt_blocks,
-            memory_db: ctx.memory_db,
-            app_config: ctx.app_config,
-            permission_mgr: ctx.permission_mgr,
+            memory_db: ctx.memory_db.clone(),
+            app_config: ctx.app_config.clone(),
+            permission_mgr: ctx.permission_mgr.clone(),
             transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
-            hook_engine: ctx.hook_engine,
-            policy_enforcer: ctx.policy_enforcer,
-            task_mgr: ctx.task_mgr,
+            hook_engine: ctx.hook_engine.clone(),
+            policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
+            task_mgr: ctx.task_mgr.clone(),
             session_id: ctx.session_id,
             task_obs: ctx.task_obs,
             tx: ctx.tx,
         };
         run_agentic_loop(&agentic, &mut session_messages).await;
+        if let Some(content) =
+            latest_assistant_message_content(&session_messages).map(str::to_string)
+        {
+            run_tui_vdd_review(&ctx, &content, &mut session_messages).await;
+        }
         send_or_warn(
             ctx.tx,
             super::events::AppEvent::SyncMessages(session_messages),
@@ -4132,11 +4179,82 @@ async fn handle_turn_result(
             message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
         }
         session_messages.push(message);
+        run_tui_vdd_review(&ctx, &rendered_content, &mut session_messages).await;
         send_or_warn(
             ctx.tx,
             super::events::AppEvent::SyncMessages(session_messages),
             ctx.session_id,
         );
+    }
+}
+
+async fn run_tui_vdd_review(
+    ctx: &TurnContext<'_>,
+    content: &str,
+    session_messages: &mut Vec<serde_json::Value>,
+) {
+    let Some(engine) = ctx.vdd_engine.as_ref() else {
+        return;
+    };
+    if content.len() < 100 {
+        return;
+    }
+
+    send_or_warn(
+        ctx.tx,
+        super::events::AppEvent::ToolStart {
+            name: "vdd".to_string(),
+            description: format!("Reviewing response with VDD adversary for {}", ctx.provider),
+        },
+        ctx.session_id,
+    );
+
+    let user_task = latest_user_message_content(session_messages)
+        .unwrap_or_default()
+        .to_string();
+    let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth);
+    match engine.review_text(content, &user_task, builder).await {
+        Ok(result) => {
+            let genuine_count = result
+                .findings
+                .iter()
+                .filter(|finding| finding.status == crate::vdd::FindingStatus::Genuine)
+                .count();
+            let summary = if result.findings.is_empty() {
+                "VDD review complete: no issues found.".to_string()
+            } else {
+                format!(
+                    "VDD review complete: {} finding(s), {genuine_count} genuine.",
+                    result.findings.len()
+                )
+            };
+            send_or_warn(
+                ctx.tx,
+                super::events::AppEvent::ToolDone {
+                    name: "vdd".to_string(),
+                    success: true,
+                    content: summary,
+                },
+                ctx.session_id,
+            );
+            if !result.context_injection.is_empty() {
+                session_messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!("<vdd-review>\n{}\n</vdd-review>", result.context_injection),
+                }));
+            }
+        }
+        Err(error) => {
+            send_or_warn(
+                ctx.tx,
+                super::events::AppEvent::ToolDone {
+                    name: "vdd".to_string(),
+                    success: false,
+                    content: format!("VDD review failed: {error}"),
+                },
+                ctx.session_id,
+            );
+        }
     }
 }
 
@@ -4818,6 +4936,8 @@ mod tests {
                 memory_db: None,
                 app_config: None,
                 permission_mgr: None,
+                vdd_engine: None,
+                vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
                 policy_enforcer,
@@ -4882,6 +5002,8 @@ mod tests {
                 memory_db: None,
                 app_config: None,
                 permission_mgr: None,
+                vdd_engine: None,
+                vdd_builder_auth: &crate::vdd::VddProviderAuth::None,
                 transient_allowed_tool_rules: &[],
                 hook_engine: None,
                 policy_enforcer,
@@ -4998,6 +5120,7 @@ mod tests {
             headers: vec![("Authorization".to_string(), "Bearer kimi-key".to_string())],
             wire_api: crate::pipeline::WireApi::ChatCompletions,
             claude_code_token: None,
+            vdd_builder_auth: crate::vdd::VddProviderAuth::None,
             prompt_blocks: Some(blocks.clone()),
         });
 
@@ -5015,6 +5138,7 @@ mod tests {
             vec![("Authorization".to_string(), "Bearer kimi-key".to_string())]
         );
         assert!(app.api_client.claude_code_token.is_none());
+        assert_eq!(app.vdd_builder_auth, crate::vdd::VddProviderAuth::None);
         assert_eq!(
             app.api_client.wire_api,
             crate::pipeline::WireApi::ChatCompletions

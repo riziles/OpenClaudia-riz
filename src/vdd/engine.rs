@@ -20,7 +20,7 @@ use crate::vdd::prompts::{build_adversary_request, build_revision_request};
 use crate::vdd::review::{AdversaryReview, VddIteration, VddSession};
 use crate::vdd::sink::{create_crosslink_issues, persist_session};
 use crate::vdd::static_analysis::{run_shell_command, StaticAnalysisResult};
-use crate::vdd::transport::{send_to_adversary, send_to_builder};
+use crate::vdd::transport::{send_to_adversary, send_to_builder, VddProviderAuth};
 use crate::vdd::triage::{parse_findings, triage_findings, TriageContext};
 
 /// The core VDD engine that orchestrates adversarial review loops.
@@ -28,6 +28,7 @@ pub struct VddEngine {
     pub(crate) config: VddConfig,
     pub(crate) app_config: AppConfig,
     pub(crate) client: Client,
+    pub(crate) adversary_auth: Option<VddProviderAuth>,
 }
 
 /// Typed pair of `(provider_name, api_key)` for the builder agent.
@@ -46,13 +47,29 @@ pub struct VddEngine {
 pub struct BuilderProvider<'a> {
     pub name: &'a str,
     pub api_key: Option<&'a ApiKey>,
+    pub auth: Option<&'a VddProviderAuth>,
 }
 
 impl<'a> BuilderProvider<'a> {
     /// Construct a builder-provider handle.
     #[must_use]
     pub const fn new(name: &'a str, api_key: Option<&'a ApiKey>) -> Self {
-        Self { name, api_key }
+        Self {
+            name,
+            api_key,
+            auth: None,
+        }
+    }
+
+    /// Construct a builder-provider handle from runtime auth selected at
+    /// startup.
+    #[must_use]
+    pub const fn with_auth(name: &'a str, auth: &'a VddProviderAuth) -> Self {
+        Self {
+            name,
+            api_key: None,
+            auth: Some(auth),
+        }
     }
 }
 
@@ -75,6 +92,22 @@ impl VddEngine {
             config: config.clone(),
             app_config: app_config.clone(),
             client,
+            adversary_auth: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_adversary_auth(
+        config: &VddConfig,
+        app_config: &AppConfig,
+        client: Client,
+        adversary_auth: Option<VddProviderAuth>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            app_config: app_config.clone(),
+            client,
+            adversary_auth,
         }
     }
 
@@ -146,6 +179,7 @@ impl VddEngine {
             &self.config,
             &self.app_config,
             &adversary_request,
+            self.adversary_auth.as_ref(),
         )
         .await?;
 
@@ -159,6 +193,7 @@ impl VddEngine {
             builder_code: builder_text,
             builder_provider: builder.name,
             builder_api_key: builder.api_key,
+            builder_auth: builder.auth,
         };
         triage_findings(&mut findings, &triage_ctx).await;
 
@@ -459,6 +494,7 @@ impl VddEngine {
             &revision_request,
             builder.name,
             builder.api_key,
+            builder.auth,
         )
         .await
         {
@@ -519,6 +555,7 @@ impl VddEngine {
             &self.config,
             &self.app_config,
             &adversary_request,
+            self.adversary_auth.as_ref(),
         )
         .await?;
 
@@ -532,6 +569,7 @@ impl VddEngine {
             builder_code: ctx.builder_text,
             builder_provider: ctx.builder.name,
             builder_api_key: ctx.builder.api_key,
+            builder_auth: ctx.builder.auth,
         };
         triage_findings(&mut findings, &triage_ctx).await;
 
