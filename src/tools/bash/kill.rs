@@ -80,7 +80,7 @@ pub fn terminate_process_tree(pid: u32) {
         if sigterm_result != 0 {
             tracing::debug!(
                 pid,
-                errno = unsafe { *libc::__errno_location() },
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
                 "terminate_process_tree: SIGTERM to process group failed"
             );
         }
@@ -109,7 +109,7 @@ pub fn terminate_process_tree(pid: u32) {
             if sigkill_result != 0 {
                 tracing::debug!(
                     pid,
-                    errno = unsafe { *libc::__errno_location() },
+                    errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
                     "terminate_process_tree: SIGKILL to process group failed"
                 );
             }
