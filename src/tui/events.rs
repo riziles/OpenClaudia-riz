@@ -79,6 +79,8 @@ pub enum ApiRetryKind {
 pub enum AppEvent {
     /// Terminal key event
     Key(KeyEvent),
+    /// Bracketed terminal paste payload
+    Paste(String),
     /// Terminal resize
     Resize(u16, u16),
     /// Animation tick
@@ -254,12 +256,13 @@ impl EventHandler {
 /// terminals that support the kitty keyboard protocol.
 ///
 /// See: <https://github.com/ratatui/ratatui/issues/347>
-const fn translate_terminal_event(evt: &CEvent) -> Option<AppEvent> {
-    match *evt {
+fn translate_terminal_event(evt: &CEvent) -> Option<AppEvent> {
+    match evt {
         CEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            Some(AppEvent::Key(key))
+            Some(AppEvent::Key(*key))
         }
-        CEvent::Resize(w, h) => Some(AppEvent::Resize(w, h)),
+        CEvent::Paste(text) => Some(AppEvent::Paste(text.clone())),
+        CEvent::Resize(w, h) => Some(AppEvent::Resize(*w, *h)),
         _ => None,
     }
 }
@@ -326,6 +329,14 @@ mod tests {
                 assert_eq!(h, 40);
             }
             _ => panic!("expected AppEvent::Resize"),
+        }
+    }
+
+    #[test]
+    fn paste_events_are_forwarded() {
+        match translate_terminal_event(&CEvent::Paste("one\ntwo".to_string())) {
+            Some(AppEvent::Paste(text)) => assert_eq!(text, "one\ntwo"),
+            _ => panic!("expected AppEvent::Paste"),
         }
     }
 }

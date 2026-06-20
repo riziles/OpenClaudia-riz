@@ -42,6 +42,10 @@ const KEYBIND_SECTIONS: &[(&str, &[Shortcut])] = &[
                 description: "send message",
             },
             Shortcut {
+                keys: "Shift+Enter / Alt+Enter / Ctrl+J",
+                description: "insert newline",
+            },
+            Shortcut {
                 keys: "Backspace / Delete",
                 description: "edit input",
             },
@@ -351,7 +355,11 @@ mod tests {
             "rendered overlay must not advertise legacy REPL-only commands"
         );
         assert!(
-            !rendered.contains("Shift+Enter") && !rendered.contains("Ctrl+L"),
+            rendered.contains("Shift+Enter / Alt+Enter / Ctrl+J"),
+            "rendered overlay must advertise implemented multiline input shortcuts"
+        );
+        assert!(
+            !rendered.contains("Ctrl+L"),
             "rendered overlay must not advertise unimplemented TUI shortcuts"
         );
         assert!(

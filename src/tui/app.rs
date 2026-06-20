@@ -10,7 +10,7 @@ use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
 use crossterm::{
-    event::{KeyCode, KeyModifiers},
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -26,6 +26,10 @@ use std::time::Duration;
 
 use crate::file_error::{self, FileError};
 
+const INPUT_PROMPT_WIDTH: u16 = 2;
+const MIN_INPUT_HEIGHT: u16 = 3;
+const MAX_INPUT_HEIGHT: u16 = 8;
+
 /// Absolute, PATH-independent location of `git` for synchronous TUI helpers.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
     LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
@@ -39,6 +43,14 @@ fn git_bin() -> Result<&'static Path, String> {
 
 fn git_command() -> Result<Command, String> {
     Ok(Command::new(git_bin()?))
+}
+
+fn inserts_newline(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+}
+
+fn input_content_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(INPUT_PROMPT_WIDTH).max(1)
 }
 
 fn current_exe_command() -> Result<Command, String> {
@@ -1263,7 +1275,7 @@ impl App {
 
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1341,7 +1353,7 @@ impl App {
         }
 
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
 
         // Save session on exit
         self.chat_session
@@ -1376,6 +1388,7 @@ impl App {
     fn handle_app_event(&mut self, event: Result<AppEvent, std::sync::mpsc::RecvError>) -> bool {
         match event {
             Ok(AppEvent::Key(key)) => self.handle_key(key),
+            Ok(AppEvent::Paste(text)) => self.handle_paste(text),
             Ok(AppEvent::Tick) => {
                 self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
             }
@@ -1731,6 +1744,18 @@ impl App {
         }
     }
 
+    fn handle_paste(&mut self, text: String) {
+        if self.overlay.is_some()
+            || self.is_waiting
+            || self.pending_permission.is_some()
+            || self.pending_user_question.is_some()
+        {
+            return;
+        }
+
+        self.input.insert_str(&text);
+    }
+
     /// Handle the universal Ctrl+C interrupt. Distinct from the per-mode
     /// dispatchers because Ctrl+C is the single cross-mode keystroke —
     /// it must deny a pending permission prompt before quitting, and it
@@ -2047,10 +2072,15 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Enter if inserts_newline(key.modifiers) => self.input.insert_newline(),
             KeyCode::Enter if !self.input.is_empty() => {
                 let text = self.input.take();
                 self.handle_input(text);
             }
+            KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.insert_newline();
+            }
+            KeyCode::Char('\n' | '\r') => self.input.insert_newline(),
             KeyCode::Char(c) => self.input.insert(c),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -3031,14 +3061,24 @@ impl App {
         self.next_turn_allowed_tool_rules.clear();
     }
 
+    fn input_area_height(&self, area_width: u16) -> u16 {
+        let content_rows = self
+            .input
+            .visual_line_count(input_content_width(area_width));
+        content_rows
+            .saturating_add(1)
+            .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT)
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
+        let input_height = self.input_area_height(frame.area().width);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8), // Welcome box
-                Constraint::Min(3),    // Messages
-                Constraint::Length(3), // Input
-                Constraint::Length(1), // Status
+                Constraint::Length(8),            // Welcome box
+                Constraint::Min(3),               // Messages
+                Constraint::Length(input_height), // Input
+                Constraint::Length(1),            // Status
             ])
             .split(frame.area());
 
@@ -3058,7 +3098,7 @@ impl App {
         } else {
             "\u{203A} ".to_string()
         };
-        let display_text = format!("{prompt_text}{}", self.input.content);
+        let display_text = format!("{prompt_text}{}", self.input.content.replace('\n', "\n  "));
 
         let input_para = Paragraph::new(display_text)
             .block(input_block)
@@ -3067,10 +3107,12 @@ impl App {
 
         // Cursor
         if !self.is_waiting {
-            let prompt_width = 2u16;
-            let cursor_pos = u16::try_from(self.input.cursor_position()).unwrap_or(u16::MAX);
-            let cx = chunks[2].x + prompt_width + cursor_pos;
-            let cy = chunks[2].y + 1;
+            let (cursor_row, cursor_col) = self
+                .input
+                .visual_cursor_position(input_content_width(chunks[2].width));
+            let max_cursor_row = chunks[2].height.saturating_sub(2);
+            let cx = chunks[2].x + INPUT_PROMPT_WIDTH + cursor_col;
+            let cy = chunks[2].y + 1 + cursor_row.min(max_cursor_row);
             frame.set_cursor_position(Position::new(
                 cx.min(chunks[2].right().saturating_sub(1)),
                 cy,
@@ -3752,6 +3794,9 @@ fn describe_event(event: &super::events::AppEvent) -> String {
             format!("UserQuestion(n={})", questions.len())
         }
         super::events::AppEvent::Key(_) => "Key".to_string(),
+        super::events::AppEvent::Paste(text) => {
+            format!("Paste(chars={})", text.chars().count())
+        }
         super::events::AppEvent::Resize(w, h) => format!("Resize({w},{h})"),
         super::events::AppEvent::Tick => "Tick".to_string(),
         super::events::AppEvent::ShellDone { target, .. } => {
@@ -5212,6 +5257,63 @@ mod tests {
             "streaming mode must NOT capture text keystrokes into the input"
         );
         assert!(app.is_waiting, "non-Esc keys must not cancel the stream");
+    }
+
+    #[test]
+    fn modified_enter_inserts_newline_without_submitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.input.insert_str("first");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert_eq!(app.input.content, "first\n");
+        assert!(
+            app.session_messages.is_empty(),
+            "modified Enter must not submit the prompt"
+        );
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_without_submitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.input.insert_str("first");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.input.content, "first\n");
+        assert!(
+            app.session_messages.is_empty(),
+            "Ctrl+J must not submit the prompt"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_multiline_prompt() {
+        let mut app = App::new("test", "anthropic");
+
+        app.handle_app_event(Ok(AppEvent::Paste("first\r\nsecond".to_string())));
+
+        assert_eq!(app.input.content, "first\nsecond");
+        assert!(app.session_messages.is_empty());
+    }
+
+    #[test]
+    fn enter_submits_full_multiline_prompt() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test", "anthropic");
+        app.input.insert_str("first\nsecond");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.session_messages
+                .last()
+                .and_then(|msg| msg.get("content")),
+            Some(&serde_json::json!("first\nsecond"))
+        );
     }
 
     /// Global Ctrl+C escape hatch: while a modal overlay is open, Ctrl+C
