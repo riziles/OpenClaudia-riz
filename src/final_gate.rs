@@ -45,6 +45,14 @@ pub fn validate_final_answer(
         return Err(Denial::new("final answer requires a non-empty summary"));
     }
 
+    // Allow conversational turns with no tool activity — nothing to cite.
+    if evidence.is_empty() && verification.is_empty() {
+        return Ok(FinalGateReport {
+            evidence: Vec::new(),
+            verification: Vec::new(),
+        });
+    }
+
     let hydrated_evidence =
         authoritative_evidence(evidence, ledger, "final answer requires evidence")?;
     if !hydrated_evidence
