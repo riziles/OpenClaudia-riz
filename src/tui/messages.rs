@@ -489,6 +489,7 @@ impl MessageList {
             });
         }
         self.is_streaming = false;
+        self.scroll_to_bottom();
     }
 
     pub const fn scroll_up(&mut self, n: u16) {

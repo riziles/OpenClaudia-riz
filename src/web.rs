@@ -873,8 +873,13 @@ pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, Str
 fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
     use headless_chrome::{Browser, LaunchOptions};
 
+    let profile_dir = std::path::PathBuf::from(".openclaudia/browser_profile");
+    std::fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("Failed to create browser profile directory: {e}"))?;
+
     let opts = LaunchOptions::default_builder()
         .headless(true)
+        .user_data_dir(Some(profile_dir))
         .build()
         .map_err(|e| format!("Failed to configure browser: {e}"))?;
     Browser::new(opts).map_err(|e| {
