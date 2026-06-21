@@ -80,7 +80,8 @@ proxy:
   host: "127.0.0.1"
   # Provider: anthropic, openai, google/gemini, deepseek, qwen/alibaba,
   # zai/glm/zhipu, kimi/moonshot, minimax, ollama, local, lmstudio,
-  # localai, text-generation-webui
+  # localai, text-generation-webui, openrouter, opencode/opencode-go,
+  # openai-compatible
   target: anthropic
 
 providers:
@@ -116,6 +117,22 @@ providers:
   minimax:
     base_url: https://api.minimax.io/v1
     # api_key: ${MINIMAX_API_KEY}
+  # OpenRouter (OpenAI-compatible aggregator) - /model list fetches /v1/models
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    # api_key: ${OPENROUTER_API_KEY}
+    # headers:
+    #   HTTP-Referer: https://example.com
+    #   X-OpenRouter-Title: OpenClaudia
+  # OpenCode Go OpenAI-compatible endpoint subset
+  opencode:
+    base_url: https://opencode.ai/zen/go/v1
+    # api_key: ${OPENCODE_API_KEY}
+  # Generic remote OpenAI-compatible endpoint
+  openai-compatible:
+    base_url: https://api.example.com/v1
+    # api_key: ${OPENAI_COMPATIBLE_API_KEY}
+    # model: my-model-name
   # Ollama for local LLM inference
   ollama:
     base_url: http://localhost:11434

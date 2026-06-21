@@ -160,7 +160,7 @@ enum Commands {
         #[arg(long)]
         host: Option<String>,
 
-        /// Target provider (anthropic, openai, google, gemini, deepseek, qwen, alibaba, zai, glm, zhipu, kimi, moonshot, minimax, ollama, local, lmstudio, localai, text-generation-webui)
+        /// Target provider (anthropic, openai, google, gemini, deepseek, qwen, alibaba, zai, glm, zhipu, kimi, moonshot, minimax, ollama, local, lmstudio, localai, text-generation-webui, openrouter, opencode, opencode-go, openai-compatible)
         #[arg(
             short,
             long,
@@ -206,7 +206,7 @@ enum Commands {
         #[arg(long)]
         host: Option<String>,
 
-        /// Target provider (anthropic, openai, google, gemini, deepseek, qwen, alibaba, zai, glm, zhipu, kimi, moonshot, minimax, ollama, local, lmstudio, localai, text-generation-webui)
+        /// Target provider (anthropic, openai, google, gemini, deepseek, qwen, alibaba, zai, glm, zhipu, kimi, moonshot, minimax, ollama, local, lmstudio, localai, text-generation-webui, openrouter, opencode, opencode-go, openai-compatible)
         #[arg(
             short,
             long,

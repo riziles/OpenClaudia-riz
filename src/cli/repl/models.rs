@@ -14,9 +14,16 @@ pub async fn fetch_dynamic_models(
         return None;
     }
 
-    match providers::fetch_models(
+    let extra_headers: Vec<(String, String)> = provider_config
+        .headers
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    match providers::fetch_models_with_headers(
         &provider_config.base_url,
         provider_config.api_key.as_ref(),
+        &extra_headers,
         adapter,
     )
     .await

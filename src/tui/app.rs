@@ -758,6 +758,47 @@ fn provider_switch_auth_to_vdd_auth(auth: &ProviderSwitchAuth) -> crate::vdd::Vd
     }
 }
 
+fn static_model_strings(provider: &str) -> Vec<String> {
+    crate::providers::static_models_for_provider(provider)
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+
+fn format_model_list(
+    provider: &str,
+    current_model: &str,
+    models: &[String],
+    source: &str,
+    fallback_note: Option<&str>,
+) -> String {
+    let body = if models.is_empty() {
+        "  (no models returned)".to_string()
+    } else {
+        models
+            .iter()
+            .map(|model| {
+                let marker = if model == current_model {
+                    " <- current"
+                } else {
+                    ""
+                };
+                format!("  {model}{marker}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let note = fallback_note.map_or_else(String::new, |note| format!("\n\n{note}"));
+    let list_kind = if source.contains("fallback") {
+        "this fallback list"
+    } else {
+        "this list"
+    };
+    format!(
+        "Available models for {provider} ({source}):\n{body}{note}\n\nUse /model <name> to switch. Model names are not limited to {list_kind}."
+    )
+}
+
 /// Which input mode the TUI is in when a keystroke arrives (crosslink #364).
 ///
 /// The three values map 1:1 to the three explicit `handle_key_*` methods
@@ -1514,6 +1555,36 @@ impl App {
                 self.messages.add(DisplayMessage::error(format!(
                     "Provider switch failed: {msg}"
                 )));
+            }
+            Ok(AppEvent::ModelListReady {
+                provider,
+                current_model,
+                models,
+                source,
+                fallback_note,
+            }) => {
+                self.messages.add(DisplayMessage::system(format_model_list(
+                    &provider,
+                    &current_model,
+                    &models,
+                    &source,
+                    fallback_note.as_deref(),
+                )));
+                self.messages.scroll_to_bottom();
+            }
+            Ok(AppEvent::ModelListError {
+                provider,
+                message,
+                fallback_models,
+            }) => {
+                self.messages.add(DisplayMessage::system(format_model_list(
+                    &provider,
+                    &self.model,
+                    &fallback_models,
+                    "fallback catalog",
+                    Some(&format!("Dynamic model fetch failed: {message}")),
+                )));
+                self.messages.scroll_to_bottom();
             }
             Err(_) => return false,
         }
@@ -2484,6 +2555,9 @@ impl App {
     }
 
     fn can_use_prompt_model(&self, model: &str) -> bool {
+        if crate::providers::is_openai_compatible_passthrough_target(&self.provider) {
+            return true;
+        }
         let detected = crate::providers::ProviderKind::from_model(model);
         detected == crate::providers::ProviderKind::Unknown
             || canonical_provider_name(detected.name()) == canonical_provider_name(&self.provider)
@@ -2545,6 +2619,92 @@ impl App {
         true
     }
 
+    fn show_model_list_fallback(&mut self, note: Option<&str>) {
+        let models = static_model_strings(&self.provider);
+        self.messages.add(DisplayMessage::system(format_model_list(
+            &self.provider,
+            &self.model,
+            &models,
+            "fallback catalog",
+            note,
+        )));
+    }
+
+    fn start_model_list_fetch_or_show_fallback(&mut self) {
+        let fallback_models = static_model_strings(&self.provider);
+        let Ok(adapter) = crate::providers::get_adapter(&self.provider) else {
+            self.show_model_list_fallback(Some("No adapter is registered for this provider."));
+            return;
+        };
+        if !adapter.supports_model_listing() {
+            self.show_model_list_fallback(None);
+            return;
+        }
+
+        let Some(app_config) = self.app_config.as_ref() else {
+            self.show_model_list_fallback(Some(
+                "No active provider config is available for dynamic model listing.",
+            ));
+            return;
+        };
+        let Some(provider_config) = app_config.get_provider(&self.provider).cloned() else {
+            self.show_model_list_fallback(Some(
+                "No provider config was found for dynamic model listing.",
+            ));
+            return;
+        };
+        let Some(handle) = self.runtime_handle.clone() else {
+            self.show_model_list_fallback(Some(
+                "No async runtime is bound for dynamic model listing.",
+            ));
+            return;
+        };
+        let Some(tx) = self.event_sender() else {
+            self.show_model_list_fallback(Some(
+                "No TUI event channel is bound for dynamic model listing.",
+            ));
+            return;
+        };
+
+        let provider = self.provider.clone();
+        let current_model = self.model.clone();
+        let extra_headers: Vec<(String, String)> = provider_config
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self.messages.add(DisplayMessage::system(format!(
+            "Fetching models for {provider} from the configured /models endpoint..."
+        )));
+        handle.spawn(async move {
+            let event = match crate::providers::fetch_models_with_headers(
+                &provider_config.base_url,
+                provider_config.api_key.as_ref(),
+                &extra_headers,
+                adapter,
+            )
+            .await
+            {
+                Ok(models) => {
+                    let model_ids: Vec<String> = models.into_iter().map(|model| model.id).collect();
+                    AppEvent::ModelListReady {
+                        provider,
+                        current_model,
+                        models: model_ids,
+                        source: "provider API".to_string(),
+                        fallback_note: None,
+                    }
+                }
+                Err(err) => AppEvent::ModelListError {
+                    provider,
+                    message: err.to_string(),
+                    fallback_models,
+                },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
     fn handle_slash_model(&mut self, text: &str) -> bool {
         if text != "/model" && text != "/models" && !text.starts_with("/model ") {
             return false;
@@ -2565,23 +2725,7 @@ impl App {
         }
 
         if args.eq_ignore_ascii_case("list") {
-            let models = crate::providers::static_models_for_provider(&self.provider);
-            let body = models
-                .iter()
-                .map(|model| {
-                    let marker = if *model == self.model {
-                        " <- current"
-                    } else {
-                        ""
-                    };
-                    format!("  {model}{marker}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.messages.add(DisplayMessage::system(format!(
-                "Available models for {}:\n{body}\n\nUse /model <name> to switch. Model names are not limited to this fallback list.",
-                self.provider
-            )));
+            self.start_model_list_fetch_or_show_fallback();
             return true;
         }
 
@@ -3811,6 +3955,17 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::ProviderSwitchError(e) => {
             let snippet: String = e.chars().take(80).collect();
             format!("ProviderSwitchError({snippet:?})")
+        }
+        super::events::AppEvent::ModelListReady {
+            provider, models, ..
+        } => {
+            format!("ModelListReady({provider}, {} models)", models.len())
+        }
+        super::events::AppEvent::ModelListError {
+            provider, message, ..
+        } => {
+            let snippet: String = message.chars().take(80).collect();
+            format!("ModelListError({provider}, {snippet:?})")
         }
     }
 }

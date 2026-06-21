@@ -516,9 +516,15 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
 
     if adapter.supports_model_listing() {
         if let Some(provider_config) = state.config.active_provider() {
-            match providers::fetch_models(
+            let extra_headers: Vec<(String, String)> = provider_config
+                .headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            match providers::fetch_models_with_headers(
                 &provider_config.base_url,
                 provider_config.api_key.as_ref(),
+                &extra_headers,
                 adapter,
             )
             .await
@@ -1892,6 +1898,9 @@ async fn proxy_passthrough(
 /// that callers can rely on a configured default when the model is opaque.
 #[must_use]
 pub fn determine_provider(model: &str, config: &AppConfig) -> String {
+    if providers::is_openai_compatible_passthrough_target(&config.proxy.target) {
+        return config.proxy.target.clone();
+    }
     let kind = crate::providers::ProviderKind::from_model(model);
     if kind == crate::providers::ProviderKind::Unknown {
         return config.proxy.target.clone();
@@ -3131,6 +3140,20 @@ mod tests {
             determine_provider("some-unknown-model-xyz", &config),
             "deepseek"
         );
+    }
+
+    #[test]
+    fn determine_provider_preserves_openai_compatible_aggregator_targets() {
+        let config = minimal_config("openrouter");
+        assert_eq!(
+            determine_provider("anthropic/claude-sonnet-4-6", &config),
+            "openrouter"
+        );
+        assert_eq!(determine_provider("openai/gpt-5.2", &config), "openrouter");
+
+        let config = minimal_config("opencode");
+        assert_eq!(determine_provider("qwen3.7-plus", &config), "opencode");
+        assert_eq!(determine_provider("kimi-k2.7-code", &config), "opencode");
     }
 
     // ── Usage extraction (B1-adjacent: token tracking in proxy) ──────────────

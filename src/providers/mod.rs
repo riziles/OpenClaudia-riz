@@ -405,6 +405,10 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "lmstudio",
     "localai",
     "text-generation-webui",
+    "openrouter",
+    "opencode",
+    "opencode-go",
+    "openai-compatible",
 ];
 
 /// Canonical per-target default model table.
@@ -425,6 +429,9 @@ pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
     ("kimi", "kimi-k2.7-code"),
     ("moonshot", "kimi-k2.7-code"),
     ("minimax", "MiniMax-M3"),
+    ("openrouter", "~openai/gpt-latest"),
+    ("opencode", "kimi-k2.7-code"),
+    ("opencode-go", "kimi-k2.7-code"),
 ];
 
 /// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
@@ -456,8 +463,33 @@ pub fn api_key_env_var_for_target(provider_name: &str) -> &'static str {
         "qwen" | "alibaba" => "QWEN_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY or MOONSHOT_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "opencode" | "opencode-go" => "OPENCODE_API_KEY",
+        "openai-compatible" => "OPENAI_COMPATIBLE_API_KEY or API_KEY",
         _ => "API_KEY",
     }
+}
+
+/// Targets that should keep the selected provider even when a model ID looks
+/// like another vendor's namespace.
+///
+/// Aggregators such as OpenRouter intentionally use slugs like
+/// `anthropic/claude-...`; local OpenAI-compatible servers often expose
+/// arbitrary names too. Prefix-based provider inference would otherwise route
+/// those requests to a different configured provider.
+#[must_use]
+pub fn is_openai_compatible_passthrough_target(target: &str) -> bool {
+    matches!(
+        target.trim().to_ascii_lowercase().as_str(),
+        "local"
+            | "lmstudio"
+            | "localai"
+            | "text-generation-webui"
+            | "openrouter"
+            | "opencode"
+            | "opencode-go"
+            | "openai-compatible"
+    )
 }
 
 /// Resolve a provider name to its singleton adapter.
@@ -496,7 +528,15 @@ pub fn get_adapter(provider: &str) -> Result<&'static dyn ProviderAdapter, Provi
         "ollama" => &OLLAMA,
         // OpenAI-compatible providers: explicitly named (no silent fallback
         // for unrecognised names — see the `_ =>` arm below).
-        "openai" | "local" | "lmstudio" | "localai" | "text-generation-webui" => &OPENAI,
+        "openai"
+        | "local"
+        | "lmstudio"
+        | "localai"
+        | "text-generation-webui"
+        | "openrouter"
+        | "opencode"
+        | "opencode-go"
+        | "openai-compatible" => &OPENAI,
         _ => {
             return Err(ProviderError::UnknownProvider {
                 name: provider.to_string(),
@@ -566,6 +606,23 @@ pub async fn fetch_models(
     api_key: Option<&ApiKey>,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
+    fetch_models_with_headers(base_url, api_key, &[], adapter).await
+}
+
+/// Fetch available models with optional operator-supplied headers.
+///
+/// Custom OpenAI-compatible providers often require routing or attribution
+/// headers in addition to bearer auth; this mirrors chat request forwarding.
+///
+/// # Errors
+///
+/// Returns a `ProviderError` if the provider does not support model listing or the request fails.
+pub async fn fetch_models_with_headers(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &[(String, String)],
+    adapter: &dyn ProviderAdapter,
+) -> Result<Vec<ModelInfo>, ProviderError> {
     if !adapter.supports_model_listing() {
         return Err(ProviderError::Unsupported(format!(
             "Provider '{}' does not support model listing",
@@ -588,6 +645,9 @@ pub async fn fetch_models(
     // `.as_str()` at the request boundary.
     if let Some(key) = api_key {
         request = request.header("Authorization", format!("Bearer {}", key.as_str()));
+    }
+    for (key, value) in extra_headers {
+        request = request.header(key.as_str(), value.as_str());
     }
 
     let response = request
@@ -773,6 +833,10 @@ mod tests {
         assert_eq!(get_adapter("local").unwrap().name(), "openai");
         assert_eq!(get_adapter("lmstudio").unwrap().name(), "openai");
         assert_eq!(get_adapter("localai").unwrap().name(), "openai");
+        assert_eq!(get_adapter("openrouter").unwrap().name(), "openai");
+        assert_eq!(get_adapter("opencode").unwrap().name(), "openai");
+        assert_eq!(get_adapter("opencode-go").unwrap().name(), "openai");
+        assert_eq!(get_adapter("openai-compatible").unwrap().name(), "openai");
         // Crosslink #433: unknown names are now an explicit error, NOT a
         // silent OpenAI fallback. See `get_adapter_unknown_provider_*`
         // tests below for the full forensic pin.
@@ -944,6 +1008,62 @@ mod tests {
             ProviderError::InvalidResponse(msg) => assert!(msg.contains("created"), "{msg}"),
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_models_with_headers_preserves_versioned_provider_roots() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut buf = [0_u8; 4096];
+            let read = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            assert!(
+                request.starts_with("get /api/v1/models "),
+                "request used unexpected path:\n{request}"
+            );
+            assert!(
+                request.contains("authorization: bearer sk-test-model-key"),
+                "request missing bearer auth:\n{request}"
+            );
+            assert!(
+                request.contains("x-custom-route: test-value"),
+                "request missing custom header:\n{request}"
+            );
+
+            let body = r#"{"object":"list","data":[{"id":"openrouter/test-model"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let key = ApiKey::try_from_string("sk-test-model-key".to_string()).expect("valid key");
+        let headers = vec![("X-Custom-Route".to_string(), "test-value".to_string())];
+        let models = fetch_models_with_headers(
+            &format!("http://{addr}/api/v1"),
+            Some(&key),
+            &headers,
+            &OPENAI,
+        )
+        .await
+        .expect("model list should fetch");
+
+        server.join().expect("server thread must finish");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "openrouter/test-model");
     }
 
     #[test]
@@ -1484,6 +1604,10 @@ mod tests {
             ("lmstudio", "openai"),
             ("localai", "openai"),
             ("text-generation-webui", "openai"),
+            ("openrouter", "openai"),
+            ("opencode", "openai"),
+            ("opencode-go", "openai"),
+            ("openai-compatible", "openai"),
         ];
         for (input, expected) in cases {
             let adapter = get_adapter(input)
@@ -1528,6 +1652,18 @@ mod tests {
         assert_eq!(
             api_key_env_var_for_target("  MOONSHOT  "),
             "KIMI_API_KEY or MOONSHOT_API_KEY"
+        );
+        assert_eq!(
+            api_key_env_var_for_target("OpenRouter"),
+            "OPENROUTER_API_KEY"
+        );
+        assert_eq!(
+            api_key_env_var_for_target("opencode-go"),
+            "OPENCODE_API_KEY"
+        );
+        assert_eq!(
+            api_key_env_var_for_target("openai-compatible"),
+            "OPENAI_COMPATIBLE_API_KEY or API_KEY"
         );
         assert_eq!(api_key_env_var_for_target("unknown"), "API_KEY");
     }

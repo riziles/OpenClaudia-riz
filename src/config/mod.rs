@@ -190,6 +190,22 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("providers.kimi.base_url", "https://api.moonshot.ai/v1")?
         // MiniMax (OpenAI-compatible)
         .set_default("providers.minimax.base_url", "https://api.minimax.io/v1")?
+        // OpenRouter (OpenAI-compatible aggregator; docs use /api/v1)
+        .set_default(
+            "providers.openrouter.base_url",
+            "https://openrouter.ai/api/v1",
+        )?
+        // OpenCode Go OpenAI-compatible endpoint subset.
+        .set_default(
+            "providers.opencode.base_url",
+            "https://opencode.ai/zen/go/v1",
+        )?
+        // Generic remote OpenAI-compatible endpoint. Users override
+        // `base_url`, `api_key`, `model`, and optional headers in config.
+        .set_default(
+            "providers.openai-compatible.base_url",
+            "https://api.openai.com",
+        )?
         // Local OpenAI-compatible providers.
         .set_default("providers.ollama.base_url", "http://localhost:11434")?
         .set_default("providers.local.base_url", "http://localhost:1234/v1")?
@@ -265,6 +281,23 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     if let Ok(key) = std::env::var("MINIMAX_API_KEY") {
         builder = maybe_set_api_key(builder, "providers.minimax.api_key", key)?;
     }
+    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+        builder = maybe_set_api_key(builder, "providers.openrouter.api_key", key)?;
+    }
+    if let Ok(key) = std::env::var("OPENCODE_API_KEY") {
+        builder = maybe_set_api_key(builder, "providers.opencode.api_key", key)?;
+    }
+    let openai_compatible_key = std::env::var("OPENAI_COMPATIBLE_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            std::env::var("API_KEY")
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+        });
+    if let Some(key) = openai_compatible_key {
+        builder = maybe_set_api_key(builder, "providers.openai-compatible.api_key", key)?;
+    }
 
     // `ApiKey::deserialize` (invoked transitively here) enforces non-empty,
     // ASCII, and control-char-free keys. The whitespace-only normalization
@@ -331,6 +364,9 @@ fn canonical_provider_config_key(name: &str) -> Option<&'static str> {
         "minimax" => Some("minimax"),
         "ollama" => Some("ollama"),
         "local" | "lmstudio" | "localai" | "text-generation-webui" => Some("local"),
+        "openrouter" => Some("openrouter"),
+        "opencode" | "opencode-go" => Some("opencode"),
+        "openai-compatible" => Some("openai-compatible"),
         _ => None,
     }
 }
@@ -493,6 +529,55 @@ mod tests {
             Some("kimi-key-0000000000")
         );
         assert!(config.get_provider("MOONSHOT").is_some());
+    }
+
+    #[test]
+    fn app_config_get_provider_resolves_openai_compatible_aliases() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "opencode".to_string(),
+            ProviderConfig {
+                api_key: Some(test_api_key("opencode")),
+                base_url: "https://opencode.ai/zen/go/v1".to_string(),
+                model: None,
+                headers: HashMap::new(),
+                thinking: ThinkingConfig::default(),
+            },
+        );
+        providers.insert(
+            "openrouter".to_string(),
+            ProviderConfig {
+                api_key: Some(test_api_key("router")),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                model: None,
+                headers: HashMap::new(),
+                thinking: ThinkingConfig::default(),
+            },
+        );
+
+        let config = AppConfig {
+            proxy: ProxyConfig::default(),
+            providers,
+            hooks: HooksConfig::default(),
+            session: SessionConfig::default(),
+            keybindings: KeybindingsConfig::default(),
+            vdd: VddConfig::default(),
+            guardrails: GuardrailsConfig::default(),
+            permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
+            managed_settings_path: None,
+        };
+
+        assert_eq!(
+            config
+                .get_provider("opencode-go")
+                .and_then(|provider| provider.api_key.as_ref())
+                .map(ApiKey::as_str),
+            Some("opencode-0000000000")
+        );
+        assert!(config.get_provider("OPENROUTER").is_some());
     }
 
     #[test]

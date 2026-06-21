@@ -180,6 +180,20 @@ pub enum AppEvent {
     ProviderSwitchReady(ProviderSwitch),
     /// A `/provider <name>` background resolution failed.
     ProviderSwitchError(String),
+    /// A `/model list` background fetch completed.
+    ModelListReady {
+        provider: String,
+        current_model: String,
+        models: Vec<String>,
+        source: String,
+        fallback_note: Option<String>,
+    },
+    /// A `/model list` background fetch failed.
+    ModelListError {
+        provider: String,
+        message: String,
+        fallback_models: Vec<String>,
+    },
 }
 
 /// Handles terminal events in a background thread, merges with async events.

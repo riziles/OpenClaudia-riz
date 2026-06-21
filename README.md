@@ -9,8 +9,8 @@ OpenClaudia is a Rust-based CLI that transforms any LLM into an agentic coding a
 ## Features
 
 - **Behavioral Modes** — Three-axis model (agency, quality, scope) with 8 presets and 6 modifiers for fine-grained control over AI behavior
-- **Multi-Provider Support** — Anthropic, OpenAI, Google Gemini, DeepSeek, Qwen, Z.AI/GLM, Kimi/Moonshot, MiniMax, Ollama, and any OpenAI-compatible server
-- **Local LLM Support** — Run with Ollama, LM Studio, LocalAI, or any OpenAI-compatible endpoint
+- **Multi-Provider Support** — Anthropic, OpenAI, Google Gemini, DeepSeek, Qwen, Z.AI/GLM, Kimi/Moonshot, MiniMax, OpenRouter, OpenCode Go, Ollama, and OpenAI-compatible servers
+- **Local/Custom LLM Support** — Run with Ollama, LM Studio, LocalAI, OpenRouter, OpenCode Go, or any OpenAI-compatible endpoint
 - **Auto-Detect Provider** — Pass `-m gemini-3.5-flash` and the provider is detected automatically
 - **30+ Agentic Tools** — Bash, file ops, LSP, web search, notebooks, task tracking, plan mode, worktrees, cron scheduling, MCP resources
 - **Tool Execution Loop** — Multi-turn tool calling with automatic result feedback (works across all providers)
@@ -103,6 +103,9 @@ openclaudia --mode debug      # Investigation-first debugging
 | `ZAI_API_KEY` | Z.AI (GLM) | For Z.AI |
 | `KIMI_API_KEY` or `MOONSHOT_API_KEY` | Kimi/Moonshot | For Kimi |
 | `MINIMAX_API_KEY` | MiniMax | For MiniMax |
+| `OPENROUTER_API_KEY` | OpenRouter | For OpenRouter |
+| `OPENCODE_API_KEY` | OpenCode Go | For OpenCode Go |
+| `OPENAI_COMPATIBLE_API_KEY` or `API_KEY` | Generic OpenAI-compatible endpoint | For `openai-compatible` |
 
 ### Config File
 
@@ -114,7 +117,8 @@ proxy:
   host: "127.0.0.1"
   # Provider: anthropic, openai, google/gemini, deepseek, qwen/alibaba,
   # zai/glm/zhipu, kimi/moonshot, minimax, ollama, local, lmstudio,
-  # localai, text-generation-webui
+  # localai, text-generation-webui, openrouter, opencode/opencode-go,
+  # openai-compatible
   target: anthropic
 
 providers:
@@ -142,6 +146,22 @@ providers:
     base_url: https://api.moonshot.ai/v1
   minimax:
     base_url: https://api.minimax.io/v1
+  # OpenRouter (OpenAI-compatible aggregator)
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    # api_key: ${OPENROUTER_API_KEY}
+    # headers:
+    #   HTTP-Referer: https://example.com
+    #   X-OpenRouter-Title: OpenClaudia
+  # OpenCode Go OpenAI-compatible endpoint subset
+  opencode:
+    base_url: https://opencode.ai/zen/go/v1
+    # api_key: ${OPENCODE_API_KEY}
+  # Generic OpenAI-compatible endpoint
+  openai-compatible:
+    base_url: https://api.example.com/v1
+    # api_key: ${OPENAI_COMPATIBLE_API_KEY}
+    # model: my-model-name
   # Ollama for local LLM inference
   ollama:
     base_url: http://localhost:11434
@@ -420,9 +440,10 @@ The lists below are the built-in `/model list` fallback catalog. Model names are
 - Popular: `llama3.1`, `deepseek-r1`, `gemma3`, `qwen3`, `mistral`, `phi4`, `llava`
 - Any model installed — run `ollama list` to see available models
 
-### OpenAI-Compatible (Local)
-- Works with LM Studio, LocalAI, text-generation-webui, vLLM, and any OpenAI-compatible server
-- Set `base_url` to your local server (e.g., `http://localhost:1234/v1`)
+### OpenAI-Compatible (Custom)
+- Works with OpenRouter, OpenCode Go, LM Studio, LocalAI, text-generation-webui, vLLM, and any OpenAI-compatible server
+- Set `base_url` to the provider root (for example, `https://openrouter.ai/api/v1` or `http://localhost:1234/v1`)
+- Run `/model list` or `/models` to fetch model IDs from the configured `/models` endpoint when the provider supports it
 
 ## Behavioral Modes
 
