@@ -44,6 +44,9 @@ tool_struggles.txt
 # === End crosslink managed ===
 .claude/worktrees/
 
+# Project-local Chromium profile used by browser-backed web tools.
+.openclaudia/browser_profile/
+
 # oh-my-claudecode / aider machine-local orchestration state (never commit)
 .omc/
 .aider*

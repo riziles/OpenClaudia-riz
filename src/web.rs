@@ -16,6 +16,7 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -503,6 +504,9 @@ pub fn html_to_markdown(html: &str) -> String {
 #[cfg(feature = "browser")]
 const DUCKDUCKGO_HTML_URL: &str = "https://html.duckduckgo.com/html/";
 
+#[cfg(feature = "browser")]
+const BROWSER_PROFILE_DIR: &str = ".openclaudia/browser_profile";
+
 /// Result from `web_fetch`
 #[derive(Debug, Clone)]
 pub struct FetchResult {
@@ -873,8 +877,10 @@ pub fn search_bing(_query: &str, _limit: usize) -> Result<Vec<SearchResult>, Str
 fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
     use headless_chrome::{Browser, LaunchOptions};
 
+    let user_data_dir = browser_profile_dir()?;
     let opts = LaunchOptions::default_builder()
         .headless(true)
+        .user_data_dir(Some(user_data_dir))
         .build()
         .map_err(|e| format!("Failed to configure browser: {e}"))?;
     Browser::new(opts).map_err(|e| {
@@ -883,6 +889,25 @@ fn launch_browser_for_scraping() -> Result<headless_chrome::Browser, String> {
              on PATH, or ensure network access for the first-run auto-download."
         )
     })
+}
+
+#[cfg(feature = "browser")]
+fn browser_profile_dir() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Failed to resolve current directory for browser profile: {e}"))?;
+    browser_profile_dir_under(&cwd)
+}
+
+#[cfg(feature = "browser")]
+fn browser_profile_dir_under(project_root: &Path) -> Result<PathBuf, String> {
+    let dir = project_root.join(BROWSER_PROFILE_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create Chromium browser profile directory '{}': {e}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
 }
 
 /// Search `DuckDuckGo` via a headless Chromium and parse the rendered
@@ -1176,6 +1201,20 @@ mod tests {
     fn shared_http_client_builder_succeeds() {
         let client = build_shared_http_client().expect("shared HTTP client builder must succeed");
         drop(client);
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn browser_profile_dir_is_project_local_and_created() {
+        let root = tempfile::tempdir().expect("temp project root");
+        let dir = browser_profile_dir_under(root.path()).expect("browser profile dir");
+
+        assert_eq!(dir, root.path().join(".openclaudia/browser_profile"));
+        assert!(dir.is_dir(), "browser profile directory must be created");
+        assert!(
+            dir.starts_with(root.path()),
+            "browser profile must stay inside the project root"
+        );
     }
 
     #[test]
