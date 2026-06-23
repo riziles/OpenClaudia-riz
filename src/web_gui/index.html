@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="default-model" content="__DEFAULT_MODEL__">
+  <title>OpenClaudia</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="header">
+      <span class="header__title">OpenClaudia</span>
+      <div class="header__actions">
+        <span id="connection-status" class="header__status" aria-live="polite">
+          connecting…
+        </span>
+        <button id="theme-toggle" class="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+          💻
+        </button>
+      </div>
+    </header>
+
+    <main id="chat" class="chat" role="log" aria-label="Conversation" aria-live="polite"></main>
+
+    <footer class="input-area">
+      <form id="chat-form" class="input-area__form" autocomplete="off">
+        <textarea
+          id="chat-input"
+          class="input-area__field"
+          rows="1"
+          placeholder="Type a message… (Shift+Enter for new line)"
+          aria-label="Chat input"
+        ></textarea>
+        <button id="chat-submit" class="input-area__submit" type="submit" aria-label="Send message">
+          ↑
+        </button>
+      </form>
+    </footer>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

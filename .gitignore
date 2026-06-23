@@ -50,3 +50,4 @@ tool_struggles.txt
 # oh-my-claudecode / aider machine-local orchestration state (never commit)
 .omc/
 .aider*
+.env
