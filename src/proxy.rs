@@ -40,6 +40,55 @@ use crate::services::policy::{
 use crate::session::{get_session_context, SessionManager, TokenUsage};
 use crate::vdd::{VddEngine, VddResult};
 
+// ── Embedded web GUI assets ──────────────────────────────────────────────
+
+const WEB_GUI_INDEX: &str = include_str!("web_gui/index.html");
+const WEB_GUI_STYLE: &str = include_str!("web_gui/style.css");
+const WEB_GUI_APP_JS: &str = include_str!("web_gui/app.js");
+const WEB_GUI_CHAT_JS: &str = include_str!("web_gui/chat.js");
+const WEB_GUI_API_JS: &str = include_str!("web_gui/api.js");
+
+/// Minimal web GUI landing page. Serves the embedded SPA that talks to
+/// the proxy's `/v1/chat/completions` endpoint via SSE streaming.
+/// Injects the configured default model into the HTML so the frontend
+/// can include it in API requests without hardcoding.
+async fn web_gui_index(State(state): State<ProxyState>) -> impl IntoResponse {
+    let default_model = crate::providers::default_model_for_target(&state.config.proxy.target);
+    let html = WEB_GUI_INDEX.replace("__DEFAULT_MODEL__", default_model);
+    Response::builder()
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap()
+}
+
+async fn web_gui_style() -> impl IntoResponse {
+    Response::builder()
+        .header("content-type", "text/css; charset=utf-8")
+        .body(Body::from(WEB_GUI_STYLE))
+        .unwrap()
+}
+
+async fn web_gui_app_js() -> impl IntoResponse {
+    Response::builder()
+        .header("content-type", "application/javascript; charset=utf-8")
+        .body(Body::from(WEB_GUI_APP_JS))
+        .unwrap()
+}
+
+async fn web_gui_chat_js() -> impl IntoResponse {
+    Response::builder()
+        .header("content-type", "application/javascript; charset=utf-8")
+        .body(Body::from(WEB_GUI_CHAT_JS))
+        .unwrap()
+}
+
+async fn web_gui_api_js() -> impl IntoResponse {
+    Response::builder()
+        .header("content-type", "application/javascript; charset=utf-8")
+        .body(Body::from(WEB_GUI_API_JS))
+        .unwrap()
+}
+
 /// Normalize base URL by stripping trailing slash and /v1 suffix.
 /// This prevents double /v1/v1 when endpoint paths include /v1 prefix.
 #[must_use]
@@ -220,7 +269,9 @@ pub struct ChatCompletionRequest {
 
 /// Create the proxy router
 pub fn create_router(state: ProxyState) -> Router {
-    Router::new()
+    // In dev mode, serve web GUI files from disk for hot reloading.
+    // Set OPENCLAUDIA_WEB_GUI_DEV=1 — no rebuild needed for CSS/JS changes.
+    let router = Router::new()
         // Health check
         .route("/health", get(health_check))
         // Auth routes (device flow for Claude Max OAuth)
@@ -240,8 +291,22 @@ pub fn create_router(state: ProxyState) -> Router {
         // Anthropic-compatible endpoints (for direct Anthropic clients)
         .route("/v1/messages", any(proxy_anthropic_messages))
         // Catch-all for other API routes
-        .route("/v1/{*path}", any(proxy_passthrough))
-        .with_state(state)
+        .route("/v1/{*path}", any(proxy_passthrough));
+
+    // Web GUI: serve from disk in dev mode, embedded otherwise
+    let router = if std::env::var("OPENCLAUDIA_WEB_GUI_DEV").as_deref() == Ok("1") {
+        use tower_http::services::ServeDir;
+        router.fallback_service(ServeDir::new("src/web_gui"))
+    } else {
+        router
+            .route("/", get(web_gui_index))
+            .route("/style.css", get(web_gui_style))
+            .route("/app.js", get(web_gui_app_js))
+            .route("/chat.js", get(web_gui_chat_js))
+            .route("/api.js", get(web_gui_api_js))
+    };
+
+    router.with_state(state)
 }
 
 /// Health check endpoint
