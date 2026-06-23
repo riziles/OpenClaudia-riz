@@ -3216,18 +3216,22 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let input_height = self.input_area_height(frame.area().width);
+        // Hide welcome box once there are messages — reclaim vertical space
+        let welcome_height: u16 = if self.messages.len() > 0 { 0 } else { 8 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),            // Welcome box
-                Constraint::Min(3),               // Messages
-                Constraint::Length(input_height), // Input
-                Constraint::Length(1),            // Status
+                Constraint::Length(welcome_height), // Welcome box
+                Constraint::Min(3),                  // Messages
+                Constraint::Length(input_height),    // Input
+                Constraint::Length(1),               // Status
             ])
             .split(frame.area());
 
         // ── Welcome box (two-column, bordered) ──
-        self.draw_welcome_box(frame, chunks[0]);
+        if welcome_height > 0 {
+            self.draw_welcome_box(frame, chunks[0]);
+        }
 
         // ── Messages ──
         self.messages.render(frame, chunks[1]);
